@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option go_package = "github.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1";
+
+// RuntimeService provides code execution management within Firecracker microVMs.
+service RuntimeService {
+    // CreateExecution creates a new code execution request.
+    rpc CreateExecution(CreateExecutionRequest) returns (CreateExecutionResponse);
+
+    // GetExecution retrieves an execution by ID.
+    rpc GetExecution(GetExecutionRequest) returns (GetExecutionResponse);
+
+    // ListExecutions lists executions for an organization with pagination.
+    rpc ListExecutions(ListExecutionsRequest) returns (ListExecutionsResponse);
+
+    // CancelExecution cancels a running or pending execution.
+    rpc CancelExecution(CancelExecutionRequest) returns (CancelExecutionResponse);
+
+    // GetExecutionMetrics retrieves resource usage metrics for an execution.
+    rpc GetExecutionMetrics(GetExecutionMetricsRequest) returns (GetExecutionMetricsResponse);
+}
+
+// CreateExecutionRequest is the request for creating a new execution.
+message CreateExecutionRequest {
+    string organization_id = 1;
+    string requested_by = 2;
+    string language = 3;
+    string code = 4;
+    string stdin = 5;
+    int32 vcpu = 6;
+    int32 memory_mb = 7;
+    int32 timeout_sec = 8;
+}
+
+// CreateExecutionResponse is the response for creating a new execution.
+message CreateExecutionResponse {
+    Execution execution = 1;
+}
+
+// GetExecutionRequest is the request for retrieving an execution.
+message GetExecutionRequest {
+    string id = 1;
+}
+
+// GetExecutionResponse is the response for retrieving an execution.
+message GetExecutionResponse {
+    Execution execution = 1;
+}
+
+// ListExecutionsRequest is the request for listing executions.
+message ListExecutionsRequest {
+    string organization_id = 1;
+    int32 page = 2;
+    int32 page_size = 3;
+}
+
+// ListExecutionsResponse is the response for listing executions.
+message ListExecutionsResponse {
+    repeated Execution executions = 1;
+    int32 total = 2;
+}
+
+// CancelExecutionRequest is the request for cancelling an execution.
+message CancelExecutionRequest {
+    string id = 1;
+}
+
+// CancelExecutionResponse is the response for cancelling an execution.
+message CancelExecutionResponse {
+    bool success = 1;
+}
+
+// GetExecutionMetricsRequest is the request for retrieving execution metrics.
+message GetExecutionMetricsRequest {
+    string execution_id = 1;
+}
+
+// GetExecutionMetricsResponse is the response for retrieving execution metrics.
+message GetExecutionMetricsResponse {
+    ExecutionMetrics metrics = 1;
+}
+
+// Execution represents a code execution and its lifecycle.
+message Execution {
+    string id = 1;
+    string organization_id = 2;
+    string requested_by = 3;
+    string language = 4;
+    string code = 5;
+    string stdin = 6;
+    string status = 7;
+    int32 exit_code = 8;
+    string stdout = 9;
+    string stderr = 10;
+    string error = 11;
+    int32 vcpu = 12;
+    int32 memory_mb = 13;
+    int32 timeout_sec = 14;
+    int64 duration_ms = 15;
+    string created_at = 16;
+    string started_at = 17;
+    string completed_at = 18;
+}
+
+// ExecutionMetrics captures resource usage during an execution.
+message ExecutionMetrics {
+    string id = 1;
+    string execution_id = 2;
+    string vm_id = 3;
+    int64 cpu_time_ms = 4;
+    double memory_peak_mb = 5;
+    double memory_avg_mb = 6;
+    int64 io_read_bytes = 7;
+    int64 io_write_bytes = 8;
+    int64 boot_time_ms = 9;
+    int64 compile_time_ms = 10;
+    int64 exec_time_ms = 11;
+    int64 total_time_ms = 12;
+}
