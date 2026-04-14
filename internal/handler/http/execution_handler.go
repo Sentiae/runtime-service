@@ -35,13 +35,13 @@ func (h *ExecutionHandler) RegisterRoutes(r chi.Router) {
 
 // CreateExecutionRequest represents the request body for creating an execution
 type CreateExecutionRequest struct {
-	Language  string             `json:"language"`
-	Code      string             `json:"code"`
-	Stdin     string             `json:"stdin,omitempty"`
-	Args      domain.JSONMap     `json:"args,omitempty"`
-	EnvVars   domain.JSONMap     `json:"env_vars,omitempty"`
-	NodeID    *string            `json:"node_id,omitempty"`
-	Resources *ResourceRequest   `json:"resources,omitempty"`
+	Language  string           `json:"language"`
+	Code      string           `json:"code"`
+	Stdin     string           `json:"stdin,omitempty"`
+	Args      domain.JSONMap   `json:"args,omitempty"`
+	EnvVars   domain.JSONMap   `json:"env_vars,omitempty"`
+	NodeID    *string          `json:"node_id,omitempty"`
+	Resources *ResourceRequest `json:"resources,omitempty"`
 }
 
 // ResourceRequest represents resource limits in the request
@@ -80,7 +80,7 @@ func (h *ExecutionHandler) CreateExecution(w http.ResponseWriter, r *http.Reques
 
 	lang := domain.Language(req.Language)
 	if !lang.IsValid() {
-		RespondBadRequest(w, "Unsupported language", map[string]interface{}{
+		RespondBadRequest(w, "Unsupported language", map[string]any{
 			"language":  req.Language,
 			"supported": []string{"go", "python", "javascript", "typescript", "rust", "c", "cpp", "bash"},
 		})
@@ -174,7 +174,7 @@ func (h *ExecutionHandler) ListExecutions(w http.ResponseWriter, r *http.Request
 		items[i] = executionToResponse(&e)
 	}
 
-	RespondSuccess(w, map[string]interface{}{
+	RespondSuccess(w, map[string]any{
 		"items": items,
 		"total": total,
 	})
@@ -227,19 +227,19 @@ func (h *ExecutionHandler) GetExecutionMetrics(w http.ResponseWriter, r *http.Re
 
 // ExecutionResponse is the API response for an execution
 type ExecutionResponse struct {
-	ID             string                 `json:"id"`
-	OrganizationID string                 `json:"organization_id"`
-	Language       string                 `json:"language"`
-	Status         string                 `json:"status"`
-	ExitCode       *int                   `json:"exit_code,omitempty"`
-	Stdout         string                 `json:"stdout,omitempty"`
-	Stderr         string                 `json:"stderr,omitempty"`
-	Error          string                 `json:"error,omitempty"`
-	Resources      ResourceResponse       `json:"resources"`
-	DurationMS     *int64                 `json:"duration_ms,omitempty"`
-	CreatedAt      string                 `json:"created_at"`
-	StartedAt      *string                `json:"started_at,omitempty"`
-	CompletedAt    *string                `json:"completed_at,omitempty"`
+	ID             string           `json:"id"`
+	OrganizationID string           `json:"organization_id"`
+	Language       string           `json:"language"`
+	Status         string           `json:"status"`
+	ExitCode       *int             `json:"exit_code,omitempty"`
+	Stdout         string           `json:"stdout,omitempty"`
+	Stderr         string           `json:"stderr,omitempty"`
+	Error          string           `json:"error,omitempty"`
+	Resources      ResourceResponse `json:"resources"`
+	DurationMS     *int64           `json:"duration_ms,omitempty"`
+	CreatedAt      string           `json:"created_at"`
+	StartedAt      *string          `json:"started_at,omitempty"`
+	CompletedAt    *string          `json:"completed_at,omitempty"`
 }
 
 // ResourceResponse is the API response for resource limits

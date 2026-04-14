@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	pkdebug "github.com/sentiae/platform-kit/debug"
 	"github.com/sentiae/runtime-service/internal/di"
 	"github.com/sentiae/runtime-service/pkg/config"
 	"github.com/sentiae/runtime-service/pkg/logger"
@@ -23,8 +24,13 @@ var (
 )
 
 func main() {
+	stopPprof := pkdebug.StartPprofServer(context.Background(), "RUNTIME_DEBUG_PPROF")
+	defer func() { _ = stopPprof() }()
 	// Load configuration
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
 
 	// Initialize logger
 	logger.Init()

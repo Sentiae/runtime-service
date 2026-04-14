@@ -7,20 +7,20 @@ import (
 
 // Response represents a standard API response
 type Response struct {
-	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   *ErrorInfo  `json:"error,omitempty"`
+	Success bool       `json:"success"`
+	Data    any        `json:"data,omitempty"`
+	Error   *ErrorInfo `json:"error,omitempty"`
 }
 
 // ErrorInfo contains error details
 type ErrorInfo struct {
-	Code    string                 `json:"code"`
-	Message string                 `json:"message"`
-	Details map[string]interface{} `json:"details,omitempty"`
+	Code    string         `json:"code"`
+	Message string         `json:"message"`
+	Details map[string]any `json:"details,omitempty"`
 }
 
 // RespondJSON writes a JSON response
-func RespondJSON(w http.ResponseWriter, statusCode int, data interface{}) {
+func RespondJSON(w http.ResponseWriter, statusCode int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 
@@ -32,7 +32,7 @@ func RespondJSON(w http.ResponseWriter, statusCode int, data interface{}) {
 }
 
 // RespondSuccess writes a successful JSON response
-func RespondSuccess(w http.ResponseWriter, data interface{}) {
+func RespondSuccess(w http.ResponseWriter, data any) {
 	RespondJSON(w, http.StatusOK, Response{
 		Success: true,
 		Data:    data,
@@ -40,7 +40,7 @@ func RespondSuccess(w http.ResponseWriter, data interface{}) {
 }
 
 // RespondCreated writes a 201 Created response
-func RespondCreated(w http.ResponseWriter, data interface{}) {
+func RespondCreated(w http.ResponseWriter, data any) {
 	RespondJSON(w, http.StatusCreated, Response{
 		Success: true,
 		Data:    data,
@@ -53,7 +53,7 @@ func RespondNoContent(w http.ResponseWriter) {
 }
 
 // RespondError writes an error JSON response
-func RespondError(w http.ResponseWriter, statusCode int, code, message string, details map[string]interface{}) {
+func RespondError(w http.ResponseWriter, statusCode int, code, message string, details map[string]any) {
 	RespondJSON(w, statusCode, Response{
 		Success: false,
 		Error: &ErrorInfo{
@@ -65,7 +65,7 @@ func RespondError(w http.ResponseWriter, statusCode int, code, message string, d
 }
 
 // RespondBadRequest writes a 400 Bad Request response
-func RespondBadRequest(w http.ResponseWriter, message string, details map[string]interface{}) {
+func RespondBadRequest(w http.ResponseWriter, message string, details map[string]any) {
 	RespondError(w, http.StatusBadRequest, "BAD_REQUEST", message, details)
 }
 

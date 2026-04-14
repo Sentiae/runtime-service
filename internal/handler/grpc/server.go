@@ -97,10 +97,10 @@ func (s *Server) Shutdown() {
 func loggingUnaryInterceptor() grpc.UnaryServerInterceptor {
 	return func(
 		ctx context.Context,
-		req interface{},
+		req any,
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
-	) (interface{}, error) {
+	) (any, error) {
 		start := time.Now()
 
 		userID := getUserIDFromContext(ctx)
@@ -125,7 +125,7 @@ func loggingUnaryInterceptor() grpc.UnaryServerInterceptor {
 // loggingStreamInterceptor logs all streaming RPC calls.
 func loggingStreamInterceptor() grpc.StreamServerInterceptor {
 	return func(
-		srv interface{},
+		srv any,
 		ss grpc.ServerStream,
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,
@@ -155,10 +155,10 @@ func loggingStreamInterceptor() grpc.StreamServerInterceptor {
 func recoveryUnaryInterceptor() grpc.UnaryServerInterceptor {
 	return func(
 		ctx context.Context,
-		req interface{},
+		req any,
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
-	) (resp interface{}, err error) {
+	) (resp any, err error) {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("[gRPC Recovery] panic in %s: %v\n%s", info.FullMethod, r, debug.Stack())
@@ -173,7 +173,7 @@ func recoveryUnaryInterceptor() grpc.UnaryServerInterceptor {
 // recoveryStreamInterceptor recovers from panics in streaming RPCs.
 func recoveryStreamInterceptor() grpc.StreamServerInterceptor {
 	return func(
-		srv interface{},
+		srv any,
 		ss grpc.ServerStream,
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,
@@ -193,10 +193,10 @@ func recoveryStreamInterceptor() grpc.StreamServerInterceptor {
 func devAuthUnaryInterceptor() grpc.UnaryServerInterceptor {
 	return func(
 		ctx context.Context,
-		req interface{},
+		req any,
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
-	) (interface{}, error) {
+	) (any, error) {
 		md, ok := metadata.FromIncomingContext(ctx)
 		if ok {
 			if userIDs := md.Get("x-user-id"); len(userIDs) > 0 {
@@ -210,7 +210,7 @@ func devAuthUnaryInterceptor() grpc.UnaryServerInterceptor {
 // devAuthStreamInterceptor extracts user ID from x-user-id metadata in development mode.
 func devAuthStreamInterceptor() grpc.StreamServerInterceptor {
 	return func(
-		srv interface{},
+		srv any,
 		ss grpc.ServerStream,
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,

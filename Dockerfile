@@ -9,14 +9,17 @@ ARG GITHUB_TOKEN
 ENV GOPRIVATE=github.com/sentiae/*
 RUN git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
 
-WORKDIR /build
+WORKDIR /app
+
+# Copy local replace dependencies
+COPY platform-kit/ /platform-kit/
 
 # Copy go.mod and go.sum first for better caching
-COPY go.mod go.sum ./
+COPY runtime-service/go.mod runtime-service/go.sum ./
 RUN go mod download && go mod verify
 
 # Copy source code
-COPY . .
+COPY runtime-service/ .
 
 # Build the application with optimizations and security flags
 ARG VERSION=dev
@@ -26,10 +29,13 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -installsuffix cgo \
     -ldflags="-w -s -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" \
     -o /build/bin/runtime-service \
-    cmd/server/main.go
+    ./cmd/server/
 
 # Verify the binary was built
 RUN test -f /build/bin/runtime-service || (echo "Binary not found" && exit 1)
+
+# Create optional dirs so COPY won't fail
+RUN mkdir -p /build/migrations /build/configs
 
 # Runtime Stage - Minimal Production Image
 FROM alpine:3.19

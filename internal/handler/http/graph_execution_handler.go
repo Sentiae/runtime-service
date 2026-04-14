@@ -31,7 +31,14 @@ func (h *GraphExecutionHandler) RegisterRoutes(r chi.Router) {
 		r.Post("/{execution_id}/cancel", h.CancelExecution)
 		r.Get("/{execution_id}/nodes", h.ListNodeExecutions)
 		r.Get("/{execution_id}/nodes/{node_id}", h.GetNodeExecution)
+		r.Get("/{execution_id}/parallelism-report", h.GetParallelismReport)
 	})
+
+	// Mirror the parallelism-report endpoint at the spec-required path
+	// "/executions/{id}/parallelism-report" so external callers don't
+	// have to know the runtime distinguishes graph-executions from
+	// single-shot executions.
+	r.Get("/executions/{execution_id}/parallelism-report", h.GetParallelismReport)
 }
 
 // ExecuteGraphRequest represents the request body for executing a graph
@@ -119,7 +126,7 @@ func (h *GraphExecutionHandler) ListExecutions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	RespondSuccess(w, map[string]interface{}{
+	RespondSuccess(w, map[string]any{
 		"items": execs,
 		"total": total,
 	})
@@ -159,10 +166,22 @@ func (h *GraphExecutionHandler) ListNodeExecutions(w http.ResponseWriter, r *htt
 		return
 	}
 
-	RespondSuccess(w, map[string]interface{}{
+	RespondSuccess(w, map[string]any{
 		"items": nodes,
 		"total": len(nodes),
 	})
+}
+
+// GetParallelismReport handles GET /api/v1/graph-executions/{execution_id}/parallelism-report
+// and the alias /api/v1/executions/{execution_id}/parallelism-report.
+func (h *GraphExecutionHandler) GetParallelismReport(w http.ResponseWriter, r *http.Request) {
+	execID, err := GetUUIDParam(r, "execution_id")
+	if err != nil {
+		RespondBadRequest(w, "Invalid execution ID", nil)
+		return
+	}
+	report := h.engine.GetParallelismReport(execID)
+	RespondSuccess(w, report)
 }
 
 // GetNodeExecution handles GET /api/v1/graph-executions/{execution_id}/nodes/{node_id}

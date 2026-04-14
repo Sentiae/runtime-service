@@ -76,7 +76,7 @@ func (h *TerminalHandler) CreateTerminalSession(w http.ResponseWriter, r *http.R
 		lang = domain.LanguageBash
 	}
 	if !lang.IsValid() {
-		RespondBadRequest(w, "Unsupported language", map[string]interface{}{
+		RespondBadRequest(w, "Unsupported language", map[string]any{
 			"language": req.Language,
 		})
 		return
@@ -149,7 +149,7 @@ func (h *TerminalHandler) ListTerminalSessions(w http.ResponseWriter, r *http.Re
 		items[i] = terminalSessionToResponse(&s, r)
 	}
 
-	RespondSuccess(w, map[string]interface{}{
+	RespondSuccess(w, map[string]any{
 		"items": items,
 	})
 }

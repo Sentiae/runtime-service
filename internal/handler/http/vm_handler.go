@@ -62,7 +62,7 @@ func (h *VMHandler) ListActiveVMs(w http.ResponseWriter, r *http.Request) {
 		items[i] = vmToResponse(&vm)
 	}
 
-	RespondSuccess(w, map[string]interface{}{
+	RespondSuccess(w, map[string]any{
 		"items": items,
 		"total": len(items),
 	})

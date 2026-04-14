@@ -7,7 +7,7 @@ import (
 
 // AutoMigrate runs auto-migration for all runtime service models
 func AutoMigrate(db *gorm.DB) error {
-	models := []interface{}{
+	models := []any{
 		&domain.Execution{},
 		&domain.MicroVM{},
 		&domain.Snapshot{},
@@ -22,6 +22,16 @@ func AutoMigrate(db *gorm.DB) error {
 		&domain.GraphExecutionTrace{},
 		&domain.GraphTraceNodeSnapshot{},
 		&domain.TerminalSession{},
+		&domain.TestRun{},
+		&domain.VMUsageRecord{},
+
+		// 9.4 — customer-hosted Firecracker agent dispatch
+		&domain.RuntimeAgent{},
+		&domain.AgentRoutingPolicy{},
+
+		// 9.x audit follow-ups: regression tests generated from
+		// captured production traces.
+		&domain.RegressionTestTemplate{},
 	}
 
 	if err := db.AutoMigrate(models...); err != nil {

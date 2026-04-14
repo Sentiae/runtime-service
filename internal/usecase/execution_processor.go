@@ -15,11 +15,11 @@ type GraphPendingProcessor interface {
 // PendingProcessor runs a background loop that processes pending single
 // executions and pending graph executions on a configurable interval.
 type PendingProcessor struct {
-	executionUC   ExecutionUseCase
-	graphProc     GraphPendingProcessor
-	interval      time.Duration
-	batchSize     int
-	stopCh        chan struct{}
+	executionUC ExecutionUseCase
+	graphProc   GraphPendingProcessor
+	interval    time.Duration
+	batchSize   int
+	stopCh      chan struct{}
 }
 
 // NewPendingProcessor creates a new PendingProcessor

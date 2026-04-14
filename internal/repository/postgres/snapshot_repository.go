@@ -58,6 +58,21 @@ func (r *snapshotRepository) FindByExecution(ctx context.Context, executionID uu
 	return snapshots, err
 }
 
+func (r *snapshotRepository) FindLatestCheckpointByVM(ctx context.Context, vmID uuid.UUID) (*domain.Snapshot, error) {
+	var snapshot domain.Snapshot
+	err := r.db.WithContext(ctx).
+		Where("vm_id = ? AND kind = ?", vmID, domain.SnapshotKindCheckpoint).
+		Order("created_at DESC").
+		First(&snapshot).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, domain.ErrSnapshotNotFound
+		}
+		return nil, err
+	}
+	return &snapshot, nil
+}
+
 func (r *snapshotRepository) Delete(ctx context.Context, id uuid.UUID) error {
 	return r.db.WithContext(ctx).Where("id = ?", id).Delete(&domain.Snapshot{}).Error
 }

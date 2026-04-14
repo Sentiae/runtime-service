@@ -10,10 +10,10 @@ import (
 type TerminalSessionStatus string
 
 const (
-	TerminalSessionStatusCreating  TerminalSessionStatus = "creating"
-	TerminalSessionStatusActive    TerminalSessionStatus = "active"
-	TerminalSessionStatusClosed    TerminalSessionStatus = "closed"
-	TerminalSessionStatusError     TerminalSessionStatus = "error"
+	TerminalSessionStatusCreating TerminalSessionStatus = "creating"
+	TerminalSessionStatusActive   TerminalSessionStatus = "active"
+	TerminalSessionStatusClosed   TerminalSessionStatus = "closed"
+	TerminalSessionStatusError    TerminalSessionStatus = "error"
 )
 
 // IsValid checks if the terminal session status is valid

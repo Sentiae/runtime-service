@@ -8,21 +8,21 @@ import (
 
 // MicroVM represents a Firecracker microVM instance
 type MicroVM struct {
-	ID           uuid.UUID `json:"id" gorm:"type:uuid;primary_key"`
-	Status       VMStatus  `json:"status" gorm:"type:varchar(20);not null;default:'creating';index"`
-	VCPU         int       `json:"vcpu" gorm:"not null;default:1"`
-	MemoryMB     int       `json:"memory_mb" gorm:"not null;default:128"`
-	KernelPath   string    `json:"kernel_path" gorm:"type:varchar(500);not null"`
-	RootfsPath   string    `json:"rootfs_path" gorm:"type:varchar(500);not null"`
-	SocketPath   string    `json:"socket_path" gorm:"type:varchar(500)"`
-	PID          *int      `json:"pid,omitempty"`
-	IPAddress    string    `json:"ip_address,omitempty" gorm:"type:varchar(45)"`
+	ID           uuid.UUID   `json:"id" gorm:"type:uuid;primary_key"`
+	Status       VMStatus    `json:"status" gorm:"type:varchar(20);not null;default:'creating';index"`
+	VCPU         int         `json:"vcpu" gorm:"not null;default:1"`
+	MemoryMB     int         `json:"memory_mb" gorm:"not null;default:128"`
+	KernelPath   string      `json:"kernel_path" gorm:"type:varchar(500);not null"`
+	RootfsPath   string      `json:"rootfs_path" gorm:"type:varchar(500);not null"`
+	SocketPath   string      `json:"socket_path" gorm:"type:varchar(500)"`
+	PID          *int        `json:"pid,omitempty"`
+	IPAddress    string      `json:"ip_address,omitempty" gorm:"type:varchar(45)"`
 	NetworkMode  NetworkMode `json:"network_mode" gorm:"type:varchar(20);not null;default:'isolated'"`
-	Language     Language  `json:"language" gorm:"type:varchar(20);not null"`
-	BootTimeMS   *int64    `json:"boot_time_ms,omitempty"`
-	ExecutionID  *uuid.UUID `json:"execution_id,omitempty" gorm:"type:uuid;index"`
-	CreatedAt    time.Time `json:"created_at" gorm:"not null"`
-	TerminatedAt *time.Time `json:"terminated_at,omitempty"`
+	Language     Language    `json:"language" gorm:"type:varchar(20);not null"`
+	BootTimeMS   *int64      `json:"boot_time_ms,omitempty"`
+	ExecutionID  *uuid.UUID  `json:"execution_id,omitempty" gorm:"type:uuid;index"`
+	CreatedAt    time.Time   `json:"created_at" gorm:"not null"`
+	TerminatedAt *time.Time  `json:"terminated_at,omitempty"`
 }
 
 // TableName specifies the table name for GORM

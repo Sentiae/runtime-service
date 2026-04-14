@@ -18,21 +18,44 @@ import (
 	"github.com/sentiae/runtime-service/internal/repository"
 )
 
+// DefaultMaxParallelism caps how many nodes execute concurrently within
+// a single wave. A node graph with hundreds of independent test nodes
+// would otherwise spawn one Firecracker VM per node and exhaust the
+// host. The DI container can override this via SetMaxParallelism.
+const DefaultMaxParallelism = 4
+
+// nodeTimings records the wall-clock window each node ran in. Stored
+// per-execution so the parallelism report can compute critical path,
+// lane utilisation, and idle gaps. Lives in memory only — durable
+// trace data goes via the GraphTraceRecorder.
+type nodeTimings struct {
+	NodeID         uuid.UUID `json:"node_id"`
+	NodeName       string    `json:"node_name"`
+	Lane           int       `json:"lane"`
+	StartedAt      time.Time `json:"started_at"`
+	CompletedAt    time.Time `json:"completed_at"`
+	DurationMS     int64     `json:"duration_ms"`
+	OnCriticalPath bool      `json:"on_critical_path"`
+}
+
 // GraphExecutionEngine orchestrates the execution of node graphs using
 // topological sorting and wave-based parallel execution.
 type GraphExecutionEngine struct {
-	graphRepo     repository.GraphDefinitionRepository
-	nodeRepo      repository.GraphNodeRepository
-	edgeRepo      repository.GraphEdgeRepository
-	graphExecRepo repository.GraphExecutionRepository
-	nodeExecRepo  repository.NodeExecutionRepository
-	executionUC   ExecutionUseCase
+	graphRepo      repository.GraphDefinitionRepository
+	nodeRepo       repository.GraphNodeRepository
+	edgeRepo       repository.GraphEdgeRepository
+	graphExecRepo  repository.GraphExecutionRepository
+	nodeExecRepo   repository.NodeExecutionRepository
+	executionUC    ExecutionUseCase
 	eventPublisher EventPublisher
 	traceRecorder  *GraphTraceRecorder
 	httpClient     *http.Client
 
+	maxParallelism int
+
 	mu            sync.Mutex
 	cancellations map[uuid.UUID]context.CancelFunc
+	timings       map[uuid.UUID][]nodeTimings // per-execution-id
 }
 
 // NewGraphExecutionEngine creates a new graph execution engine
@@ -54,13 +77,33 @@ func NewGraphExecutionEngine(
 		executionUC:    executionUC,
 		eventPublisher: eventPublisher,
 		httpClient:     &http.Client{Timeout: 30 * time.Second},
+		maxParallelism: DefaultMaxParallelism,
 		cancellations:  make(map[uuid.UUID]context.CancelFunc),
+		timings:        make(map[uuid.UUID][]nodeTimings),
 	}
 }
 
 // SetTraceRecorder sets the trace recorder for execution tracing
 func (e *GraphExecutionEngine) SetTraceRecorder(recorder *GraphTraceRecorder) {
 	e.traceRecorder = recorder
+}
+
+// SetMaxParallelism overrides the per-wave concurrency cap. Values <= 0
+// reset to DefaultMaxParallelism.
+func (e *GraphExecutionEngine) SetMaxParallelism(n int) {
+	if n <= 0 {
+		n = DefaultMaxParallelism
+	}
+	e.mu.Lock()
+	e.maxParallelism = n
+	e.mu.Unlock()
+}
+
+// MaxParallelism returns the current concurrency cap.
+func (e *GraphExecutionEngine) MaxParallelism() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.maxParallelism
 }
 
 // ExecuteGraph starts execution of a graph and returns the execution record.
@@ -308,15 +351,38 @@ func (e *GraphExecutionEngine) runGraph(
 			return ready[i].Name < ready[j].Name
 		})
 
-		// Execute ready nodes in parallel
+		// Execute ready nodes in parallel, bounded by maxParallelism.
+		// We use a buffered channel as a counting semaphore — every
+		// goroutine grabs a slot before doing work and releases it on
+		// exit, capping in-flight execution without throwing away
+		// fairness or ordering.
+		maxPar := e.MaxParallelism()
+		if maxPar <= 0 {
+			maxPar = DefaultMaxParallelism
+		}
+		sem := make(chan struct{}, maxPar)
+
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 		errCh := make(chan error, len(ready))
+		laneAssign := func() int {
+			// Lane assignment is just the order goroutines acquire
+			// the semaphore, modulo maxPar. Used for the
+			// parallelism-report visualisation only.
+			return int(time.Now().UnixNano()) % maxPar
+		}
 
 		for _, node := range ready {
 			wg.Add(1)
 			go func(n *domain.GraphNode) {
 				defer wg.Done()
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				defer func() { <-sem }()
+				lane := laneAssign()
 
 				nodeSeq := func() int {
 					mu.Lock()
@@ -354,6 +420,14 @@ func (e *GraphExecutionEngine) runGraph(
 				completedAt := time.Now().UTC()
 
 				if err != nil {
+					e.recordTiming(graphExec.ID, nodeTimings{
+						NodeID:      n.ID,
+						NodeName:    n.Name,
+						Lane:        lane,
+						StartedAt:   startedAt,
+						CompletedAt: completedAt,
+						DurationMS:  completedAt.Sub(startedAt).Milliseconds(),
+					})
 					nodeExec.MarkFailed(err.Error())
 					nodeExec.ExecutionID = execID
 					_ = e.nodeExecRepo.Update(ctx, nodeExec)
@@ -373,11 +447,19 @@ func (e *GraphExecutionEngine) runGraph(
 				_ = e.nodeExecRepo.Update(ctx, nodeExec)
 				_ = e.eventPublisher.Publish(ctx, EventNodeExecCompleted, nodeExec.ID.String(), nodeExec)
 
-				// Store output and record trace
+				// Store output, record trace, and persist timings
 				mu.Lock()
 				outputs[n.ID] = output
 				completedNodes++
 				mu.Unlock()
+				e.recordTiming(graphExec.ID, nodeTimings{
+					NodeID:      n.ID,
+					NodeName:    n.Name,
+					Lane:        lane,
+					StartedAt:   startedAt,
+					CompletedAt: completedAt,
+					DurationMS:  completedAt.Sub(startedAt).Milliseconds(),
+				})
 
 				if trace != nil && e.traceRecorder != nil {
 					_ = e.traceRecorder.RecordNode(ctx, trace, n.ID, n.Name, string(n.NodeType), nodeSeq, nodeInput, output, n.Config, "completed", "", startedAt, completedAt)
@@ -648,7 +730,7 @@ func (e *GraphExecutionEngine) executeHTTPNode(ctx context.Context, node *domain
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	if headers, ok := node.Config["headers"].(map[string]interface{}); ok {
+	if headers, ok := node.Config["headers"].(map[string]any); ok {
 		for k, v := range headers {
 			req.Header.Set(k, fmt.Sprintf("%v", v))
 		}
@@ -677,4 +759,143 @@ func (e *GraphExecutionEngine) executeHTTPNode(ctx context.Context, node *domain
 	}
 
 	return output, nil
+}
+
+// recordTiming appends a per-node timing record under the execution ID.
+// We bound retention to the most recent 10k nodes per execution so
+// pathological graphs cannot leak unbounded memory.
+func (e *GraphExecutionEngine) recordTiming(execID uuid.UUID, t nodeTimings) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rows := e.timings[execID]
+	rows = append(rows, t)
+	if len(rows) > 10000 {
+		rows = rows[len(rows)-10000:]
+	}
+	e.timings[execID] = rows
+}
+
+// ParallelismReport aggregates the recorded per-node timings into a
+// view useful for "why did my pipeline take so long?" debugging.
+type ParallelismReport struct {
+	ExecutionID        uuid.UUID     `json:"execution_id"`
+	MaxParallelism     int           `json:"max_parallelism"`
+	TotalNodes         int           `json:"total_nodes"`
+	TotalWallClockMS   int64         `json:"total_wall_clock_ms"`
+	TotalCPUTimeMS     int64         `json:"total_cpu_time_ms"`
+	AverageUtilisation float64       `json:"average_utilisation"`
+	CriticalPathMS     int64         `json:"critical_path_ms"`
+	LaneUtilisation    []LaneReport  `json:"lane_utilisation"`
+	Nodes              []nodeTimings `json:"nodes"`
+}
+
+// LaneReport summarises one lane (a virtual worker slot).
+type LaneReport struct {
+	Lane           int     `json:"lane"`
+	NodeCount      int     `json:"node_count"`
+	BusyMS         int64   `json:"busy_ms"`
+	UtilisationPct float64 `json:"utilisation_pct"`
+}
+
+// GetParallelismReport returns aggregated timing data for the given
+// execution. Returns an empty report (no error) when no timings have
+// been recorded yet — useful for "still running" UIs that want to
+// poll without distinguishing not-found from in-progress.
+func (e *GraphExecutionEngine) GetParallelismReport(execID uuid.UUID) ParallelismReport {
+	e.mu.Lock()
+	rows := append([]nodeTimings(nil), e.timings[execID]...)
+	maxPar := e.maxParallelism
+	e.mu.Unlock()
+
+	report := ParallelismReport{
+		ExecutionID:    execID,
+		MaxParallelism: maxPar,
+		TotalNodes:     len(rows),
+		Nodes:          rows,
+	}
+	if len(rows) == 0 {
+		return report
+	}
+
+	// Wall-clock = max(completed) - min(started).
+	first := rows[0].StartedAt
+	last := rows[0].CompletedAt
+	for _, r := range rows {
+		if r.StartedAt.Before(first) {
+			first = r.StartedAt
+		}
+		if r.CompletedAt.After(last) {
+			last = r.CompletedAt
+		}
+		report.TotalCPUTimeMS += r.DurationMS
+	}
+	wall := last.Sub(first).Milliseconds()
+	if wall < 1 {
+		wall = 1
+	}
+	report.TotalWallClockMS = wall
+
+	// Lane busy time. Lane assignments are heuristic so the per-lane
+	// number is informational only — sum across lanes equals total CPU.
+	laneBusy := make(map[int]int64)
+	laneCount := make(map[int]int)
+	for _, r := range rows {
+		laneBusy[r.Lane] += r.DurationMS
+		laneCount[r.Lane]++
+	}
+	for lane, busy := range laneBusy {
+		report.LaneUtilisation = append(report.LaneUtilisation, LaneReport{
+			Lane:           lane,
+			NodeCount:      laneCount[lane],
+			BusyMS:         busy,
+			UtilisationPct: float64(busy) / float64(wall) * 100,
+		})
+	}
+	report.AverageUtilisation = float64(report.TotalCPUTimeMS) / (float64(wall) * float64(maxPar)) * 100
+
+	// Critical path = the longest chronological chain that reaches the
+	// last completion. Sort by completed-ascending then walk backwards
+	// taking the longest predecessor that finishes before each step.
+	sortedByEnd := append([]nodeTimings(nil), rows...)
+	sort.Slice(sortedByEnd, func(i, j int) bool {
+		return sortedByEnd[i].CompletedAt.Before(sortedByEnd[j].CompletedAt)
+	})
+	type cp struct {
+		idx    int
+		lenMS  int64
+		prevIx int
+	}
+	dp := make([]cp, len(sortedByEnd))
+	bestIdx := 0
+	for i, r := range sortedByEnd {
+		dp[i] = cp{idx: i, lenMS: r.DurationMS, prevIx: -1}
+		for j := 0; j < i; j++ {
+			if !sortedByEnd[j].CompletedAt.After(r.StartedAt) {
+				if dp[j].lenMS+r.DurationMS > dp[i].lenMS {
+					dp[i].lenMS = dp[j].lenMS + r.DurationMS
+					dp[i].prevIx = j
+				}
+			}
+		}
+		if dp[i].lenMS > dp[bestIdx].lenMS {
+			bestIdx = i
+		}
+	}
+	report.CriticalPathMS = dp[bestIdx].lenMS
+	// Walk back and tag the chain as on-critical-path on the public list.
+	cur := bestIdx
+	criticalIDs := map[uuid.UUID]struct{}{}
+	for cur >= 0 {
+		criticalIDs[sortedByEnd[cur].NodeID] = struct{}{}
+		cur = dp[cur].prevIx
+	}
+	for i := range report.Nodes {
+		if _, ok := criticalIDs[report.Nodes[i].NodeID]; ok {
+			report.Nodes[i].OnCriticalPath = true
+		}
+	}
+	sort.Slice(report.LaneUtilisation, func(i, j int) bool {
+		return report.LaneUtilisation[i].Lane < report.LaneUtilisation[j].Lane
+	})
+	return report
 }

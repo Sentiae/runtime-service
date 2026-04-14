@@ -121,11 +121,11 @@ func (e *Execution) MarkTimeout(stdout, stderr string) {
 
 // ResourceLimit defines resource constraints for an execution
 type ResourceLimit struct {
-	VCPU       int           `json:"vcpu" gorm:"column:vcpu;not null;default:1"`
-	MemoryMB   int           `json:"memory_mb" gorm:"column:memory_mb;not null;default:128"`
-	TimeoutSec int           `json:"timeout_sec" gorm:"column:timeout_sec;not null;default:30"`
-	Network    NetworkMode   `json:"network" gorm:"column:network;type:varchar(20);not null;default:'isolated'"`
-	DiskMB     int           `json:"disk_mb" gorm:"column:disk_mb;not null;default:256"`
+	VCPU       int         `json:"vcpu" gorm:"column:vcpu;not null;default:1"`
+	MemoryMB   int         `json:"memory_mb" gorm:"column:memory_mb;not null;default:128"`
+	TimeoutSec int         `json:"timeout_sec" gorm:"column:timeout_sec;not null;default:30"`
+	Network    NetworkMode `json:"network" gorm:"column:network;type:varchar(20);not null;default:'isolated'"`
+	DiskMB     int         `json:"disk_mb" gorm:"column:disk_mb;not null;default:256"`
 }
 
 // Validate checks if resource limits are within acceptable bounds

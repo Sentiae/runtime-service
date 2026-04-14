@@ -113,10 +113,10 @@ func TestVMInstance_Validate(t *testing.T) {
 
 func TestVMInstance_NeedsReconciliation(t *testing.T) {
 	tests := []struct {
-		name   string
-		state  VMInstanceState
+		name    string
+		state   VMInstanceState
 		desired VMInstanceState
-		needs  bool
+		needs   bool
 	}{
 		{"pending -> running", VMInstanceStatePending, VMInstanceStateRunning, true},
 		{"running -> running", VMInstanceStateRunning, VMInstanceStateRunning, false},

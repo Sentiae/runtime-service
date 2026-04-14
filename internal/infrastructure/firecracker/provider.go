@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,15 +25,234 @@ import (
 	"github.com/sentiae/runtime-service/pkg/config"
 )
 
+const (
+	bridgeName   = "fcbr0"
+	bridgeSubnet = "172.16.0.0/24"
+	bridgeIP     = "172.16.0.1/24"
+)
+
 // Provider implements the VMProvider and ExecutionRunner interfaces
 // using Firecracker microVMs for secure code execution
 type Provider struct {
-	cfg config.FirecrackerConfig
+	cfg        config.FirecrackerConfig
+	bridgeOnce sync.Once
+	bridgeErr  error
+	tapCounter atomic.Uint32 // monotonic counter for unique /30 subnets
 }
 
 // NewProvider creates a new Firecracker provider
 func NewProvider(cfg config.FirecrackerConfig) *Provider {
 	return &Provider{cfg: cfg}
+}
+
+// --- Network Setup ---
+
+// setupBridge creates the fcbr0 bridge if it does not already exist.
+// It is safe to call multiple times; the actual work runs only once.
+func (p *Provider) setupBridge() error {
+	p.bridgeOnce.Do(func() {
+		p.bridgeErr = p.doSetupBridge()
+	})
+	return p.bridgeErr
+}
+
+func (p *Provider) doSetupBridge() error {
+	// Check whether the bridge already exists
+	if err := exec.Command("ip", "link", "show", bridgeName).Run(); err == nil {
+		log.Printf("Bridge %s already exists, skipping creation", bridgeName)
+		return nil
+	}
+
+	cmds := [][]string{
+		{"ip", "link", "add", bridgeName, "type", "bridge"},
+		{"ip", "addr", "add", bridgeIP, "dev", bridgeName},
+		{"ip", "link", "set", bridgeName, "up"},
+	}
+	for _, args := range cmds {
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			return fmt.Errorf("bridge setup %v: %s: %w", args, string(out), err)
+		}
+	}
+
+	// Enable IP forwarding (best-effort; may already be enabled)
+	_ = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
+
+	// Add NAT masquerade rule (idempotent with -C check)
+	if exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", bridgeSubnet, "-j", "MASQUERADE").Run() != nil {
+		if out, err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", bridgeSubnet, "-j", "MASQUERADE").CombinedOutput(); err != nil {
+			log.Printf("Warning: iptables masquerade failed: %s: %v", string(out), err)
+		}
+	}
+
+	log.Printf("Bridge %s created with %s", bridgeName, bridgeIP)
+	return nil
+}
+
+// createTapDevice creates a TAP device for a VM and attaches it to the bridge.
+// It returns the tap device name and the guest IP address to configure inside the VM.
+func (p *Provider) createTapDevice(vmID uuid.UUID) (tapName string, hostIP string, guestIP string, err error) {
+	if err = p.setupBridge(); err != nil {
+		return "", "", "", fmt.Errorf("setup bridge: %w", err)
+	}
+
+	shortID := vmID.String()[:8]
+	tapName = "tap-" + shortID
+
+	// Allocate a unique /30 subnet index. Each VM gets a 4-address block:
+	//   base = 172.16.0.(n*4)  (network)
+	//   host = 172.16.0.(n*4+1)
+	//   guest = 172.16.0.(n*4+2)
+	//   bcast = 172.16.0.(n*4+3)
+	// We skip index 0 because 172.16.0.1 is the bridge IP.
+	idx := p.tapCounter.Add(1) // starts at 1
+	base := idx * 4
+	if base+3 > 254 {
+		return "", "", "", fmt.Errorf("TAP IP space exhausted (index %d)", idx)
+	}
+	hostIP = fmt.Sprintf("172.16.0.%d", base+1)
+	guestIP = fmt.Sprintf("172.16.0.%d", base+2)
+	hostCIDR := fmt.Sprintf("%s/30", hostIP)
+
+	cmds := [][]string{
+		{"ip", "tuntap", "add", "dev", tapName, "mode", "tap"},
+		{"ip", "addr", "add", hostCIDR, "dev", tapName},
+		{"ip", "link", "set", tapName, "up"},
+		{"ip", "link", "set", tapName, "master", bridgeName},
+	}
+	for _, args := range cmds {
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			// Best-effort cleanup on failure
+			_ = exec.Command("ip", "link", "del", tapName).Run()
+			return "", "", "", fmt.Errorf("create tap %v: %s: %w", args, string(out), err)
+		}
+	}
+
+	log.Printf("Created TAP %s: host=%s guest=%s", tapName, hostIP, guestIP)
+	return tapName, hostIP, guestIP, nil
+}
+
+// destroyTapDevice removes a TAP device.
+func (p *Provider) destroyTapDevice(tapName string) error {
+	if out, err := exec.Command("ip", "link", "del", tapName).CombinedOutput(); err != nil {
+		return fmt.Errorf("delete tap %s: %s: %w", tapName, string(out), err)
+	}
+	log.Printf("Destroyed TAP %s", tapName)
+	return nil
+}
+
+// cleanupTap is a no-op when tapName is empty (isolated mode). Otherwise
+// it tears down both the device and any iptables rules installed for it.
+func (p *Provider) cleanupTap(tapName string, policy domain.NetworkPolicy) {
+	if tapName == "" {
+		return
+	}
+	if policy.Mode == domain.NetworkPolicyEgressList {
+		p.flushEgressList(tapName)
+	}
+	if err := p.destroyTapDevice(tapName); err != nil {
+		log.Printf("Warning: failed to destroy TAP %s: %v", tapName, err)
+	}
+}
+
+// applyEgressList installs an iptables FORWARD chain that drops every
+// packet leaving the VM's TAP except those destined to one of the
+// allowed hosts/CIDRs. It runs `iptables` as a child process — the same
+// pattern used by setupBridge — so we don't need cgo or netlink bindings.
+//
+// Hostnames are resolved once at boot. Failed lookups are logged but do
+// not abort boot: the caller still gets a working (but more locked-down)
+// network rather than a dead VM.
+func (p *Provider) applyEgressList(tapName string, allowed []string) error {
+	chain := egressChainName(tapName)
+	// Create a dedicated chain so we never collide with another VM.
+	cmds := [][]string{
+		{"iptables", "-N", chain},
+		{"iptables", "-I", "FORWARD", "-i", tapName, "-j", chain},
+	}
+	for _, args := range cmds {
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			return fmt.Errorf("egress chain setup %v: %s: %w", args, string(out), err)
+		}
+	}
+
+	// ACCEPT each allowed destination.
+	for _, host := range allowed {
+		host = strings.TrimSpace(host)
+		if host == "" {
+			continue
+		}
+		dests := []string{host}
+		// If the entry is neither IP nor CIDR, resolve it.
+		if _, _, err := net.ParseCIDR(host); err != nil {
+			if ip := net.ParseIP(host); ip == nil {
+				ips, dnsErr := net.LookupIP(host)
+				if dnsErr != nil {
+					log.Printf("Warning: failed to resolve %s for egress allowlist: %v", host, dnsErr)
+					continue
+				}
+				dests = nil
+				for _, ip := range ips {
+					if ip.To4() != nil {
+						dests = append(dests, ip.String())
+					}
+				}
+			}
+		}
+		for _, d := range dests {
+			args := []string{"iptables", "-A", chain, "-d", d, "-j", "ACCEPT"}
+			if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+				log.Printf("Warning: failed to add ACCEPT rule for %s: %s: %v", d, string(out), err)
+			}
+		}
+	}
+
+	// Trailing DROP for everything else leaving the TAP.
+	if out, err := exec.Command("iptables", "-A", chain, "-j", "DROP").CombinedOutput(); err != nil {
+		return fmt.Errorf("egress trailing DROP: %s: %w", string(out), err)
+	}
+	log.Printf("Egress allowlist installed on %s with %d host(s)", tapName, len(allowed))
+	return nil
+}
+
+// flushEgressList removes the per-VM iptables chain installed by
+// applyEgressList. Called from cleanupTap on shutdown / boot failure.
+func (p *Provider) flushEgressList(tapName string) {
+	chain := egressChainName(tapName)
+	// Best-effort: each command is idempotent on the rule-not-found path.
+	cmds := [][]string{
+		{"iptables", "-D", "FORWARD", "-i", tapName, "-j", chain},
+		{"iptables", "-F", chain},
+		{"iptables", "-X", chain},
+	}
+	for _, args := range cmds {
+		_ = exec.Command(args[0], args[1:]...).Run()
+	}
+}
+
+// egressChainName returns a deterministic, length-bounded iptables chain
+// name. iptables enforces a 28-character limit on chain names, so we use
+// a short prefix plus the tap suffix (which is itself bounded by Linux
+// IFNAMSIZ at 15 chars).
+func egressChainName(tapName string) string {
+	suffix := tapName
+	if len(suffix) > 20 {
+		suffix = suffix[:20]
+	}
+	return "fc-eg-" + suffix
+}
+
+// generateMAC returns a deterministic MAC address derived from a VM UUID.
+// Format: AA:FC:xx:xx:xx:xx using the first 4 bytes of the UUID.
+func generateMAC(vmID uuid.UUID) string {
+	b := vmID[:]
+	return fmt.Sprintf("AA:FC:%02X:%02X:%02X:%02X", b[0], b[1], b[2], b[3])
+}
+
+// vmIDFromSocketPath extracts the VM UUID from the socket path (basename minus .sock).
+func vmIDFromSocketPath(socketPath string) (uuid.UUID, error) {
+	base := filepath.Base(socketPath)
+	name := strings.TrimSuffix(base, ".sock")
+	return uuid.Parse(name)
 }
 
 // Boot starts a new Firecracker microVM
@@ -45,6 +266,39 @@ func (p *Provider) Boot(ctx context.Context, bootCfg usecase.VMBootConfig) (*use
 	// Ensure socket directory exists
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0750); err != nil {
 		return nil, fmt.Errorf("failed to create socket dir: %w", err)
+	}
+
+	// Apply network policy. In "isolated" mode we skip TAP creation
+	// entirely so the guest boots with no network device. In "egress
+	// list" mode we create the TAP and then install iptables DROP/ACCEPT
+	// rules. "allow_host" and the empty default behave like before.
+	policy := bootCfg.NetworkPolicy
+	if policy.Mode == "" {
+		policy.Mode = domain.NetworkPolicyAllowHost
+	}
+
+	var (
+		tapName string
+		guestIP string
+	)
+	attachNetwork := policy.Mode != domain.NetworkPolicyIsolated
+	if attachNetwork {
+		var err error
+		tapName, _, guestIP, err = p.createTapDevice(bootCfg.VMID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create TAP device: %w", err)
+		}
+		// Apply per-VM iptables rules for egress restriction. We do it
+		// before starting Firecracker so the kernel never sees an
+		// unfiltered packet leaving the new TAP.
+		if policy.Mode == domain.NetworkPolicyEgressList {
+			if err := p.applyEgressList(tapName, policy.AllowedHosts); err != nil {
+				_ = p.destroyTapDevice(tapName)
+				return nil, fmt.Errorf("failed to apply egress list: %w", err)
+			}
+		}
+	} else {
+		log.Printf("VM %s booting in isolated mode (no network)", bootCfg.VMID)
 	}
 
 	// Build Firecracker command
@@ -73,6 +327,7 @@ func (p *Provider) Boot(ctx context.Context, bootCfg usecase.VMBootConfig) (*use
 	}
 
 	if err := cmd.Start(); err != nil {
+		p.cleanupTap(tapName, policy)
 		return nil, fmt.Errorf("failed to start firecracker: %w", err)
 	}
 
@@ -80,45 +335,38 @@ func (p *Provider) Boot(ctx context.Context, bootCfg usecase.VMBootConfig) (*use
 
 	// Wait for the API socket to be available
 	if err := p.waitForSocket(ctx, socketPath); err != nil {
-		// Kill the process if socket doesn't come up
 		_ = cmd.Process.Kill()
+		p.cleanupTap(tapName, policy)
 		return nil, fmt.Errorf("firecracker socket not ready: %w", err)
 	}
 
 	// Configure the VM via Firecracker API
-	if err := p.configureVM(ctx, socketPath, kernelPath, rootfsPath, bootCfg); err != nil {
+	if err := p.configureVMWithPolicy(ctx, socketPath, kernelPath, rootfsPath, bootCfg, attachNetwork, tapName); err != nil {
 		_ = cmd.Process.Kill()
+		p.cleanupTap(tapName, policy)
 		return nil, fmt.Errorf("failed to configure VM: %w", err)
 	}
 
 	// Start the VM instance
 	if err := p.startInstance(ctx, socketPath); err != nil {
 		_ = cmd.Process.Kill()
+		p.cleanupTap(tapName, policy)
 		return nil, fmt.Errorf("failed to start VM instance: %w", err)
 	}
 
 	bootTimeMS := time.Since(start).Milliseconds()
-	log.Printf("Firecracker VM booted: pid=%d, socket=%s, boot=%dms", pid, socketPath, bootTimeMS)
-
-	// Discover the VM's IP address
-	ipAddress := ""
-	if bootCfg.NetworkMode == domain.NetworkModeBridged {
-		ip, err := p.discoverIPAddress(ctx, socketPath, bootCfg.VMID)
-		if err != nil {
-			log.Printf("Warning: failed to discover IP for VM %s: %v", bootCfg.VMID, err)
-		} else {
-			ipAddress = ip
-		}
-	}
+	log.Printf("Firecracker VM booted: pid=%d, socket=%s, tap=%s, guest=%s, boot=%dms",
+		pid, socketPath, tapName, guestIP, bootTimeMS)
 
 	return &usecase.VMBootResult{
 		PID:        pid,
-		IPAddress:  ipAddress,
+		IPAddress:  guestIP,
+		SocketPath: socketPath,
 		BootTimeMS: bootTimeMS,
 	}, nil
 }
 
-// Terminate kills a running microVM
+// Terminate kills a running microVM and cleans up its TAP device.
 func (p *Provider) Terminate(ctx context.Context, socketPath string, pid int) error {
 	// Send shutdown request via API first for graceful shutdown
 	if socketPath != "" {
@@ -132,23 +380,38 @@ func (p *Provider) Terminate(ctx context.Context, socketPath string, pid int) er
 	}
 
 	if err := process.Signal(syscall.SIGTERM); err != nil {
-		// Already dead
-		return nil
+		// Already dead — fall through to cleanup
+	} else {
+		// Wait briefly for graceful shutdown, then force kill
+		done := make(chan error, 1)
+		go func() {
+			_, err := process.Wait()
+			done <- err
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = process.Kill()
+		}
 	}
 
-	// Wait briefly for graceful shutdown, then force kill
-	done := make(chan error, 1)
-	go func() {
-		_, err := process.Wait()
-		done <- err
-	}()
-
-	select {
-	case <-done:
-		return nil
-	case <-time.After(5 * time.Second):
-		return process.Kill()
+	// Clean up the TAP device associated with this VM
+	if socketPath != "" {
+		if vmID, err := vmIDFromSocketPath(socketPath); err == nil {
+			tapName := "tap-" + vmID.String()[:8]
+			if err := p.destroyTapDevice(tapName); err != nil {
+				log.Printf("Warning: failed to destroy TAP %s: %v", tapName, err)
+			}
+		}
 	}
+
+	// Clean up the socket file
+	if socketPath != "" {
+		_ = os.Remove(socketPath)
+	}
+
+	return nil
 }
 
 // Pause pauses a running microVM (for snapshot creation)
@@ -161,63 +424,320 @@ func (p *Provider) Resume(ctx context.Context, socketPath string) error {
 	return p.sendAction(ctx, socketPath, "Resume")
 }
 
-// Run executes code inside a microVM by writing the source file and running it
-// via the guest agent (SSH or vsock). The guest rootfs image must include the
-// language runtime and an SSH server listening on port 22.
+// Run executes code inside a dedicated Firecracker microVM using rootfs injection.
+//
+// Instead of SSH, it:
+//  1. Copies the language rootfs to a temporary file for this execution.
+//  2. Loop-mounts the copy and injects the user's code plus a run script.
+//  3. Overwrites /init so the VM executes the code on boot and powers off.
+//  4. Boots a fresh Firecracker instance with the modified rootfs.
+//  5. Waits for the Firecracker process to exit (the VM powers off after execution).
+//  6. Remounts the rootfs and reads stdout/stderr/exit_code from well-known files.
+//
+// This approach is simpler and more secure than SSH: no network stack required
+// inside the guest, no SSH keys to manage, and no race conditions on SSH readiness.
 func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domain.Execution) (*usecase.RunResult, error) {
 	start := time.Now()
 
-	if vm.IPAddress == "" {
-		return nil, fmt.Errorf("VM %s has no IP address for SSH access", vm.ID)
+	// 1. Create a copy of the rootfs for this execution
+	srcRootfs := p.rootfsForLanguage(execution.Language)
+	execRootfs := filepath.Join(p.cfg.RootfsBasePath, fmt.Sprintf("exec-%s.ext4", execution.ID))
+	if err := copyFile(srcRootfs, execRootfs); err != nil {
+		return nil, fmt.Errorf("copy rootfs: %w", err)
+	}
+	defer os.Remove(execRootfs)
+
+	// 2. Mount the rootfs and inject code + run script
+	mountDir := filepath.Join(os.TempDir(), "fc-mount-"+execution.ID.String())
+	if err := os.MkdirAll(mountDir, 0755); err != nil {
+		return nil, fmt.Errorf("create mount dir: %w", err)
+	}
+	defer os.RemoveAll(mountDir)
+
+	if err := p.injectCode(execRootfs, mountDir, execution); err != nil {
+		return nil, fmt.Errorf("inject code: %w", err)
 	}
 
-	// Determine file extension and run command based on language
-	ext, compileCmd, runCmd := p.languageCommands(execution.Language)
-	filename := "code" + ext
-	remotePath := "/tmp/" + filename
+	// 3. Boot a temporary VM with the modified rootfs
+	execVMID := uuid.New()
+	socketPath := p.socketPath(execVMID)
 
-	// 1. Copy code into the VM via SSH
-	if err := p.sshWriteFile(ctx, vm.IPAddress, remotePath, execution.Code); err != nil {
-		return nil, fmt.Errorf("copy code to VM: %w", err)
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0750); err != nil {
+		return nil, fmt.Errorf("create socket dir: %w", err)
 	}
 
-	// 2. Compile if needed
-	var compileTimeMS *int64
-	if compileCmd != "" {
-		compileStart := time.Now()
-		compileResult, err := p.sshExec(ctx, vm.IPAddress, compileCmd, "", execution.Resources.TimeoutSec)
-		if err != nil {
-			return nil, fmt.Errorf("compile in VM: %w", err)
-		}
-		ct := time.Since(compileStart).Milliseconds()
-		compileTimeMS = &ct
-
-		if compileResult.ExitCode != 0 {
-			return &usecase.RunResult{
-				ExitCode:      compileResult.ExitCode,
-				Stdout:        "",
-				Stderr:        compileResult.Stderr,
-				CompileTimeMS: compileTimeMS,
-				ExecTimeMS:    time.Since(start).Milliseconds(),
-			}, nil
-		}
-	}
-
-	// 3. Run the code
-	result, err := p.sshExec(ctx, vm.IPAddress, runCmd, execution.Stdin, execution.Resources.TimeoutSec)
+	// Create TAP device (networking is set up even though we don't use SSH;
+	// Firecracker requires a network config or explicit opt-out per API)
+	tapName, _, guestIP, err := p.createTapDevice(execVMID)
 	if err != nil {
-		return nil, fmt.Errorf("execute in VM: %w", err)
+		return nil, fmt.Errorf("create TAP for exec VM: %w", err)
 	}
+	defer func() { _ = p.destroyTapDevice(tapName) }()
+
+	cmd := exec.CommandContext(ctx, p.cfg.BinaryPath, "--api-sock", socketPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start firecracker: %w", err)
+	}
+
+	// Ensure the process is cleaned up no matter what
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		_ = os.Remove(socketPath)
+	}()
+
+	if err := p.waitForSocket(ctx, socketPath); err != nil {
+		return nil, fmt.Errorf("firecracker socket not ready: %w", err)
+	}
+
+	// Configure VM: use execution resources from the parent VM
+	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off init=/init"
+	execBootCfg := usecase.VMBootConfig{
+		VMID:     execVMID,
+		Language: execution.Language,
+		VCPU:     vm.VCPU,
+		MemoryMB: vm.MemoryMB,
+	}
+
+	client := p.unixHTTPClient(socketPath)
+
+	// Machine config
+	machineConfig := map[string]any{
+		"vcpu_count":   execBootCfg.VCPU,
+		"mem_size_mib": execBootCfg.MemoryMB,
+	}
+	if err := p.apiPut(ctx, client, "/machine-config", machineConfig); err != nil {
+		return nil, fmt.Errorf("configure machine: %w", err)
+	}
+
+	// Boot source with init=/init
+	bootSource := map[string]any{
+		"kernel_image_path": p.cfg.KernelPath,
+		"boot_args":         bootArgs,
+	}
+	if err := p.apiPut(ctx, client, "/boot-source", bootSource); err != nil {
+		return nil, fmt.Errorf("configure boot source: %w", err)
+	}
+
+	// Rootfs drive (the modified copy)
+	rootfsDrive := map[string]any{
+		"drive_id":       "rootfs",
+		"path_on_host":   execRootfs,
+		"is_root_device": true,
+		"is_read_only":   false,
+	}
+	if err := p.apiPut(ctx, client, "/drives/rootfs", rootfsDrive); err != nil {
+		return nil, fmt.Errorf("configure rootfs: %w", err)
+	}
+
+	// Network interface
+	mac := generateMAC(execVMID)
+	netIface := map[string]any{
+		"iface_id":      "eth0",
+		"guest_mac":     mac,
+		"host_dev_name": tapName,
+	}
+	if err := p.apiPut(ctx, client, "/network-interfaces/eth0", netIface); err != nil {
+		return nil, fmt.Errorf("configure network: %w", err)
+	}
+
+	// Vsock device (for guest agent communication)
+	// Guest CID must be >= 3 (0=hypervisor, 1=reserved, 2=host)
+	guestCID := 3 + (p.tapCounter.Load() % 250) // unique CID per VM
+	vsockCfg := map[string]any{
+		"guest_cid": guestCID,
+		"uds_path":  socketPath + ".vsock",
+	}
+	if err := p.apiPut(ctx, client, "/vsock", vsockCfg); err != nil {
+		log.Printf("Warning: failed to configure vsock (agent communication disabled): %v", err)
+		// Don't fail — rootfs-injection still works without vsock
+	}
+
+	// Start the instance
+	if err := p.startInstance(ctx, socketPath); err != nil {
+		return nil, fmt.Errorf("start instance: %w", err)
+	}
+
+	// 4. Wait for the VM to exit (it powers off after running the script)
+	timeout := time.Duration(execution.Resources.TimeoutSec) * time.Second
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+	timedOut := false
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+
+	select {
+	case <-waitDone:
+		// VM exited normally
+	case <-time.After(timeout):
+		timedOut = true
+		_ = cmd.Process.Kill()
+		<-waitDone
+	case <-ctx.Done():
+		_ = cmd.Process.Kill()
+		<-waitDone
+		return nil, ctx.Err()
+	}
+
+	_ = guestIP // used by TAP but not needed for rootfs-injection reads
+
+	// 5. Remount rootfs and read results
+	stdout, stderr, exitCode, readErr := p.readResults(execRootfs, mountDir)
 
 	execTimeMS := time.Since(start).Milliseconds()
 
+	if timedOut {
+		return &usecase.RunResult{
+			ExitCode:   124,
+			Stdout:     stdout,
+			Stderr:     "execution timed out",
+			ExecTimeMS: execTimeMS,
+		}, nil
+	}
+
+	if readErr != nil {
+		return nil, fmt.Errorf("read execution results: %w", readErr)
+	}
+
 	return &usecase.RunResult{
-		ExitCode:      result.ExitCode,
-		Stdout:        result.Stdout,
-		Stderr:        result.Stderr,
-		CompileTimeMS: compileTimeMS,
-		ExecTimeMS:    execTimeMS,
+		ExitCode:   exitCode,
+		Stdout:     stdout,
+		Stderr:     stderr,
+		ExecTimeMS: execTimeMS,
 	}, nil
+}
+
+// injectCode mounts the rootfs image, writes the user's code and a run script,
+// and overwrites /init so the VM executes the code on boot and then powers off.
+func (p *Provider) injectCode(rootfsPath, mountDir string, execution *domain.Execution) error {
+	// Mount
+	if out, err := exec.Command("mount", "-o", "loop", rootfsPath, mountDir).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount rootfs: %s: %w", string(out), err)
+	}
+
+	// We must unmount before returning so Firecracker can use the image
+	defer func() {
+		_ = exec.Command("umount", mountDir).Run()
+	}()
+
+	// Ensure /tmp exists inside the rootfs
+	tmpDir := filepath.Join(mountDir, "tmp")
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		return fmt.Errorf("mkdir /tmp: %w", err)
+	}
+
+	// Write code file
+	ext, compileCmd, runCmd := p.languageCommands(execution.Language)
+	codeFile := "code" + ext
+	if err := os.WriteFile(filepath.Join(tmpDir, codeFile), []byte(execution.Code), 0644); err != nil {
+		return fmt.Errorf("write code file: %w", err)
+	}
+
+	// Write stdin if present
+	if execution.Stdin != "" {
+		if err := os.WriteFile(filepath.Join(tmpDir, "stdin.txt"), []byte(execution.Stdin), 0644); err != nil {
+			return fmt.Errorf("write stdin: %w", err)
+		}
+	}
+
+	// Build the run script
+	stdinRedirect := ""
+	if execution.Stdin != "" {
+		stdinRedirect = " < /tmp/stdin.txt"
+	}
+
+	var scriptBody string
+	if compileCmd != "" {
+		// Compiled language: compile first, then run the binary
+		scriptBody = fmt.Sprintf(`# Compile
+%s > /tmp/compile_stdout.txt 2> /tmp/compile_stderr.txt
+COMPILE_RC=$?
+if [ $COMPILE_RC -ne 0 ]; then
+    cat /tmp/compile_stdout.txt > /tmp/stdout.txt
+    cat /tmp/compile_stderr.txt > /tmp/stderr.txt
+    echo $COMPILE_RC > /tmp/exit_code.txt
+    sync
+    reboot -f
+fi
+# Run
+%s%s > /tmp/stdout.txt 2> /tmp/stderr.txt
+echo $? > /tmp/exit_code.txt
+`, compileCmd, runCmd, stdinRedirect)
+	} else {
+		scriptBody = fmt.Sprintf(`%s%s > /tmp/stdout.txt 2> /tmp/stderr.txt
+echo $? > /tmp/exit_code.txt
+`, runCmd, stdinRedirect)
+	}
+
+	runScript := fmt.Sprintf(`#!/bin/sh
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+cd /tmp
+%s
+sync
+reboot -f
+`, scriptBody)
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "run.sh"), []byte(runScript), 0755); err != nil {
+		return fmt.Errorf("write run script: %w", err)
+	}
+
+	// Overwrite /init (or /sbin/init) to call our run script.
+	// The kernel boot_args specify init=/init so we write to /init.
+	initScript := `#!/bin/sh
+exec /tmp/run.sh
+`
+	if err := os.WriteFile(filepath.Join(mountDir, "init"), []byte(initScript), 0755); err != nil {
+		return fmt.Errorf("write /init: %w", err)
+	}
+
+	return nil
+}
+
+// readResults mounts the rootfs image and reads stdout, stderr, and exit code
+// from well-known files written by the run script.
+func (p *Provider) readResults(rootfsPath, mountDir string) (stdout, stderr string, exitCode int, err error) {
+	if out, mountErr := exec.Command("mount", "-o", "loop", rootfsPath, mountDir).CombinedOutput(); mountErr != nil {
+		return "", "", 1, fmt.Errorf("remount rootfs: %s: %w", string(out), mountErr)
+	}
+	defer func() {
+		_ = exec.Command("umount", mountDir).Run()
+	}()
+
+	stdoutBytes, _ := os.ReadFile(filepath.Join(mountDir, "tmp", "stdout.txt"))
+	stderrBytes, _ := os.ReadFile(filepath.Join(mountDir, "tmp", "stderr.txt"))
+	exitCodeBytes, _ := os.ReadFile(filepath.Join(mountDir, "tmp", "exit_code.txt"))
+
+	stdout = string(stdoutBytes)
+	stderr = string(stderrBytes)
+	exitCode, _ = strconv.Atoi(strings.TrimSpace(string(exitCodeBytes)))
+
+	return stdout, stderr, exitCode, nil
+}
+
+// copyFile copies src to dst using io.Copy for efficiency.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Close()
 }
 
 // sshResult holds the output of an SSH command execution.
@@ -343,30 +863,31 @@ func (p *Provider) waitForSocket(ctx context.Context, socketPath string) error {
 	}
 }
 
-// configureVM sends configuration to the Firecracker API via Unix socket HTTP.
-func (p *Provider) configureVM(ctx context.Context, socketPath, kernelPath, rootfsPath string, cfg usecase.VMBootConfig) error {
+// configureVMWithPolicy is the network-policy-aware variant. When
+// attachNetwork is false (isolated mode) the network-interfaces step is
+// skipped entirely; otherwise it falls through to the standard
+// configureVM. Splitting the helper keeps configureVM's signature stable
+// for the existing call sites and tests.
+func (p *Provider) configureVMWithPolicy(ctx context.Context, socketPath, kernelPath, rootfsPath string, cfg usecase.VMBootConfig, attachNetwork bool, tapName string) error {
 	client := p.unixHTTPClient(socketPath)
 
-	// 1. Set machine configuration (vCPU + memory)
-	machineConfig := map[string]interface{}{
-		"vcpu_count":  cfg.VCPU,
+	machineConfig := map[string]any{
+		"vcpu_count":   cfg.VCPU,
 		"mem_size_mib": cfg.MemoryMB,
 	}
 	if err := p.apiPut(ctx, client, "/machine-config", machineConfig); err != nil {
 		return fmt.Errorf("configure machine: %w", err)
 	}
 
-	// 2. Set boot source (kernel + boot args)
-	bootSource := map[string]interface{}{
+	bootSource := map[string]any{
 		"kernel_image_path": kernelPath,
-		"boot_args":         "console=ttyS0 reboot=k panic=1 pci=off",
+		"boot_args":         "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init",
 	}
 	if err := p.apiPut(ctx, client, "/boot-source", bootSource); err != nil {
 		return fmt.Errorf("configure boot source: %w", err)
 	}
 
-	// 3. Attach rootfs drive
-	rootfsDrive := map[string]interface{}{
+	rootfsDrive := map[string]any{
 		"drive_id":       "rootfs",
 		"path_on_host":   rootfsPath,
 		"is_root_device": true,
@@ -376,16 +897,89 @@ func (p *Provider) configureVM(ctx context.Context, socketPath, kernelPath, root
 		return fmt.Errorf("configure rootfs drive: %w", err)
 	}
 
-	// 4. Configure network if bridged mode
-	if cfg.NetworkMode == domain.NetworkModeBridged {
-		netIface := map[string]interface{}{
-			"iface_id":    "eth0",
-			"guest_mac":   "AA:FC:00:00:00:01",
-			"host_dev_name": "tap0",
+	if attachNetwork {
+		if tapName == "" {
+			tapName = "tap-" + cfg.VMID.String()[:8]
+		}
+		netIface := map[string]any{
+			"iface_id":      "eth0",
+			"guest_mac":     generateMAC(cfg.VMID),
+			"host_dev_name": tapName,
 		}
 		if err := p.apiPut(ctx, client, "/network-interfaces/eth0", netIface); err != nil {
 			return fmt.Errorf("configure network: %w", err)
 		}
+	}
+
+	guestCID := 3 + (p.tapCounter.Load() % 250)
+	vsockCfg := map[string]any{
+		"guest_cid": guestCID,
+		"uds_path":  socketPath + ".vsock",
+	}
+	if err := p.apiPut(ctx, client, "/vsock", vsockCfg); err != nil {
+		log.Printf("Warning: vsock config failed (agent communication disabled): %v", err)
+	}
+
+	log.Printf("Configured VM via socket %s: kernel=%s, rootfs=%s, vcpu=%d, mem=%dMB, network=%v",
+		socketPath, kernelPath, rootfsPath, cfg.VCPU, cfg.MemoryMB, attachNetwork)
+	return nil
+}
+
+// configureVM sends configuration to the Firecracker API via Unix socket HTTP.
+func (p *Provider) configureVM(ctx context.Context, socketPath, kernelPath, rootfsPath string, cfg usecase.VMBootConfig) error {
+	client := p.unixHTTPClient(socketPath)
+
+	// 1. Set machine configuration (vCPU + memory)
+	machineConfig := map[string]any{
+		"vcpu_count":   cfg.VCPU,
+		"mem_size_mib": cfg.MemoryMB,
+	}
+	if err := p.apiPut(ctx, client, "/machine-config", machineConfig); err != nil {
+		return fmt.Errorf("configure machine: %w", err)
+	}
+
+	// 2. Set boot source (kernel + boot args)
+	bootSource := map[string]any{
+		"kernel_image_path": kernelPath,
+		"boot_args":         "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init",
+	}
+	if err := p.apiPut(ctx, client, "/boot-source", bootSource); err != nil {
+		return fmt.Errorf("configure boot source: %w", err)
+	}
+
+	// 3. Attach rootfs drive
+	rootfsDrive := map[string]any{
+		"drive_id":       "rootfs",
+		"path_on_host":   rootfsPath,
+		"is_root_device": true,
+		"is_read_only":   false,
+	}
+	if err := p.apiPut(ctx, client, "/drives/rootfs", rootfsDrive); err != nil {
+		return fmt.Errorf("configure rootfs drive: %w", err)
+	}
+
+	// 4. Always configure networking (TAP device was created before Firecracker started)
+	tapName := "tap-" + cfg.VMID.String()[:8]
+	mac := generateMAC(cfg.VMID)
+	netIface := map[string]any{
+		"iface_id":      "eth0",
+		"guest_mac":     mac,
+		"host_dev_name": tapName,
+	}
+	if err := p.apiPut(ctx, client, "/network-interfaces/eth0", netIface); err != nil {
+		return fmt.Errorf("configure network: %w", err)
+	}
+
+	// 5. Configure vsock for guest agent communication
+	guestCID := 3 + (p.tapCounter.Load() % 250)
+	vsockCfg := map[string]any{
+		"guest_cid": guestCID,
+		"uds_path":  socketPath + ".vsock",
+	}
+	if err := p.apiPut(ctx, client, "/vsock", vsockCfg); err != nil {
+		log.Printf("Warning: vsock config failed (agent communication disabled): %v", err)
+	} else {
+		log.Printf("Vsock configured: guest_cid=%d", guestCID)
 	}
 
 	log.Printf("Configured VM via socket %s: kernel=%s, rootfs=%s, vcpu=%d, mem=%dMB",
@@ -422,7 +1016,7 @@ func (p *Provider) unixHTTPClient(socketPath string) *http.Client {
 }
 
 // apiPut sends a PUT request to the Firecracker API.
-func (p *Provider) apiPut(ctx context.Context, client *http.Client, path string, payload interface{}) error {
+func (p *Provider) apiPut(ctx context.Context, client *http.Client, path string, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
@@ -449,7 +1043,7 @@ func (p *Provider) apiPut(ctx context.Context, client *http.Client, path string,
 }
 
 // apiGet sends a GET request to the Firecracker API and decodes the JSON response.
-func (p *Provider) apiGet(ctx context.Context, client *http.Client, path string, result interface{}) error {
+func (p *Provider) apiGet(ctx context.Context, client *http.Client, path string, result any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost"+path, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
@@ -492,7 +1086,7 @@ func (p *Provider) CreateSnapshot(ctx context.Context, socketPath string, snapsh
 	client := p.unixHTTPClient(socketPath)
 
 	// Call Firecracker PUT /snapshot/create
-	snapshotReq := map[string]interface{}{
+	snapshotReq := map[string]any{
 		"snapshot_type": "Full",
 		"snapshot_path": statePath,
 		"mem_file_path": memPath,
@@ -533,9 +1127,9 @@ func (p *Provider) RestoreSnapshot(ctx context.Context, socketPath, memPath, sta
 	}
 
 	// Call Firecracker PUT /snapshot/load
-	loadReq := map[string]interface{}{
-		"snapshot_path":      statePath,
-		"mem_backend": map[string]interface{}{
+	loadReq := map[string]any{
+		"snapshot_path": statePath,
+		"mem_backend": map[string]any{
 			"backend_type": "File",
 			"backend_path": memPath,
 		},

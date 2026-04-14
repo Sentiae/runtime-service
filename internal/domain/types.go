@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 )
 
-// JSONMap is a map[string]interface{} for JSONB storage
-type JSONMap map[string]interface{}
+// JSONMap is a map[string]any for JSONB storage
+type JSONMap map[string]any
 
 // Value implements driver.Valuer for database storage
 func (j JSONMap) Value() (driver.Value, error) {
@@ -17,7 +17,7 @@ func (j JSONMap) Value() (driver.Value, error) {
 }
 
 // Scan implements sql.Scanner for database retrieval
-func (j *JSONMap) Scan(value interface{}) error {
+func (j *JSONMap) Scan(value any) error {
 	if value == nil {
 		*j = nil
 		return nil

@@ -123,26 +123,26 @@ type VMInstanceUseCase interface {
 
 // CreateVMInstanceInput represents the input for creating a VM instance
 type CreateVMInstanceInput struct {
-	ExecutionID  *uuid.UUID        `json:"execution_id,omitempty"`
-	Language     domain.Language   `json:"language"`
-	BaseImage    string            `json:"base_image,omitempty"`
+	ExecutionID  *uuid.UUID             `json:"execution_id,omitempty"`
+	Language     domain.Language        `json:"language"`
+	BaseImage    string                 `json:"base_image,omitempty"`
 	DesiredState domain.VMInstanceState `json:"desired_state"`
-	VCPU         int               `json:"vcpu"`
-	MemoryMB     int               `json:"memory_mb"`
-	DiskMB       int               `json:"disk_mb"`
+	VCPU         int                    `json:"vcpu"`
+	MemoryMB     int                    `json:"memory_mb"`
+	DiskMB       int                    `json:"disk_mb"`
 }
 
 // HostInfo describes a host machine available for VM placement
 type HostInfo struct {
-	ID           string    `json:"id"`
-	Address      string    `json:"address"`
-	TotalVCPU    int       `json:"total_vcpu"`
-	TotalMemMB   int       `json:"total_mem_mb"`
-	UsedVCPU     int       `json:"used_vcpu"`
-	UsedMemMB    int       `json:"used_mem_mb"`
-	Labels       map[string]string `json:"labels,omitempty"`
-	Available    bool      `json:"available"`
-	LastHeartbeat time.Time `json:"last_heartbeat"`
+	ID            string            `json:"id"`
+	Address       string            `json:"address"`
+	TotalVCPU     int               `json:"total_vcpu"`
+	TotalMemMB    int               `json:"total_mem_mb"`
+	UsedVCPU      int               `json:"used_vcpu"`
+	UsedMemMB     int               `json:"used_mem_mb"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	Available     bool              `json:"available"`
+	LastHeartbeat time.Time         `json:"last_heartbeat"`
 }
 
 // AvailableVCPU returns the number of unused vCPUs on this host.
@@ -180,14 +180,14 @@ type VMMetrics struct {
 
 // CreateExecutionInput represents the input for creating an execution
 type CreateExecutionInput struct {
-	OrganizationID uuid.UUID         `json:"organization_id"`
-	RequestedBy    uuid.UUID         `json:"requested_by"`
-	NodeID         *uuid.UUID        `json:"node_id,omitempty"`
-	WorkflowID     *uuid.UUID        `json:"workflow_id,omitempty"`
-	Language       domain.Language   `json:"language"`
-	Code           string            `json:"code"`
-	Stdin          string            `json:"stdin,omitempty"`
-	Args           domain.JSONMap    `json:"args,omitempty"`
-	EnvVars        domain.JSONMap    `json:"env_vars,omitempty"`
+	OrganizationID uuid.UUID             `json:"organization_id"`
+	RequestedBy    uuid.UUID             `json:"requested_by"`
+	NodeID         *uuid.UUID            `json:"node_id,omitempty"`
+	WorkflowID     *uuid.UUID            `json:"workflow_id,omitempty"`
+	Language       domain.Language       `json:"language"`
+	Code           string                `json:"code"`
+	Stdin          string                `json:"stdin,omitempty"`
+	Args           domain.JSONMap        `json:"args,omitempty"`
+	EnvVars        domain.JSONMap        `json:"env_vars,omitempty"`
 	Resources      *domain.ResourceLimit `json:"resources,omitempty"`
 }

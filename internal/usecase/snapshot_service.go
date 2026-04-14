@@ -138,7 +138,7 @@ func (s *snapshotService) RestoreSnapshot(ctx context.Context, snapshotID uuid.U
 	}
 
 	// Load the snapshot into the fresh Firecracker instance
-	socketPath := vm.SocketPath
+	socketPath := bootResult.SocketPath
 	if socketPath == "" {
 		// Derive the socket path the same way the provider does
 		socketPath = fmt.Sprintf("/tmp/firecracker/%s.sock", vmID.String())

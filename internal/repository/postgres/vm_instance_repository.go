@@ -72,6 +72,26 @@ func (r *vmInstanceRepository) FindByHost(ctx context.Context, hostID string) ([
 	return instances, err
 }
 
+// FindCheckpointable returns running VMs whose CheckpointIntervalSeconds
+// is set (>0) and whose last checkpoint (if any) is older than the
+// configured interval. The checkpoint scheduler invokes this on every
+// tick and snapshots whatever it gets back.
+func (r *vmInstanceRepository) FindCheckpointable(ctx context.Context) ([]domain.VMInstance, error) {
+	var instances []domain.VMInstance
+	// Use a single query that compares NOW() against the last checkpoint
+	// timestamp plus the per-row interval. Postgres handles the math
+	// inline so we don't fetch and filter in Go.
+	err := r.db.WithContext(ctx).
+		Where(`state = ?
+			AND checkpoint_interval_seconds > 0
+			AND (last_checkpoint_at IS NULL
+				OR last_checkpoint_at + (checkpoint_interval_seconds || ' seconds')::interval <= NOW())`,
+			domain.VMInstanceStateRunning).
+		Order("COALESCE(last_checkpoint_at, '1970-01-01'::timestamp) ASC").
+		Find(&instances).Error
+	return instances, err
+}
+
 func (r *vmInstanceRepository) Delete(ctx context.Context, id uuid.UUID) error {
 	return r.db.WithContext(ctx).Where("id = ?", id).Delete(&domain.VMInstance{}).Error
 }

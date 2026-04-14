@@ -78,17 +78,17 @@ type VMInstanceResponse struct {
 
 // HostResponse is the API response for a host
 type HostResponse struct {
-	ID            string            `json:"id"`
-	Address       string            `json:"address"`
-	TotalVCPU     int               `json:"total_vcpu"`
-	TotalMemMB    int               `json:"total_mem_mb"`
-	UsedVCPU      int               `json:"used_vcpu"`
-	UsedMemMB     int               `json:"used_mem_mb"`
-	AvailableVCPU int               `json:"available_vcpu"`
-	AvailableMemMB int              `json:"available_mem_mb"`
-	Available     bool              `json:"available"`
-	Labels        map[string]string `json:"labels,omitempty"`
-	LastHeartbeat string            `json:"last_heartbeat"`
+	ID             string            `json:"id"`
+	Address        string            `json:"address"`
+	TotalVCPU      int               `json:"total_vcpu"`
+	TotalMemMB     int               `json:"total_mem_mb"`
+	UsedVCPU       int               `json:"used_vcpu"`
+	UsedMemMB      int               `json:"used_mem_mb"`
+	AvailableVCPU  int               `json:"available_vcpu"`
+	AvailableMemMB int               `json:"available_mem_mb"`
+	Available      bool              `json:"available"`
+	Labels         map[string]string `json:"labels,omitempty"`
+	LastHeartbeat  string            `json:"last_heartbeat"`
 }
 
 // --- Handlers ---
@@ -103,7 +103,7 @@ func (h *VMInstanceHandler) CreateVMInstance(w http.ResponseWriter, r *http.Requ
 
 	lang := domain.Language(req.Language)
 	if !lang.IsValid() {
-		RespondBadRequest(w, "Unsupported language", map[string]interface{}{
+		RespondBadRequest(w, "Unsupported language", map[string]any{
 			"language": req.Language,
 		})
 		return
@@ -196,7 +196,7 @@ func (h *VMInstanceHandler) ListVMInstances(w http.ResponseWriter, r *http.Reque
 		items[i] = vmInstanceToResponse(&inst)
 	}
 
-	RespondSuccess(w, map[string]interface{}{
+	RespondSuccess(w, map[string]any{
 		"items": items,
 		"total": len(items),
 	})
@@ -218,7 +218,7 @@ func (h *VMInstanceHandler) SetDesiredState(w http.ResponseWriter, r *http.Reque
 
 	desiredState := domain.VMInstanceState(req.DesiredState)
 	if !desiredState.IsValid() {
-		RespondBadRequest(w, "Invalid desired state", map[string]interface{}{
+		RespondBadRequest(w, "Invalid desired state", map[string]any{
 			"desired_state": req.DesiredState,
 			"valid_states":  []string{"pending", "booting", "running", "paused", "terminated"},
 		})
@@ -281,7 +281,7 @@ func (h *VMInstanceHandler) ListHosts(w http.ResponseWriter, r *http.Request) {
 		items[i] = hostToResponse(&host)
 	}
 
-	RespondSuccess(w, map[string]interface{}{
+	RespondSuccess(w, map[string]any{
 		"items": items,
 		"total": len(items),
 	})

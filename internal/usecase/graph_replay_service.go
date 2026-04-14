@@ -32,14 +32,14 @@ type GraphReplayUseCase interface {
 
 // TraceComparisonStep shows the differences between two traces at a specific step
 type TraceComparisonStep struct {
-	SequenceNumber int                           `json:"sequence_number"`
-	NodeName       string                        `json:"node_name"`
-	NodeType       string                        `json:"node_type"`
+	SequenceNumber int                            `json:"sequence_number"`
+	NodeName       string                         `json:"node_name"`
+	NodeType       string                         `json:"node_type"`
 	Trace1         *domain.GraphTraceNodeSnapshot `json:"trace1,omitempty"`
 	Trace2         *domain.GraphTraceNodeSnapshot `json:"trace2,omitempty"`
-	InputChanged   bool                          `json:"input_changed"`
-	OutputChanged  bool                          `json:"output_changed"`
-	StatusChanged  bool                          `json:"status_changed"`
+	InputChanged   bool                           `json:"input_changed"`
+	OutputChanged  bool                           `json:"output_changed"`
+	StatusChanged  bool                           `json:"status_changed"`
 }
 
 // graphReplaySessionState holds in-memory state for an active replay session

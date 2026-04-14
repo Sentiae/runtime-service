@@ -17,6 +17,7 @@ type executionService struct {
 	vmUC        VMUseCase
 	runner      ExecutionRunner
 	vmProvider  VMProvider
+	eventPub    EventPublisher
 }
 
 // ExecutionRunner abstracts the actual code execution within a microVM
@@ -57,6 +58,31 @@ func NewExecutionService(
 		svc.vmProvider = vmProvider[0]
 	}
 	return svc
+}
+
+// SetEventPublisher sets the event publisher for execution events.
+func (s *executionService) SetEventPublisher(pub EventPublisher) {
+	s.eventPub = pub
+}
+
+// publishExecutionEvent publishes an event when an execution completes or fails.
+func (s *executionService) publishExecutionEvent(ctx context.Context, execution *domain.Execution) {
+	if s.eventPub == nil {
+		return
+	}
+	eventType := EventExecCompleted
+	if execution.Status == domain.ExecutionStatusFailed {
+		eventType = EventExecFailed
+	}
+	_ = s.eventPub.Publish(ctx, eventType, execution.ID.String(), map[string]any{
+		"id":              execution.ID.String(),
+		"organization_id": execution.OrganizationID.String(),
+		"node_id":         execution.NodeID,
+		"language":        string(execution.Language),
+		"status":          string(execution.Status),
+		"exit_code":       execution.ExitCode,
+		"duration_ms":     execution.DurationMS,
+	})
 }
 
 func (s *executionService) CreateExecution(ctx context.Context, input CreateExecutionInput) (*domain.Execution, error) {
@@ -170,6 +196,11 @@ func (s *executionService) ExecuteSync(ctx context.Context, input CreateExecutio
 	return s.execRepo.FindByID(ctx, execution.ID)
 }
 
+// maxPendingAge is the maximum time an execution can remain in "pending"
+// status before being marked as failed. This prevents executions from being
+// stuck forever when the VM provider is unavailable.
+const maxPendingAge = 5 * time.Minute
+
 func (s *executionService) ProcessPending(ctx context.Context, limit int) (int, error) {
 	pending, err := s.execRepo.FindPending(ctx, limit)
 	if err != nil {
@@ -178,6 +209,25 @@ func (s *executionService) ProcessPending(ctx context.Context, limit int) (int, 
 
 	processed := 0
 	for _, exec := range pending {
+		// If the execution has been pending too long, mark it as failed
+		// instead of retrying indefinitely.
+		if time.Since(exec.CreatedAt) > maxPendingAge {
+			log.Printf("Execution %s has been pending for %s, marking as failed",
+				exec.ID, time.Since(exec.CreatedAt).Round(time.Second))
+			exec.MarkFailed(
+				fmt.Sprintf("execution stuck in pending for over %s; VM provider may be unavailable", maxPendingAge),
+				-1, "", "",
+			)
+			exec.UpdatedAt = time.Now().UTC()
+			if updateErr := s.execRepo.Update(ctx, &exec); updateErr != nil {
+				log.Printf("Failed to mark stale execution %s as failed: %v", exec.ID, updateErr)
+			} else {
+				s.publishExecutionEvent(ctx, &exec)
+				processed++
+			}
+			continue
+		}
+
 		if err := s.executeOne(ctx, &exec); err != nil {
 			log.Printf("Failed to process execution %s: %v", exec.ID, err)
 			continue
@@ -250,6 +300,9 @@ func (s *executionService) executeOne(ctx context.Context, execution *domain.Exe
 	if err := s.execRepo.Update(ctx, execution); err != nil {
 		return fmt.Errorf("failed to update execution result: %w", err)
 	}
+
+	// Publish execution event for cross-service integration (canvas badges, spec status)
+	s.publishExecutionEvent(ctx, execution)
 
 	// Record metrics if we have a result
 	if result != nil {

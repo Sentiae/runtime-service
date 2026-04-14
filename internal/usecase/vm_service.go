@@ -12,8 +12,8 @@ import (
 )
 
 type vmService struct {
-	vmRepo      repository.MicroVMRepository
-	vmProvider  VMProvider
+	vmRepo     repository.MicroVMRepository
+	vmProvider VMProvider
 }
 
 // VMProvider abstracts the Firecracker microVM lifecycle
@@ -53,12 +53,20 @@ type VMBootConfig struct {
 	KernelPath  string
 	RootfsPath  string
 	SocketPath  string
+	// NetworkPolicy lets the caller pin egress posture per-VM. When the
+	// Mode is empty the firecracker provider falls back to the legacy
+	// "always attach a TAP device" behaviour for backwards compatibility.
+	NetworkPolicy domain.NetworkPolicy
+	// EnvVars is injected into the guest before the entrypoint runs.
+	// Used by the test-DB provisioner to push DATABASE_URL into the VM.
+	EnvVars map[string]string
 }
 
 // VMBootResult holds the result of booting a microVM
 type VMBootResult struct {
 	PID        int
 	IPAddress  string
+	SocketPath string // For Firecracker: socket path; for containers: container name
 	BootTimeMS int64
 }
 
@@ -110,6 +118,7 @@ func (s *vmService) CreateVM(ctx context.Context, language domain.Language, vcpu
 	vm.Status = domain.VMStatusReady
 	vm.PID = &bootResult.PID
 	vm.IPAddress = bootResult.IPAddress
+	vm.SocketPath = bootResult.SocketPath
 	vm.BootTimeMS = &bootResult.BootTimeMS
 
 	if err := s.vmRepo.Update(ctx, vm); err != nil {

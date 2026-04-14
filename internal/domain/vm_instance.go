@@ -51,9 +51,17 @@ type VMInstance struct {
 	SocketPath   string          `json:"socket_path,omitempty" gorm:"type:varchar(500)"`
 	PID          *int            `json:"pid,omitempty"`
 	ErrorMessage string          `json:"error_message,omitempty" gorm:"type:text"`
-	CreatedAt    time.Time       `json:"created_at" gorm:"not null"`
-	UpdatedAt    time.Time       `json:"updated_at" gorm:"not null"`
-	TerminatedAt *time.Time      `json:"terminated_at,omitempty"`
+
+	// CheckpointIntervalSeconds drives the automatic checkpoint scheduler.
+	// 0 (the default) disables periodic snapshots; any positive value
+	// causes the scheduler to pause-snapshot-resume the VM at that
+	// cadence. Long-running test VMs typically set this to 300 (5 min).
+	CheckpointIntervalSeconds int        `json:"checkpoint_interval_seconds" gorm:"not null;default:0"`
+	LastCheckpointAt          *time.Time `json:"last_checkpoint_at,omitempty"`
+
+	CreatedAt    time.Time  `json:"created_at" gorm:"not null"`
+	UpdatedAt    time.Time  `json:"updated_at" gorm:"not null"`
+	TerminatedAt *time.Time `json:"terminated_at,omitempty"`
 }
 
 // TableName specifies the table name for GORM

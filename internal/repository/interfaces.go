@@ -34,6 +34,9 @@ type SnapshotRepository interface {
 	FindByID(ctx context.Context, id uuid.UUID) (*domain.Snapshot, error)
 	FindBaseByLanguage(ctx context.Context, language domain.Language) (*domain.Snapshot, error)
 	FindByExecution(ctx context.Context, executionID uuid.UUID) ([]domain.Snapshot, error)
+	// FindLatestCheckpointByVM returns the most recent automatic
+	// checkpoint for a VM. Returns ErrSnapshotNotFound when none exists.
+	FindLatestCheckpointByVM(ctx context.Context, vmID uuid.UUID) (*domain.Snapshot, error)
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 
@@ -52,6 +55,9 @@ type VMInstanceRepository interface {
 	FindAll(ctx context.Context, statusFilter *domain.VMInstanceState) ([]domain.VMInstance, error)
 	FindNeedingReconciliation(ctx context.Context) ([]domain.VMInstance, error)
 	FindByHost(ctx context.Context, hostID string) ([]domain.VMInstance, error)
+	// FindCheckpointable returns running VMs whose checkpoint interval has
+	// elapsed since the last automatic snapshot.
+	FindCheckpointable(ctx context.Context) ([]domain.VMInstance, error)
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 

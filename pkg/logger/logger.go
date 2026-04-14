@@ -15,10 +15,10 @@ func Init() {
 	ErrorLogger = log.New(os.Stderr, "ERROR: ", log.Ldate|log.Ltime|log.Lshortfile)
 }
 
-func Info(v ...interface{}) {
+func Info(v ...any) {
 	InfoLogger.Println(v...)
 }
 
-func Error(v ...interface{}) {
+func Error(v ...any) {
 	ErrorLogger.Println(v...)
 }

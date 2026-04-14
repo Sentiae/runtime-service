@@ -37,12 +37,12 @@ func (h *GraphHandler) RegisterRoutes(r chi.Router) {
 
 // CreateGraphRequest represents the request body for creating a graph
 type CreateGraphRequest struct {
-	Name        string                  `json:"name"`
-	Description string                  `json:"description,omitempty"`
-	CanvasID    *string                 `json:"canvas_id,omitempty"`
-	WorkflowID  *string                 `json:"workflow_id,omitempty"`
-	Nodes       []CreateNodeRequest     `json:"nodes"`
-	Edges       []CreateEdgeRequest     `json:"edges"`
+	Name        string              `json:"name"`
+	Description string              `json:"description,omitempty"`
+	CanvasID    *string             `json:"canvas_id,omitempty"`
+	WorkflowID  *string             `json:"workflow_id,omitempty"`
+	Nodes       []CreateNodeRequest `json:"nodes"`
+	Edges       []CreateEdgeRequest `json:"edges"`
 }
 
 // CreateNodeRequest represents a node in the create graph request
@@ -183,7 +183,7 @@ func (h *GraphHandler) GetGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	RespondSuccess(w, map[string]interface{}{
+	RespondSuccess(w, map[string]any{
 		"graph": graph,
 		"nodes": nodes,
 		"edges": edges,
@@ -207,7 +207,7 @@ func (h *GraphHandler) ListGraphs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	RespondSuccess(w, map[string]interface{}{
+	RespondSuccess(w, map[string]any{
 		"items": graphs,
 		"total": total,
 	})
@@ -346,7 +346,7 @@ func (h *GraphHandler) ValidateGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	RespondSuccess(w, map[string]interface{}{
+	RespondSuccess(w, map[string]any{
 		"valid":   true,
 		"message": "Graph validation passed",
 	})

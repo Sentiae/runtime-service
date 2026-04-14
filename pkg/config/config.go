@@ -2,249 +2,337 @@ package config
 
 import (
 	"fmt"
-	"log"
-	"os"
-	"strconv"
-	"strings"
 	"time"
+
+	pkconfig "github.com/sentiae/platform-kit/config"
 )
 
-// Config represents the complete application configuration
+// Config represents the complete application configuration.
 type Config struct {
-	App         AppConfig         `yaml:"app"`
-	Logging     LoggingConfig     `yaml:"logging"`
-	Server      ServerConfig      `yaml:"server"`
-	Database    DatabaseConfig    `yaml:"database"`
-	Services    ServicesConfig    `yaml:"services"`
-	Firecracker FirecrackerConfig `yaml:"firecracker"`
-	Kafka       KafkaConfig       `yaml:"kafka"`
+	App         AppConfig         `mapstructure:"app"`
+	Logging     LoggingConfig     `mapstructure:"logging"`
+	Server      ServerConfig      `mapstructure:"server"`
+	Database    DatabaseConfig    `mapstructure:"database"`
+	Services    ServicesConfig    `mapstructure:"services"`
+	Firecracker FirecrackerConfig `mapstructure:"firecracker"`
+	Container   ContainerConfig   `mapstructure:"container"`
+	Kafka       KafkaConfig       `mapstructure:"kafka"`
 }
 
-// KafkaConfig contains Kafka event publishing configuration
-type KafkaConfig struct {
-	Enabled bool     `yaml:"enabled"`
-	Brokers []string `yaml:"brokers"`
-	Topic   string   `yaml:"topic"`
-}
-
-// AppConfig contains application metadata
+// AppConfig contains application metadata.
 type AppConfig struct {
-	Name        string `yaml:"name"`
-	Version     string `yaml:"version"`
-	Environment string `yaml:"environment"`
+	Name         string `mapstructure:"name"`
+	Version      string `mapstructure:"version"`
+	Environment  string `mapstructure:"environment"`
+	ExecutorType string `mapstructure:"executor_type"` // "firecracker" or "container"
+	UseVsock     bool   `mapstructure:"use_vsock"`     // Use vsock agent for Firecracker
 }
 
-// LoggingConfig contains logging configuration
+// LoggingConfig contains logging configuration.
 type LoggingConfig struct {
-	Level  string `yaml:"level"`
-	Format string `yaml:"format"`
-	Output string `yaml:"output"`
+	Level  string `mapstructure:"level"`
+	Format string `mapstructure:"format"`
+	Output string `mapstructure:"output"`
 }
 
-// ServerConfig contains server configuration
+// ServerConfig contains server configuration.
 type ServerConfig struct {
-	HTTP HTTPConfig `yaml:"http"`
-	GRPC GRPCConfig `yaml:"grpc"`
+	HTTP HTTPConfig `mapstructure:"http"`
+	GRPC GRPCConfig `mapstructure:"grpc"`
 }
 
-// HTTPConfig contains HTTP server configuration
+// HTTPConfig contains HTTP server configuration.
 type HTTPConfig struct {
-	Enabled  bool           `yaml:"enabled"`
-	Host     string         `yaml:"host"`
-	Port     string         `yaml:"port"`
-	BasePath string         `yaml:"base_path"`
-	Timeouts TimeoutsConfig `yaml:"timeouts"`
+	Enabled  bool           `mapstructure:"enabled"`
+	Host     string         `mapstructure:"host"`
+	Port     string         `mapstructure:"port"`
+	BasePath string         `mapstructure:"base_path"`
+	Timeouts TimeoutsConfig `mapstructure:"timeouts"`
 }
 
-// TimeoutsConfig contains timeout settings
+// TimeoutsConfig contains timeout settings.
 type TimeoutsConfig struct {
-	Read     time.Duration `yaml:"read"`
-	Write    time.Duration `yaml:"write"`
-	Idle     time.Duration `yaml:"idle"`
-	Shutdown time.Duration `yaml:"shutdown"`
+	Read     time.Duration `mapstructure:"read"`
+	Write    time.Duration `mapstructure:"write"`
+	Idle     time.Duration `mapstructure:"idle"`
+	Shutdown time.Duration `mapstructure:"shutdown"`
 }
 
-// GRPCConfig contains gRPC server configuration
+// GRPCConfig contains gRPC server configuration.
 type GRPCConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	Host    string `yaml:"host"`
-	Port    string `yaml:"port"`
+	Enabled bool   `mapstructure:"enabled"`
+	Host    string `mapstructure:"host"`
+	Port    string `mapstructure:"port"`
 }
 
-// DatabaseConfig contains database configuration
+// DatabaseConfig contains database configuration.
 type DatabaseConfig struct {
-	Postgres PostgresConfig `yaml:"postgres"`
+	Postgres PostgresConfig `mapstructure:"postgres"`
 }
 
-// PostgresConfig contains PostgreSQL configuration
+// PostgresConfig contains PostgreSQL configuration.
 type PostgresConfig struct {
-	Host       string           `yaml:"host"`
-	Port       string           `yaml:"port"`
-	User       string           `yaml:"user"`
-	Password   string           `yaml:"password"`
-	Database   string           `yaml:"database"`
-	SSLMode    string           `yaml:"ssl_mode"`
-	Pool       PoolConfig       `yaml:"pool"`
-	Migrations MigrationsConfig `yaml:"migrations"`
-	LogLevel   string           `yaml:"log_level"`
+	Host       string           `mapstructure:"host"`
+	Port       string           `mapstructure:"port"`
+	User       string           `mapstructure:"user"`
+	Password   string           `mapstructure:"password"`
+	Database   string           `mapstructure:"database"`
+	SSLMode    string           `mapstructure:"ssl_mode"`
+	Pool       PoolConfig       `mapstructure:"pool"`
+	Migrations MigrationsConfig `mapstructure:"migrations"`
+	LogLevel   string           `mapstructure:"log_level"`
 }
 
-// PoolConfig contains connection pool settings
+// PoolConfig contains connection pool settings.
 type PoolConfig struct {
-	MaxOpenConns int           `yaml:"max_open_conns"`
-	MaxIdleConns int           `yaml:"max_idle_conns"`
-	MaxLifetime  time.Duration `yaml:"max_lifetime"`
-	MaxIdleTime  time.Duration `yaml:"max_idle_time"`
+	MaxOpenConns int           `mapstructure:"max_open_conns"`
+	MaxIdleConns int           `mapstructure:"max_idle_conns"`
+	MaxLifetime  time.Duration `mapstructure:"max_lifetime"`
+	MaxIdleTime  time.Duration `mapstructure:"max_idle_time"`
 }
 
-// MigrationsConfig contains migration settings
+// MigrationsConfig contains migration settings.
 type MigrationsConfig struct {
-	Enabled     bool   `yaml:"enabled"`
-	Path        string `yaml:"path"`
-	AutoMigrate bool   `yaml:"auto_migrate"`
+	Enabled     bool   `mapstructure:"enabled"`
+	Path        string `mapstructure:"path"`
+	AutoMigrate bool   `mapstructure:"auto_migrate"`
 }
 
-// ServicesConfig contains external service endpoints
+// ServicesConfig contains external service endpoints.
 type ServicesConfig struct {
-	Identity   ServiceEndpoint `yaml:"identity"`
-	Permission ServiceEndpoint `yaml:"permission"`
-	Canvas     ServiceEndpoint `yaml:"canvas"`
+	Identity   ServiceEndpoint `mapstructure:"identity"`
+	Permission ServiceEndpoint `mapstructure:"permission"`
+	Canvas     ServiceEndpoint `mapstructure:"canvas"`
 }
 
-// ServiceEndpoint represents an external service configuration
+// ServiceEndpoint represents an external service configuration.
 type ServiceEndpoint struct {
-	Enabled bool          `yaml:"enabled"`
-	URL     string        `yaml:"url"`
-	Timeout time.Duration `yaml:"timeout"`
+	Enabled bool          `mapstructure:"enabled"`
+	URL     string        `mapstructure:"url"`
+	Timeout time.Duration `mapstructure:"timeout"`
 }
 
-// FirecrackerConfig contains Firecracker microVM configuration
+// FirecrackerConfig contains Firecracker microVM configuration.
 type FirecrackerConfig struct {
-	BinaryPath     string        `yaml:"binary_path"`
-	JailerPath     string        `yaml:"jailer_path"`
-	KernelPath     string        `yaml:"kernel_path"`
-	RootfsBasePath string        `yaml:"rootfs_base_path"`
-	SnapshotPath   string        `yaml:"snapshot_path"`
-	SocketDir      string        `yaml:"socket_dir"`
-	DefaultVCPU    int           `yaml:"default_vcpu"`
-	DefaultMemMB   int           `yaml:"default_mem_mb"`
-	MaxVCPU        int           `yaml:"max_vcpu"`
-	MaxMemMB       int           `yaml:"max_mem_mb"`
-	DefaultTimeout time.Duration `yaml:"default_timeout"`
-	MaxTimeout     time.Duration `yaml:"max_timeout"`
-	PoolSize       int           `yaml:"pool_size"`
-	UseJailer      bool          `yaml:"use_jailer"`
+	BinaryPath     string        `mapstructure:"binary_path"`
+	JailerPath     string        `mapstructure:"jailer_path"`
+	KernelPath     string        `mapstructure:"kernel_path"`
+	RootfsBasePath string        `mapstructure:"rootfs_base_path"`
+	SnapshotPath   string        `mapstructure:"snapshot_path"`
+	SocketDir      string        `mapstructure:"socket_dir"`
+	DefaultVCPU    int           `mapstructure:"default_vcpu"`
+	DefaultMemMB   int           `mapstructure:"default_mem_mb"`
+	MaxVCPU        int           `mapstructure:"max_vcpu"`
+	MaxMemMB       int           `mapstructure:"max_mem_mb"`
+	DefaultTimeout time.Duration `mapstructure:"default_timeout"`
+	MaxTimeout     time.Duration `mapstructure:"max_timeout"`
+	PoolSize       int           `mapstructure:"pool_size"`
+	UseJailer      bool          `mapstructure:"use_jailer"`
 }
 
-// Load loads configuration from environment variables with defaults
-func Load() *Config {
-	cfg := &Config{
-		App: AppConfig{
-			Name:        getEnv("APP_NAME", "runtime-service"),
-			Version:     getEnv("VERSION", "dev"),
-			Environment: getEnv("ENVIRONMENT", "development"),
-		},
-		Logging: LoggingConfig{
-			Level:  getEnv("LOG_LEVEL", "info"),
-			Format: getEnv("LOG_FORMAT", "json"),
-			Output: getEnv("LOG_OUTPUT", "stdout"),
-		},
-		Server: ServerConfig{
-			HTTP: HTTPConfig{
-				Enabled:  getEnvAsBool("SERVER_HTTP_ENABLED", true),
-				Host:     getEnv("SERVER_HOST", "0.0.0.0"),
-				Port:     getEnv("PORT", "8090"),
-				BasePath: getEnv("SERVER_BASE_PATH", "/api/v1"),
-				Timeouts: TimeoutsConfig{
-					Read:     getEnvAsDuration("SERVER_READ_TIMEOUT", "30s"),
-					Write:    getEnvAsDuration("SERVER_WRITE_TIMEOUT", "120s"),
-					Idle:     getEnvAsDuration("SERVER_IDLE_TIMEOUT", "60s"),
-					Shutdown: getEnvAsDuration("SERVER_SHUTDOWN_TIMEOUT", "30s"),
-				},
-			},
-			GRPC: GRPCConfig{
-				Enabled: getEnvAsBool("GRPC_ENABLED", true),
-				Host:    getEnv("GRPC_HOST", "0.0.0.0"),
-				Port:    getEnv("GRPC_PORT", "50060"),
-			},
-		},
-		Database: DatabaseConfig{
-			Postgres: PostgresConfig{
-				Host:     getEnv("DB_HOST", "localhost"),
-				Port:     getEnv("DB_PORT", "5432"),
-				User:     getEnv("DB_USER", "postgres"),
-				Password: getEnv("DB_PASSWORD", "postgres"),
-				Database: getEnv("DB_NAME", "runtime_service"),
-				SSLMode:  getEnv("DB_SSL_MODE", "disable"),
-				Pool: PoolConfig{
-					MaxOpenConns: getEnvAsInt("DB_MAX_OPEN_CONNS", 25),
-					MaxIdleConns: getEnvAsInt("DB_MAX_IDLE_CONNS", 10),
-					MaxLifetime:  getEnvAsDuration("DB_MAX_LIFETIME", "5m"),
-					MaxIdleTime:  getEnvAsDuration("DB_MAX_IDLE_TIME", "10m"),
-				},
-				Migrations: MigrationsConfig{
-					Enabled:     getEnvAsBool("DB_MIGRATIONS_ENABLED", true),
-					Path:        getEnv("DB_MIGRATIONS_PATH", "./migrations"),
-					AutoMigrate: getEnvAsBool("DB_AUTO_MIGRATE", false),
-				},
-				LogLevel: getEnv("DB_LOG_LEVEL", "warn"),
-			},
-		},
-		Services: ServicesConfig{
-			Identity: ServiceEndpoint{
-				Enabled: getEnvAsBool("IDENTITY_SERVICE_ENABLED", true),
-				URL:     getEnv("IDENTITY_SERVICE_URL", "identity-service:50051"),
-				Timeout: getEnvAsDuration("IDENTITY_SERVICE_TIMEOUT", "5s"),
-			},
-			Permission: ServiceEndpoint{
-				Enabled: getEnvAsBool("PERMISSION_SERVICE_ENABLED", true),
-				URL:     getEnv("PERMISSION_SERVICE_URL", "permission-service:50054"),
-				Timeout: getEnvAsDuration("PERMISSION_SERVICE_TIMEOUT", "5s"),
-			},
-			Canvas: ServiceEndpoint{
-				Enabled: getEnvAsBool("CANVAS_SERVICE_ENABLED", true),
-				URL:     getEnv("CANVAS_SERVICE_URL", "canvas-service:50058"),
-				Timeout: getEnvAsDuration("CANVAS_SERVICE_TIMEOUT", "10s"),
-			},
-		},
-		Firecracker: FirecrackerConfig{
-			BinaryPath:     getEnv("FC_BINARY_PATH", "/usr/local/bin/firecracker"),
-			JailerPath:     getEnv("FC_JAILER_PATH", "/usr/local/bin/jailer"),
-			KernelPath:     getEnv("FC_KERNEL_PATH", "/var/lib/firecracker/kernel/vmlinux"),
-			RootfsBasePath: getEnv("FC_ROOTFS_BASE_PATH", "/var/lib/firecracker/rootfs"),
-			SnapshotPath:   getEnv("FC_SNAPSHOT_PATH", "/var/lib/firecracker/snapshots"),
-			SocketDir:      getEnv("FC_SOCKET_DIR", "/tmp/firecracker"),
-			DefaultVCPU:    getEnvAsInt("FC_DEFAULT_VCPU", 1),
-			DefaultMemMB:   getEnvAsInt("FC_DEFAULT_MEM_MB", 128),
-			MaxVCPU:        getEnvAsInt("FC_MAX_VCPU", 4),
-			MaxMemMB:       getEnvAsInt("FC_MAX_MEM_MB", 2048),
-			DefaultTimeout: getEnvAsDuration("FC_DEFAULT_TIMEOUT", "30s"),
-			MaxTimeout:     getEnvAsDuration("FC_MAX_TIMEOUT", "300s"),
-			PoolSize:       getEnvAsInt("FC_POOL_SIZE", 5),
-			UseJailer:      getEnvAsBool("FC_USE_JAILER", false),
-		},
-	}
-
-	// Kafka configuration
-	kafkaBrokers := getEnv("KAFKA_BROKERS", "")
-	var brokers []string
-	if kafkaBrokers != "" {
-		for _, b := range splitAndTrim(kafkaBrokers, ",") {
-			if b != "" {
-				brokers = append(brokers, b)
-			}
-		}
-	}
-	cfg.Kafka = KafkaConfig{
-		Enabled: getEnvAsBool("KAFKA_ENABLED", false),
-		Brokers: brokers,
-		Topic:   getEnv("KAFKA_TOPIC", "sentiae.runtime"),
-	}
-
-	return cfg
+// ContainerConfig contains Docker container executor configuration.
+type ContainerConfig struct {
+	DefaultVCPU    int           `mapstructure:"default_vcpu"`
+	DefaultMemMB   int           `mapstructure:"default_mem_mb"`
+	MaxVCPU        int           `mapstructure:"max_vcpu"`
+	MaxMemMB       int           `mapstructure:"max_mem_mb"`
+	DefaultTimeout time.Duration `mapstructure:"default_timeout"`
+	MaxTimeout     time.Duration `mapstructure:"max_timeout"`
 }
 
-// GetDatabaseURL returns the PostgreSQL connection URL
+// KafkaConfig contains Kafka event publishing configuration.
+type KafkaConfig struct {
+	Enabled bool     `mapstructure:"enabled"`
+	Brokers []string `mapstructure:"brokers"`
+	Topic   string   `mapstructure:"topic"`
+	GroupID string   `mapstructure:"group_id"`
+	// InboundTopics lists topics the runtime-service consumes from. Defaults
+	// to the canvas execution-request topic when unset.
+	InboundTopics []string `mapstructure:"inbound_topics"`
+}
+
+// Load loads configuration from config files, environment variables, and defaults.
+// Environment variables use the APP_ prefix (e.g. APP_SERVER_HTTP_PORT).
+func Load() (*Config, error) {
+	var cfg Config
+	err := pkconfig.Load(&cfg, pkconfig.Options{
+		EnvPrefix:   "APP",
+		ConfigPaths: []string{"configs", "."},
+		Defaults: map[string]any{
+			// App defaults
+			"app.name":          "runtime-service",
+			"app.version":       "dev",
+			"app.environment":   "development",
+			"app.executor_type": "container",
+
+			// Logging defaults
+			"logging.level":  "info",
+			"logging.format": "json",
+			"logging.output": "stdout",
+
+			// HTTP server defaults
+			"server.http.enabled":           true,
+			"server.http.host":              "0.0.0.0",
+			"server.http.port":              "8090",
+			"server.http.base_path":         "/api/v1",
+			"server.http.timeouts.read":     "30s",
+			"server.http.timeouts.write":    "120s",
+			"server.http.timeouts.idle":     "60s",
+			"server.http.timeouts.shutdown": "30s",
+
+			// gRPC server defaults
+			"server.grpc.enabled": true,
+			"server.grpc.host":    "0.0.0.0",
+			"server.grpc.port":    "50060",
+
+			// Database defaults
+			"database.postgres.host":                    "localhost",
+			"database.postgres.port":                    "5432",
+			"database.postgres.user":                    "postgres",
+			"database.postgres.password":                "postgres",
+			"database.postgres.database":                "runtime_service",
+			"database.postgres.ssl_mode":                "disable",
+			"database.postgres.pool.max_open_conns":     25,
+			"database.postgres.pool.max_idle_conns":     10,
+			"database.postgres.pool.max_lifetime":       "5m",
+			"database.postgres.pool.max_idle_time":      "10m",
+			"database.postgres.migrations.enabled":      true,
+			"database.postgres.migrations.path":         "./migrations",
+			"database.postgres.migrations.auto_migrate": false,
+			"database.postgres.log_level":               "warn",
+
+			// Services defaults
+			"services.identity.enabled":   true,
+			"services.identity.url":       "identity-service:50051",
+			"services.identity.timeout":   "5s",
+			"services.permission.enabled": true,
+			"services.permission.url":     "permission-service:50054",
+			"services.permission.timeout": "5s",
+			"services.canvas.enabled":     true,
+			"services.canvas.url":         "canvas-service:50058",
+			"services.canvas.timeout":     "10s",
+
+			// Firecracker defaults
+			"firecracker.binary_path":      "/usr/local/bin/firecracker",
+			"firecracker.jailer_path":      "/usr/local/bin/jailer",
+			"firecracker.kernel_path":      "/var/lib/firecracker/kernel/vmlinux",
+			"firecracker.rootfs_base_path": "/var/lib/firecracker/rootfs",
+			"firecracker.snapshot_path":    "/var/lib/firecracker/snapshots",
+			"firecracker.socket_dir":       "/tmp/firecracker",
+			"firecracker.default_vcpu":     1,
+			"firecracker.default_mem_mb":   128,
+			"firecracker.max_vcpu":         4,
+			"firecracker.max_mem_mb":       2048,
+			"firecracker.default_timeout":  "30s",
+			"firecracker.max_timeout":      "300s",
+			"firecracker.pool_size":        5,
+			"firecracker.use_jailer":       false,
+
+			// Container defaults
+			"container.default_vcpu":    1,
+			"container.default_mem_mb":  256,
+			"container.max_vcpu":        4,
+			"container.max_mem_mb":      2048,
+			"container.default_timeout": "30s",
+			"container.max_timeout":     "300s",
+
+			// Kafka defaults
+			"kafka.enabled": false,
+			"kafka.topic":   "sentiae.runtime",
+		},
+		BindEnvs: [][2]string{
+			// App bindings
+			{"app.name", "APP_APP_NAME"},
+			{"app.version", "APP_VERSION"},
+			{"app.environment", "APP_ENVIRONMENT"},
+			{"app.executor_type", "APP_EXECUTOR_TYPE"},
+			{"app.use_vsock", "APP_USE_VSOCK"},
+
+			// Logging bindings
+			{"logging.level", "APP_LOGGING_LEVEL"},
+			{"logging.format", "APP_LOGGING_FORMAT"},
+			{"logging.output", "APP_LOGGING_OUTPUT"},
+
+			// HTTP server bindings
+			{"server.http.enabled", "APP_SERVER_HTTP_ENABLED"},
+			{"server.http.host", "APP_SERVER_HTTP_HOST"},
+			{"server.http.port", "APP_SERVER_PORT"},
+			{"server.http.base_path", "APP_SERVER_HTTP_BASE_PATH"},
+			{"server.http.timeouts.read", "APP_SERVER_HTTP_TIMEOUTS_READ"},
+			{"server.http.timeouts.write", "APP_SERVER_HTTP_TIMEOUTS_WRITE"},
+			{"server.http.timeouts.idle", "APP_SERVER_HTTP_TIMEOUTS_IDLE"},
+			{"server.http.timeouts.shutdown", "APP_SERVER_HTTP_TIMEOUTS_SHUTDOWN"},
+
+			// gRPC bindings
+			{"server.grpc.enabled", "APP_SERVER_GRPC_ENABLED"},
+			{"server.grpc.host", "APP_SERVER_GRPC_HOST"},
+			{"server.grpc.port", "APP_GRPC_PORT"},
+
+			// Database bindings
+			{"database.postgres.host", "APP_DATABASE_HOST"},
+			{"database.postgres.port", "APP_DATABASE_PORT"},
+			{"database.postgres.user", "APP_DATABASE_USER"},
+			{"database.postgres.password", "APP_DATABASE_PASSWORD"},
+			{"database.postgres.database", "APP_DATABASE_NAME"},
+			{"database.postgres.ssl_mode", "APP_DATABASE_SSL_MODE"},
+			{"database.postgres.pool.max_open_conns", "APP_DATABASE_MAX_OPEN_CONNS"},
+			{"database.postgres.pool.max_idle_conns", "APP_DATABASE_MAX_IDLE_CONNS"},
+			{"database.postgres.pool.max_lifetime", "APP_DATABASE_MAX_LIFETIME"},
+			{"database.postgres.pool.max_idle_time", "APP_DATABASE_MAX_IDLE_TIME"},
+			{"database.postgres.migrations.enabled", "APP_DATABASE_MIGRATIONS_ENABLED"},
+			{"database.postgres.migrations.path", "APP_DATABASE_MIGRATIONS_PATH"},
+			{"database.postgres.migrations.auto_migrate", "APP_DATABASE_AUTO_MIGRATE"},
+			{"database.postgres.log_level", "APP_DATABASE_LOG_LEVEL"},
+
+			// Services bindings
+			{"services.identity.enabled", "APP_SERVICES_IDENTITY_ENABLED"},
+			{"services.identity.url", "APP_SERVICES_IDENTITY_URL"},
+			{"services.identity.timeout", "APP_SERVICES_IDENTITY_TIMEOUT"},
+			{"services.permission.enabled", "APP_SERVICES_PERMISSION_ENABLED"},
+			{"services.permission.url", "APP_SERVICES_PERMISSION_URL"},
+			{"services.permission.timeout", "APP_SERVICES_PERMISSION_TIMEOUT"},
+			{"services.canvas.enabled", "APP_SERVICES_CANVAS_ENABLED"},
+			{"services.canvas.url", "APP_SERVICES_CANVAS_URL"},
+			{"services.canvas.timeout", "APP_SERVICES_CANVAS_TIMEOUT"},
+
+			// Firecracker bindings
+			{"firecracker.binary_path", "APP_FC_BINARY_PATH"},
+			{"firecracker.jailer_path", "APP_FC_JAILER_PATH"},
+			{"firecracker.kernel_path", "APP_FC_KERNEL_PATH"},
+			{"firecracker.rootfs_base_path", "APP_FC_ROOTFS_BASE_PATH"},
+			{"firecracker.snapshot_path", "APP_FC_SNAPSHOT_PATH"},
+			{"firecracker.socket_dir", "APP_FC_SOCKET_DIR"},
+			{"firecracker.default_vcpu", "APP_FC_DEFAULT_VCPU"},
+			{"firecracker.default_mem_mb", "APP_FC_DEFAULT_MEM_MB"},
+			{"firecracker.max_vcpu", "APP_FC_MAX_VCPU"},
+			{"firecracker.max_mem_mb", "APP_FC_MAX_MEM_MB"},
+			{"firecracker.default_timeout", "APP_FC_DEFAULT_TIMEOUT"},
+			{"firecracker.max_timeout", "APP_FC_MAX_TIMEOUT"},
+			{"firecracker.pool_size", "APP_FC_POOL_SIZE"},
+			{"firecracker.use_jailer", "APP_FC_USE_JAILER"},
+
+			// Container bindings
+			{"container.default_vcpu", "APP_CONTAINER_DEFAULT_VCPU"},
+			{"container.default_mem_mb", "APP_CONTAINER_DEFAULT_MEM_MB"},
+			{"container.max_vcpu", "APP_CONTAINER_MAX_VCPU"},
+			{"container.max_mem_mb", "APP_CONTAINER_MAX_MEM_MB"},
+			{"container.default_timeout", "APP_CONTAINER_DEFAULT_TIMEOUT"},
+			{"container.max_timeout", "APP_CONTAINER_MAX_TIMEOUT"},
+
+			// Kafka bindings
+			{"kafka.enabled", "APP_KAFKA_ENABLED"},
+			{"kafka.brokers", "APP_KAFKA_BROKERS"},
+			{"kafka.topic", "APP_KAFKA_TOPIC"},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("loading config: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+// GetDatabaseURL returns the PostgreSQL connection URL.
 func (c *Config) GetDatabaseURL() string {
 	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		c.Database.Postgres.Host,
@@ -254,55 +342,4 @@ func (c *Config) GetDatabaseURL() string {
 		c.Database.Postgres.Database,
 		c.Database.Postgres.SSLMode,
 	)
-}
-
-// Helper functions for environment variable parsing
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-func getEnvAsInt(key string, defaultValue int) int {
-	if value := os.Getenv(key); value != "" {
-		if intValue, err := strconv.Atoi(value); err == nil {
-			return intValue
-		}
-		log.Printf("Warning: Invalid integer value for %s: %s, using default: %d", key, value, defaultValue)
-	}
-	return defaultValue
-}
-
-func getEnvAsBool(key string, defaultValue bool) bool {
-	if value := os.Getenv(key); value != "" {
-		if boolValue, err := strconv.ParseBool(value); err == nil {
-			return boolValue
-		}
-		log.Printf("Warning: Invalid boolean value for %s: %s, using default: %t", key, value, defaultValue)
-	}
-	return defaultValue
-}
-
-func splitAndTrim(s, sep string) []string {
-	parts := strings.Split(s, sep)
-	result := make([]string, 0, len(parts))
-	for _, p := range parts {
-		trimmed := strings.TrimSpace(p)
-		if trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
-}
-
-func getEnvAsDuration(key string, defaultValue string) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if duration, err := time.ParseDuration(value); err == nil {
-			return duration
-		}
-		log.Printf("Warning: Invalid duration value for %s: %s, using default: %s", key, value, defaultValue)
-	}
-	duration, _ := time.ParseDuration(defaultValue)
-	return duration
 }
