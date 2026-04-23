@@ -44,4 +44,18 @@ const (
 	EventExecCreated   = "sentiae.runtime.execution.created"
 	EventExecCompleted = "sentiae.runtime.execution.completed"
 	EventExecFailed    = "sentiae.runtime.execution.failed"
+
+	// Test-run lifecycle events. `test.completed` is distinct from
+	// `execution.completed` — test-specific consumers (saga coordinators,
+	// canvas gates, Pulse) care about per-test verdicts, retries, and
+	// flakiness, not the generic execution payload.
+	EventTestCompleted = "sentiae.runtime.test.completed"
+	EventTestQueued    = "sentiae.runtime.test.queued"
+
+	// Quarantine lifecycle (§8.3). Auto-quarantine flips Quarantined=true
+	// when a test has sustained flakiness (FlakinessScore > threshold
+	// over N runs); manual override lets an operator take a test out of
+	// rotation or bring it back ahead of the scheduler.
+	EventTestQuarantined   = "sentiae.runtime.test.quarantined"
+	EventTestUnquarantined = "sentiae.runtime.test.unquarantined"
 )

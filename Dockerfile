@@ -13,6 +13,7 @@ WORKDIR /app
 
 # Copy local replace dependencies
 COPY platform-kit/ /platform-kit/
+COPY foundry-service/ /foundry-service/
 
 # Copy go.mod and go.sum first for better caching
 COPY runtime-service/go.mod runtime-service/go.sum ./
@@ -24,7 +25,7 @@ COPY runtime-service/ .
 # Build the application with optimizations and security flags
 ARG VERSION=dev
 ARG BUILD_TIME
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+RUN CGO_ENABLED=0 go build \
     -a \
     -installsuffix cgo \
     -ldflags="-w -s -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" \

@@ -9,12 +9,18 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"google.golang.org/grpc"
 )
 
-// Client is a thin HTTP client for foundry-service.
+// Client talks to foundry-service. A7.2: GenerateTests routes through
+// foundry gRPC Dispatch(operation=generate_tests) when a gRPC channel is
+// wired via WithGRPC. HTTP stays in place as a rollback fallback.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
+	grpc       *grpcDispatcher
+	preferGRPC bool
 }
 
 // NewClient constructs a new foundry-service client.
@@ -32,7 +38,25 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
+		preferGRPC: preferGRPCFromEnv(),
 	}
+}
+
+// WithGRPC attaches a foundry gRPC channel for A7.2.
+func (c *Client) WithGRPC(conn *grpc.ClientConn) *Client {
+	if c == nil {
+		return c
+	}
+	c.grpc = newGRPCDispatcher(conn)
+	return c
+}
+
+// SetPreferGRPC toggles routing post-construction.
+func (c *Client) SetPreferGRPC(v bool) {
+	if c == nil {
+		return
+	}
+	c.preferGRPC = v
 }
 
 // GenerateTestRequest carries acceptance criteria plus target language/framework.
@@ -59,7 +83,21 @@ type FoundryClient interface {
 }
 
 // GenerateTests calls foundry-service to generate test code.
+//
+// A7.2: routes to foundry gRPC Dispatch(generate_tests) when preferGRPC
+// is set; HTTP path is DEPRECATED fallback.
 func (c *Client) GenerateTests(ctx context.Context, orgID string, req GenerateTestRequest) (*GenerateTestResponse, error) {
+	if c.preferGRPC && c.grpc != nil {
+		if out, err := c.grpc.generateTests(ctx, orgID, req); err == nil {
+			return out, nil
+		}
+	}
+	return c.generateTestsHTTP(ctx, orgID, req)
+}
+
+// generateTestsHTTP is the DEPRECATED HTTP implementation preserved for
+// A7.2 rollback.
+func (c *Client) generateTestsHTTP(ctx context.Context, orgID string, req GenerateTestRequest) (*GenerateTestResponse, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("foundry: marshal: %w", err)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pkdebug "github.com/sentiae/platform-kit/debug"
+	pkkafka "github.com/sentiae/platform-kit/kafka"
 	"github.com/sentiae/runtime-service/internal/di"
 	"github.com/sentiae/runtime-service/pkg/config"
 	"github.com/sentiae/runtime-service/pkg/logger"
@@ -23,9 +24,36 @@ var (
 	BuildTime = "unknown"
 )
 
+// maybeRegisterKafkaSchemas runs the G17 schema-registry bootstrap.
+// Gated by APP_KAFKA_REGISTER_SCHEMAS_ON_BOOT=true.
+func maybeRegisterKafkaSchemas() {
+	if os.Getenv("APP_KAFKA_REGISTER_SCHEMAS_ON_BOOT") != "true" {
+		return
+	}
+	url := os.Getenv("APP_KAFKA_SCHEMA_REGISTRY_URL")
+	if url == "" {
+		return
+	}
+	prefix := os.Getenv("APP_KAFKA_TOPIC_PREFIX")
+	if prefix == "" {
+		prefix = "sentiae"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	registry := pkkafka.NewSchemaRegistry(url)
+	result := pkkafka.RegisterAllSchemas(ctx, registry, prefix)
+	if len(result.Errors) > 0 {
+		log.Printf("schema-registry bootstrap: registered=%d skipped=%d errors=%d (first: %s)",
+			result.Registered, result.Skipped, len(result.Errors), result.Errors[0])
+		return
+	}
+	log.Printf("schema-registry bootstrap: registered %d schemas", result.Registered)
+}
+
 func main() {
 	stopPprof := pkdebug.StartPprofServer(context.Background(), "RUNTIME_DEBUG_PPROF")
 	defer func() { _ = stopPprof() }()
+	go maybeRegisterKafkaSchemas()
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {

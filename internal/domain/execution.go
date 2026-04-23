@@ -119,13 +119,27 @@ func (e *Execution) MarkTimeout(stdout, stderr string) {
 	}
 }
 
-// ResourceLimit defines resource constraints for an execution
+// ResourceLimit defines resource constraints for an execution.
+//
+// §9.1 gap-closure: in addition to the coarse vCPU/memory/disk-size
+// caps, callers can now express per-second rate limits that map 1:1
+// onto Firecracker's rate_limiter block. Zero means "no limit".
 type ResourceLimit struct {
 	VCPU       int         `json:"vcpu" gorm:"column:vcpu;not null;default:1"`
 	MemoryMB   int         `json:"memory_mb" gorm:"column:memory_mb;not null;default:128"`
 	TimeoutSec int         `json:"timeout_sec" gorm:"column:timeout_sec;not null;default:30"`
 	Network    NetworkMode `json:"network" gorm:"column:network;type:varchar(20);not null;default:'isolated'"`
 	DiskMB     int         `json:"disk_mb" gorm:"column:disk_mb;not null;default:256"`
+
+	// Disk throughput caps. Enforced via Firecracker per-drive rate
+	// limiters on the rootfs drive. 0 = unlimited.
+	DiskBandwidthMBps int64 `json:"disk_bandwidth_mbps" gorm:"column:disk_bandwidth_mbps;not null;default:0"`
+	DiskIOPS          int64 `json:"disk_iops" gorm:"column:disk_iops;not null;default:0"`
+
+	// Network throughput caps. Enforced via Firecracker per-iface
+	// tx/rx rate limiters. 0 = unlimited.
+	NetworkBandwidthMBps int64 `json:"network_bandwidth_mbps" gorm:"column:network_bandwidth_mbps;not null;default:0"`
+	NetworkPPS           int64 `json:"network_pps" gorm:"column:network_pps;not null;default:0"`
 }
 
 // Validate checks if resource limits are within acceptable bounds

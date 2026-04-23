@@ -65,4 +65,9 @@ var (
 	ErrTerminalSessionNotFound = errors.New("terminal session not found")
 	ErrTerminalSessionClosed   = errors.New("terminal session is already closed")
 	ErrTerminalVMNotReady      = errors.New("terminal VM is not ready")
+
+	// §9.2 hermetic chain integrity. ErrHashMismatch is returned when
+	// a step's verified prior-artifact digest does not match what the
+	// store rehydrates — indicates corruption or tampering.
+	ErrHashMismatch = errors.New("artifact: hash mismatch between step and store")
 )

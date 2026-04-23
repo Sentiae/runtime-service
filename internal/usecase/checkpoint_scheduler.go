@@ -257,6 +257,79 @@ func (s *CheckpointScheduler) RestoreLatest(ctx context.Context) (int, error) {
 	return restored, nil
 }
 
+// CheckpointNow snapshots the VM immediately and leaves it paused.
+// (§9.3) This is the path an agent takes when it sends a "pause"
+// signal to its sandbox VM: the snapshot captures the full state for
+// later restore, and the CPU stays stopped so no work happens while
+// the operator inspects the machine. Unlike checkpointOne, this does
+// NOT resume the VM afterwards — callers must issue Resume explicitly
+// (or restore from the snapshot).
+//
+// The fast-path bypasses the interval check — an agent can always
+// pause regardless of the scheduler cadence.
+func (s *CheckpointScheduler) CheckpointNow(ctx context.Context, vmID uuid.UUID) (*domain.Snapshot, error) {
+	vm, err := s.vmRepo.FindByID(ctx, vmID)
+	if err != nil {
+		return nil, fmt.Errorf("load vm: %w", err)
+	}
+	if vm.SocketPath == "" {
+		return nil, fmt.Errorf("VM %s has no socket path", vm.ID)
+	}
+	if err := s.vmProvider.Pause(ctx, vm.SocketPath); err != nil {
+		return nil, fmt.Errorf("pause: %w", err)
+	}
+
+	snapshotID := uuid.New()
+	start := time.Now()
+	result, err := s.vmProvider.CreateSnapshot(ctx, vm.SocketPath, snapshotID)
+	if err != nil {
+		// Resume so the agent-requested pause doesn't leave the VM
+		// stuck if the snapshot fails. The caller sees the error and
+		// can retry.
+		_ = s.vmProvider.Resume(ctx, vm.SocketPath)
+		return nil, fmt.Errorf("create snapshot: %w", err)
+	}
+	createMS := time.Since(start).Milliseconds()
+	now := time.Now().UTC()
+
+	row := &domain.Snapshot{
+		ID:             snapshotID,
+		VMID:           vm.ID,
+		ExecutionID:    vm.ExecutionID,
+		Language:       vm.Language,
+		MemoryFilePath: result.MemoryFilePath,
+		StateFilePath:  result.StateFilePath,
+		SizeBytes:      result.SizeBytes,
+		VCPU:           vm.VCPU,
+		MemoryMB:       vm.MemoryMB,
+		Description:    fmt.Sprintf("agent pause @ %s", now.Format(time.RFC3339)),
+		Kind:           domain.SnapshotKindCheckpoint,
+		RestoreTimeMS:  &createMS,
+		CreatedAt:      now,
+	}
+	if err := s.snapshotRepo.Create(ctx, row); err != nil {
+		_ = s.vmProvider.DeleteSnapshotFiles(result.MemoryFilePath, result.StateFilePath)
+		_ = s.vmProvider.Resume(ctx, vm.SocketPath)
+		return nil, fmt.Errorf("persist snapshot row: %w", err)
+	}
+
+	vm.LastCheckpointAt = &now
+	vm.UpdatedAt = now
+	if err := s.vmRepo.Update(ctx, vm); err != nil {
+		log.Printf("[CHECKPOINT] last_checkpoint_at update for VM %s failed: %v", vm.ID, err)
+	}
+
+	_ = s.eventPublisher.Publish(ctx, "runtime.checkpoint.paused", vm.ID.String(), map[string]any{
+		"vm_id":       vm.ID.String(),
+		"snapshot_id": snapshotID.String(),
+		"size_bytes":  result.SizeBytes,
+		"reason":      "agent_pause",
+		"created_at":  now.Format(time.RFC3339),
+	})
+	log.Printf("[CHECKPOINT] agent-paused VM %s -> snapshot %s (%d bytes, %dms)", vm.ID, snapshotID, result.SizeBytes, createMS)
+	return row, nil
+}
+
 // noopEventPublisher is the local fallback used when no publisher is
 // wired (e.g. in tests). It satisfies EventPublisher with empty methods.
 type noopEventPublisher struct{}

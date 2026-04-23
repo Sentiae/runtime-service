@@ -11,12 +11,16 @@ import (
 
 // VMHandler handles microVM-related HTTP requests
 type VMHandler struct {
-	vmUC usecase.VMUseCase
+	vmUC        usecase.VMUseCase
+	checkpoints *usecase.CheckpointScheduler
 }
 
-// NewVMHandler creates a new VM handler
-func NewVMHandler(uc usecase.VMUseCase) *VMHandler {
-	return &VMHandler{vmUC: uc}
+// NewVMHandler creates a new VM handler. The optional checkpoint
+// scheduler enables the POST /vms/{id}/pause endpoint (§9.3); pass
+// nil when the caller hasn't wired snapshotting yet and the endpoint
+// will respond with 503.
+func NewVMHandler(uc usecase.VMUseCase, cp *usecase.CheckpointScheduler) *VMHandler {
+	return &VMHandler{vmUC: uc, checkpoints: cp}
 }
 
 // RegisterRoutes registers VM routes on the router
@@ -25,6 +29,7 @@ func (h *VMHandler) RegisterRoutes(r chi.Router) {
 		r.Get("/", h.ListActiveVMs)
 		r.Get("/{vm_id}", h.GetVM)
 		r.Post("/{vm_id}/terminate", h.TerminateVM)
+		r.Post("/{vm_id}/pause", h.PauseVM)
 	})
 }
 
@@ -90,6 +95,38 @@ func (h *VMHandler) TerminateVM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	RespondNoContent(w)
+}
+
+// PauseVM handles POST /api/v1/vms/{vm_id}/pause.
+//
+// §9.3 gap-closure: when an agent asks its sandbox VM to pause we
+// snapshot immediately (not on the scheduler cadence) and leave the
+// CPU stopped. Callers restore from the returned snapshot to resume.
+func (h *VMHandler) PauseVM(w http.ResponseWriter, r *http.Request) {
+	vmID, err := GetUUIDParam(r, "vm_id")
+	if err != nil {
+		RespondBadRequest(w, "Invalid VM ID", nil)
+		return
+	}
+	if h.checkpoints == nil {
+		RespondError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "checkpoint scheduler not configured", nil)
+		return
+	}
+	snap, err := h.checkpoints.CheckpointNow(r.Context(), vmID)
+	if err != nil {
+		if errors.Is(err, domain.ErrVMNotFound) {
+			RespondNotFound(w, "VM not found")
+			return
+		}
+		RespondInternalError(w, err.Error())
+		return
+	}
+	RespondSuccess(w, map[string]any{
+		"vm_id":       vmID.String(),
+		"snapshot_id": snap.ID.String(),
+		"size_bytes":  snap.SizeBytes,
+		"created_at":  snap.CreatedAt.Format("2006-01-02T15:04:05Z"),
+	})
 }
 
 // VMResponse is the API response for a microVM

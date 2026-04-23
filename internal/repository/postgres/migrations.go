@@ -32,6 +32,12 @@ func AutoMigrate(db *gorm.DB) error {
 		// 9.x audit follow-ups: regression tests generated from
 		// captured production traces.
 		&domain.RegressionTestTemplate{},
+
+		// §9.2 — HermeticBuild row tracks pinned inputs + output
+		// digest for reproducible builds.
+		&domain.HermeticBuild{},
+		&domain.HermeticBuildStep{},
+		&domain.StepArtifactHash{},
 	}
 
 	if err := db.AutoMigrate(models...); err != nil {

@@ -21,6 +21,10 @@ type TestRunnerProfile struct {
 	Command   string
 	VMProfile string
 	Network   bool // whether the VM needs outbound network access
+	// EnvVars pin additional environment for the runner VM. Populated
+	// by middleware layers (§8.3 db-provisioning) without mutating the
+	// source profile table.
+	EnvVars map[string]string
 }
 
 // defaultUnit is returned when no more specific row matches.

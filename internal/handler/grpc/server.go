@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
@@ -77,6 +78,11 @@ func NewServer(
 	// Register services
 	runtimev1.RegisterRuntimeServiceServer(grpcServer, executionServer)
 
+	// Enable server reflection so grpcurl / grpcui can introspect the
+	// service in development + staging. Production can strip via build tag
+	// later if needed.
+	reflection.Register(grpcServer)
+
 	return &Server{
 		grpcServer:      grpcServer,
 		executionServer: executionServer,
@@ -86,6 +92,12 @@ func NewServer(
 // GetGRPCServer returns the underlying gRPC server.
 func (s *Server) GetGRPCServer() *grpc.Server {
 	return s.grpcServer
+}
+
+// ExecutionServer returns the underlying ExecutionServer so callers (DI)
+// can attach additional dependencies after construction.
+func (s *Server) ExecutionServer() *ExecutionServer {
+	return s.executionServer
 }
 
 // Shutdown gracefully shuts down the gRPC server.

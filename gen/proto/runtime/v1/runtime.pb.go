@@ -21,7 +21,6 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// CreateExecutionRequest is the request for creating a new execution.
 type CreateExecutionRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	OrganizationId string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
@@ -122,7 +121,6 @@ func (x *CreateExecutionRequest) GetTimeoutSec() int32 {
 	return 0
 }
 
-// CreateExecutionResponse is the response for creating a new execution.
 type CreateExecutionResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Execution     *Execution             `protobuf:"bytes,1,opt,name=execution,proto3" json:"execution,omitempty"`
@@ -167,7 +165,6 @@ func (x *CreateExecutionResponse) GetExecution() *Execution {
 	return nil
 }
 
-// GetExecutionRequest is the request for retrieving an execution.
 type GetExecutionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -212,7 +209,6 @@ func (x *GetExecutionRequest) GetId() string {
 	return ""
 }
 
-// GetExecutionResponse is the response for retrieving an execution.
 type GetExecutionResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Execution     *Execution             `protobuf:"bytes,1,opt,name=execution,proto3" json:"execution,omitempty"`
@@ -257,7 +253,6 @@ func (x *GetExecutionResponse) GetExecution() *Execution {
 	return nil
 }
 
-// ListExecutionsRequest is the request for listing executions.
 type ListExecutionsRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	OrganizationId string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
@@ -318,7 +313,6 @@ func (x *ListExecutionsRequest) GetPageSize() int32 {
 	return 0
 }
 
-// ListExecutionsResponse is the response for listing executions.
 type ListExecutionsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Executions    []*Execution           `protobuf:"bytes,1,rep,name=executions,proto3" json:"executions,omitempty"`
@@ -371,7 +365,6 @@ func (x *ListExecutionsResponse) GetTotal() int32 {
 	return 0
 }
 
-// CancelExecutionRequest is the request for cancelling an execution.
 type CancelExecutionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -416,7 +409,6 @@ func (x *CancelExecutionRequest) GetId() string {
 	return ""
 }
 
-// CancelExecutionResponse is the response for cancelling an execution.
 type CancelExecutionResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
@@ -461,7 +453,6 @@ func (x *CancelExecutionResponse) GetSuccess() bool {
 	return false
 }
 
-// GetExecutionMetricsRequest is the request for retrieving execution metrics.
 type GetExecutionMetricsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ExecutionId   string                 `protobuf:"bytes,1,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
@@ -506,7 +497,6 @@ func (x *GetExecutionMetricsRequest) GetExecutionId() string {
 	return ""
 }
 
-// GetExecutionMetricsResponse is the response for retrieving execution metrics.
 type GetExecutionMetricsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Metrics       *ExecutionMetrics      `protobuf:"bytes,1,opt,name=metrics,proto3" json:"metrics,omitempty"`
@@ -551,7 +541,6 @@ func (x *GetExecutionMetricsResponse) GetMetrics() *ExecutionMetrics {
 	return nil
 }
 
-// Execution represents a code execution and its lifecycle.
 type Execution struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Id             string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -732,7 +721,6 @@ func (x *Execution) GetCompletedAt() string {
 	return ""
 }
 
-// ExecutionMetrics captures resource usage during an execution.
 type ExecutionMetrics struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -865,6 +853,1138 @@ func (x *ExecutionMetrics) GetTotalTimeMs() int64 {
 	return 0
 }
 
+type ExecuteRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	OrganizationId string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
+	RequestedBy    string                 `protobuf:"bytes,2,opt,name=requested_by,json=requestedBy,proto3" json:"requested_by,omitempty"`
+	Language       string                 `protobuf:"bytes,3,opt,name=language,proto3" json:"language,omitempty"`
+	Code           string                 `protobuf:"bytes,4,opt,name=code,proto3" json:"code,omitempty"`
+	Stdin          string                 `protobuf:"bytes,5,opt,name=stdin,proto3" json:"stdin,omitempty"`
+	TimeoutSec     int32                  `protobuf:"varint,6,opt,name=timeout_sec,json=timeoutSec,proto3" json:"timeout_sec,omitempty"`
+	Vcpu           int32                  `protobuf:"varint,7,opt,name=vcpu,proto3" json:"vcpu,omitempty"`
+	MemoryMb       int32                  `protobuf:"varint,8,opt,name=memory_mb,json=memoryMb,proto3" json:"memory_mb,omitempty"`
+	// Optional canvas-node id for traceability.
+	CanvasNodeId  string `protobuf:"bytes,9,opt,name=canvas_node_id,json=canvasNodeId,proto3" json:"canvas_node_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExecuteRequest) Reset() {
+	*x = ExecuteRequest{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExecuteRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExecuteRequest) ProtoMessage() {}
+
+func (x *ExecuteRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExecuteRequest.ProtoReflect.Descriptor instead.
+func (*ExecuteRequest) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *ExecuteRequest) GetOrganizationId() string {
+	if x != nil {
+		return x.OrganizationId
+	}
+	return ""
+}
+
+func (x *ExecuteRequest) GetRequestedBy() string {
+	if x != nil {
+		return x.RequestedBy
+	}
+	return ""
+}
+
+func (x *ExecuteRequest) GetLanguage() string {
+	if x != nil {
+		return x.Language
+	}
+	return ""
+}
+
+func (x *ExecuteRequest) GetCode() string {
+	if x != nil {
+		return x.Code
+	}
+	return ""
+}
+
+func (x *ExecuteRequest) GetStdin() string {
+	if x != nil {
+		return x.Stdin
+	}
+	return ""
+}
+
+func (x *ExecuteRequest) GetTimeoutSec() int32 {
+	if x != nil {
+		return x.TimeoutSec
+	}
+	return 0
+}
+
+func (x *ExecuteRequest) GetVcpu() int32 {
+	if x != nil {
+		return x.Vcpu
+	}
+	return 0
+}
+
+func (x *ExecuteRequest) GetMemoryMb() int32 {
+	if x != nil {
+		return x.MemoryMb
+	}
+	return 0
+}
+
+func (x *ExecuteRequest) GetCanvasNodeId() string {
+	if x != nil {
+		return x.CanvasNodeId
+	}
+	return ""
+}
+
+type ExecuteResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Execution     *Execution             `protobuf:"bytes,1,opt,name=execution,proto3" json:"execution,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExecuteResponse) Reset() {
+	*x = ExecuteResponse{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExecuteResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExecuteResponse) ProtoMessage() {}
+
+func (x *ExecuteResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExecuteResponse.ProtoReflect.Descriptor instead.
+func (*ExecuteResponse) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *ExecuteResponse) GetExecution() *Execution {
+	if x != nil {
+		return x.Execution
+	}
+	return nil
+}
+
+type ExecuteAsyncResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// job_id is the execution row id — callers poll with
+	// GetExecutionStatus / GetExecutionResult.
+	JobId         string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Status        string `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExecuteAsyncResponse) Reset() {
+	*x = ExecuteAsyncResponse{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExecuteAsyncResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExecuteAsyncResponse) ProtoMessage() {}
+
+func (x *ExecuteAsyncResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExecuteAsyncResponse.ProtoReflect.Descriptor instead.
+func (*ExecuteAsyncResponse) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ExecuteAsyncResponse) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+func (x *ExecuteAsyncResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+type GetExecutionStatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetExecutionStatusRequest) Reset() {
+	*x = GetExecutionStatusRequest{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetExecutionStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetExecutionStatusRequest) ProtoMessage() {}
+
+func (x *GetExecutionStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetExecutionStatusRequest.ProtoReflect.Descriptor instead.
+func (*GetExecutionStatusRequest) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *GetExecutionStatusRequest) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+type GetExecutionStatusResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Status        string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	CreatedAt     string                 `protobuf:"bytes,3,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	StartedAt     string                 `protobuf:"bytes,4,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+	CompletedAt   string                 `protobuf:"bytes,5,opt,name=completed_at,json=completedAt,proto3" json:"completed_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetExecutionStatusResponse) Reset() {
+	*x = GetExecutionStatusResponse{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetExecutionStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetExecutionStatusResponse) ProtoMessage() {}
+
+func (x *GetExecutionStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetExecutionStatusResponse.ProtoReflect.Descriptor instead.
+func (*GetExecutionStatusResponse) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *GetExecutionStatusResponse) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+func (x *GetExecutionStatusResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *GetExecutionStatusResponse) GetCreatedAt() string {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return ""
+}
+
+func (x *GetExecutionStatusResponse) GetStartedAt() string {
+	if x != nil {
+		return x.StartedAt
+	}
+	return ""
+}
+
+func (x *GetExecutionStatusResponse) GetCompletedAt() string {
+	if x != nil {
+		return x.CompletedAt
+	}
+	return ""
+}
+
+type GetExecutionResultRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetExecutionResultRequest) Reset() {
+	*x = GetExecutionResultRequest{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetExecutionResultRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetExecutionResultRequest) ProtoMessage() {}
+
+func (x *GetExecutionResultRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetExecutionResultRequest.ProtoReflect.Descriptor instead.
+func (*GetExecutionResultRequest) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *GetExecutionResultRequest) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+type GetExecutionResultResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Status        string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	ExitCode      int32                  `protobuf:"varint,3,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
+	Stdout        string                 `protobuf:"bytes,4,opt,name=stdout,proto3" json:"stdout,omitempty"`
+	Stderr        string                 `protobuf:"bytes,5,opt,name=stderr,proto3" json:"stderr,omitempty"`
+	Error         string                 `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
+	DurationMs    int64                  `protobuf:"varint,7,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetExecutionResultResponse) Reset() {
+	*x = GetExecutionResultResponse{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetExecutionResultResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetExecutionResultResponse) ProtoMessage() {}
+
+func (x *GetExecutionResultResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetExecutionResultResponse.ProtoReflect.Descriptor instead.
+func (*GetExecutionResultResponse) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *GetExecutionResultResponse) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+func (x *GetExecutionResultResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *GetExecutionResultResponse) GetExitCode() int32 {
+	if x != nil {
+		return x.ExitCode
+	}
+	return 0
+}
+
+func (x *GetExecutionResultResponse) GetStdout() string {
+	if x != nil {
+		return x.Stdout
+	}
+	return ""
+}
+
+func (x *GetExecutionResultResponse) GetStderr() string {
+	if x != nil {
+		return x.Stderr
+	}
+	return ""
+}
+
+func (x *GetExecutionResultResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *GetExecutionResultResponse) GetDurationMs() int64 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
+type DispatchTestRunRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	OrganizationId string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
+	CanvasId       string                 `protobuf:"bytes,2,opt,name=canvas_id,json=canvasId,proto3" json:"canvas_id,omitempty"`          // optional
+	CodeNodeId     string                 `protobuf:"bytes,3,opt,name=code_node_id,json=codeNodeId,proto3" json:"code_node_id,omitempty"`  // optional — node-scoped runs
+	TestNodeId     string                 `protobuf:"bytes,4,opt,name=test_node_id,json=testNodeId,proto3" json:"test_node_id,omitempty"`  // optional
+	ExecutionId    string                 `protobuf:"bytes,5,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"` // optional — link to parent exec
+	Language       string                 `protobuf:"bytes,6,opt,name=language,proto3" json:"language,omitempty"`
+	// test_type: "unit" | "integration" | "e2e" | "perf" | "security"
+	// | "contract" | "visual" | "accessibility". Empty → "unit".
+	TestType      string `protobuf:"bytes,7,opt,name=test_type,json=testType,proto3" json:"test_type,omitempty"`
+	MaxRetries    int32  `protobuf:"varint,8,opt,name=max_retries,json=maxRetries,proto3" json:"max_retries,omitempty"`
+	TimeoutSec    int32  `protobuf:"varint,9,opt,name=timeout_sec,json=timeoutSec,proto3" json:"timeout_sec,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DispatchTestRunRequest) Reset() {
+	*x = DispatchTestRunRequest{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DispatchTestRunRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DispatchTestRunRequest) ProtoMessage() {}
+
+func (x *DispatchTestRunRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DispatchTestRunRequest.ProtoReflect.Descriptor instead.
+func (*DispatchTestRunRequest) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *DispatchTestRunRequest) GetOrganizationId() string {
+	if x != nil {
+		return x.OrganizationId
+	}
+	return ""
+}
+
+func (x *DispatchTestRunRequest) GetCanvasId() string {
+	if x != nil {
+		return x.CanvasId
+	}
+	return ""
+}
+
+func (x *DispatchTestRunRequest) GetCodeNodeId() string {
+	if x != nil {
+		return x.CodeNodeId
+	}
+	return ""
+}
+
+func (x *DispatchTestRunRequest) GetTestNodeId() string {
+	if x != nil {
+		return x.TestNodeId
+	}
+	return ""
+}
+
+func (x *DispatchTestRunRequest) GetExecutionId() string {
+	if x != nil {
+		return x.ExecutionId
+	}
+	return ""
+}
+
+func (x *DispatchTestRunRequest) GetLanguage() string {
+	if x != nil {
+		return x.Language
+	}
+	return ""
+}
+
+func (x *DispatchTestRunRequest) GetTestType() string {
+	if x != nil {
+		return x.TestType
+	}
+	return ""
+}
+
+func (x *DispatchTestRunRequest) GetMaxRetries() int32 {
+	if x != nil {
+		return x.MaxRetries
+	}
+	return 0
+}
+
+func (x *DispatchTestRunRequest) GetTimeoutSec() int32 {
+	if x != nil {
+		return x.TimeoutSec
+	}
+	return 0
+}
+
+type TestRunHandle struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TestRunId     string                 `protobuf:"bytes,1,opt,name=test_run_id,json=testRunId,proto3" json:"test_run_id,omitempty"`
+	ExecutionId   string                 `protobuf:"bytes,2,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
+	Status        string                 `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"` // "queued" | "dispatched"
+	RunnerMatched bool                   `protobuf:"varint,4,opt,name=runner_matched,json=runnerMatched,proto3" json:"runner_matched,omitempty"`
+	Command       string                 `protobuf:"bytes,5,opt,name=command,proto3" json:"command,omitempty"`
+	VmProfile     string                 `protobuf:"bytes,6,opt,name=vm_profile,json=vmProfile,proto3" json:"vm_profile,omitempty"`
+	Network       string                 `protobuf:"bytes,7,opt,name=network,proto3" json:"network,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TestRunHandle) Reset() {
+	*x = TestRunHandle{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TestRunHandle) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TestRunHandle) ProtoMessage() {}
+
+func (x *TestRunHandle) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TestRunHandle.ProtoReflect.Descriptor instead.
+func (*TestRunHandle) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *TestRunHandle) GetTestRunId() string {
+	if x != nil {
+		return x.TestRunId
+	}
+	return ""
+}
+
+func (x *TestRunHandle) GetExecutionId() string {
+	if x != nil {
+		return x.ExecutionId
+	}
+	return ""
+}
+
+func (x *TestRunHandle) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *TestRunHandle) GetRunnerMatched() bool {
+	if x != nil {
+		return x.RunnerMatched
+	}
+	return false
+}
+
+func (x *TestRunHandle) GetCommand() string {
+	if x != nil {
+		return x.Command
+	}
+	return ""
+}
+
+func (x *TestRunHandle) GetVmProfile() string {
+	if x != nil {
+		return x.VmProfile
+	}
+	return ""
+}
+
+func (x *TestRunHandle) GetNetwork() string {
+	if x != nil {
+		return x.Network
+	}
+	return ""
+}
+
+type GetTestCoverageRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TestRunId     string                 `protobuf:"bytes,1,opt,name=test_run_id,json=testRunId,proto3" json:"test_run_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetTestCoverageRequest) Reset() {
+	*x = GetTestCoverageRequest{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetTestCoverageRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetTestCoverageRequest) ProtoMessage() {}
+
+func (x *GetTestCoverageRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetTestCoverageRequest.ProtoReflect.Descriptor instead.
+func (*GetTestCoverageRequest) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *GetTestCoverageRequest) GetTestRunId() string {
+	if x != nil {
+		return x.TestRunId
+	}
+	return ""
+}
+
+type TestCoverage struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TestRunId     string                 `protobuf:"bytes,1,opt,name=test_run_id,json=testRunId,proto3" json:"test_run_id,omitempty"`
+	Passed        int32                  `protobuf:"varint,2,opt,name=passed,proto3" json:"passed,omitempty"`
+	Failed        int32                  `protobuf:"varint,3,opt,name=failed,proto3" json:"failed,omitempty"`
+	Skipped       int32                  `protobuf:"varint,4,opt,name=skipped,proto3" json:"skipped,omitempty"`
+	CoveragePct   float64                `protobuf:"fixed64,5,opt,name=coverage_pct,json=coveragePct,proto3" json:"coverage_pct,omitempty"`
+	HasCoverage   bool                   `protobuf:"varint,6,opt,name=has_coverage,json=hasCoverage,proto3" json:"has_coverage,omitempty"`
+	DurationMs    int64                  `protobuf:"varint,7,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	Status        string                 `protobuf:"bytes,8,opt,name=status,proto3" json:"status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TestCoverage) Reset() {
+	*x = TestCoverage{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TestCoverage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TestCoverage) ProtoMessage() {}
+
+func (x *TestCoverage) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TestCoverage.ProtoReflect.Descriptor instead.
+func (*TestCoverage) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *TestCoverage) GetTestRunId() string {
+	if x != nil {
+		return x.TestRunId
+	}
+	return ""
+}
+
+func (x *TestCoverage) GetPassed() int32 {
+	if x != nil {
+		return x.Passed
+	}
+	return 0
+}
+
+func (x *TestCoverage) GetFailed() int32 {
+	if x != nil {
+		return x.Failed
+	}
+	return 0
+}
+
+func (x *TestCoverage) GetSkipped() int32 {
+	if x != nil {
+		return x.Skipped
+	}
+	return 0
+}
+
+func (x *TestCoverage) GetCoveragePct() float64 {
+	if x != nil {
+		return x.CoveragePct
+	}
+	return 0
+}
+
+func (x *TestCoverage) GetHasCoverage() bool {
+	if x != nil {
+		return x.HasCoverage
+	}
+	return false
+}
+
+func (x *TestCoverage) GetDurationMs() int64 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
+func (x *TestCoverage) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+type GetTestCoverageDeltaRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	BaseTestRunId string                 `protobuf:"bytes,1,opt,name=base_test_run_id,json=baseTestRunId,proto3" json:"base_test_run_id,omitempty"`
+	HeadTestRunId string                 `protobuf:"bytes,2,opt,name=head_test_run_id,json=headTestRunId,proto3" json:"head_test_run_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetTestCoverageDeltaRequest) Reset() {
+	*x = GetTestCoverageDeltaRequest{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetTestCoverageDeltaRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetTestCoverageDeltaRequest) ProtoMessage() {}
+
+func (x *GetTestCoverageDeltaRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetTestCoverageDeltaRequest.ProtoReflect.Descriptor instead.
+func (*GetTestCoverageDeltaRequest) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *GetTestCoverageDeltaRequest) GetBaseTestRunId() string {
+	if x != nil {
+		return x.BaseTestRunId
+	}
+	return ""
+}
+
+func (x *GetTestCoverageDeltaRequest) GetHeadTestRunId() string {
+	if x != nil {
+		return x.HeadTestRunId
+	}
+	return ""
+}
+
+type TestCoverageDelta struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	BasePct       float64                `protobuf:"fixed64,1,opt,name=base_pct,json=basePct,proto3" json:"base_pct,omitempty"`
+	HeadPct       float64                `protobuf:"fixed64,2,opt,name=head_pct,json=headPct,proto3" json:"head_pct,omitempty"`
+	DeltaPct      float64                `protobuf:"fixed64,3,opt,name=delta_pct,json=deltaPct,proto3" json:"delta_pct,omitempty"`
+	BasePassed    int32                  `protobuf:"varint,4,opt,name=base_passed,json=basePassed,proto3" json:"base_passed,omitempty"`
+	HeadPassed    int32                  `protobuf:"varint,5,opt,name=head_passed,json=headPassed,proto3" json:"head_passed,omitempty"`
+	BaseFailed    int32                  `protobuf:"varint,6,opt,name=base_failed,json=baseFailed,proto3" json:"base_failed,omitempty"`
+	HeadFailed    int32                  `protobuf:"varint,7,opt,name=head_failed,json=headFailed,proto3" json:"head_failed,omitempty"`
+	NewFailures   int32                  `protobuf:"varint,8,opt,name=new_failures,json=newFailures,proto3" json:"new_failures,omitempty"`       // failed at head but passing at base
+	FixedFailures int32                  `protobuf:"varint,9,opt,name=fixed_failures,json=fixedFailures,proto3" json:"fixed_failures,omitempty"` // passing at head but failing at base
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TestCoverageDelta) Reset() {
+	*x = TestCoverageDelta{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TestCoverageDelta) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TestCoverageDelta) ProtoMessage() {}
+
+func (x *TestCoverageDelta) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TestCoverageDelta.ProtoReflect.Descriptor instead.
+func (*TestCoverageDelta) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *TestCoverageDelta) GetBasePct() float64 {
+	if x != nil {
+		return x.BasePct
+	}
+	return 0
+}
+
+func (x *TestCoverageDelta) GetHeadPct() float64 {
+	if x != nil {
+		return x.HeadPct
+	}
+	return 0
+}
+
+func (x *TestCoverageDelta) GetDeltaPct() float64 {
+	if x != nil {
+		return x.DeltaPct
+	}
+	return 0
+}
+
+func (x *TestCoverageDelta) GetBasePassed() int32 {
+	if x != nil {
+		return x.BasePassed
+	}
+	return 0
+}
+
+func (x *TestCoverageDelta) GetHeadPassed() int32 {
+	if x != nil {
+		return x.HeadPassed
+	}
+	return 0
+}
+
+func (x *TestCoverageDelta) GetBaseFailed() int32 {
+	if x != nil {
+		return x.BaseFailed
+	}
+	return 0
+}
+
+func (x *TestCoverageDelta) GetHeadFailed() int32 {
+	if x != nil {
+		return x.HeadFailed
+	}
+	return 0
+}
+
+func (x *TestCoverageDelta) GetNewFailures() int32 {
+	if x != nil {
+		return x.NewFailures
+	}
+	return 0
+}
+
+func (x *TestCoverageDelta) GetFixedFailures() int32 {
+	if x != nil {
+		return x.FixedFailures
+	}
+	return 0
+}
+
+type GetVMUsageRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Scope is EITHER execution_id (one run) or organization_id + window.
+	ExecutionId    string `protobuf:"bytes,1,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
+	OrganizationId string `protobuf:"bytes,2,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
+	Since          string `protobuf:"bytes,3,opt,name=since,proto3" json:"since,omitempty"` // RFC 3339
+	Until          string `protobuf:"bytes,4,opt,name=until,proto3" json:"until,omitempty"` // RFC 3339
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *GetVMUsageRequest) Reset() {
+	*x = GetVMUsageRequest{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetVMUsageRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetVMUsageRequest) ProtoMessage() {}
+
+func (x *GetVMUsageRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetVMUsageRequest.ProtoReflect.Descriptor instead.
+func (*GetVMUsageRequest) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *GetVMUsageRequest) GetExecutionId() string {
+	if x != nil {
+		return x.ExecutionId
+	}
+	return ""
+}
+
+func (x *GetVMUsageRequest) GetOrganizationId() string {
+	if x != nil {
+		return x.OrganizationId
+	}
+	return ""
+}
+
+func (x *GetVMUsageRequest) GetSince() string {
+	if x != nil {
+		return x.Since
+	}
+	return ""
+}
+
+func (x *GetVMUsageRequest) GetUntil() string {
+	if x != nil {
+		return x.Until
+	}
+	return ""
+}
+
+type VMUsage struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Scope                string                 `protobuf:"bytes,1,opt,name=scope,proto3" json:"scope,omitempty"` // "execution" | "organization"
+	TotalCpuTimeMs       int64                  `protobuf:"varint,2,opt,name=total_cpu_time_ms,json=totalCpuTimeMs,proto3" json:"total_cpu_time_ms,omitempty"`
+	TotalMemoryMbSeconds float64                `protobuf:"fixed64,3,opt,name=total_memory_mb_seconds,json=totalMemoryMbSeconds,proto3" json:"total_memory_mb_seconds,omitempty"`
+	TotalBootTimeMs      int64                  `protobuf:"varint,4,opt,name=total_boot_time_ms,json=totalBootTimeMs,proto3" json:"total_boot_time_ms,omitempty"`
+	ExecutionCount       int32                  `protobuf:"varint,5,opt,name=execution_count,json=executionCount,proto3" json:"execution_count,omitempty"`
+	ActiveVms            int32                  `protobuf:"varint,6,opt,name=active_vms,json=activeVms,proto3" json:"active_vms,omitempty"`
+	// estimated_cost_usd is an optional cost projection. Zero when the
+	// service is not configured with a cost model yet.
+	EstimatedCostUsd float64 `protobuf:"fixed64,7,opt,name=estimated_cost_usd,json=estimatedCostUsd,proto3" json:"estimated_cost_usd,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *VMUsage) Reset() {
+	*x = VMUsage{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VMUsage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VMUsage) ProtoMessage() {}
+
+func (x *VMUsage) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VMUsage.ProtoReflect.Descriptor instead.
+func (*VMUsage) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *VMUsage) GetScope() string {
+	if x != nil {
+		return x.Scope
+	}
+	return ""
+}
+
+func (x *VMUsage) GetTotalCpuTimeMs() int64 {
+	if x != nil {
+		return x.TotalCpuTimeMs
+	}
+	return 0
+}
+
+func (x *VMUsage) GetTotalMemoryMbSeconds() float64 {
+	if x != nil {
+		return x.TotalMemoryMbSeconds
+	}
+	return 0
+}
+
+func (x *VMUsage) GetTotalBootTimeMs() int64 {
+	if x != nil {
+		return x.TotalBootTimeMs
+	}
+	return 0
+}
+
+func (x *VMUsage) GetExecutionCount() int32 {
+	if x != nil {
+		return x.ExecutionCount
+	}
+	return 0
+}
+
+func (x *VMUsage) GetActiveVms() int32 {
+	if x != nil {
+		return x.ActiveVms
+	}
+	return 0
+}
+
+func (x *VMUsage) GetEstimatedCostUsd() float64 {
+	if x != nil {
+		return x.EstimatedCostUsd
+	}
+	return 0
+}
+
 var File_proto_runtime_v1_runtime_proto protoreflect.FileDescriptor
 
 const file_proto_runtime_v1_runtime_proto_rawDesc = "" +
@@ -943,13 +2063,125 @@ const file_proto_runtime_v1_runtime_proto_rawDesc = "" +
 	" \x01(\x03R\rcompileTimeMs\x12 \n" +
 	"\fexec_time_ms\x18\v \x01(\x03R\n" +
 	"execTimeMs\x12\"\n" +
-	"\rtotal_time_ms\x18\f \x01(\x03R\vtotalTimeMs2\xdc\x03\n" +
+	"\rtotal_time_ms\x18\f \x01(\x03R\vtotalTimeMs\"\x9a\x02\n" +
+	"\x0eExecuteRequest\x12'\n" +
+	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\x12!\n" +
+	"\frequested_by\x18\x02 \x01(\tR\vrequestedBy\x12\x1a\n" +
+	"\blanguage\x18\x03 \x01(\tR\blanguage\x12\x12\n" +
+	"\x04code\x18\x04 \x01(\tR\x04code\x12\x14\n" +
+	"\x05stdin\x18\x05 \x01(\tR\x05stdin\x12\x1f\n" +
+	"\vtimeout_sec\x18\x06 \x01(\x05R\n" +
+	"timeoutSec\x12\x12\n" +
+	"\x04vcpu\x18\a \x01(\x05R\x04vcpu\x12\x1b\n" +
+	"\tmemory_mb\x18\b \x01(\x05R\bmemoryMb\x12$\n" +
+	"\x0ecanvas_node_id\x18\t \x01(\tR\fcanvasNodeId\"F\n" +
+	"\x0fExecuteResponse\x123\n" +
+	"\texecution\x18\x01 \x01(\v2\x15.runtime.v1.ExecutionR\texecution\"E\n" +
+	"\x14ExecuteAsyncResponse\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x16\n" +
+	"\x06status\x18\x02 \x01(\tR\x06status\"2\n" +
+	"\x19GetExecutionStatusRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xac\x01\n" +
+	"\x1aGetExecutionStatusResponse\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x16\n" +
+	"\x06status\x18\x02 \x01(\tR\x06status\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\x03 \x01(\tR\tcreatedAt\x12\x1d\n" +
+	"\n" +
+	"started_at\x18\x04 \x01(\tR\tstartedAt\x12!\n" +
+	"\fcompleted_at\x18\x05 \x01(\tR\vcompletedAt\"2\n" +
+	"\x19GetExecutionResultRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xcf\x01\n" +
+	"\x1aGetExecutionResultResponse\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x16\n" +
+	"\x06status\x18\x02 \x01(\tR\x06status\x12\x1b\n" +
+	"\texit_code\x18\x03 \x01(\x05R\bexitCode\x12\x16\n" +
+	"\x06stdout\x18\x04 \x01(\tR\x06stdout\x12\x16\n" +
+	"\x06stderr\x18\x05 \x01(\tR\x06stderr\x12\x14\n" +
+	"\x05error\x18\x06 \x01(\tR\x05error\x12\x1f\n" +
+	"\vduration_ms\x18\a \x01(\x03R\n" +
+	"durationMs\"\xc0\x02\n" +
+	"\x16DispatchTestRunRequest\x12'\n" +
+	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\x12\x1b\n" +
+	"\tcanvas_id\x18\x02 \x01(\tR\bcanvasId\x12 \n" +
+	"\fcode_node_id\x18\x03 \x01(\tR\n" +
+	"codeNodeId\x12 \n" +
+	"\ftest_node_id\x18\x04 \x01(\tR\n" +
+	"testNodeId\x12!\n" +
+	"\fexecution_id\x18\x05 \x01(\tR\vexecutionId\x12\x1a\n" +
+	"\blanguage\x18\x06 \x01(\tR\blanguage\x12\x1b\n" +
+	"\ttest_type\x18\a \x01(\tR\btestType\x12\x1f\n" +
+	"\vmax_retries\x18\b \x01(\x05R\n" +
+	"maxRetries\x12\x1f\n" +
+	"\vtimeout_sec\x18\t \x01(\x05R\n" +
+	"timeoutSec\"\xe4\x01\n" +
+	"\rTestRunHandle\x12\x1e\n" +
+	"\vtest_run_id\x18\x01 \x01(\tR\ttestRunId\x12!\n" +
+	"\fexecution_id\x18\x02 \x01(\tR\vexecutionId\x12\x16\n" +
+	"\x06status\x18\x03 \x01(\tR\x06status\x12%\n" +
+	"\x0erunner_matched\x18\x04 \x01(\bR\rrunnerMatched\x12\x18\n" +
+	"\acommand\x18\x05 \x01(\tR\acommand\x12\x1d\n" +
+	"\n" +
+	"vm_profile\x18\x06 \x01(\tR\tvmProfile\x12\x18\n" +
+	"\anetwork\x18\a \x01(\tR\anetwork\"8\n" +
+	"\x16GetTestCoverageRequest\x12\x1e\n" +
+	"\vtest_run_id\x18\x01 \x01(\tR\ttestRunId\"\xf7\x01\n" +
+	"\fTestCoverage\x12\x1e\n" +
+	"\vtest_run_id\x18\x01 \x01(\tR\ttestRunId\x12\x16\n" +
+	"\x06passed\x18\x02 \x01(\x05R\x06passed\x12\x16\n" +
+	"\x06failed\x18\x03 \x01(\x05R\x06failed\x12\x18\n" +
+	"\askipped\x18\x04 \x01(\x05R\askipped\x12!\n" +
+	"\fcoverage_pct\x18\x05 \x01(\x01R\vcoveragePct\x12!\n" +
+	"\fhas_coverage\x18\x06 \x01(\bR\vhasCoverage\x12\x1f\n" +
+	"\vduration_ms\x18\a \x01(\x03R\n" +
+	"durationMs\x12\x16\n" +
+	"\x06status\x18\b \x01(\tR\x06status\"o\n" +
+	"\x1bGetTestCoverageDeltaRequest\x12'\n" +
+	"\x10base_test_run_id\x18\x01 \x01(\tR\rbaseTestRunId\x12'\n" +
+	"\x10head_test_run_id\x18\x02 \x01(\tR\rheadTestRunId\"\xb4\x02\n" +
+	"\x11TestCoverageDelta\x12\x19\n" +
+	"\bbase_pct\x18\x01 \x01(\x01R\abasePct\x12\x19\n" +
+	"\bhead_pct\x18\x02 \x01(\x01R\aheadPct\x12\x1b\n" +
+	"\tdelta_pct\x18\x03 \x01(\x01R\bdeltaPct\x12\x1f\n" +
+	"\vbase_passed\x18\x04 \x01(\x05R\n" +
+	"basePassed\x12\x1f\n" +
+	"\vhead_passed\x18\x05 \x01(\x05R\n" +
+	"headPassed\x12\x1f\n" +
+	"\vbase_failed\x18\x06 \x01(\x05R\n" +
+	"baseFailed\x12\x1f\n" +
+	"\vhead_failed\x18\a \x01(\x05R\n" +
+	"headFailed\x12!\n" +
+	"\fnew_failures\x18\b \x01(\x05R\vnewFailures\x12%\n" +
+	"\x0efixed_failures\x18\t \x01(\x05R\rfixedFailures\"\x8b\x01\n" +
+	"\x11GetVMUsageRequest\x12!\n" +
+	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12'\n" +
+	"\x0forganization_id\x18\x02 \x01(\tR\x0eorganizationId\x12\x14\n" +
+	"\x05since\x18\x03 \x01(\tR\x05since\x12\x14\n" +
+	"\x05until\x18\x04 \x01(\tR\x05until\"\xa4\x02\n" +
+	"\aVMUsage\x12\x14\n" +
+	"\x05scope\x18\x01 \x01(\tR\x05scope\x12)\n" +
+	"\x11total_cpu_time_ms\x18\x02 \x01(\x03R\x0etotalCpuTimeMs\x125\n" +
+	"\x17total_memory_mb_seconds\x18\x03 \x01(\x01R\x14totalMemoryMbSeconds\x12+\n" +
+	"\x12total_boot_time_ms\x18\x04 \x01(\x03R\x0ftotalBootTimeMs\x12'\n" +
+	"\x0fexecution_count\x18\x05 \x01(\x05R\x0eexecutionCount\x12\x1d\n" +
+	"\n" +
+	"active_vms\x18\x06 \x01(\x05R\tactiveVms\x12,\n" +
+	"\x12estimated_cost_usd\x18\a \x01(\x01R\x10estimatedCostUsd2\xfd\b\n" +
 	"\x0eRuntimeService\x12Z\n" +
 	"\x0fCreateExecution\x12\".runtime.v1.CreateExecutionRequest\x1a#.runtime.v1.CreateExecutionResponse\x12Q\n" +
 	"\fGetExecution\x12\x1f.runtime.v1.GetExecutionRequest\x1a .runtime.v1.GetExecutionResponse\x12W\n" +
 	"\x0eListExecutions\x12!.runtime.v1.ListExecutionsRequest\x1a\".runtime.v1.ListExecutionsResponse\x12Z\n" +
 	"\x0fCancelExecution\x12\".runtime.v1.CancelExecutionRequest\x1a#.runtime.v1.CancelExecutionResponse\x12f\n" +
-	"\x13GetExecutionMetrics\x12&.runtime.v1.GetExecutionMetricsRequest\x1a'.runtime.v1.GetExecutionMetricsResponseBCZAgithub.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1b\x06proto3"
+	"\x13GetExecutionMetrics\x12&.runtime.v1.GetExecutionMetricsRequest\x1a'.runtime.v1.GetExecutionMetricsResponse\x12B\n" +
+	"\aExecute\x12\x1a.runtime.v1.ExecuteRequest\x1a\x1b.runtime.v1.ExecuteResponse\x12L\n" +
+	"\fExecuteAsync\x12\x1a.runtime.v1.ExecuteRequest\x1a .runtime.v1.ExecuteAsyncResponse\x12c\n" +
+	"\x12GetExecutionStatus\x12%.runtime.v1.GetExecutionStatusRequest\x1a&.runtime.v1.GetExecutionStatusResponse\x12c\n" +
+	"\x12GetExecutionResult\x12%.runtime.v1.GetExecutionResultRequest\x1a&.runtime.v1.GetExecutionResultResponse\x12P\n" +
+	"\x0fDispatchTestRun\x12\".runtime.v1.DispatchTestRunRequest\x1a\x19.runtime.v1.TestRunHandle\x12O\n" +
+	"\x0fGetTestCoverage\x12\".runtime.v1.GetTestCoverageRequest\x1a\x18.runtime.v1.TestCoverage\x12^\n" +
+	"\x14GetTestCoverageDelta\x12'.runtime.v1.GetTestCoverageDeltaRequest\x1a\x1d.runtime.v1.TestCoverageDelta\x12@\n" +
+	"\n" +
+	"GetVMUsage\x12\x1d.runtime.v1.GetVMUsageRequest\x1a\x13.runtime.v1.VMUsageBCZAgithub.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1b\x06proto3"
 
 var (
 	file_proto_runtime_v1_runtime_proto_rawDescOnce sync.Once
@@ -963,7 +2195,7 @@ func file_proto_runtime_v1_runtime_proto_rawDescGZIP() []byte {
 	return file_proto_runtime_v1_runtime_proto_rawDescData
 }
 
-var file_proto_runtime_v1_runtime_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_proto_runtime_v1_runtime_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
 var file_proto_runtime_v1_runtime_proto_goTypes = []any{
 	(*CreateExecutionRequest)(nil),      // 0: runtime.v1.CreateExecutionRequest
 	(*CreateExecutionResponse)(nil),     // 1: runtime.v1.CreateExecutionResponse
@@ -977,27 +2209,59 @@ var file_proto_runtime_v1_runtime_proto_goTypes = []any{
 	(*GetExecutionMetricsResponse)(nil), // 9: runtime.v1.GetExecutionMetricsResponse
 	(*Execution)(nil),                   // 10: runtime.v1.Execution
 	(*ExecutionMetrics)(nil),            // 11: runtime.v1.ExecutionMetrics
+	(*ExecuteRequest)(nil),              // 12: runtime.v1.ExecuteRequest
+	(*ExecuteResponse)(nil),             // 13: runtime.v1.ExecuteResponse
+	(*ExecuteAsyncResponse)(nil),        // 14: runtime.v1.ExecuteAsyncResponse
+	(*GetExecutionStatusRequest)(nil),   // 15: runtime.v1.GetExecutionStatusRequest
+	(*GetExecutionStatusResponse)(nil),  // 16: runtime.v1.GetExecutionStatusResponse
+	(*GetExecutionResultRequest)(nil),   // 17: runtime.v1.GetExecutionResultRequest
+	(*GetExecutionResultResponse)(nil),  // 18: runtime.v1.GetExecutionResultResponse
+	(*DispatchTestRunRequest)(nil),      // 19: runtime.v1.DispatchTestRunRequest
+	(*TestRunHandle)(nil),               // 20: runtime.v1.TestRunHandle
+	(*GetTestCoverageRequest)(nil),      // 21: runtime.v1.GetTestCoverageRequest
+	(*TestCoverage)(nil),                // 22: runtime.v1.TestCoverage
+	(*GetTestCoverageDeltaRequest)(nil), // 23: runtime.v1.GetTestCoverageDeltaRequest
+	(*TestCoverageDelta)(nil),           // 24: runtime.v1.TestCoverageDelta
+	(*GetVMUsageRequest)(nil),           // 25: runtime.v1.GetVMUsageRequest
+	(*VMUsage)(nil),                     // 26: runtime.v1.VMUsage
 }
 var file_proto_runtime_v1_runtime_proto_depIdxs = []int32{
 	10, // 0: runtime.v1.CreateExecutionResponse.execution:type_name -> runtime.v1.Execution
 	10, // 1: runtime.v1.GetExecutionResponse.execution:type_name -> runtime.v1.Execution
 	10, // 2: runtime.v1.ListExecutionsResponse.executions:type_name -> runtime.v1.Execution
 	11, // 3: runtime.v1.GetExecutionMetricsResponse.metrics:type_name -> runtime.v1.ExecutionMetrics
-	0,  // 4: runtime.v1.RuntimeService.CreateExecution:input_type -> runtime.v1.CreateExecutionRequest
-	2,  // 5: runtime.v1.RuntimeService.GetExecution:input_type -> runtime.v1.GetExecutionRequest
-	4,  // 6: runtime.v1.RuntimeService.ListExecutions:input_type -> runtime.v1.ListExecutionsRequest
-	6,  // 7: runtime.v1.RuntimeService.CancelExecution:input_type -> runtime.v1.CancelExecutionRequest
-	8,  // 8: runtime.v1.RuntimeService.GetExecutionMetrics:input_type -> runtime.v1.GetExecutionMetricsRequest
-	1,  // 9: runtime.v1.RuntimeService.CreateExecution:output_type -> runtime.v1.CreateExecutionResponse
-	3,  // 10: runtime.v1.RuntimeService.GetExecution:output_type -> runtime.v1.GetExecutionResponse
-	5,  // 11: runtime.v1.RuntimeService.ListExecutions:output_type -> runtime.v1.ListExecutionsResponse
-	7,  // 12: runtime.v1.RuntimeService.CancelExecution:output_type -> runtime.v1.CancelExecutionResponse
-	9,  // 13: runtime.v1.RuntimeService.GetExecutionMetrics:output_type -> runtime.v1.GetExecutionMetricsResponse
-	9,  // [9:14] is the sub-list for method output_type
-	4,  // [4:9] is the sub-list for method input_type
-	4,  // [4:4] is the sub-list for extension type_name
-	4,  // [4:4] is the sub-list for extension extendee
-	0,  // [0:4] is the sub-list for field type_name
+	10, // 4: runtime.v1.ExecuteResponse.execution:type_name -> runtime.v1.Execution
+	0,  // 5: runtime.v1.RuntimeService.CreateExecution:input_type -> runtime.v1.CreateExecutionRequest
+	2,  // 6: runtime.v1.RuntimeService.GetExecution:input_type -> runtime.v1.GetExecutionRequest
+	4,  // 7: runtime.v1.RuntimeService.ListExecutions:input_type -> runtime.v1.ListExecutionsRequest
+	6,  // 8: runtime.v1.RuntimeService.CancelExecution:input_type -> runtime.v1.CancelExecutionRequest
+	8,  // 9: runtime.v1.RuntimeService.GetExecutionMetrics:input_type -> runtime.v1.GetExecutionMetricsRequest
+	12, // 10: runtime.v1.RuntimeService.Execute:input_type -> runtime.v1.ExecuteRequest
+	12, // 11: runtime.v1.RuntimeService.ExecuteAsync:input_type -> runtime.v1.ExecuteRequest
+	15, // 12: runtime.v1.RuntimeService.GetExecutionStatus:input_type -> runtime.v1.GetExecutionStatusRequest
+	17, // 13: runtime.v1.RuntimeService.GetExecutionResult:input_type -> runtime.v1.GetExecutionResultRequest
+	19, // 14: runtime.v1.RuntimeService.DispatchTestRun:input_type -> runtime.v1.DispatchTestRunRequest
+	21, // 15: runtime.v1.RuntimeService.GetTestCoverage:input_type -> runtime.v1.GetTestCoverageRequest
+	23, // 16: runtime.v1.RuntimeService.GetTestCoverageDelta:input_type -> runtime.v1.GetTestCoverageDeltaRequest
+	25, // 17: runtime.v1.RuntimeService.GetVMUsage:input_type -> runtime.v1.GetVMUsageRequest
+	1,  // 18: runtime.v1.RuntimeService.CreateExecution:output_type -> runtime.v1.CreateExecutionResponse
+	3,  // 19: runtime.v1.RuntimeService.GetExecution:output_type -> runtime.v1.GetExecutionResponse
+	5,  // 20: runtime.v1.RuntimeService.ListExecutions:output_type -> runtime.v1.ListExecutionsResponse
+	7,  // 21: runtime.v1.RuntimeService.CancelExecution:output_type -> runtime.v1.CancelExecutionResponse
+	9,  // 22: runtime.v1.RuntimeService.GetExecutionMetrics:output_type -> runtime.v1.GetExecutionMetricsResponse
+	13, // 23: runtime.v1.RuntimeService.Execute:output_type -> runtime.v1.ExecuteResponse
+	14, // 24: runtime.v1.RuntimeService.ExecuteAsync:output_type -> runtime.v1.ExecuteAsyncResponse
+	16, // 25: runtime.v1.RuntimeService.GetExecutionStatus:output_type -> runtime.v1.GetExecutionStatusResponse
+	18, // 26: runtime.v1.RuntimeService.GetExecutionResult:output_type -> runtime.v1.GetExecutionResultResponse
+	20, // 27: runtime.v1.RuntimeService.DispatchTestRun:output_type -> runtime.v1.TestRunHandle
+	22, // 28: runtime.v1.RuntimeService.GetTestCoverage:output_type -> runtime.v1.TestCoverage
+	24, // 29: runtime.v1.RuntimeService.GetTestCoverageDelta:output_type -> runtime.v1.TestCoverageDelta
+	26, // 30: runtime.v1.RuntimeService.GetVMUsage:output_type -> runtime.v1.VMUsage
+	18, // [18:31] is the sub-list for method output_type
+	5,  // [5:18] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_proto_runtime_v1_runtime_proto_init() }
@@ -1011,7 +2275,7 @@ func file_proto_runtime_v1_runtime_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_runtime_v1_runtime_proto_rawDesc), len(file_proto_runtime_v1_runtime_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   12,
+			NumMessages:   27,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

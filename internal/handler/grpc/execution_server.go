@@ -10,13 +10,24 @@ import (
 
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
 	"github.com/sentiae/runtime-service/internal/domain"
+	"github.com/sentiae/runtime-service/internal/repository/postgres"
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
 
 // ExecutionServer implements the gRPC RuntimeServiceServer interface.
+//
+// It hosts the legacy CreateExecution/* RPCs plus the richer Execute*,
+// DispatchTestRun, GetTestCoverage*, and GetVMUsage surfaces wired via
+// WithTestRunDeps. Fields beyond executionUC may be nil when the
+// matching dependency isn't configured; the RPC methods then report
+// Unavailable rather than panicking.
 type ExecutionServer struct {
 	runtimev1.UnimplementedRuntimeServiceServer
-	executionUC usecase.ExecutionUseCase
+	executionUC     usecase.ExecutionUseCase
+	testRunRepo     *postgres.TestRunRepo
+	testRunDispatch TestRunDispatcher
+	vmUC            usecase.VMUseCase
+	executionsLister ExecutionsLister
 }
 
 // NewExecutionServer creates a new ExecutionServer.

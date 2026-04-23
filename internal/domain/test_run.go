@@ -35,11 +35,73 @@ type TestRun struct {
 	// times when the runner reports a classified-transient error (network
 	// timeout, VM provisioning failure, etc). Non-transient errors land
 	// in TestRunStatusError immediately.
-	RetryCount int       `json:"retry_count" gorm:"default:0"`
-	MaxRetries int       `json:"max_retries" gorm:"default:2"`
-	WasRetried bool      `json:"was_retried" gorm:"default:false"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	RetryCount int  `json:"retry_count" gorm:"default:0"`
+	MaxRetries int  `json:"max_retries" gorm:"default:2"`
+	WasRetried bool `json:"was_retried" gorm:"default:false"`
+
+	// §8.1 gap-closure:
+	//
+	// Framework names the underlying test runner (jest, vitest, pytest,
+	// go-test, cargo-test, etc). Stored as a string rather than an enum
+	// so the field keeps up with new runners without a migration.
+	Framework string `json:"framework,omitempty" gorm:"type:varchar(40)"`
+	// TimeoutMS is the wall-clock limit the scheduler enforces on this
+	// run. 0 means "use the service default" (typically 5min). Set per
+	// run so long-running integration suites don't share a budget with
+	// fast unit tests.
+	TimeoutMS int64 `json:"timeout_ms,omitempty" gorm:"default:0"`
+	// FlakinessScore is a 0-1 rolling estimate of how often this test
+	// fails non-deterministically. Populated by a periodic job that
+	// looks at the last N runs and computes pass-rate variance; a
+	// flaky score triggers auto-quarantine in the test-gate policy.
+	FlakinessScore float64 `json:"flakiness_score" gorm:"type:float;default:0"`
+
+	// Critical marks tests that MUST pass before a deploy can promote
+	// (§8.5 "all critical tests pass" quality gate). Gate queries can
+	// select `WHERE critical = true AND status IN (passed)` to form
+	// the authoritative pass subset rather than all-or-nothing.
+	Critical bool `json:"critical" gorm:"default:false;index"`
+
+	// §8.3 auto-quarantine. Quarantined=true signals the delivery gate
+	// to skip this test when computing "critical tests pass" and lets
+	// the UI render a muted badge. QuarantinedAt records when the
+	// transition happened so the scheduler can re-evaluate and release
+	// tests that have stabilised.
+	Quarantined   bool       `json:"quarantined" gorm:"default:false;index"`
+	QuarantinedAt *time.Time `json:"quarantined_at,omitempty"`
+
+	// §8.4 — per-executor result payload (perf metrics, security
+	// findings array, contract provider report). Populated by the
+	// type-specific executor in multi_type_dispatcher.
+	ResultJSON JSONMap `json:"result_json,omitempty" gorm:"type:jsonb"`
+
+	// §8.3 db-mode — ephemeral Postgres provisioning for integration
+	// tests that need an isolated DB. DBMode is read by the provisioning
+	// middleware which resolves a connection string and injects it into
+	// the runner profile env.
+	DBMode TestDBMode `json:"db_mode,omitempty" gorm:"type:varchar(30);default:'none'"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TestDBMode classifies whether the test needs a provisioned database.
+// The default `none` leaves DATABASE_URL untouched; `ephemeral_pg`
+// provisions a throwaway Postgres DB for the duration of the run.
+type TestDBMode string
+
+const (
+	TestDBModeNone        TestDBMode = "none"
+	TestDBModeEphemeralPg TestDBMode = "ephemeral_pg"
+)
+
+// IsValid reports whether the mode is a recognized enum.
+func (m TestDBMode) IsValid() bool {
+	switch m {
+	case TestDBModeNone, TestDBModeEphemeralPg, "":
+		return true
+	}
+	return false
 }
 
 // TestRunStatus represents the lifecycle of a test run.
@@ -84,6 +146,29 @@ func (t *TestRun) MarkError(errMsg string) {
 	t.Status = TestRunStatusError
 	t.ErrorMessage = errMsg
 	t.UpdatedAt = time.Now()
+}
+
+// Quarantine flips the quarantine flag and stamps the transition time.
+// Idempotent: calling twice on an already-quarantined test is a no-op.
+func (t *TestRun) Quarantine(now time.Time) {
+	if t.Quarantined {
+		return
+	}
+	t.Quarantined = true
+	stamp := now
+	t.QuarantinedAt = &stamp
+	t.UpdatedAt = now
+}
+
+// Unquarantine clears the quarantine flag. Used both when a test has
+// stabilised and when an operator manually overrides the scheduler.
+func (t *TestRun) Unquarantine(now time.Time) {
+	if !t.Quarantined {
+		return
+	}
+	t.Quarantined = false
+	t.QuarantinedAt = nil
+	t.UpdatedAt = now
 }
 
 // IsTransientError classifies a runner error message as something worth

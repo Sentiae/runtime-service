@@ -38,6 +38,25 @@ type Provider struct {
 	bridgeOnce sync.Once
 	bridgeErr  error
 	tapCounter atomic.Uint32 // monotonic counter for unique /30 subnets
+
+	// pool is the optional pre-warmed VM pool (§9.1). When set, Boot
+	// hands a pooled VM to callers when available and falls back to a
+	// fresh cold boot when the pool is empty. Nil pool preserves the
+	// legacy "always cold boot" behaviour.
+	pool *VMPool
+
+	// checkpointScheduler, when set, drives per-VM automatic
+	// snapshotting (CS-2 G2.8). Boot() registers the new VM; Terminate()
+	// deregisters it. Nil is safe — Boot/Terminate stay on the legacy
+	// no-snapshot path.
+	checkpointScheduler *CheckpointScheduler
+}
+
+// SetCheckpointScheduler attaches a running CheckpointScheduler so
+// Boot/Terminate register + deregister VMs automatically. Must be
+// called before Boot for the wiring to apply to the first VM.
+func (p *Provider) SetCheckpointScheduler(s *CheckpointScheduler) {
+	p.checkpointScheduler = s
 }
 
 // NewProvider creates a new Firecracker provider
@@ -255,8 +274,41 @@ func vmIDFromSocketPath(socketPath string) (uuid.UUID, error) {
 	return uuid.Parse(name)
 }
 
-// Boot starts a new Firecracker microVM
+// SetPool wires the pre-warmed pool. The pool must be started separately
+// by the caller (typically from DI). Passing nil clears the pool and
+// reverts Boot to the cold-boot-only path.
+func (p *Provider) SetPool(pool *VMPool) {
+	p.pool = pool
+}
+
+// Boot starts a Firecracker microVM. When a pool is wired via SetPool
+// and has a VM available, the pooled VM is returned directly — this
+// is the §9.1 fast path. Otherwise Boot falls back to bootCold, the
+// original "start a fresh Firecracker process" logic.
 func (p *Provider) Boot(ctx context.Context, bootCfg usecase.VMBootConfig) (*usecase.VMBootResult, error) {
+	if p.pool != nil {
+		// Non-blocking pool check: we don't want Boot's latency to
+		// regress in the empty-pool case. The pool's internal bootFresh
+		// uses bootCold, not Boot, so there's no recursion.
+		select {
+		case vm := <-p.pool.available:
+			if vm != nil {
+				return &usecase.VMBootResult{
+					PID:        vm.PID,
+					IPAddress:  vm.IPAddress,
+					SocketPath: vm.SocketPath,
+					BootTimeMS: vm.BootTimeMS,
+				}, nil
+			}
+		default:
+		}
+	}
+	return p.bootCold(ctx, bootCfg)
+}
+
+// bootCold starts a fresh Firecracker microVM, bypassing any pool.
+// This is the original Boot implementation.
+func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (*usecase.VMBootResult, error) {
 	start := time.Now()
 
 	socketPath := p.socketPath(bootCfg.VMID)
@@ -358,6 +410,15 @@ func (p *Provider) Boot(ctx context.Context, bootCfg usecase.VMBootConfig) (*use
 	log.Printf("Firecracker VM booted: pid=%d, socket=%s, tap=%s, guest=%s, boot=%dms",
 		pid, socketPath, tapName, guestIP, bootTimeMS)
 
+	// CS-2 G2.8 — register with the per-VM checkpoint scheduler. Nil
+	// scheduler leaves the legacy (no auto-snapshot) behaviour intact.
+	if p.checkpointScheduler != nil {
+		p.checkpointScheduler.Register(context.Background(), VMRegistration{
+			VMID:       bootCfg.VMID,
+			SocketPath: socketPath,
+		})
+	}
+
 	return &usecase.VMBootResult{
 		PID:        pid,
 		IPAddress:  guestIP,
@@ -368,6 +429,15 @@ func (p *Provider) Boot(ctx context.Context, bootCfg usecase.VMBootConfig) (*use
 
 // Terminate kills a running microVM and cleans up its TAP device.
 func (p *Provider) Terminate(ctx context.Context, socketPath string, pid int) error {
+	// CS-2 G2.8 — deregister from the checkpoint scheduler BEFORE we
+	// send the shutdown signal so the goroutine can't race with the
+	// guest tearing down.
+	if p.checkpointScheduler != nil && socketPath != "" {
+		if vmID, err := vmIDFromSocketPath(socketPath); err == nil {
+			p.checkpointScheduler.Deregister(vmID)
+		}
+	}
+
 	// Send shutdown request via API first for graceful shutdown
 	if socketPath != "" {
 		_ = p.sendAction(ctx, socketPath, "SendCtrlAltDel")
@@ -492,13 +562,19 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 		return nil, fmt.Errorf("firecracker socket not ready: %w", err)
 	}
 
-	// Configure VM: use execution resources from the parent VM
+	// Configure VM: use execution resources from the parent VM. Rate
+	// limits come from the execution's ResourceLimit so tests inherit
+	// the same disk+net caps as any other sandbox. (§8.3 / §9.1.5)
 	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off init=/init"
 	execBootCfg := usecase.VMBootConfig{
-		VMID:     execVMID,
-		Language: execution.Language,
-		VCPU:     vm.VCPU,
-		MemoryMB: vm.MemoryMB,
+		VMID:                 execVMID,
+		Language:             execution.Language,
+		VCPU:                 vm.VCPU,
+		MemoryMB:             vm.MemoryMB,
+		DiskBandwidthMBps:    execution.Resources.DiskBandwidthMBps,
+		DiskIOPS:             execution.Resources.DiskIOPS,
+		NetworkBandwidthMBps: execution.Resources.NetworkBandwidthMBps,
+		NetworkPPS:           execution.Resources.NetworkPPS,
 	}
 
 	client := p.unixHTTPClient(socketPath)
@@ -521,23 +597,31 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 		return nil, fmt.Errorf("configure boot source: %w", err)
 	}
 
-	// Rootfs drive (the modified copy)
+	// Rootfs drive (the modified copy). Apply per-drive rate limiter
+	// when caller specified DiskBandwidthMBps / DiskIOPS (§9.1.5).
 	rootfsDrive := map[string]any{
 		"drive_id":       "rootfs",
 		"path_on_host":   execRootfs,
 		"is_root_device": true,
 		"is_read_only":   false,
 	}
+	if rl := driveRateLimiter(execBootCfg.DiskBandwidthMBps, execBootCfg.DiskIOPS); rl != nil {
+		rootfsDrive["rate_limiter"] = rl
+	}
 	if err := p.apiPut(ctx, client, "/drives/rootfs", rootfsDrive); err != nil {
 		return nil, fmt.Errorf("configure rootfs: %w", err)
 	}
 
-	// Network interface
+	// Network interface with per-iface rate limiters for egress shaping.
 	mac := generateMAC(execVMID)
 	netIface := map[string]any{
 		"iface_id":      "eth0",
 		"guest_mac":     mac,
 		"host_dev_name": tapName,
+	}
+	if rl := netRateLimiter(execBootCfg.NetworkBandwidthMBps, execBootCfg.NetworkPPS); rl != nil {
+		netIface["tx_rate_limiter"] = rl
+		netIface["rx_rate_limiter"] = rl
 	}
 	if err := p.apiPut(ctx, client, "/network-interfaces/eth0", netIface); err != nil {
 		return nil, fmt.Errorf("configure network: %w", err)
@@ -893,6 +977,9 @@ func (p *Provider) configureVMWithPolicy(ctx context.Context, socketPath, kernel
 		"is_root_device": true,
 		"is_read_only":   false,
 	}
+	if rl := driveRateLimiter(cfg.DiskBandwidthMBps, cfg.DiskIOPS); rl != nil {
+		rootfsDrive["rate_limiter"] = rl
+	}
 	if err := p.apiPut(ctx, client, "/drives/rootfs", rootfsDrive); err != nil {
 		return fmt.Errorf("configure rootfs drive: %w", err)
 	}
@@ -905,6 +992,10 @@ func (p *Provider) configureVMWithPolicy(ctx context.Context, socketPath, kernel
 			"iface_id":      "eth0",
 			"guest_mac":     generateMAC(cfg.VMID),
 			"host_dev_name": tapName,
+		}
+		if rl := netRateLimiter(cfg.NetworkBandwidthMBps, cfg.NetworkPPS); rl != nil {
+			netIface["tx_rate_limiter"] = rl
+			netIface["rx_rate_limiter"] = rl
 		}
 		if err := p.apiPut(ctx, client, "/network-interfaces/eth0", netIface); err != nil {
 			return fmt.Errorf("configure network: %w", err)
@@ -954,6 +1045,9 @@ func (p *Provider) configureVM(ctx context.Context, socketPath, kernelPath, root
 		"is_root_device": true,
 		"is_read_only":   false,
 	}
+	if rl := driveRateLimiter(cfg.DiskBandwidthMBps, cfg.DiskIOPS); rl != nil {
+		rootfsDrive["rate_limiter"] = rl
+	}
 	if err := p.apiPut(ctx, client, "/drives/rootfs", rootfsDrive); err != nil {
 		return fmt.Errorf("configure rootfs drive: %w", err)
 	}
@@ -965,6 +1059,10 @@ func (p *Provider) configureVM(ctx context.Context, socketPath, kernelPath, root
 		"iface_id":      "eth0",
 		"guest_mac":     mac,
 		"host_dev_name": tapName,
+	}
+	if rl := netRateLimiter(cfg.NetworkBandwidthMBps, cfg.NetworkPPS); rl != nil {
+		netIface["tx_rate_limiter"] = rl
+		netIface["rx_rate_limiter"] = rl
 	}
 	if err := p.apiPut(ctx, client, "/network-interfaces/eth0", netIface); err != nil {
 		return fmt.Errorf("configure network: %w", err)
@@ -1421,4 +1519,50 @@ func parseNetDev(netdev string) (rxBytes, txBytes int64) {
 		txBytes += tx
 	}
 	return rxBytes, txBytes
+}
+
+// driveRateLimiter builds a Firecracker rate_limiter block for a drive.
+// Values default to nil (unlimited) when both bandwidth and IOPS are 0.
+// Bandwidth caps are per-second bytes; IOPS caps are operations/sec.
+// See https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/patch-block.md
+func driveRateLimiter(bandwidthMBps, iops int64) map[string]any {
+	if bandwidthMBps <= 0 && iops <= 0 {
+		return nil
+	}
+	rl := map[string]any{}
+	if bandwidthMBps > 0 {
+		rl["bandwidth"] = map[string]any{
+			"size":        bandwidthMBps * 1024 * 1024, // MBps → bytes
+			"refill_time": 1000,                        // ms
+		}
+	}
+	if iops > 0 {
+		rl["ops"] = map[string]any{
+			"size":        iops,
+			"refill_time": 1000,
+		}
+	}
+	return rl
+}
+
+// netRateLimiter builds a Firecracker rate_limiter block for a network
+// interface. bandwidthMBps caps bytes/sec; pps caps packets/sec.
+func netRateLimiter(bandwidthMBps, pps int64) map[string]any {
+	if bandwidthMBps <= 0 && pps <= 0 {
+		return nil
+	}
+	rl := map[string]any{}
+	if bandwidthMBps > 0 {
+		rl["bandwidth"] = map[string]any{
+			"size":        bandwidthMBps * 1024 * 1024,
+			"refill_time": 1000,
+		}
+	}
+	if pps > 0 {
+		rl["ops"] = map[string]any{
+			"size":        pps,
+			"refill_time": 1000,
+		}
+	}
+	return rl
 }

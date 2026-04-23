@@ -5,12 +5,14 @@ import (
 	"errors"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/timetravel"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"gorm.io/gorm"
 )
 
 type snapshotRepository struct {
-	db *gorm.DB
+	db       *gorm.DB
+	recorder timetravel.Recorder
 }
 
 // NewSnapshotRepository creates a new PostgreSQL snapshot repository
@@ -18,8 +20,21 @@ func NewSnapshotRepository(db *gorm.DB) *snapshotRepository {
 	return &snapshotRepository{db: db}
 }
 
+// WithRecorder enables time-travel snapshots on every VM snapshot
+// write. CS11 slice (2026-04-18).
+func (r *snapshotRepository) WithRecorder(rec timetravel.Recorder) *snapshotRepository {
+	r.recorder = rec
+	return r
+}
+
 func (r *snapshotRepository) Create(ctx context.Context, snapshot *domain.Snapshot) error {
-	return r.db.WithContext(ctx).Create(snapshot).Error
+	if err := r.db.WithContext(ctx).Create(snapshot).Error; err != nil {
+		return err
+	}
+	if r.recorder != nil && snapshot != nil {
+		_ = r.recorder.RecordEntity(ctx, "vm_snapshot", snapshot.ID.String(), snapshot)
+	}
+	return nil
 }
 
 func (r *snapshotRepository) FindByID(ctx context.Context, id uuid.UUID) (*domain.Snapshot, error) {

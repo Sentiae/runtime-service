@@ -4,25 +4,48 @@ package runtime.v1;
 
 option go_package = "github.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1";
 
-// RuntimeService provides code execution management within Firecracker microVMs.
+// RuntimeService provides code execution + test-run management inside
+// Firecracker microVMs.
+//
+// The original CreateExecution/GetExecution/ListExecutions/CancelExecution/
+// GetExecutionMetrics surface is preserved for existing callers. Task
+// "Expose gRPC on canvas-service and runtime-service" adds the caller-
+// friendlier Execute*/GetExecution{Status,Result}/DispatchTestRun/
+// GetTestCoverage*/GetVMUsage RPCs used by foundry-service, canvas-service,
+// and ops-service.
 service RuntimeService {
-    // CreateExecution creates a new code execution request.
+    // ── Legacy execution API ───────────────────────────────────────────
     rpc CreateExecution(CreateExecutionRequest) returns (CreateExecutionResponse);
-
-    // GetExecution retrieves an execution by ID.
     rpc GetExecution(GetExecutionRequest) returns (GetExecutionResponse);
-
-    // ListExecutions lists executions for an organization with pagination.
     rpc ListExecutions(ListExecutionsRequest) returns (ListExecutionsResponse);
-
-    // CancelExecution cancels a running or pending execution.
     rpc CancelExecution(CancelExecutionRequest) returns (CancelExecutionResponse);
-
-    // GetExecutionMetrics retrieves resource usage metrics for an execution.
     rpc GetExecutionMetrics(GetExecutionMetricsRequest) returns (GetExecutionMetricsResponse);
+
+    // ── Convenience execution API (task) ───────────────────────────────
+    // Execute runs code synchronously inside a Firecracker VM and returns
+    // the completed execution. Used by canvas run-code-from-node.
+    rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+    // ExecuteAsync enqueues an execution and returns an opaque job_id
+    // the caller polls with GetExecutionStatus / GetExecutionResult.
+    rpc ExecuteAsync(ExecuteRequest) returns (ExecuteAsyncResponse);
+    // GetExecutionStatus returns the lifecycle status + timestamps.
+    rpc GetExecutionStatus(GetExecutionStatusRequest) returns (GetExecutionStatusResponse);
+    // GetExecutionResult returns the completed stdout/stderr/exit_code.
+    rpc GetExecutionResult(GetExecutionResultRequest) returns (GetExecutionResultResponse);
+
+    // ── Test-run dispatch + coverage ───────────────────────────────────
+    rpc DispatchTestRun(DispatchTestRunRequest) returns (TestRunHandle);
+    rpc GetTestCoverage(GetTestCoverageRequest) returns (TestCoverage);
+    rpc GetTestCoverageDelta(GetTestCoverageDeltaRequest) returns (TestCoverageDelta);
+
+    // ── VM usage (session cost preview) ────────────────────────────────
+    rpc GetVMUsage(GetVMUsageRequest) returns (VMUsage);
 }
 
-// CreateExecutionRequest is the request for creating a new execution.
+// ─────────────────────────────────────────────────────────────────────
+// Legacy execution messages (unchanged).
+// ─────────────────────────────────────────────────────────────────────
+
 message CreateExecutionRequest {
     string organization_id = 1;
     string requested_by = 2;
@@ -34,55 +57,45 @@ message CreateExecutionRequest {
     int32 timeout_sec = 8;
 }
 
-// CreateExecutionResponse is the response for creating a new execution.
 message CreateExecutionResponse {
     Execution execution = 1;
 }
 
-// GetExecutionRequest is the request for retrieving an execution.
 message GetExecutionRequest {
     string id = 1;
 }
 
-// GetExecutionResponse is the response for retrieving an execution.
 message GetExecutionResponse {
     Execution execution = 1;
 }
 
-// ListExecutionsRequest is the request for listing executions.
 message ListExecutionsRequest {
     string organization_id = 1;
     int32 page = 2;
     int32 page_size = 3;
 }
 
-// ListExecutionsResponse is the response for listing executions.
 message ListExecutionsResponse {
     repeated Execution executions = 1;
     int32 total = 2;
 }
 
-// CancelExecutionRequest is the request for cancelling an execution.
 message CancelExecutionRequest {
     string id = 1;
 }
 
-// CancelExecutionResponse is the response for cancelling an execution.
 message CancelExecutionResponse {
     bool success = 1;
 }
 
-// GetExecutionMetricsRequest is the request for retrieving execution metrics.
 message GetExecutionMetricsRequest {
     string execution_id = 1;
 }
 
-// GetExecutionMetricsResponse is the response for retrieving execution metrics.
 message GetExecutionMetricsResponse {
     ExecutionMetrics metrics = 1;
 }
 
-// Execution represents a code execution and its lifecycle.
 message Execution {
     string id = 1;
     string organization_id = 2;
@@ -104,7 +117,6 @@ message Execution {
     string completed_at = 18;
 }
 
-// ExecutionMetrics captures resource usage during an execution.
 message ExecutionMetrics {
     string id = 1;
     string execution_id = 2;
@@ -118,4 +130,142 @@ message ExecutionMetrics {
     int64 compile_time_ms = 10;
     int64 exec_time_ms = 11;
     int64 total_time_ms = 12;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Convenience execution messages.
+// ─────────────────────────────────────────────────────────────────────
+
+message ExecuteRequest {
+    string organization_id = 1;
+    string requested_by = 2;
+    string language = 3;
+    string code = 4;
+    string stdin = 5;
+    int32  timeout_sec = 6;
+    int32  vcpu = 7;
+    int32  memory_mb = 8;
+    // Optional canvas-node id for traceability.
+    string canvas_node_id = 9;
+}
+
+message ExecuteResponse {
+    Execution execution = 1;
+}
+
+message ExecuteAsyncResponse {
+    // job_id is the execution row id — callers poll with
+    // GetExecutionStatus / GetExecutionResult.
+    string job_id = 1;
+    string status = 2;
+}
+
+message GetExecutionStatusRequest {
+    string job_id = 1;
+}
+
+message GetExecutionStatusResponse {
+    string job_id = 1;
+    string status = 2;
+    string created_at = 3;
+    string started_at = 4;
+    string completed_at = 5;
+}
+
+message GetExecutionResultRequest {
+    string job_id = 1;
+}
+
+message GetExecutionResultResponse {
+    string job_id = 1;
+    string status = 2;
+    int32  exit_code = 3;
+    string stdout = 4;
+    string stderr = 5;
+    string error = 6;
+    int64  duration_ms = 7;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Test-run dispatch + coverage.
+// ─────────────────────────────────────────────────────────────────────
+
+message DispatchTestRunRequest {
+    string organization_id = 1;
+    string canvas_id = 2;                // optional
+    string code_node_id = 3;             // optional — node-scoped runs
+    string test_node_id = 4;             // optional
+    string execution_id = 5;             // optional — link to parent exec
+    string language = 6;
+    // test_type: "unit" | "integration" | "e2e" | "perf" | "security"
+    // | "contract" | "visual" | "accessibility". Empty → "unit".
+    string test_type = 7;
+    int32  max_retries = 8;
+    int32  timeout_sec = 9;
+}
+
+message TestRunHandle {
+    string test_run_id = 1;
+    string execution_id = 2;
+    string status = 3;                   // "queued" | "dispatched"
+    bool   runner_matched = 4;
+    string command = 5;
+    string vm_profile = 6;
+    string network = 7;
+}
+
+message GetTestCoverageRequest {
+    string test_run_id = 1;
+}
+
+message TestCoverage {
+    string test_run_id = 1;
+    int32  passed = 2;
+    int32  failed = 3;
+    int32  skipped = 4;
+    double coverage_pct = 5;
+    bool   has_coverage = 6;
+    int64  duration_ms = 7;
+    string status = 8;
+}
+
+message GetTestCoverageDeltaRequest {
+    string base_test_run_id = 1;
+    string head_test_run_id = 2;
+}
+
+message TestCoverageDelta {
+    double base_pct = 1;
+    double head_pct = 2;
+    double delta_pct = 3;
+    int32  base_passed = 4;
+    int32  head_passed = 5;
+    int32  base_failed = 6;
+    int32  head_failed = 7;
+    int32  new_failures = 8;              // failed at head but passing at base
+    int32  fixed_failures = 9;            // passing at head but failing at base
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// VM usage for session cost preview.
+// ─────────────────────────────────────────────────────────────────────
+
+message GetVMUsageRequest {
+    // Scope is EITHER execution_id (one run) or organization_id + window.
+    string execution_id = 1;
+    string organization_id = 2;
+    string since = 3;                    // RFC 3339
+    string until = 4;                    // RFC 3339
+}
+
+message VMUsage {
+    string scope = 1;                    // "execution" | "organization"
+    int64  total_cpu_time_ms = 2;
+    double total_memory_mb_seconds = 3;
+    int64  total_boot_time_ms = 4;
+    int32  execution_count = 5;
+    int32  active_vms = 6;
+    // estimated_cost_usd is an optional cost projection. Zero when the
+    // service is not configured with a cost model yet.
+    double estimated_cost_usd = 7;
 }

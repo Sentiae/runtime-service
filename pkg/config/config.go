@@ -17,6 +17,7 @@ type Config struct {
 	Firecracker FirecrackerConfig `mapstructure:"firecracker"`
 	Container   ContainerConfig   `mapstructure:"container"`
 	Kafka       KafkaConfig       `mapstructure:"kafka"`
+	Hermetic    HermeticConfig    `mapstructure:"hermetic"`
 }
 
 // AppConfig contains application metadata.
@@ -103,6 +104,7 @@ type ServicesConfig struct {
 	Identity   ServiceEndpoint `mapstructure:"identity"`
 	Permission ServiceEndpoint `mapstructure:"permission"`
 	Canvas     ServiceEndpoint `mapstructure:"canvas"`
+	Git        ServiceEndpoint `mapstructure:"git"`
 }
 
 // ServiceEndpoint represents an external service configuration.
@@ -128,6 +130,26 @@ type FirecrackerConfig struct {
 	MaxTimeout     time.Duration `mapstructure:"max_timeout"`
 	PoolSize       int           `mapstructure:"pool_size"`
 	UseJailer      bool          `mapstructure:"use_jailer"`
+
+	// §9.1 — pool size per language profile. Separate from PoolSize
+	// which is the legacy single-bucket default. When 0, falls back
+	// to PoolSize; when both are 0, the pool defaults to 2.
+	PoolSizePerProfile int `mapstructure:"pool_size_per_profile"`
+
+	// §9.1 — language profiles to pre-warm. Empty list disables the
+	// pool entirely (cold boots only). Each language becomes its own
+	// VMPool bucket with PoolSizePerProfile slots.
+	PoolLanguages []string `mapstructure:"pool_languages"`
+
+	// §9.3 — per-VM auto-snapshot interval (minutes). 0 falls back to
+	// the package default (DefaultCheckpointIntervalMinutes = 15).
+	CheckpointIntervalMinutes int `mapstructure:"checkpoint_interval_minutes"`
+
+	// §9.3 — set false to skip wiring the per-VM auto-snapshot
+	// scheduler. Defaults true in production-like environments; local
+	// dev can set false to avoid writing snapshot files under
+	// SnapshotPath.
+	EnableCheckpointScheduler bool `mapstructure:"enable_checkpoint_scheduler"`
 }
 
 // ContainerConfig contains Docker container executor configuration.
@@ -138,6 +160,14 @@ type ContainerConfig struct {
 	MaxMemMB       int           `mapstructure:"max_mem_mb"`
 	DefaultTimeout time.Duration `mapstructure:"default_timeout"`
 	MaxTimeout     time.Duration `mapstructure:"max_timeout"`
+}
+
+// HermeticConfig toggles §9.2 enforcement knobs. Both default off so
+// existing callers (CI pipelines that haven't plumbed
+// base_image_digest yet) don't break; operators opt in per environment.
+type HermeticConfig struct {
+	EnforceBaseImageDigest bool `mapstructure:"enforce_base_image_digest"`
+	EnforceReproducibility bool `mapstructure:"enforce_reproducibility"`
 }
 
 // KafkaConfig contains Kafka event publishing configuration.
@@ -183,7 +213,7 @@ func Load() (*Config, error) {
 			// gRPC server defaults
 			"server.grpc.enabled": true,
 			"server.grpc.host":    "0.0.0.0",
-			"server.grpc.port":    "50060",
+			"server.grpc.port":    "50062",
 
 			// Database defaults
 			"database.postgres.host":                    "localhost",
@@ -211,6 +241,13 @@ func Load() (*Config, error) {
 			"services.canvas.enabled":     true,
 			"services.canvas.url":         "canvas-service:50058",
 			"services.canvas.timeout":     "10s",
+			// Git service HTTP origin (symbol graph + impact analysis).
+			// Empty URL disables the symbol graph path in
+			// AffectedTestResolver (it falls back to the filename
+			// heuristic), so this is safe to leave unset locally.
+			"services.git.enabled": false,
+			"services.git.url":     "",
+			"services.git.timeout": "10s",
 
 			// Firecracker defaults
 			"firecracker.binary_path":      "/usr/local/bin/firecracker",
@@ -227,6 +264,13 @@ func Load() (*Config, error) {
 			"firecracker.max_timeout":      "300s",
 			"firecracker.pool_size":        5,
 			"firecracker.use_jailer":       false,
+			// §9.1 — per-profile warm pool defaults. Per-profile size of
+			// 2 mirrors the spec default; empty language list keeps
+			// backwards-compat (no pool) until operators opt in.
+			"firecracker.pool_size_per_profile":     2,
+			"firecracker.pool_languages":            []string{},
+			"firecracker.checkpoint_interval_minutes": 15,
+			"firecracker.enable_checkpoint_scheduler": false,
 
 			// Container defaults
 			"container.default_vcpu":    1,
@@ -239,6 +283,11 @@ func Load() (*Config, error) {
 			// Kafka defaults
 			"kafka.enabled": false,
 			"kafka.topic":   "sentiae.runtime",
+
+			// §9.2 hermetic enforcement defaults — off so callers aren't
+			// surprised by new validation.
+			"hermetic.enforce_base_image_digest": false,
+			"hermetic.enforce_reproducibility":   false,
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -294,6 +343,10 @@ func Load() (*Config, error) {
 			{"services.canvas.enabled", "APP_SERVICES_CANVAS_ENABLED"},
 			{"services.canvas.url", "APP_SERVICES_CANVAS_URL"},
 			{"services.canvas.timeout", "APP_SERVICES_CANVAS_TIMEOUT"},
+			{"services.git.enabled", "APP_SERVICES_GIT_ENABLED"},
+			{"services.git.url", "APP_SERVICES_GIT_URL"},
+			{"services.git.url", "GIT_SERVICE_URL"},
+			{"services.git.timeout", "APP_SERVICES_GIT_TIMEOUT"},
 
 			// Firecracker bindings
 			{"firecracker.binary_path", "APP_FC_BINARY_PATH"},
@@ -310,6 +363,13 @@ func Load() (*Config, error) {
 			{"firecracker.max_timeout", "APP_FC_MAX_TIMEOUT"},
 			{"firecracker.pool_size", "APP_FC_POOL_SIZE"},
 			{"firecracker.use_jailer", "APP_FC_USE_JAILER"},
+			// §9.1 / §9.3
+			{"firecracker.pool_size_per_profile", "FIRECRACKER_POOL_SIZE"},
+			{"firecracker.pool_size_per_profile", "APP_FC_POOL_SIZE_PER_PROFILE"},
+			{"firecracker.pool_languages", "APP_FC_POOL_LANGUAGES"},
+			{"firecracker.checkpoint_interval_minutes", "FIRECRACKER_CHECKPOINT_INTERVAL"},
+			{"firecracker.checkpoint_interval_minutes", "APP_FC_CHECKPOINT_INTERVAL_MINUTES"},
+			{"firecracker.enable_checkpoint_scheduler", "APP_FC_ENABLE_CHECKPOINT_SCHEDULER"},
 
 			// Container bindings
 			{"container.default_vcpu", "APP_CONTAINER_DEFAULT_VCPU"},
@@ -323,6 +383,12 @@ func Load() (*Config, error) {
 			{"kafka.enabled", "APP_KAFKA_ENABLED"},
 			{"kafka.brokers", "APP_KAFKA_BROKERS"},
 			{"kafka.topic", "APP_KAFKA_TOPIC"},
+
+			// §9.2 hermetic enforcement
+			{"hermetic.enforce_base_image_digest", "HERMETIC_REQUIRE_BASE_IMAGE_DIGEST"},
+			{"hermetic.enforce_base_image_digest", "APP_HERMETIC_ENFORCE_BASE_IMAGE_DIGEST"},
+			{"hermetic.enforce_reproducibility", "HERMETIC_ENFORCE_REPRODUCIBILITY"},
+			{"hermetic.enforce_reproducibility", "APP_HERMETIC_ENFORCE_REPRODUCIBILITY"},
 		},
 	})
 	if err != nil {

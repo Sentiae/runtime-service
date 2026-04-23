@@ -60,6 +60,21 @@ type VMBootConfig struct {
 	// EnvVars is injected into the guest before the entrypoint runs.
 	// Used by the test-DB provisioner to push DATABASE_URL into the VM.
 	EnvVars map[string]string
+
+	// Firecracker rate limits (§9.1.5). Zero = unlimited.
+	// DiskBandwidthMBps caps per-second read+write throughput on the
+	// rootfs drive.  DiskIOPS caps ops/sec.  NetworkBandwidthMBps /
+	// NetworkPPS cap egress throughput / packets-per-second on the TAP.
+	DiskBandwidthMBps    int64
+	DiskIOPS             int64
+	NetworkBandwidthMBps int64
+	NetworkPPS           int64
+
+	// DeploymentTarget pins where this VM should run (§9.4). When
+	// the mode is `customer_hosted`, the VMService routes lifecycle
+	// calls to CustomerAPIURL instead of the local Firecracker
+	// process. nil → default to sentiae_hosted.
+	DeploymentTarget *domain.DeploymentTarget
 }
 
 // VMBootResult holds the result of booting a microVM
@@ -141,8 +156,54 @@ func (s *vmService) AcquireVM(ctx context.Context, language domain.Language, res
 		return vm, nil
 	}
 
-	// No available VM — create a new one
-	return s.CreateVM(ctx, language, resources.VCPU, resources.MemoryMB)
+	// No available VM — create a new one. Rate-limit fields are
+	// carried through CreateVM via a dedicated sibling so the public
+	// CreateVM signature stays source-compatible.
+	return s.createVMWithLimits(ctx, language, resources)
+}
+
+// createVMWithLimits mirrors CreateVM but threads per-request rate
+// limits onto the boot config so Firecracker enforces them. Kept
+// unexported because callers go through AcquireVM.
+func (s *vmService) createVMWithLimits(ctx context.Context, language domain.Language, resources domain.ResourceLimit) (*domain.MicroVM, error) {
+	vmID := uuid.New()
+	vm := &domain.MicroVM{
+		ID:          vmID,
+		Status:      domain.VMStatusCreating,
+		VCPU:        resources.VCPU,
+		MemoryMB:    resources.MemoryMB,
+		NetworkMode: domain.NetworkModeIsolated,
+		Language:    language,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := s.vmRepo.Create(ctx, vm); err != nil {
+		return nil, fmt.Errorf("failed to create VM record: %w", err)
+	}
+	bootResult, err := s.vmProvider.Boot(ctx, VMBootConfig{
+		VMID:                 vmID,
+		Language:             language,
+		VCPU:                 resources.VCPU,
+		MemoryMB:             resources.MemoryMB,
+		NetworkMode:          domain.NetworkModeIsolated,
+		DiskBandwidthMBps:    resources.DiskBandwidthMBps,
+		DiskIOPS:             resources.DiskIOPS,
+		NetworkBandwidthMBps: resources.NetworkBandwidthMBps,
+		NetworkPPS:           resources.NetworkPPS,
+	})
+	if err != nil {
+		vm.Status = domain.VMStatusError
+		_ = s.vmRepo.Update(ctx, vm)
+		return nil, fmt.Errorf("failed to boot VM: %w", err)
+	}
+	vm.Status = domain.VMStatusReady
+	vm.PID = &bootResult.PID
+	vm.IPAddress = bootResult.IPAddress
+	vm.SocketPath = bootResult.SocketPath
+	vm.BootTimeMS = &bootResult.BootTimeMS
+	if err := s.vmRepo.Update(ctx, vm); err != nil {
+		return nil, fmt.Errorf("failed to update VM after boot: %w", err)
+	}
+	return vm, nil
 }
 
 func (s *vmService) ReleaseVM(ctx context.Context, vmID uuid.UUID) error {

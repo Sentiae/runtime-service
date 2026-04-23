@@ -19,29 +19,58 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	RuntimeService_CreateExecution_FullMethodName     = "/runtime.v1.RuntimeService/CreateExecution"
-	RuntimeService_GetExecution_FullMethodName        = "/runtime.v1.RuntimeService/GetExecution"
-	RuntimeService_ListExecutions_FullMethodName      = "/runtime.v1.RuntimeService/ListExecutions"
-	RuntimeService_CancelExecution_FullMethodName     = "/runtime.v1.RuntimeService/CancelExecution"
-	RuntimeService_GetExecutionMetrics_FullMethodName = "/runtime.v1.RuntimeService/GetExecutionMetrics"
+	RuntimeService_CreateExecution_FullMethodName      = "/runtime.v1.RuntimeService/CreateExecution"
+	RuntimeService_GetExecution_FullMethodName         = "/runtime.v1.RuntimeService/GetExecution"
+	RuntimeService_ListExecutions_FullMethodName       = "/runtime.v1.RuntimeService/ListExecutions"
+	RuntimeService_CancelExecution_FullMethodName      = "/runtime.v1.RuntimeService/CancelExecution"
+	RuntimeService_GetExecutionMetrics_FullMethodName  = "/runtime.v1.RuntimeService/GetExecutionMetrics"
+	RuntimeService_Execute_FullMethodName              = "/runtime.v1.RuntimeService/Execute"
+	RuntimeService_ExecuteAsync_FullMethodName         = "/runtime.v1.RuntimeService/ExecuteAsync"
+	RuntimeService_GetExecutionStatus_FullMethodName   = "/runtime.v1.RuntimeService/GetExecutionStatus"
+	RuntimeService_GetExecutionResult_FullMethodName   = "/runtime.v1.RuntimeService/GetExecutionResult"
+	RuntimeService_DispatchTestRun_FullMethodName      = "/runtime.v1.RuntimeService/DispatchTestRun"
+	RuntimeService_GetTestCoverage_FullMethodName      = "/runtime.v1.RuntimeService/GetTestCoverage"
+	RuntimeService_GetTestCoverageDelta_FullMethodName = "/runtime.v1.RuntimeService/GetTestCoverageDelta"
+	RuntimeService_GetVMUsage_FullMethodName           = "/runtime.v1.RuntimeService/GetVMUsage"
 )
 
 // RuntimeServiceClient is the client API for RuntimeService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// RuntimeService provides code execution management within Firecracker microVMs.
+// RuntimeService provides code execution + test-run management inside
+// Firecracker microVMs.
+//
+// The original CreateExecution/GetExecution/ListExecutions/CancelExecution/
+// GetExecutionMetrics surface is preserved for existing callers. Task
+// "Expose gRPC on canvas-service and runtime-service" adds the caller-
+// friendlier Execute*/GetExecution{Status,Result}/DispatchTestRun/
+// GetTestCoverage*/GetVMUsage RPCs used by foundry-service, canvas-service,
+// and ops-service.
 type RuntimeServiceClient interface {
-	// CreateExecution creates a new code execution request.
+	// ── Legacy execution API ───────────────────────────────────────────
 	CreateExecution(ctx context.Context, in *CreateExecutionRequest, opts ...grpc.CallOption) (*CreateExecutionResponse, error)
-	// GetExecution retrieves an execution by ID.
 	GetExecution(ctx context.Context, in *GetExecutionRequest, opts ...grpc.CallOption) (*GetExecutionResponse, error)
-	// ListExecutions lists executions for an organization with pagination.
 	ListExecutions(ctx context.Context, in *ListExecutionsRequest, opts ...grpc.CallOption) (*ListExecutionsResponse, error)
-	// CancelExecution cancels a running or pending execution.
 	CancelExecution(ctx context.Context, in *CancelExecutionRequest, opts ...grpc.CallOption) (*CancelExecutionResponse, error)
-	// GetExecutionMetrics retrieves resource usage metrics for an execution.
 	GetExecutionMetrics(ctx context.Context, in *GetExecutionMetricsRequest, opts ...grpc.CallOption) (*GetExecutionMetricsResponse, error)
+	// ── Convenience execution API (task) ───────────────────────────────
+	// Execute runs code synchronously inside a Firecracker VM and returns
+	// the completed execution. Used by canvas run-code-from-node.
+	Execute(ctx context.Context, in *ExecuteRequest, opts ...grpc.CallOption) (*ExecuteResponse, error)
+	// ExecuteAsync enqueues an execution and returns an opaque job_id
+	// the caller polls with GetExecutionStatus / GetExecutionResult.
+	ExecuteAsync(ctx context.Context, in *ExecuteRequest, opts ...grpc.CallOption) (*ExecuteAsyncResponse, error)
+	// GetExecutionStatus returns the lifecycle status + timestamps.
+	GetExecutionStatus(ctx context.Context, in *GetExecutionStatusRequest, opts ...grpc.CallOption) (*GetExecutionStatusResponse, error)
+	// GetExecutionResult returns the completed stdout/stderr/exit_code.
+	GetExecutionResult(ctx context.Context, in *GetExecutionResultRequest, opts ...grpc.CallOption) (*GetExecutionResultResponse, error)
+	// ── Test-run dispatch + coverage ───────────────────────────────────
+	DispatchTestRun(ctx context.Context, in *DispatchTestRunRequest, opts ...grpc.CallOption) (*TestRunHandle, error)
+	GetTestCoverage(ctx context.Context, in *GetTestCoverageRequest, opts ...grpc.CallOption) (*TestCoverage, error)
+	GetTestCoverageDelta(ctx context.Context, in *GetTestCoverageDeltaRequest, opts ...grpc.CallOption) (*TestCoverageDelta, error)
+	// ── VM usage (session cost preview) ────────────────────────────────
+	GetVMUsage(ctx context.Context, in *GetVMUsageRequest, opts ...grpc.CallOption) (*VMUsage, error)
 }
 
 type runtimeServiceClient struct {
@@ -102,22 +131,123 @@ func (c *runtimeServiceClient) GetExecutionMetrics(ctx context.Context, in *GetE
 	return out, nil
 }
 
+func (c *runtimeServiceClient) Execute(ctx context.Context, in *ExecuteRequest, opts ...grpc.CallOption) (*ExecuteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExecuteResponse)
+	err := c.cc.Invoke(ctx, RuntimeService_Execute_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) ExecuteAsync(ctx context.Context, in *ExecuteRequest, opts ...grpc.CallOption) (*ExecuteAsyncResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExecuteAsyncResponse)
+	err := c.cc.Invoke(ctx, RuntimeService_ExecuteAsync_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) GetExecutionStatus(ctx context.Context, in *GetExecutionStatusRequest, opts ...grpc.CallOption) (*GetExecutionStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetExecutionStatusResponse)
+	err := c.cc.Invoke(ctx, RuntimeService_GetExecutionStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) GetExecutionResult(ctx context.Context, in *GetExecutionResultRequest, opts ...grpc.CallOption) (*GetExecutionResultResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetExecutionResultResponse)
+	err := c.cc.Invoke(ctx, RuntimeService_GetExecutionResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) DispatchTestRun(ctx context.Context, in *DispatchTestRunRequest, opts ...grpc.CallOption) (*TestRunHandle, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TestRunHandle)
+	err := c.cc.Invoke(ctx, RuntimeService_DispatchTestRun_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) GetTestCoverage(ctx context.Context, in *GetTestCoverageRequest, opts ...grpc.CallOption) (*TestCoverage, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TestCoverage)
+	err := c.cc.Invoke(ctx, RuntimeService_GetTestCoverage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) GetTestCoverageDelta(ctx context.Context, in *GetTestCoverageDeltaRequest, opts ...grpc.CallOption) (*TestCoverageDelta, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TestCoverageDelta)
+	err := c.cc.Invoke(ctx, RuntimeService_GetTestCoverageDelta_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runtimeServiceClient) GetVMUsage(ctx context.Context, in *GetVMUsageRequest, opts ...grpc.CallOption) (*VMUsage, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VMUsage)
+	err := c.cc.Invoke(ctx, RuntimeService_GetVMUsage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RuntimeServiceServer is the server API for RuntimeService service.
 // All implementations must embed UnimplementedRuntimeServiceServer
 // for forward compatibility.
 //
-// RuntimeService provides code execution management within Firecracker microVMs.
+// RuntimeService provides code execution + test-run management inside
+// Firecracker microVMs.
+//
+// The original CreateExecution/GetExecution/ListExecutions/CancelExecution/
+// GetExecutionMetrics surface is preserved for existing callers. Task
+// "Expose gRPC on canvas-service and runtime-service" adds the caller-
+// friendlier Execute*/GetExecution{Status,Result}/DispatchTestRun/
+// GetTestCoverage*/GetVMUsage RPCs used by foundry-service, canvas-service,
+// and ops-service.
 type RuntimeServiceServer interface {
-	// CreateExecution creates a new code execution request.
+	// ── Legacy execution API ───────────────────────────────────────────
 	CreateExecution(context.Context, *CreateExecutionRequest) (*CreateExecutionResponse, error)
-	// GetExecution retrieves an execution by ID.
 	GetExecution(context.Context, *GetExecutionRequest) (*GetExecutionResponse, error)
-	// ListExecutions lists executions for an organization with pagination.
 	ListExecutions(context.Context, *ListExecutionsRequest) (*ListExecutionsResponse, error)
-	// CancelExecution cancels a running or pending execution.
 	CancelExecution(context.Context, *CancelExecutionRequest) (*CancelExecutionResponse, error)
-	// GetExecutionMetrics retrieves resource usage metrics for an execution.
 	GetExecutionMetrics(context.Context, *GetExecutionMetricsRequest) (*GetExecutionMetricsResponse, error)
+	// ── Convenience execution API (task) ───────────────────────────────
+	// Execute runs code synchronously inside a Firecracker VM and returns
+	// the completed execution. Used by canvas run-code-from-node.
+	Execute(context.Context, *ExecuteRequest) (*ExecuteResponse, error)
+	// ExecuteAsync enqueues an execution and returns an opaque job_id
+	// the caller polls with GetExecutionStatus / GetExecutionResult.
+	ExecuteAsync(context.Context, *ExecuteRequest) (*ExecuteAsyncResponse, error)
+	// GetExecutionStatus returns the lifecycle status + timestamps.
+	GetExecutionStatus(context.Context, *GetExecutionStatusRequest) (*GetExecutionStatusResponse, error)
+	// GetExecutionResult returns the completed stdout/stderr/exit_code.
+	GetExecutionResult(context.Context, *GetExecutionResultRequest) (*GetExecutionResultResponse, error)
+	// ── Test-run dispatch + coverage ───────────────────────────────────
+	DispatchTestRun(context.Context, *DispatchTestRunRequest) (*TestRunHandle, error)
+	GetTestCoverage(context.Context, *GetTestCoverageRequest) (*TestCoverage, error)
+	GetTestCoverageDelta(context.Context, *GetTestCoverageDeltaRequest) (*TestCoverageDelta, error)
+	// ── VM usage (session cost preview) ────────────────────────────────
+	GetVMUsage(context.Context, *GetVMUsageRequest) (*VMUsage, error)
 	mustEmbedUnimplementedRuntimeServiceServer()
 }
 
@@ -142,6 +272,30 @@ func (UnimplementedRuntimeServiceServer) CancelExecution(context.Context, *Cance
 }
 func (UnimplementedRuntimeServiceServer) GetExecutionMetrics(context.Context, *GetExecutionMetricsRequest) (*GetExecutionMetricsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetExecutionMetrics not implemented")
+}
+func (UnimplementedRuntimeServiceServer) Execute(context.Context, *ExecuteRequest) (*ExecuteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Execute not implemented")
+}
+func (UnimplementedRuntimeServiceServer) ExecuteAsync(context.Context, *ExecuteRequest) (*ExecuteAsyncResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExecuteAsync not implemented")
+}
+func (UnimplementedRuntimeServiceServer) GetExecutionStatus(context.Context, *GetExecutionStatusRequest) (*GetExecutionStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetExecutionStatus not implemented")
+}
+func (UnimplementedRuntimeServiceServer) GetExecutionResult(context.Context, *GetExecutionResultRequest) (*GetExecutionResultResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetExecutionResult not implemented")
+}
+func (UnimplementedRuntimeServiceServer) DispatchTestRun(context.Context, *DispatchTestRunRequest) (*TestRunHandle, error) {
+	return nil, status.Error(codes.Unimplemented, "method DispatchTestRun not implemented")
+}
+func (UnimplementedRuntimeServiceServer) GetTestCoverage(context.Context, *GetTestCoverageRequest) (*TestCoverage, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTestCoverage not implemented")
+}
+func (UnimplementedRuntimeServiceServer) GetTestCoverageDelta(context.Context, *GetTestCoverageDeltaRequest) (*TestCoverageDelta, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTestCoverageDelta not implemented")
+}
+func (UnimplementedRuntimeServiceServer) GetVMUsage(context.Context, *GetVMUsageRequest) (*VMUsage, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetVMUsage not implemented")
 }
 func (UnimplementedRuntimeServiceServer) mustEmbedUnimplementedRuntimeServiceServer() {}
 func (UnimplementedRuntimeServiceServer) testEmbeddedByValue()                        {}
@@ -254,6 +408,150 @@ func _RuntimeService_GetExecutionMetrics_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RuntimeService_Execute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExecuteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).Execute(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_Execute_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).Execute(ctx, req.(*ExecuteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_ExecuteAsync_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExecuteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).ExecuteAsync(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_ExecuteAsync_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).ExecuteAsync(ctx, req.(*ExecuteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_GetExecutionStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetExecutionStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).GetExecutionStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_GetExecutionStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).GetExecutionStatus(ctx, req.(*GetExecutionStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_GetExecutionResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetExecutionResultRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).GetExecutionResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_GetExecutionResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).GetExecutionResult(ctx, req.(*GetExecutionResultRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_DispatchTestRun_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DispatchTestRunRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).DispatchTestRun(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_DispatchTestRun_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).DispatchTestRun(ctx, req.(*DispatchTestRunRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_GetTestCoverage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetTestCoverageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).GetTestCoverage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_GetTestCoverage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).GetTestCoverage(ctx, req.(*GetTestCoverageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_GetTestCoverageDelta_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetTestCoverageDeltaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).GetTestCoverageDelta(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_GetTestCoverageDelta_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).GetTestCoverageDelta(ctx, req.(*GetTestCoverageDeltaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RuntimeService_GetVMUsage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetVMUsageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeServiceServer).GetVMUsage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimeService_GetVMUsage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeServiceServer).GetVMUsage(ctx, req.(*GetVMUsageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RuntimeService_ServiceDesc is the grpc.ServiceDesc for RuntimeService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -280,6 +578,38 @@ var RuntimeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetExecutionMetrics",
 			Handler:    _RuntimeService_GetExecutionMetrics_Handler,
+		},
+		{
+			MethodName: "Execute",
+			Handler:    _RuntimeService_Execute_Handler,
+		},
+		{
+			MethodName: "ExecuteAsync",
+			Handler:    _RuntimeService_ExecuteAsync_Handler,
+		},
+		{
+			MethodName: "GetExecutionStatus",
+			Handler:    _RuntimeService_GetExecutionStatus_Handler,
+		},
+		{
+			MethodName: "GetExecutionResult",
+			Handler:    _RuntimeService_GetExecutionResult_Handler,
+		},
+		{
+			MethodName: "DispatchTestRun",
+			Handler:    _RuntimeService_DispatchTestRun_Handler,
+		},
+		{
+			MethodName: "GetTestCoverage",
+			Handler:    _RuntimeService_GetTestCoverage_Handler,
+		},
+		{
+			MethodName: "GetTestCoverageDelta",
+			Handler:    _RuntimeService_GetTestCoverageDelta_Handler,
+		},
+		{
+			MethodName: "GetVMUsage",
+			Handler:    _RuntimeService_GetVMUsage_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
