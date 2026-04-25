@@ -1,54 +1,58 @@
-// Package canvasservice is a narrow HTTP client that runtime-service
-// uses to push node-scoped state changes into canvas-service alongside
-// the durable Kafka fan-out. It closes §19.1 flow 1E — "a test node
-// shows green/red based on its last execution, in real time" — without
-// waiting on Kafka consumer lag.
+// Package canvasservice is a gRPC client that runtime-service uses to
+// push node-scoped state changes into canvas-service alongside the
+// durable Kafka fan-out. Closes §19.1 flow 1E.
+//
+// Platform rule: service↔service = gRPC. The legacy HTTP client was
+// removed in Foxtrot.
 package canvasservice
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"log"
-	"net/http"
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+
+	canvasv1 "github.com/sentiae/canvas-service/gen/proto/canvas/v1"
 )
 
-// Client posts node-scoped state changes to canvas-service. The client
-// is optional — runtime-service falls back to Kafka-only delivery when
-// the canvas URL is empty.
+// Client posts node-scoped state changes to canvas-service via
+// CanvasService.UpdateNodeTestBadge.
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	// ServiceToken is the inter-service bearer token. Canvas-service's
-	// AuthMiddleware accepts it alongside the X-User-ID header. Empty
-	// in tests + dev deployments that bypass auth.
-	ServiceToken string
-	// ServiceUserID is the pseudo-user-id runtime acts as. Required by
-	// canvas-service's current auth middleware.
+	conn    *grpc.ClientConn
+	client  canvasv1.CanvasServiceClient
+	timeout time.Duration
+
+	ServiceToken  string
 	ServiceUserID string
 }
 
-// NewClient builds a Client. Callers that want to disable the push
-// path entirely should pass an empty baseURL — the helpers below then
-// short-circuit with a logged warning.
-func NewClient(baseURL string, timeout time.Duration) *Client {
+// NewClient dials canvas-service's gRPC listener. An empty grpcAddr
+// disables the push path.
+func NewClient(grpcAddr string, timeout time.Duration) *Client {
+	if grpcAddr == "" {
+		return &Client{}
+	}
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	conn, err := grpc.NewClient(grpcAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		return &Client{timeout: timeout}
+	}
 	return &Client{
-		baseURL:    baseURL,
-		httpClient: &http.Client{Timeout: timeout},
+		conn:    conn,
+		client:  canvasv1.NewCanvasServiceClient(conn),
+		timeout: timeout,
 	}
 }
 
-// TestResultPayload mirrors the canvas-service NodeReceiversHandler
-// testResultRequest. Kept as a separate exported type so callers
-// don't have to rebuild the field map.
+// TestResultPayload mirrors canvas-service's test-badge input.
 type TestResultPayload struct {
 	RunID       string   `json:"run_id"`
 	Status      string   `json:"status"`
@@ -60,46 +64,54 @@ type TestResultPayload struct {
 	DurationMS  int64    `json:"duration_ms,omitempty"`
 }
 
-// ApplyTestResult pushes a terminal test-run verdict onto the target
-// canvas node. Returns nil on success and on any transport error —
-// the Kafka path is authoritative; this push is best-effort.
-func (c *Client) ApplyTestResult(ctx context.Context, canvasID, nodeID uuid.UUID, payload TestResultPayload) error {
-	if c == nil || c.baseURL == "" {
-		return nil
-	}
-	url := fmt.Sprintf("%s/api/v1/canvases/%s/nodes/%s/test-result", c.baseURL, canvasID, nodeID)
-	return c.post(ctx, url, payload)
-}
-
-// post marshals + POSTs the payload and swallows non-2xx into a log
-// line so the caller isn't forced to unwind on best-effort calls.
-func (c *Client) post(ctx context.Context, url string, body any) error {
-	b, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("canvasservice: marshal: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
-	if err != nil {
-		return fmt.Errorf("canvasservice: new request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+func (c *Client) outCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	md := metadata.MD{}
 	if c.ServiceToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.ServiceToken)
+		md.Set("authorization", "Bearer "+c.ServiceToken)
 	}
 	if c.ServiceUserID != "" {
-		req.Header.Set("X-User-ID", c.ServiceUserID)
+		md.Set("x-user-id", c.ServiceUserID)
 	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		log.Printf("[canvasservice] POST %s failed: %v", url, err)
-		return err
+	if len(md) > 0 {
+		ctx = metadata.NewOutgoingContext(ctx, md)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
-		log.Printf("[canvasservice] POST %s returned %d: %s", url, resp.StatusCode, string(respBody))
-		return fmt.Errorf("canvasservice: %s returned %d", url, resp.StatusCode)
+	return context.WithTimeout(ctx, c.timeout)
+}
+
+// ApplyTestResult pushes a terminal test-run verdict onto the target
+// canvas node. Best-effort — transport errors do not affect the
+// authoritative Kafka path.
+func (c *Client) ApplyTestResult(ctx context.Context, canvasID, nodeID uuid.UUID, payload TestResultPayload) error {
+	if c == nil || c.client == nil {
+		return nil
+	}
+	req := &canvasv1.UpdateNodeTestBadgeRequest{
+		CanvasId:   canvasID.String(),
+		NodeId:     nodeID.String(),
+		RunId:      payload.RunID,
+		Status:     payload.Status,
+		Passing:    int32(payload.Passing),
+		Total:      int32(payload.Total),
+		Failed:     int32(payload.Failed),
+		Skipped:    int32(payload.Skipped),
+		DurationMs: payload.DurationMS,
+	}
+	if payload.CoveragePct != nil {
+		req.HasCoverage = true
+		req.CoveragePct = *payload.CoveragePct
+	}
+	out, cancel := c.outCtx(ctx)
+	defer cancel()
+	if _, err := c.client.UpdateNodeTestBadge(out, req); err != nil {
+		return fmt.Errorf("canvasservice: UpdateNodeTestBadge: %w", err)
 	}
 	return nil
+}
+
+// Close releases the underlying gRPC channel.
+func (c *Client) Close() error {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+	return c.conn.Close()
 }

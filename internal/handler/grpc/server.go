@@ -22,6 +22,7 @@ import (
 type Server struct {
 	grpcServer      *grpc.Server
 	executionServer *ExecutionServer
+	graphServer     *GraphServer
 }
 
 // ServerConfig holds configuration for the gRPC server.
@@ -37,6 +38,8 @@ type ServerConfig struct {
 func NewServer(
 	config ServerConfig,
 	executionUC usecase.ExecutionUseCase,
+	graphUC usecase.GraphUseCase,
+	execEngine *usecase.GraphExecutionEngine,
 ) *Server {
 	// Build interceptor chain
 	var unaryInterceptors []grpc.UnaryServerInterceptor
@@ -74,9 +77,12 @@ func NewServer(
 
 	// Create service implementations
 	executionServer := NewExecutionServer(executionUC)
+	graphServer := NewGraphServer(graphUC, execEngine)
 
 	// Register services
 	runtimev1.RegisterRuntimeServiceServer(grpcServer, executionServer)
+	runtimev1.RegisterGraphServiceServer(grpcServer, graphServer)
+	healthServer.SetServingStatus("runtime.v1.GraphService", grpc_health_v1.HealthCheckResponse_SERVING)
 
 	// Enable server reflection so grpcurl / grpcui can introspect the
 	// service in development + staging. Production can strip via build tag
@@ -86,6 +92,7 @@ func NewServer(
 	return &Server{
 		grpcServer:      grpcServer,
 		executionServer: executionServer,
+		graphServer:     graphServer,
 	}
 }
 

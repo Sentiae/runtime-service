@@ -294,6 +294,11 @@ func (c *Container) initInfrastructure(cfg *config.Config) {
 		} else {
 			c.EventPublisher = publisher
 			log.Println("Kafka event publisher initialized")
+			ensureCtx, ensureCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			if err := publisher.EnsureTopics(ensureCtx); err != nil {
+				log.Printf("Warning: Kafka EnsureTopics failed: %v (continuing)", err)
+			}
+			ensureCancel()
 		}
 
 		// Initialize inbound event consumer (canvas → runtime).
@@ -748,6 +753,8 @@ func (c *Container) initHandlers() {
 				EnableRecovery: true,
 			},
 			c.ExecutionUC,
+			c.GraphUC,
+			c.GraphEngine,
 		)
 		// Wire the extended test-run / VM-usage surface. `wrapped` already
 		// threads DB-provisioning → multi-type executor → Firecracker

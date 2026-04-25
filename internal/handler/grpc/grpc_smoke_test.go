@@ -114,7 +114,7 @@ func (f *fakeExecutionUC) ExecuteSync(ctx context.Context, in usecase.CreateExec
 func newTestServerExec(t *testing.T) (runtimev1.RuntimeServiceClient, *fakeExecutionUC, *Server, func()) {
 	t.Helper()
 	uc := newFakeExecUC()
-	srv := NewServer(ServerConfig{EnableRecovery: true}, uc)
+	srv := NewServer(ServerConfig{EnableRecovery: true}, uc, nil, nil)
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

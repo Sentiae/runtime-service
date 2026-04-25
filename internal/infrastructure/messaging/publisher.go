@@ -12,6 +12,8 @@ import (
 // EventPublisher defines the interface for publishing domain events
 type EventPublisher interface {
 	Publish(ctx context.Context, eventType string, key string, data any) error
+	// EnsureTopics pre-creates the registered Kafka topic set on boot.
+	EnsureTopics(ctx context.Context) error
 	Close() error
 }
 
@@ -45,6 +47,10 @@ func (a *platformKitAdapter) Publish(ctx context.Context, eventType, key string,
 	})
 }
 
+func (a *platformKitAdapter) EnsureTopics(ctx context.Context) error {
+	return a.pub.EnsureTopics(ctx)
+}
+
 func (a *platformKitAdapter) Close() error {
 	return a.pub.Close()
 }
@@ -60,6 +66,11 @@ func NewNoopPublisher() *NoopPublisher {
 // Publish is a no-op
 func (p *NoopPublisher) Publish(_ context.Context, eventType, key string, _ any) error {
 	log.Printf("[EVENT-NOOP] Event dropped: type=%s, key=%s", eventType, key)
+	return nil
+}
+
+// EnsureTopics is a no-op
+func (p *NoopPublisher) EnsureTopics(_ context.Context) error {
 	return nil
 }
 

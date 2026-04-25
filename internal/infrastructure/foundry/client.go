@@ -1,63 +1,43 @@
-// Package foundry wraps the foundry-service REST API for test code generation.
+// Package foundry is a gRPC client for foundry-service test-generation.
+// Platform rule: service↔service = gRPC. The legacy REST fallback was
+// removed in Foxtrot — callers must supply a gRPC channel via WithGRPC.
 package foundry
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"time"
 
 	"google.golang.org/grpc"
 )
 
-// Client talks to foundry-service. A7.2: GenerateTests routes through
-// foundry gRPC Dispatch(operation=generate_tests) when a gRPC channel is
-// wired via WithGRPC. HTTP stays in place as a rollback fallback.
+// Client talks to foundry-service over gRPC Dispatch(generate_tests).
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	grpc       *grpcDispatcher
-	preferGRPC bool
+	dispatcher *grpcDispatcher
+	timeout    time.Duration
 }
 
-// NewClient constructs a new foundry-service client.
-func NewClient(baseURL string, timeout time.Duration) *Client {
+// NewClient constructs a new foundry client. Must call WithGRPC before
+// use — baseURL arg is ignored and retained for DI compatibility.
+func NewClient(_ string, timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	return &Client{
-		baseURL: baseURL,
-		httpClient: &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        10,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
-		preferGRPC: preferGRPCFromEnv(),
-	}
+	return &Client{timeout: timeout}
 }
 
-// WithGRPC attaches a foundry gRPC channel for A7.2.
+// WithGRPC attaches a foundry gRPC channel.
 func (c *Client) WithGRPC(conn *grpc.ClientConn) *Client {
 	if c == nil {
 		return c
 	}
-	c.grpc = newGRPCDispatcher(conn)
+	c.dispatcher = newGRPCDispatcher(conn)
 	return c
 }
 
-// SetPreferGRPC toggles routing post-construction.
-func (c *Client) SetPreferGRPC(v bool) {
-	if c == nil {
-		return
-	}
-	c.preferGRPC = v
-}
+// SetPreferGRPC is a no-op kept for API compatibility.
+func (c *Client) SetPreferGRPC(_ bool) {}
 
 // GenerateTestRequest carries acceptance criteria plus target language/framework.
 type GenerateTestRequest struct {
@@ -82,52 +62,12 @@ type FoundryClient interface {
 	GenerateTests(ctx context.Context, orgID string, req GenerateTestRequest) (*GenerateTestResponse, error)
 }
 
-// GenerateTests calls foundry-service to generate test code.
-//
-// A7.2: routes to foundry gRPC Dispatch(generate_tests) when preferGRPC
-// is set; HTTP path is DEPRECATED fallback.
+// GenerateTests calls foundry-service gRPC Dispatch(generate_tests).
 func (c *Client) GenerateTests(ctx context.Context, orgID string, req GenerateTestRequest) (*GenerateTestResponse, error) {
-	if c.preferGRPC && c.grpc != nil {
-		if out, err := c.grpc.generateTests(ctx, orgID, req); err == nil {
-			return out, nil
-		}
+	if c == nil || c.dispatcher == nil {
+		return nil, fmt.Errorf("foundry client not configured")
 	}
-	return c.generateTestsHTTP(ctx, orgID, req)
-}
-
-// generateTestsHTTP is the DEPRECATED HTTP implementation preserved for
-// A7.2 rollback.
-func (c *Client) generateTestsHTTP(ctx context.Context, orgID string, req GenerateTestRequest) (*GenerateTestResponse, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("foundry: marshal: %w", err)
-	}
-	url := fmt.Sprintf("%s/api/v1/foundry/tests/generate", c.baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("foundry: new request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if orgID != "" {
-		httpReq.Header.Set("X-Organization-ID", orgID)
-	}
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("foundry: request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("foundry: %s: %s", resp.Status, string(b))
-	}
-	var envelope struct {
-		Success bool                 `json:"success"`
-		Data    GenerateTestResponse `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
-		return nil, fmt.Errorf("foundry: decode: %w", err)
-	}
-	return &envelope.Data, nil
+	return c.dispatcher.generateTests(ctx, orgID, req)
 }
 
 // NoopClient is used when foundry-service is not configured. It synthesises a
