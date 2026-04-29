@@ -21,6 +21,19 @@ type TestRun struct {
 	TestNodeID     uuid.UUID     `json:"test_node_id" gorm:"type:uuid;not null;index:idx_test_runs_node"`
 	CodeNodeID     *uuid.UUID    `json:"code_node_id,omitempty" gorm:"type:uuid;index"`
 	CanvasID       *uuid.UUID    `json:"canvas_id,omitempty" gorm:"type:uuid;index"`
+	// Cross-domain ownership links. A test run targets a specific
+	// service, may verify a Spec's acceptance criteria, and is
+	// produced inside a Session (the branch that ran tests). All are
+	// nullable for legacy rows and ad-hoc canvas runs that aren't
+	// associated with a spec/session pipeline.
+	ServiceID *uuid.UUID  `json:"service_id,omitempty" gorm:"type:uuid;index"`
+	SpecID    *uuid.UUID  `json:"spec_id,omitempty" gorm:"type:uuid;index"`
+	SessionID *uuid.UUID  `json:"session_id,omitempty" gorm:"type:uuid;index"`
+	// FeatureIDs is the M:N capability mapping derived from
+	// spec.features at run-time. Stored as a JSONB array of UUIDs so
+	// the repo layer can stay dialect-free; the consumer is the Pulse
+	// rollup which needs feature-level test signal without a join.
+	FeatureIDs UUIDArray `json:"feature_ids,omitempty" gorm:"type:jsonb;serializer:json"`
 	Language       Language      `json:"language" gorm:"type:varchar(20);not null"`
 	TestType       TestType      `json:"test_type" gorm:"type:varchar(20);not null;default:'unit';index"`
 	Status         TestRunStatus `json:"status" gorm:"type:varchar(20);not null;default:'running';index"`

@@ -3,10 +3,18 @@ package domain
 import (
 	"database/sql/driver"
 	"encoding/json"
+
+	"github.com/google/uuid"
 )
 
 // JSONMap is a map[string]any for JSONB storage
 type JSONMap map[string]any
+
+// UUIDArray is a slice of uuid.UUID stored as a JSONB array. Used for
+// M:N join columns persisted inline (e.g. TestRun.FeatureIDs) where a
+// dedicated join table is unnecessary and the read path always wants
+// the full set in a single fetch.
+type UUIDArray []uuid.UUID
 
 // Value implements driver.Valuer for database storage
 func (j JSONMap) Value() (driver.Value, error) {

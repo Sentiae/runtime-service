@@ -23,6 +23,16 @@ type HermeticBuild struct {
 	OrganizationID uuid.UUID `json:"organization_id" gorm:"type:uuid;not null;index"`
 	PipelineRunID  uuid.UUID `json:"pipeline_run_id" gorm:"type:uuid;not null;index"`
 
+	// Cross-domain ownership links so a hermetic build is traceable
+	// back to the service it produced an artifact for, the spec that
+	// triggered it, the session/branch it ran in, and the features
+	// that capability-map to it. All nullable for legacy rows and for
+	// catalog-level builds that aren't tied to a specific spec.
+	ServiceID  *uuid.UUID `json:"service_id,omitempty" gorm:"type:uuid;index"`
+	SpecID     *uuid.UUID `json:"spec_id,omitempty" gorm:"type:uuid;index"`
+	SessionID  *uuid.UUID `json:"session_id,omitempty" gorm:"type:uuid;index"`
+	FeatureIDs UUIDArray  `json:"feature_ids,omitempty" gorm:"type:jsonb;serializer:json"`
+
 	// InputDigest is the stable hash over every pinned input — source
 	// commit SHA, every dependency lockfile hash, base-image digest,
 	// tool versions. Two builds with the same InputDigest MUST produce
