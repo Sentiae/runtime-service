@@ -14,6 +14,7 @@ WORKDIR /app
 # Copy local replace dependencies
 COPY platform-kit/ /platform-kit/
 COPY foundry-service/ /foundry-service/
+COPY canvas-service/ /canvas-service/
 
 # Copy go.mod and go.sum first for better caching
 COPY runtime-service/go.mod runtime-service/go.sum ./
