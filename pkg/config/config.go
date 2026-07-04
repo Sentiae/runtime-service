@@ -9,15 +9,35 @@ import (
 
 // Config represents the complete application configuration.
 type Config struct {
-	App         AppConfig         `mapstructure:"app"`
-	Logging     LoggingConfig     `mapstructure:"logging"`
-	Server      ServerConfig      `mapstructure:"server"`
-	Database    DatabaseConfig    `mapstructure:"database"`
-	Services    ServicesConfig    `mapstructure:"services"`
-	Firecracker FirecrackerConfig `mapstructure:"firecracker"`
-	Container   ContainerConfig   `mapstructure:"container"`
-	Kafka       KafkaConfig       `mapstructure:"kafka"`
-	Hermetic    HermeticConfig    `mapstructure:"hermetic"`
+	App           AppConfig           `mapstructure:"app"`
+	Logging       LoggingConfig       `mapstructure:"logging"`
+	Server        ServerConfig        `mapstructure:"server"`
+	Database      DatabaseConfig      `mapstructure:"database"`
+	Services      ServicesConfig      `mapstructure:"services"`
+	Firecracker   FirecrackerConfig   `mapstructure:"firecracker"`
+	Container     ContainerConfig     `mapstructure:"container"`
+	Kafka         KafkaConfig         `mapstructure:"kafka"`
+	Hermetic      HermeticConfig      `mapstructure:"hermetic"`
+	SnapshotStore SnapshotStoreConfig `mapstructure:"snapshot_store"`
+}
+
+// SnapshotStoreConfig configures the durable object-store backing for
+// Firecracker memory snapshots. When Enabled, the snapshot service
+// uploads mem/state files to an S3/MinIO bucket (source of truth) and
+// fronts it with a local FilesystemStore cache (fast restore path). When
+// disabled the snapshot service stays on the original local-only flow.
+type SnapshotStoreConfig struct {
+	Enabled   bool   `mapstructure:"enabled"`
+	Endpoint  string `mapstructure:"endpoint"`
+	Bucket    string `mapstructure:"bucket"`
+	AccessKey string `mapstructure:"access_key"`
+	SecretKey string `mapstructure:"secret_key"`
+	Region    string `mapstructure:"region"`
+	UseSSL    bool   `mapstructure:"use_ssl"`
+	PathStyle bool   `mapstructure:"path_style"`
+	// CacheDir is the local FilesystemStore root used as the warm cache in
+	// front of the durable bucket.
+	CacheDir string `mapstructure:"cache_dir"`
 }
 
 // AppConfig contains application metadata.
@@ -150,7 +170,24 @@ type FirecrackerConfig struct {
 	// dev can set false to avoid writing snapshot files under
 	// SnapshotPath.
 	EnableCheckpointScheduler bool `mapstructure:"enable_checkpoint_scheduler"`
+
+	// WarmPoolEnabled gates the warm-VM / snapshot-clone code-execution
+	// path. When true (and executor_type=firecracker), code nodes run on
+	// a fast warm clone (~160ms) instead of a single-shot cold boot.
+	// Default false → cold path, zero behavior change.
+	WarmPoolEnabled bool `mapstructure:"warm_pool_enabled"`
+
+	// WarmPoolReady is the per-language pre-warm buffer depth: how many
+	// already-restored clones the pool keeps ready so an execution grabs one
+	// instantly (~0ms) instead of restoring on-demand (~160ms). 0 (default) ⇒
+	// on-demand only — exact current behavior, no background goroutines. Capped
+	// at maxWarmPoolReady so a misconfig can't exhaust the host.
+	WarmPoolReady int `mapstructure:"warm_pool_ready"`
 }
+
+// maxWarmPoolReady caps WarmPoolReady so a fat-fingered value can't pre-warm
+// enough clones to exhaust the host's index space / memory.
+const maxWarmPoolReady = 32
 
 // ContainerConfig contains Docker container executor configuration.
 type ContainerConfig struct {
@@ -160,6 +197,14 @@ type ContainerConfig struct {
 	MaxMemMB       int           `mapstructure:"max_mem_mb"`
 	DefaultTimeout time.Duration `mapstructure:"default_timeout"`
 	MaxTimeout     time.Duration `mapstructure:"max_timeout"`
+
+	// AllowHostNetwork gates whether an untrusted code-execution container
+	// may use the host network namespace. Default false → every container
+	// runs with --network none regardless of the requested NetworkMode.
+	// Hostile code on the host network can reach internal services
+	// (postgres, kafka, other pods) and exfiltrate secrets, so host
+	// networking is an explicit, deliberate operator opt-in only.
+	AllowHostNetwork bool `mapstructure:"allow_host_network"`
 }
 
 // HermeticConfig toggles §9.2 enforcement knobs. Both default off so
@@ -267,18 +312,21 @@ func Load() (*Config, error) {
 			// §9.1 — per-profile warm pool defaults. Per-profile size of
 			// 2 mirrors the spec default; empty language list keeps
 			// backwards-compat (no pool) until operators opt in.
-			"firecracker.pool_size_per_profile":     2,
-			"firecracker.pool_languages":            []string{},
+			"firecracker.pool_size_per_profile":       2,
+			"firecracker.pool_languages":              []string{},
 			"firecracker.checkpoint_interval_minutes": 15,
 			"firecracker.enable_checkpoint_scheduler": false,
+			"firecracker.warm_pool_enabled":           false,
+			"firecracker.warm_pool_ready":             0,
 
 			// Container defaults
-			"container.default_vcpu":    1,
-			"container.default_mem_mb":  256,
-			"container.max_vcpu":        4,
-			"container.max_mem_mb":      2048,
-			"container.default_timeout": "30s",
-			"container.max_timeout":     "300s",
+			"container.default_vcpu":       1,
+			"container.default_mem_mb":     256,
+			"container.max_vcpu":           4,
+			"container.max_mem_mb":         2048,
+			"container.default_timeout":    "30s",
+			"container.max_timeout":        "300s",
+			"container.allow_host_network": false,
 
 			// Kafka defaults
 			"kafka.enabled": false,
@@ -288,6 +336,19 @@ func Load() (*Config, error) {
 			// surprised by new validation.
 			"hermetic.enforce_base_image_digest": false,
 			"hermetic.enforce_reproducibility":   false,
+
+			// Durable snapshot object-store defaults. Disabled by default so
+			// existing deployments keep the local-only snapshot flow until
+			// operators opt in. MinIO-friendly defaults (path-style, no TLS).
+			"snapshot_store.enabled":    false,
+			"snapshot_store.endpoint":   "minio:9000",
+			"snapshot_store.bucket":     "sentiae-snapshots",
+			"snapshot_store.access_key": "minioadmin",
+			"snapshot_store.secret_key": "minioadmin",
+			"snapshot_store.region":     "us-east-1",
+			"snapshot_store.use_ssl":    false,
+			"snapshot_store.path_style": true,
+			"snapshot_store.cache_dir":  "/var/lib/firecracker/snapshot-cache",
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -370,6 +431,8 @@ func Load() (*Config, error) {
 			{"firecracker.checkpoint_interval_minutes", "FIRECRACKER_CHECKPOINT_INTERVAL"},
 			{"firecracker.checkpoint_interval_minutes", "APP_FC_CHECKPOINT_INTERVAL_MINUTES"},
 			{"firecracker.enable_checkpoint_scheduler", "APP_FC_ENABLE_CHECKPOINT_SCHEDULER"},
+			{"firecracker.warm_pool_enabled", "APP_WARM_POOL_ENABLED"},
+			{"firecracker.warm_pool_ready", "APP_WARM_POOL_READY"},
 
 			// Container bindings
 			{"container.default_vcpu", "APP_CONTAINER_DEFAULT_VCPU"},
@@ -378,6 +441,7 @@ func Load() (*Config, error) {
 			{"container.max_mem_mb", "APP_CONTAINER_MAX_MEM_MB"},
 			{"container.default_timeout", "APP_CONTAINER_DEFAULT_TIMEOUT"},
 			{"container.max_timeout", "APP_CONTAINER_MAX_TIMEOUT"},
+			{"container.allow_host_network", "APP_CONTAINER_ALLOW_HOST_NETWORK"},
 
 			// Kafka bindings
 			{"kafka.enabled", "APP_KAFKA_ENABLED"},
@@ -389,10 +453,31 @@ func Load() (*Config, error) {
 			{"hermetic.enforce_base_image_digest", "APP_HERMETIC_ENFORCE_BASE_IMAGE_DIGEST"},
 			{"hermetic.enforce_reproducibility", "HERMETIC_ENFORCE_REPRODUCIBILITY"},
 			{"hermetic.enforce_reproducibility", "APP_HERMETIC_ENFORCE_REPRODUCIBILITY"},
+
+			// Durable snapshot object store
+			{"snapshot_store.enabled", "APP_SNAPSHOT_STORE_ENABLED"},
+			{"snapshot_store.endpoint", "APP_SNAPSHOT_STORE_ENDPOINT"},
+			{"snapshot_store.bucket", "APP_SNAPSHOT_STORE_BUCKET"},
+			{"snapshot_store.access_key", "APP_SNAPSHOT_STORE_ACCESS_KEY"},
+			{"snapshot_store.secret_key", "APP_SNAPSHOT_STORE_SECRET_KEY"},
+			{"snapshot_store.region", "APP_SNAPSHOT_STORE_REGION"},
+			{"snapshot_store.use_ssl", "APP_SNAPSHOT_STORE_USE_SSL"},
+			{"snapshot_store.path_style", "APP_SNAPSHOT_STORE_PATH_STYLE"},
+			{"snapshot_store.cache_dir", "APP_SNAPSHOT_STORE_CACHE_DIR"},
 		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("loading config: %w", err)
+	}
+
+	// Clamp the pre-warm buffer depth into [0, maxWarmPoolReady] so a negative
+	// or oversized value can never start a runaway replenisher or exhaust the
+	// host. 0 keeps the on-demand-only behavior.
+	if cfg.Firecracker.WarmPoolReady < 0 {
+		cfg.Firecracker.WarmPoolReady = 0
+	}
+	if cfg.Firecracker.WarmPoolReady > maxWarmPoolReady {
+		cfg.Firecracker.WarmPoolReady = maxWarmPoolReady
 	}
 
 	return &cfg, nil

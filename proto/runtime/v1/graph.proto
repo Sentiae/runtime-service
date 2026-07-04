@@ -81,6 +81,12 @@ message DeployGraphRequest {
 message ExecuteGraphRequest {
   string graph_id = 1;
   google.protobuf.Struct input = 2;
+  // seeded_outputs lets the caller (deployment-service node-output cache) skip
+  // re-executing unchanged upstream nodes: keyed by FlowNode.name (the graph
+  // node name), each entry is that node's previously-computed output. A seeded
+  // node is NOT executed — its output is taken from the seed and propagated
+  // downstream exactly as a real run would, and it spins no microVM.
+  map<string, google.protobuf.Struct> seeded_outputs = 3;
 }
 
 message GraphExecution {
@@ -130,6 +136,7 @@ message NodeExecution {
   string started_at = 13;            // RFC3339, empty when unset
   string completed_at = 14;          // RFC3339, empty when unset
   string created_at = 15;            // RFC3339
+  bool   cached = 16;                // true when output was seeded from cache (not executed)
 }
 
 message ListNodeExecutionsRequest {

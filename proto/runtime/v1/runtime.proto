@@ -40,6 +40,14 @@ service RuntimeService {
 
     // ── VM usage (session cost preview) ────────────────────────────────
     rpc GetVMUsage(GetVMUsageRequest) returns (VMUsage);
+
+    // ── Multi-file project compile (no execution) ──────────────────────
+    // Compile builds a multi-file project in an ephemeral build container
+    // and returns structured compiler diagnostics. The built artifact is
+    // never executed. Used by codegen-service to compile-verify generated
+    // modules. Distinct from the Firecracker execution pool: each call
+    // runs a self-contained `docker run --rm` against a toolchain image.
+    rpc Compile(CompileRequest) returns (CompileResponse);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -268,4 +276,40 @@ message VMUsage {
     // estimated_cost_usd is an optional cost projection. Zero when the
     // service is not configured with a cost model yet.
     double estimated_cost_usd = 7;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Multi-file project compile (no execution).
+// ─────────────────────────────────────────────────────────────────────
+
+message CompileRequest {
+    string organization_id = 1;
+    string requested_by = 2;
+    string language = 3;
+    // files is the full project file set. Paths are repo-relative and may
+    // contain subdirectories (e.g. "internal/domain/user.go").
+    repeated CompileSourceFile files = 4;
+    // timeout_sec bounds the whole build. Zero → server default.
+    int32 timeout_sec = 5;
+}
+
+message CompileSourceFile {
+    string path = 1;
+    string content = 2;
+}
+
+message CompileResponse {
+    // ok is true when the project compiled without error (exit 0).
+    bool ok = 1;
+    repeated CompileDiagnostic diagnostics = 2;
+    // raw_output is the combined stdout+stderr of the build, truncated.
+    string raw_output = 3;
+    int64 compile_time_ms = 4;
+}
+
+message CompileDiagnostic {
+    string file = 1;
+    int32  line = 2;
+    int32  column = 3;
+    string message = 4;
 }

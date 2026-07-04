@@ -28,6 +28,9 @@ type ExecutionServer struct {
 	testRunDispatch TestRunDispatcher
 	vmUC            usecase.VMUseCase
 	executionsLister ExecutionsLister
+	// compileUC backs the Compile RPC (multi-file project build). May be
+	// nil — Compile then reports Unavailable rather than panicking.
+	compileUC *usecase.CompileProject
 }
 
 // NewExecutionServer creates a new ExecutionServer.
@@ -289,6 +292,12 @@ func handleDomainError(err error) error {
 		return status.Error(codes.FailedPrecondition, "microVM is not in ready state")
 	case errors.Is(err, domain.ErrVMAlreadyTerminated):
 		return status.Error(codes.FailedPrecondition, "microVM is already terminated")
+	case errors.Is(err, domain.ErrUnsupportedCompileLanguage):
+		return status.Error(codes.InvalidArgument, "unsupported compile language")
+	case errors.Is(err, domain.ErrNoSourceFiles):
+		return status.Error(codes.InvalidArgument, "compile request has no source files")
+	case errors.Is(err, domain.ErrCompileToolchainUnavailable):
+		return status.Error(codes.Unavailable, "compile toolchain unavailable")
 	default:
 		return status.Error(codes.Internal, "internal server error")
 	}

@@ -23,12 +23,13 @@ type Server struct {
 	terminalHandler      *TerminalHandler
 	testRunHandler       *TestRunHandler
 	testGenHandler       *TestGenHandler
-	runtimeAgentHandler  *RuntimeAgentHandler   // 9.4
-	regressionHandler    *RegressionTestHandler // B6 gap #5
-	dslHandler           *DSLHandler            // §19 DSL execute
-	hermeticBuildHandler *HermeticBuildHandler  // §9.2 hermetic builds
-	quarantineHandler    *TestQuarantineHandler // §8.3 quarantine toggles
+	runtimeAgentHandler  *RuntimeAgentHandler      // 9.4
+	regressionHandler    *RegressionTestHandler    // B6 gap #5
+	dslHandler           *DSLHandler               // §19 DSL execute
+	hermeticBuildHandler *HermeticBuildHandler     // §9.2 hermetic builds
+	quarantineHandler    *TestQuarantineHandler    // §8.3 quarantine toggles
 	customerAgentHandler *CustomerAgentCertHandler // §9.4 agent enrolment
+	fleetHandler         *FleetHandler             // warm-VM fleet visibility + control
 	permissionChecker    PermissionChecker
 }
 
@@ -90,6 +91,15 @@ func (s *Server) setupRoutes() {
 	// enrolment bearer token validated inside the handler.
 	if s.customerAgentHandler != nil {
 		s.customerAgentHandler.RegisterRoutes(s.router)
+	}
+
+	// Warm-VM fleet surface. Registered OUTSIDE the /api/v1 JWT group: it is the
+	// per-host data source the control plane (deployment-service Fleet RPC) polls
+	// over the internal network, which presents the shared service token, not a
+	// runtime JWT + X-User-ID. The handler guards a nil pool (warm pool disabled
+	// ⇒ GET /fleet reports {enabled:false}).
+	if s.fleetHandler != nil {
+		s.fleetHandler.RegisterRoutes(s.router)
 	}
 
 	// API routes with authentication
@@ -211,6 +221,16 @@ func (s *Server) SetTestQuarantineHandler(h *TestQuarantineHandler) {
 func (s *Server) SetCustomerAgentCertHandler(h *CustomerAgentCertHandler) {
 	if s != nil && h != nil {
 		s.customerAgentHandler = h
+	}
+}
+
+// SetFleetHandler installs the warm-VM fleet handler. Kept as a setter so the
+// DI container can pass the live *WarmPool (which may be nil when the warm pool
+// is disabled — the handler then reports the fleet as disabled rather than
+// 500ing). Always call it; the handler owns the nil-pool guard.
+func (s *Server) SetFleetHandler(h *FleetHandler) {
+	if s != nil && h != nil {
+		s.fleetHandler = h
 	}
 }
 

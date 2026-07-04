@@ -23,7 +23,11 @@ type NodeExecution struct {
 	StartedAt        *time.Time           `json:"started_at,omitempty"`
 	CompletedAt      *time.Time           `json:"completed_at,omitempty"`
 	DurationMS       *int64               `json:"duration_ms,omitempty"`
-	CreatedAt        time.Time            `json:"created_at" gorm:"not null"`
+	// Cached is true when this node's output was seeded from the deployment-service
+	// node-output cache instead of being executed — no microVM was spun. The poller
+	// reads it so the caller can distinguish a cached node from an executed one.
+	Cached    bool      `json:"cached" gorm:"not null;default:false"`
+	CreatedAt time.Time `json:"created_at" gorm:"not null"`
 }
 
 // TableName specifies the table name for GORM

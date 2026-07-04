@@ -16,13 +16,14 @@ const (
 	GraphNodeTypeHTTP      GraphNodeType = "http"
 	GraphNodeTypeInput     GraphNodeType = "input"
 	GraphNodeTypeOutput    GraphNodeType = "output"
+	GraphNodeTypeDatabase  GraphNodeType = "database"
 )
 
 // IsValid checks if the graph node type is valid
 func (t GraphNodeType) IsValid() bool {
 	switch t {
 	case GraphNodeTypeCode, GraphNodeTypeTransform, GraphNodeTypeCondition,
-		GraphNodeTypeHTTP, GraphNodeTypeInput, GraphNodeTypeOutput:
+		GraphNodeTypeHTTP, GraphNodeTypeInput, GraphNodeTypeOutput, GraphNodeTypeDatabase:
 		return true
 	}
 	return false
@@ -46,6 +47,33 @@ type GraphNode struct {
 // TableName specifies the table name for GORM
 func (GraphNode) TableName() string { return "graph_nodes" }
 
+// ResolvedCode returns the source the node should execute. A placed Code node
+// carries the user's per-instance source under Config["code"] (the F1 seam:
+// node Config = {language, code}); when present it WINS over the dedicated Code
+// field (a shared NodeVersion stub). This makes the execution boundary honor
+// the config seam regardless of how the graph node was populated.
+func (n *GraphNode) ResolvedCode() string {
+	if n.Config != nil {
+		if c, ok := n.Config["code"].(string); ok && c != "" {
+			return c
+		}
+	}
+	return n.Code
+}
+
+// ResolvedLanguage returns the language the node should execute in, preferring
+// the per-instance Config["language"] (the F1 seam) over the dedicated Language
+// field. Returns nil when neither yields a value.
+func (n *GraphNode) ResolvedLanguage() *Language {
+	if n.Config != nil {
+		if l, ok := n.Config["language"].(string); ok && l != "" {
+			lang := Language(l)
+			return &lang
+		}
+	}
+	return n.Language
+}
+
 // Validate performs validation on the graph node
 func (n *GraphNode) Validate() error {
 	if n.ID == uuid.Nil {
@@ -61,10 +89,14 @@ func (n *GraphNode) Validate() error {
 		return ErrInvalidData
 	}
 	if n.NodeType == GraphNodeTypeCode {
-		if n.Language == nil || !n.Language.IsValid() {
+		// Honor the F1 config seam: a Code node may carry its language + source
+		// in Config (config.language / config.code) instead of the dedicated
+		// fields, so validate against the resolved values.
+		lang := n.ResolvedLanguage()
+		if lang == nil || !lang.IsValid() {
 			return ErrInvalidLanguage
 		}
-		if n.Code == "" {
+		if n.ResolvedCode() == "" {
 			return ErrEmptyCode
 		}
 	}

@@ -1,0 +1,4 @@
+# Compiled binaries — build artifacts, never commit
+/server
+/guest-agent
+/bin/

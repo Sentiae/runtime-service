@@ -51,6 +51,11 @@ type GraphExecutionEngine struct {
 	traceRecorder  *GraphTraceRecorder
 	httpClient     *http.Client
 
+	// warm runs code nodes on a fast warm CLONE (~160ms) instead of a
+	// cold single-shot boot (~13s). Nil disables the warm path: code
+	// nodes fall back to executionUC.ExecuteSync (zero behavior change).
+	warm WarmCodeRunner
+
 	maxParallelism int
 
 	mu            sync.Mutex
@@ -88,6 +93,13 @@ func (e *GraphExecutionEngine) SetTraceRecorder(recorder *GraphTraceRecorder) {
 	e.traceRecorder = recorder
 }
 
+// SetWarmRunner wires the warm-clone code runner. When set, code nodes execute
+// on a fast warm clone instead of a cold single-shot boot. Nil keeps the cold
+// fallback path. Set once at wiring time before serving.
+func (e *GraphExecutionEngine) SetWarmRunner(w WarmCodeRunner) {
+	e.warm = w
+}
+
 // SetMaxParallelism overrides the per-wave concurrency cap. Values <= 0
 // reset to DefaultMaxParallelism.
 func (e *GraphExecutionEngine) SetMaxParallelism(n int) {
@@ -108,11 +120,18 @@ func (e *GraphExecutionEngine) MaxParallelism() int {
 
 // ExecuteGraph starts execution of a graph and returns the execution record.
 // The actual execution runs asynchronously in a goroutine.
+//
+// seededOutputs (keyed by node name = FlowNode.name / GraphNode.Name) lets the
+// caller pre-supply outputs for unchanged upstream nodes: a seeded node is NOT
+// executed (spins no microVM) — its output is taken from the seed, recorded as a
+// completed+cached NodeExecution, and propagated downstream as a real output
+// would. Pass nil to execute every node normally.
 func (e *GraphExecutionEngine) ExecuteGraph(
 	ctx context.Context,
 	graphID, orgID, requestedBy uuid.UUID,
 	input domain.JSONMap,
 	debugMode bool,
+	seededOutputs map[string]domain.JSONMap,
 ) (*domain.GraphExecution, error) {
 	// Load graph definition
 	graph, err := e.graphRepo.FindByID(ctx, graphID)
@@ -166,7 +185,7 @@ func (e *GraphExecutionEngine) ExecuteGraph(
 			delete(e.cancellations, graphExec.ID)
 			e.mu.Unlock()
 		}()
-		e.runGraph(execCtx, graphExec, graph, nodes, edges, input)
+		e.runGraph(execCtx, graphExec, graph, nodes, edges, input, seededOutputs)
 	}()
 
 	return graphExec, nil
@@ -210,7 +229,9 @@ func (e *GraphExecutionEngine) ProcessPendingGraphs(ctx context.Context, limit i
 				delete(e.cancellations, ge.ID)
 				e.mu.Unlock()
 			}()
-			e.runGraph(execCtx, ge, graph, nodes, edges, ge.Input)
+			// Pending-poll path carries no seeds — seeding only arrives via the
+			// synchronous ExecuteGraph RPC (the deployment-service cache path).
+			e.runGraph(execCtx, ge, graph, nodes, edges, ge.Input, nil)
 		}(exec)
 
 		processed++
@@ -272,7 +293,12 @@ func (e *GraphExecutionEngine) ListNodeExecutions(ctx context.Context, graphExec
 	return e.nodeExecRepo.FindByGraphExecution(ctx, graphExecID)
 }
 
-// runGraph is the core DAG execution algorithm
+// runGraph is the core DAG execution algorithm.
+//
+// seededOutputs (keyed by node name) pre-supplies outputs for unchanged upstream
+// nodes: a node whose name is seeded is NOT executed — it records a completed,
+// cached NodeExecution (duration 0, spins no microVM) and propagates the seed
+// downstream as a real output would. nil/empty means execute every node.
 func (e *GraphExecutionEngine) runGraph(
 	ctx context.Context,
 	graphExec *domain.GraphExecution,
@@ -280,6 +306,7 @@ func (e *GraphExecutionEngine) runGraph(
 	nodes []domain.GraphNode,
 	edges []domain.GraphEdge,
 	input domain.JSONMap,
+	seededOutputs map[string]domain.JSONMap,
 ) {
 	// Mark as running
 	graphExec.MarkRunning()
@@ -408,6 +435,42 @@ func (e *GraphExecutionEngine) runGraph(
 					Input:            nodeInput,
 					CreatedAt:        time.Now().UTC(),
 				}
+
+				// Seeded-output skip: if this node's output was pre-supplied from the
+				// cache, do NOT execute it. Record it completed+cached (duration 0,
+				// no microVM) and propagate the seed downstream exactly as a real
+				// output would.
+				if seed, ok := seededOutputs[n.Name]; ok {
+					nodeExec.MarkRunning()
+					nodeExec.Cached = true
+					nodeExec.MarkCompleted(seed)
+					if nodeExec.DurationMS != nil {
+						zero := int64(0)
+						nodeExec.DurationMS = &zero
+					}
+					if err := e.nodeExecRepo.Create(ctx, nodeExec); err != nil {
+						log.Printf("Warning: failed to create cached node execution record: %v", err)
+					}
+					_ = e.eventPublisher.Publish(ctx, EventNodeExecCompleted, nodeExec.ID.String(), nodeExec)
+
+					mu.Lock()
+					outputs[n.ID] = seed
+					completedNodes++
+					mu.Unlock()
+					e.recordTiming(graphExec.ID, nodeTimings{
+						NodeID:      n.ID,
+						NodeName:    n.Name,
+						Lane:        lane,
+						StartedAt:   startedAt,
+						CompletedAt: startedAt,
+						DurationMS:  0,
+					})
+					if trace != nil && e.traceRecorder != nil {
+						_ = e.traceRecorder.RecordNode(ctx, trace, n.ID, n.Name, string(n.NodeType), nodeSeq, nodeInput, seed, n.Config, "completed", "", startedAt, startedAt)
+					}
+					return
+				}
+
 				nodeExec.MarkRunning()
 				if err := e.nodeExecRepo.Create(ctx, nodeExec); err != nil {
 					log.Printf("Warning: failed to create node execution record: %v", err)
@@ -528,7 +591,7 @@ func (e *GraphExecutionEngine) resolveNodeInput(
 		result[k] = v
 	}
 
-	// Overlay outputs from upstream nodes via edges
+	// Overlay outputs from upstream nodes via edges.
 	for _, edge := range edges {
 		if edge.TargetNodeID != nodeID {
 			continue
@@ -538,12 +601,17 @@ func (e *GraphExecutionEngine) resolveNodeInput(
 			continue
 		}
 
-		// Map source port value to target port
-		if val, ok := srcOutput[edge.SourcePort]; ok {
+		// Default data transit: connecting A→B makes B's input the fields of
+		// A's output (e.g. a code node emitting {code,url} feeds a database
+		// node's params directly). Spread the whole upstream output, then let
+		// a named port act as an explicit override:
+		//   - source_port names an output field → bind it under target_port
+		//     (point-to-point wiring of a single value).
+		for k, v := range srcOutput {
+			result[k] = v
+		}
+		if val, ok := srcOutput[edge.SourcePort]; ok && edge.TargetPort != "" {
 			result[edge.TargetPort] = val
-		} else {
-			// If source port not found, pass the entire output
-			result[edge.TargetPort] = srcOutput
 		}
 	}
 
@@ -592,6 +660,9 @@ func (e *GraphExecutionEngine) executeNode(
 	case domain.GraphNodeTypeHTTP:
 		out, err := e.executeHTTPNode(ctx, node, input)
 		return out, nil, err
+	case domain.GraphNodeTypeDatabase:
+		out, err := e.executeDatabaseNode(ctx, node, input)
+		return out, nil, err
 	case domain.GraphNodeTypeInput:
 		return input, nil, nil
 	case domain.GraphNodeTypeOutput:
@@ -601,27 +672,50 @@ func (e *GraphExecutionEngine) executeNode(
 	}
 }
 
-// executeCodeNode runs code in a Firecracker VM via the existing ExecutionUseCase
+// executeCodeNode runs a code node. When a warm runner is wired it runs on a
+// fast warm clone (~160ms); otherwise it falls back to the cold single-shot
+// Firecracker boot via ExecutionUseCase. Both paths produce identical node
+// output via shapeCodeOutput.
 func (e *GraphExecutionEngine) executeCodeNode(
 	ctx context.Context,
 	node *domain.GraphNode,
 	input domain.JSONMap,
 	graphExec *domain.GraphExecution,
 ) (domain.JSONMap, *uuid.UUID, error) {
-	if node.Language == nil {
+	// Resolve the per-instance user code + language from the node config (the
+	// F1 seam) with a fallback to the dedicated fields — so a Code node runs
+	// the source the user wrote, not a shared stub.
+	language := node.ResolvedLanguage()
+	code := node.ResolvedCode()
+	if language == nil {
 		return nil, nil, fmt.Errorf("code node %q missing language", node.Name)
+	}
+	if code == "" {
+		return nil, nil, fmt.Errorf("code node %q missing code", node.Name)
 	}
 
 	// Convert input to stdin JSON
 	stdinBytes, _ := json.Marshal(input)
 
+	// Warm path: run on a fast warm clone. No Execution record is created,
+	// so there is no execID to return (nil).
+	if e.warm != nil {
+		res, err := e.warm.RunCode(ctx, *language, code, string(stdinBytes))
+		if err != nil {
+			return nil, nil, fmt.Errorf("warm code execution failed: %w", err)
+		}
+		output, runErr := shapeCodeOutput(res.Stdout, res.Stderr, &res.ExitCode)
+		return output, nil, runErr
+	}
+
+	// Cold fallback path: single-shot Firecracker boot via the execution service.
 	exec, err := e.executionUC.ExecuteSync(ctx, CreateExecutionInput{
 		OrganizationID: graphExec.OrganizationID,
 		RequestedBy:    graphExec.RequestedBy,
 		NodeID:         &node.ID,
 		WorkflowID:     &graphExec.GraphID,
-		Language:       *node.Language,
-		Code:           node.Code,
+		Language:       *language,
+		Code:           code,
 		Stdin:          string(stdinBytes),
 		Args:           input,
 		Resources:      &node.Resources,
@@ -631,26 +725,36 @@ func (e *GraphExecutionEngine) executeCodeNode(
 	}
 
 	execID := exec.ID
+	output, runErr := shapeCodeOutput(exec.Stdout, exec.Stderr, exec.ExitCode)
+	return output, &execID, runErr
+}
+
+// shapeCodeOutput builds the canonical code-node output map from a run's
+// stdout / stderr / exit code. It is shared by the warm and cold paths so both
+// produce byte-identical node output: the base {stdout,stderr,exit_code,output}
+// fields, a non-zero-exit error, and a best-effort merge of stdout-parsed JSON
+// for richer downstream wiring. exitCode is nil when the runner reported none.
+func shapeCodeOutput(stdout, stderr string, exitCode *int) (domain.JSONMap, error) {
 	output := domain.JSONMap{
-		"stdout":    exec.Stdout,
-		"stderr":    exec.Stderr,
-		"exit_code": exec.ExitCode,
-		"output":    exec.Stdout,
+		"stdout":    stdout,
+		"stderr":    stderr,
+		"exit_code": exitCode,
+		"output":    stdout,
 	}
 
-	if exec.ExitCode != nil && *exec.ExitCode != 0 {
-		return output, &execID, fmt.Errorf("code exited with code %d: %s", *exec.ExitCode, exec.Stderr)
+	if exitCode != nil && *exitCode != 0 {
+		return output, fmt.Errorf("code exited with code %d: %s", *exitCode, stderr)
 	}
 
-	// Try to parse stdout as JSON for richer output
+	// Try to parse stdout as JSON for richer output.
 	var parsed domain.JSONMap
-	if err := json.Unmarshal([]byte(exec.Stdout), &parsed); err == nil {
+	if err := json.Unmarshal([]byte(stdout), &parsed); err == nil {
 		for k, v := range parsed {
 			output[k] = v
 		}
 	}
 
-	return output, &execID, nil
+	return output, nil
 }
 
 // executeTransformNode applies a template transformation to input

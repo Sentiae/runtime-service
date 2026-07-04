@@ -76,34 +76,51 @@ func (p *Provider) setupBridge() error {
 }
 
 func (p *Provider) doSetupBridge() error {
-	// Check whether the bridge already exists
-	if err := exec.Command("ip", "link", "show", bridgeName).Run(); err == nil {
-		log.Printf("Bridge %s already exists, skipping creation", bridgeName)
-		return nil
+	// Create the bridge if it doesn't already exist.
+	if err := exec.Command("ip", "link", "show", bridgeName).Run(); err != nil {
+		cmds := [][]string{
+			{"ip", "link", "add", bridgeName, "type", "bridge"},
+			{"ip", "addr", "add", bridgeIP, "dev", bridgeName},
+			{"ip", "link", "set", bridgeName, "up"},
+		}
+		for _, args := range cmds {
+			if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+				return fmt.Errorf("bridge setup %v: %s: %w", args, string(out), err)
+			}
+		}
+		log.Printf("Bridge %s created with %s", bridgeName, bridgeIP)
+	} else {
+		log.Printf("Bridge %s already exists", bridgeName)
 	}
 
-	cmds := [][]string{
-		{"ip", "link", "add", bridgeName, "type", "bridge"},
-		{"ip", "addr", "add", bridgeIP, "dev", bridgeName},
-		{"ip", "link", "set", bridgeName, "up"},
-	}
-	for _, args := range cmds {
-		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
-			return fmt.Errorf("bridge setup %v: %s: %w", args, string(out), err)
-		}
-	}
+	// The firewall rules below are idempotent and applied on EVERY setup (not
+	// only on bridge creation) so a restart re-asserts them.
 
 	// Enable IP forwarding (best-effort; may already be enabled)
 	_ = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
 
-	// Add NAT masquerade rule (idempotent with -C check)
+	// NAT masquerade for VM egress (idempotent with -C check).
 	if exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", bridgeSubnet, "-j", "MASQUERADE").Run() != nil {
 		if out, err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", bridgeSubnet, "-j", "MASQUERADE").CombinedOutput(); err != nil {
 			log.Printf("Warning: iptables masquerade failed: %s: %v", string(out), err)
 		}
 	}
 
-	log.Printf("Bridge %s created with %s", bridgeName, bridgeIP)
+	// F1 ISOLATION (fleet §10b): DEFAULT-DENY VM-to-VM. Each microVM gets its
+	// own /30 and reaches peers only by routing through the host, so any
+	// FORWARDed packet whose source AND destination are both inside the VM
+	// subnet is inter-VM traffic — drop it unconditionally, regardless of any
+	// per-VM egress policy. Egress to external destinations (dst outside the
+	// subnet) is unaffected. Insert at the top of FORWARD so it precedes the
+	// per-TAP allow chains. Interface-agnostic, so it holds whether the kernel
+	// routes or bridges the frame.
+	if exec.Command("iptables", "-C", "FORWARD", "-s", bridgeSubnet, "-d", bridgeSubnet, "-j", "DROP").Run() != nil {
+		if out, err := exec.Command("iptables", "-I", "FORWARD", "1", "-s", bridgeSubnet, "-d", bridgeSubnet, "-j", "DROP").CombinedOutput(); err != nil {
+			return fmt.Errorf("install VM-to-VM default-deny: %s: %w", string(out), err)
+		}
+		log.Printf("Installed VM-to-VM default-deny (FORWARD %s -> %s DROP)", bridgeSubnet, bridgeSubnet)
+	}
+
 	return nil
 }
 
@@ -1121,6 +1138,35 @@ func (p *Provider) apiPut(ctx context.Context, client *http.Client, path string,
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://localhost"+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
+}
+
+// apiPatch sends a PATCH request to the Firecracker API. Used for state
+// transitions on a running VM (e.g. PATCH /vm {"state":"Paused"}) which the
+// snapshot path requires before /snapshot/create.
+func (p *Provider) apiPatch(ctx context.Context, client *http.Client, path string, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, "http://localhost"+path, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}

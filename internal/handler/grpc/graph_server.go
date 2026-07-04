@@ -63,6 +63,20 @@ func structToJSONMap(s *structpb.Struct) domain.JSONMap {
 	return domain.JSONMap(s.AsMap())
 }
 
+// seededOutputsFromPB converts the proto seeded_outputs map (node name → Struct)
+// into the engine's node-name-keyed JSONMap seeds. Returns nil when empty so the
+// engine executes every node normally.
+func seededOutputsFromPB(m map[string]*structpb.Struct) map[string]domain.JSONMap {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]domain.JSONMap, len(m))
+	for name, s := range m {
+		out[name] = structToJSONMap(s)
+	}
+	return out
+}
+
 func jsonMapToStruct(m domain.JSONMap) *structpb.Struct {
 	if len(m) == 0 {
 		return nil
@@ -156,6 +170,7 @@ func nodeExecToPB(n *domain.NodeExecution) *runtimev1.NodeExecution {
 		StartedAt:        timePtrToRFC3339(n.StartedAt),
 		CompletedAt:      timePtrToRFC3339(n.CompletedAt),
 		CreatedAt:        n.CreatedAt.UTC().Format(time.RFC3339Nano),
+		Cached:           n.Cached,
 	}
 	if n.DurationMS != nil {
 		out.HasDuration = true
@@ -258,7 +273,8 @@ func (s *GraphServer) ExecuteGraph(ctx context.Context, req *runtimev1.ExecuteGr
 	orgID := graphOrgIDFromCtx(ctx)
 	userID := graphUserIDFromCtx(ctx)
 	input := structToJSONMap(req.Input)
-	exec, err := s.execEng.ExecuteGraph(ctx, graphID, orgID, userID, input, false)
+	seeded := seededOutputsFromPB(req.GetSeededOutputs())
+	exec, err := s.execEng.ExecuteGraph(ctx, graphID, orgID, userID, input, false, seeded)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "execute graph: %v", err)
 	}

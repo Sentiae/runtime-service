@@ -3,7 +3,10 @@ package usecase
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +18,12 @@ type snapshotService struct {
 	snapshotRepo repository.SnapshotRepository
 	vmRepo       repository.MicroVMRepository
 	vmProvider   VMProvider
+
+	// store, when non-nil, makes snapshots durable: mem/state files are
+	// uploaded to it after creation and re-fetched from it on restore
+	// when the local copy is absent (e.g. restoring on a different host).
+	// Nil store preserves the original local-only create/restore flow.
+	store ArtifactStore
 }
 
 // NewSnapshotService creates a new snapshot use case service
@@ -27,6 +36,93 @@ func NewSnapshotService(
 		snapshotRepo: snapshotRepo,
 		vmRepo:       vmRepo,
 		vmProvider:   vmProvider,
+	}
+}
+
+// SnapshotStoreInjectable is implemented by snapshot services that accept
+// a durable object-store backing. DI type-asserts against this interface
+// to wire the store without depending on the unexported concrete type
+// (mirrors the eventPublishable pattern used for the execution service).
+type SnapshotStoreInjectable interface {
+	SetArtifactStore(store ArtifactStore)
+}
+
+// SetArtifactStore wires a durable object-store backing for snapshots.
+// Passing nil is a no-op that keeps the local-only flow.
+func (s *snapshotService) SetArtifactStore(store ArtifactStore) {
+	s.store = store
+}
+
+// snapshotMemKey / snapshotStateKey derive stable object-store keys from
+// the snapshot id. Keys are namespaced under snapshots/<id>/ so the
+// durable store stays browsable and a snapshot's two blobs sort together.
+func snapshotMemKey(id uuid.UUID) string   { return "snapshots/" + id.String() + "/mem" }
+func snapshotStateKey(id uuid.UUID) string { return "snapshots/" + id.String() + "/state" }
+
+// uploadSnapshotFile streams a local file into the artifact store under
+// the given key. Used to make a freshly-created snapshot durable.
+func uploadSnapshotFile(store ArtifactStore, key, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	if err := store.Put(key, f); err != nil {
+		return fmt.Errorf("put %s: %w", key, err)
+	}
+	return nil
+}
+
+// ensureLocalFile guarantees a snapshot file is present at localPath,
+// pulling it from the artifact store under objectKey when the local copy
+// is missing. Returns the path to use (always localPath on success). When
+// no store or key is available it just reports whether the local file
+// exists so the caller can fail with a clear "not found" rather than
+// handing a missing path to Firecracker.
+func ensureLocalFile(store ArtifactStore, objectKey, localPath string) error {
+	if _, err := os.Stat(localPath); err == nil {
+		return nil // already present — fast local restore path
+	}
+	if store == nil || objectKey == "" {
+		return fmt.Errorf("snapshot file missing locally and no object store key: %s", localPath)
+	}
+	rc, err := store.Get(objectKey)
+	if err != nil {
+		return fmt.Errorf("fetch %s from object store: %w", objectKey, err)
+	}
+	defer rc.Close()
+	if err := os.MkdirAll(dirOf(localPath), 0o750); err != nil {
+		return fmt.Errorf("mkdir for %s: %w", localPath, err)
+	}
+	tmp, err := os.CreateTemp(dirOf(localPath), ".snap-*.tmp")
+	if err != nil {
+		return fmt.Errorf("tempfile for %s: %w", localPath, err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := io.Copy(tmp, rc); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write %s: %w", localPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename into %s: %w", localPath, err)
+	}
+	return nil
+}
+
+func dirOf(p string) string { return filepath.Dir(p) }
+
+// resumeQuietly resumes a VM after a snapshot-path failure, logging (but
+// not propagating) any resume error — matching the existing failure
+// handling in CreateSnapshot.
+func (s *snapshotService) resumeQuietly(ctx context.Context, socketPath string, vmID uuid.UUID) {
+	if resumeErr := s.vmProvider.Resume(ctx, socketPath); resumeErr != nil {
+		log.Printf("Warning: failed to resume VM %s after snapshot failure: %v", vmID, resumeErr)
 	}
 }
 
@@ -60,19 +156,48 @@ func (s *snapshotService) CreateSnapshot(ctx context.Context, vmID uuid.UUID, de
 
 	createTimeMS := time.Since(start).Milliseconds()
 
+	// Make the snapshot durable: upload mem + state to the object store so
+	// the snapshot is restorable on any host (object store = source of
+	// truth). Nil store keeps the original local-only flow. An upload
+	// failure aborts the snapshot — a snapshot that only exists on this
+	// host's disk is not the durable artifact callers asked for; we resume
+	// the VM and clean up the local files before returning the error.
+	var memObjectKey, stateObjectKey string
+	if s.store != nil {
+		memObjectKey = snapshotMemKey(snapshotID)
+		stateObjectKey = snapshotStateKey(snapshotID)
+		if err := uploadSnapshotFile(s.store, memObjectKey, result.MemoryFilePath); err != nil {
+			s.resumeQuietly(ctx, vm.SocketPath, vmID)
+			if delErr := s.vmProvider.DeleteSnapshotFiles(result.MemoryFilePath, result.StateFilePath); delErr != nil {
+				log.Printf("Warning: failed to clean up snapshot files for %s after upload failure: %v", snapshotID, delErr)
+			}
+			return nil, fmt.Errorf("failed to upload snapshot memory to object store: %w", err)
+		}
+		if err := uploadSnapshotFile(s.store, stateObjectKey, result.StateFilePath); err != nil {
+			s.resumeQuietly(ctx, vm.SocketPath, vmID)
+			if delErr := s.vmProvider.DeleteSnapshotFiles(result.MemoryFilePath, result.StateFilePath); delErr != nil {
+				log.Printf("Warning: failed to clean up snapshot files for %s after upload failure: %v", snapshotID, delErr)
+			}
+			return nil, fmt.Errorf("failed to upload snapshot state to object store: %w", err)
+		}
+		log.Printf("Snapshot uploaded to object store: %s (mem=%s, state=%s)", snapshotID, memObjectKey, stateObjectKey)
+	}
+
 	snapshot := &domain.Snapshot{
-		ID:             snapshotID,
-		VMID:           vmID,
-		ExecutionID:    vm.ExecutionID,
-		Language:       vm.Language,
-		MemoryFilePath: result.MemoryFilePath,
-		StateFilePath:  result.StateFilePath,
-		SizeBytes:      result.SizeBytes,
-		VCPU:           vm.VCPU,
-		MemoryMB:       vm.MemoryMB,
-		Description:    description,
-		RestoreTimeMS:  &createTimeMS,
-		CreatedAt:      time.Now().UTC(),
+		ID:              snapshotID,
+		VMID:            vmID,
+		ExecutionID:     vm.ExecutionID,
+		Language:        vm.Language,
+		MemoryFilePath:  result.MemoryFilePath,
+		StateFilePath:   result.StateFilePath,
+		MemoryObjectKey: memObjectKey,
+		StateObjectKey:  stateObjectKey,
+		SizeBytes:       result.SizeBytes,
+		VCPU:            vm.VCPU,
+		MemoryMB:        vm.MemoryMB,
+		Description:     description,
+		RestoreTimeMS:   &createTimeMS,
+		CreatedAt:       time.Now().UTC(),
 	}
 
 	if err := s.snapshotRepo.Create(ctx, snapshot); err != nil {
@@ -142,6 +267,28 @@ func (s *snapshotService) RestoreSnapshot(ctx context.Context, snapshotID uuid.U
 	if socketPath == "" {
 		// Derive the socket path the same way the provider does
 		socketPath = fmt.Sprintf("/tmp/firecracker/%s.sock", vmID.String())
+	}
+
+	// Ensure the mem/state files exist locally before handing them to
+	// Firecracker. On a fresh host the local paths recorded at create time
+	// won't exist — pull the blobs from the durable object store using the
+	// recorded keys. When the files are already present (same-host restore)
+	// this is a cheap stat and the local fast path is preserved.
+	if err := ensureLocalFile(s.store, snapshot.MemoryObjectKey, snapshot.MemoryFilePath); err != nil {
+		if bootResult.PID > 0 {
+			_ = s.vmProvider.Terminate(ctx, socketPath, bootResult.PID)
+		}
+		vm.Status = domain.VMStatusError
+		_ = s.vmRepo.Update(ctx, vm)
+		return nil, fmt.Errorf("failed to stage snapshot memory file: %w", err)
+	}
+	if err := ensureLocalFile(s.store, snapshot.StateObjectKey, snapshot.StateFilePath); err != nil {
+		if bootResult.PID > 0 {
+			_ = s.vmProvider.Terminate(ctx, socketPath, bootResult.PID)
+		}
+		vm.Status = domain.VMStatusError
+		_ = s.vmRepo.Update(ctx, vm)
+		return nil, fmt.Errorf("failed to stage snapshot state file: %w", err)
 	}
 
 	if err := s.vmProvider.RestoreSnapshot(ctx, socketPath, snapshot.MemoryFilePath, snapshot.StateFilePath); err != nil {

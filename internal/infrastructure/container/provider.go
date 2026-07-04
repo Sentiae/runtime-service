@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,33 @@ import (
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
 	"github.com/sentiae/runtime-service/pkg/config"
+)
+
+// Untrusted-code sandbox hardening constants. Every container launched by
+// this provider runs hostile, user-authored code (e.g. a flow "code" node
+// body). The defaults below are deliberately conservative; see
+// docs/designs/runtime-sandbox-hardening.md for the threat model.
+const (
+	// untrustedUID is the non-root uid:gid the code runs as inside the
+	// container. 65534:65534 is nobody:nogroup on every mainstream base
+	// image — numeric so it works even when /etc/passwd lacks the entry.
+	untrustedUID = "65534:65534"
+
+	// untrustedTmpfs is the ONLY writable mount: a size-capped tmpfs at /tmp
+	// (the rootfs is mounted read-only). mode=1777 is world-writable+sticky
+	// so the non-root user can write scratch/temp files; exec is kept so the
+	// compiled-language paths (Go/Rust/C write & run /tmp/code_bin) keep
+	// working. Size cap blocks disk-exhaustion.
+	untrustedTmpfs = "/tmp:rw,exec,size=256m,mode=1777"
+
+	// untrustedMaxPids caps process/thread creation to blunt fork bombs.
+	untrustedMaxPids = 256
+
+	// defaultContainerMemMB / defaultContainerVCPU are applied when the boot
+	// config leaves them unset so a container is NEVER launched without a
+	// memory and CPU cap (resource-exhaustion defense).
+	defaultContainerMemMB = 256
+	defaultContainerVCPU  = 1
 )
 
 // Provider implements VMProvider and ExecutionRunner using Docker containers.
@@ -50,36 +78,20 @@ func imageForLanguage(lang domain.Language) string {
 
 // Boot creates and starts a Docker container for the given language.
 // The container ID is stored in VMBootResult and should be placed into MicroVM.SocketPath.
+//
+// SECURITY: this container runs FULLY UNTRUSTED, user-authored code. The
+// launch is hardened against container escape, host-network exposure,
+// secret exfiltration, and resource exhaustion (see hardenedRunArgs and
+// docs/designs/runtime-sandbox-hardening.md). The container is NEVER run as
+// root, never with ambient capabilities, never with a writable rootfs, and
+// never on the host network unless an operator has explicitly opted in.
 func (p *Provider) Boot(ctx context.Context, bootCfg usecase.VMBootConfig) (*usecase.VMBootResult, error) {
 	start := time.Now()
 
 	image := imageForLanguage(bootCfg.Language)
 	containerName := "sentiae-vm-" + bootCfg.VMID.String()
 
-	args := []string{
-		"run", "-d",
-		"--name", containerName,
-	}
-
-	// Apply resource limits
-	if bootCfg.MemoryMB > 0 {
-		args = append(args, "--memory", fmt.Sprintf("%dm", bootCfg.MemoryMB))
-	}
-	if bootCfg.VCPU > 0 {
-		args = append(args, "--cpus", fmt.Sprintf("%d", bootCfg.VCPU))
-	}
-
-	// Network mode mapping
-	switch bootCfg.NetworkMode {
-	case domain.NetworkModeIsolated:
-		args = append(args, "--network", "none")
-	case domain.NetworkModeHost:
-		args = append(args, "--network", "host")
-	default:
-		// bridged or unset: use default Docker networking
-	}
-
-	args = append(args, image, "sleep", "infinity")
+	args := p.hardenedRunArgs(containerName, image, bootCfg)
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	var stdout, stderr bytes.Buffer
@@ -102,6 +114,74 @@ func (p *Provider) Boot(ctx context.Context, bootCfg usecase.VMBootConfig) (*use
 		SocketPath: containerName,
 		BootTimeMS: bootTimeMS,
 	}, nil
+}
+
+// hardenedRunArgs builds the `docker run` argument list for an UNTRUSTED
+// code-execution container. Threat model: the body is hostile and assumed to
+// attempt container escape, host-network access, secret theft, and resource
+// exhaustion. Each flag closes one of those:
+//
+//   - --user 65534:65534      never root → no root-owned escape primitives.
+//   - --cap-drop ALL          drop every Linux capability (no CAP_SYS_ADMIN,
+//     CAP_DAC_OVERRIDE, CAP_NET_RAW, …).
+//   - --security-opt no-new-privileges  setuid binaries can't re-escalate.
+//   - --read-only             immutable rootfs; nothing on disk can be tampered.
+//   - --tmpfs /tmp            only writable surface, size-capped (disk-exhaustion).
+//   - --pids-limit            cap fork bombs.
+//   - --memory / --memory-swap (equal) hard RAM cap with no swap escape hatch.
+//   - --cpus                  CPU cap.
+//   - --network none          no network by default (host net is an explicit
+//     operator opt-in only — hostile code on the host network can reach
+//     internal services and exfiltrate secrets).
+//
+// HOME/TMPDIR/cache env point at the tmpfs so the read-only rootfs +
+// non-root user don't break interpreter/toolchain temp writes (the code file
+// is docker-cp'd into /tmp and read world-readable). Defaults are forced so a
+// container is never launched uncapped even when bootCfg omits them.
+func (p *Provider) hardenedRunArgs(containerName, image string, bootCfg usecase.VMBootConfig) []string {
+	memMB := bootCfg.MemoryMB
+	if memMB <= 0 {
+		memMB = defaultContainerMemMB
+	}
+	cpus := bootCfg.VCPU
+	if cpus <= 0 {
+		cpus = defaultContainerVCPU
+	}
+
+	args := []string{
+		"run", "-d",
+		"--name", containerName,
+		// --- untrusted-code sandbox hardening ---
+		"--user", untrustedUID,
+		"--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges",
+		"--read-only",
+		"--tmpfs", untrustedTmpfs,
+		"--pids-limit", strconv.Itoa(untrustedMaxPids),
+		"--memory", fmt.Sprintf("%dm", memMB),
+		"--memory-swap", fmt.Sprintf("%dm", memMB), // == memory ⇒ swap disabled
+		"--cpus", fmt.Sprintf("%d", cpus),
+		// Writable temp/cache locations on the tmpfs (rootfs is read-only).
+		"-e", "HOME=/tmp",
+		"-e", "TMPDIR=/tmp",
+		"-e", "XDG_CACHE_HOME=/tmp/.cache",
+		"-e", "NPM_CONFIG_CACHE=/tmp/.npm",
+		"-e", "GOCACHE=/tmp/.cache/go-build",
+		"-e", "GOPATH=/tmp/go",
+	}
+
+	// Network: isolated by default. Host networking hands hostile code the
+	// host's network namespace, so it is gated behind an explicit operator
+	// opt-in (AllowHostNetwork) AND an explicit host request. Anything else —
+	// isolated, bridged, or unset — collapses to --network none.
+	network := "none"
+	if p.cfg.AllowHostNetwork && bootCfg.NetworkMode == domain.NetworkModeHost {
+		network = "host"
+	}
+	args = append(args, "--network", network)
+
+	args = append(args, image, "sleep", "infinity")
+	return args
 }
 
 // Terminate forcefully removes a Docker container.

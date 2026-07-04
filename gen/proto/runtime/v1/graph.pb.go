@@ -495,9 +495,15 @@ func (x *DeployGraphRequest) GetGraphId() string {
 }
 
 type ExecuteGraphRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	GraphId       string                 `protobuf:"bytes,1,opt,name=graph_id,json=graphId,proto3" json:"graph_id,omitempty"`
-	Input         *structpb.Struct       `protobuf:"bytes,2,opt,name=input,proto3" json:"input,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	GraphId string                 `protobuf:"bytes,1,opt,name=graph_id,json=graphId,proto3" json:"graph_id,omitempty"`
+	Input   *structpb.Struct       `protobuf:"bytes,2,opt,name=input,proto3" json:"input,omitempty"`
+	// seeded_outputs lets the caller (deployment-service node-output cache) skip
+	// re-executing unchanged upstream nodes: keyed by FlowNode.name (the graph
+	// node name), each entry is that node's previously-computed output. A seeded
+	// node is NOT executed — its output is taken from the seed and propagated
+	// downstream exactly as a real run would, and it spins no microVM.
+	SeededOutputs map[string]*structpb.Struct `protobuf:"bytes,3,rep,name=seeded_outputs,json=seededOutputs,proto3" json:"seeded_outputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -542,6 +548,13 @@ func (x *ExecuteGraphRequest) GetGraphId() string {
 func (x *ExecuteGraphRequest) GetInput() *structpb.Struct {
 	if x != nil {
 		return x.Input
+	}
+	return nil
+}
+
+func (x *ExecuteGraphRequest) GetSeededOutputs() map[string]*structpb.Struct {
+	if x != nil {
+		return x.SeededOutputs
 	}
 	return nil
 }
@@ -859,6 +872,7 @@ type NodeExecution struct {
 	StartedAt        string                 `protobuf:"bytes,13,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`       // RFC3339, empty when unset
 	CompletedAt      string                 `protobuf:"bytes,14,opt,name=completed_at,json=completedAt,proto3" json:"completed_at,omitempty"` // RFC3339, empty when unset
 	CreatedAt        string                 `protobuf:"bytes,15,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`       // RFC3339
+	Cached           bool                   `protobuf:"varint,16,opt,name=cached,proto3" json:"cached,omitempty"`                             // true when output was seeded from cache (not executed)
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -996,6 +1010,13 @@ func (x *NodeExecution) GetCreatedAt() string {
 		return x.CreatedAt
 	}
 	return ""
+}
+
+func (x *NodeExecution) GetCached() bool {
+	if x != nil {
+		return x.Cached
+	}
+	return false
 }
 
 type ListNodeExecutionsRequest struct {
@@ -1578,10 +1599,14 @@ const file_proto_runtime_v1_graph_proto_rawDesc = "" +
 	"\x05nodes\x18\x04 \x03(\v2\x1a.runtime.v1.GraphNodeInputR\x05nodes\x120\n" +
 	"\x05edges\x18\x05 \x03(\v2\x1a.runtime.v1.GraphEdgeInputR\x05edges\"/\n" +
 	"\x12DeployGraphRequest\x12\x19\n" +
-	"\bgraph_id\x18\x01 \x01(\tR\agraphId\"_\n" +
+	"\bgraph_id\x18\x01 \x01(\tR\agraphId\"\x95\x02\n" +
 	"\x13ExecuteGraphRequest\x12\x19\n" +
 	"\bgraph_id\x18\x01 \x01(\tR\agraphId\x12-\n" +
-	"\x05input\x18\x02 \x01(\v2\x17.google.protobuf.StructR\x05input\"\xa3\x04\n" +
+	"\x05input\x18\x02 \x01(\v2\x17.google.protobuf.StructR\x05input\x12Y\n" +
+	"\x0eseeded_outputs\x18\x03 \x03(\v22.runtime.v1.ExecuteGraphRequest.SeededOutputsEntryR\rseededOutputs\x1aY\n" +
+	"\x12SeededOutputsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12-\n" +
+	"\x05value\x18\x02 \x01(\v2\x17.google.protobuf.StructR\x05value:\x028\x01\"\xa3\x04\n" +
 	"\x0eGraphExecution\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x19\n" +
 	"\bgraph_id\x18\x02 \x01(\tR\agraphId\x12'\n" +
@@ -1610,7 +1635,7 @@ const file_proto_runtime_v1_graph_proto_rawDesc = "" +
 	"\x1bCancelGraphExecutionRequest\x12!\n" +
 	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\".\n" +
 	"\x1cCancelGraphExecutionResponse\x12\x0e\n" +
-	"\x02ok\x18\x01 \x01(\bR\x02ok\"\x87\x04\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\"\x9f\x04\n" +
 	"\rNodeExecution\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12,\n" +
 	"\x12graph_execution_id\x18\x02 \x01(\tR\x10graphExecutionId\x12\"\n" +
@@ -1630,7 +1655,8 @@ const file_proto_runtime_v1_graph_proto_rawDesc = "" +
 	"started_at\x18\r \x01(\tR\tstartedAt\x12!\n" +
 	"\fcompleted_at\x18\x0e \x01(\tR\vcompletedAt\x12\x1d\n" +
 	"\n" +
-	"created_at\x18\x0f \x01(\tR\tcreatedAt\">\n" +
+	"created_at\x18\x0f \x01(\tR\tcreatedAt\x12\x16\n" +
+	"\x06cached\x18\x10 \x01(\bR\x06cached\">\n" +
 	"\x19ListNodeExecutionsRequest\x12!\n" +
 	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\"M\n" +
 	"\x1aListNodeExecutionsResponse\x12/\n" +
@@ -1688,7 +1714,7 @@ func file_proto_runtime_v1_graph_proto_rawDescGZIP() []byte {
 	return file_proto_runtime_v1_graph_proto_rawDescData
 }
 
-var file_proto_runtime_v1_graph_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_proto_runtime_v1_graph_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_proto_runtime_v1_graph_proto_goTypes = []any{
 	(*Graph)(nil),                        // 0: runtime.v1.Graph
 	(*GraphNodeInput)(nil),               // 1: runtime.v1.GraphNodeInput
@@ -1712,49 +1738,52 @@ var file_proto_runtime_v1_graph_proto_goTypes = []any{
 	(*ListGraphExecutionsRequest)(nil),   // 19: runtime.v1.ListGraphExecutionsRequest
 	(*ListGraphExecutionsResponse)(nil),  // 20: runtime.v1.ListGraphExecutionsResponse
 	(*GetNodeExecutionRequest)(nil),      // 21: runtime.v1.GetNodeExecutionRequest
-	(*structpb.Struct)(nil),              // 22: google.protobuf.Struct
+	nil,                                  // 22: runtime.v1.ExecuteGraphRequest.SeededOutputsEntry
+	(*structpb.Struct)(nil),              // 23: google.protobuf.Struct
 }
 var file_proto_runtime_v1_graph_proto_depIdxs = []int32{
-	22, // 0: runtime.v1.GraphNodeInput.config:type_name -> google.protobuf.Struct
+	23, // 0: runtime.v1.GraphNodeInput.config:type_name -> google.protobuf.Struct
 	2,  // 1: runtime.v1.GraphNodeInput.resources:type_name -> runtime.v1.GraphNodeResources
-	22, // 2: runtime.v1.GraphNodeInput.position:type_name -> google.protobuf.Struct
+	23, // 2: runtime.v1.GraphNodeInput.position:type_name -> google.protobuf.Struct
 	1,  // 3: runtime.v1.CreateGraphRequest.nodes:type_name -> runtime.v1.GraphNodeInput
 	3,  // 4: runtime.v1.CreateGraphRequest.edges:type_name -> runtime.v1.GraphEdgeInput
-	22, // 5: runtime.v1.ExecuteGraphRequest.input:type_name -> google.protobuf.Struct
-	22, // 6: runtime.v1.GraphExecution.input:type_name -> google.protobuf.Struct
-	22, // 7: runtime.v1.GraphExecution.output:type_name -> google.protobuf.Struct
-	22, // 8: runtime.v1.NodeExecution.input:type_name -> google.protobuf.Struct
-	22, // 9: runtime.v1.NodeExecution.output:type_name -> google.protobuf.Struct
-	11, // 10: runtime.v1.ListNodeExecutionsResponse.items:type_name -> runtime.v1.NodeExecution
-	0,  // 11: runtime.v1.ListGraphsResponse.items:type_name -> runtime.v1.Graph
-	7,  // 12: runtime.v1.ListGraphExecutionsResponse.items:type_name -> runtime.v1.GraphExecution
-	4,  // 13: runtime.v1.GraphService.CreateGraph:input_type -> runtime.v1.CreateGraphRequest
-	5,  // 14: runtime.v1.GraphService.DeployGraph:input_type -> runtime.v1.DeployGraphRequest
-	14, // 15: runtime.v1.GraphService.GetGraph:input_type -> runtime.v1.GetGraphRequest
-	15, // 16: runtime.v1.GraphService.ListGraphs:input_type -> runtime.v1.ListGraphsRequest
-	17, // 17: runtime.v1.GraphService.DeleteGraph:input_type -> runtime.v1.DeleteGraphRequest
-	6,  // 18: runtime.v1.GraphService.ExecuteGraph:input_type -> runtime.v1.ExecuteGraphRequest
-	8,  // 19: runtime.v1.GraphService.GetGraphExecution:input_type -> runtime.v1.GetGraphExecutionRequest
-	19, // 20: runtime.v1.GraphService.ListGraphExecutions:input_type -> runtime.v1.ListGraphExecutionsRequest
-	9,  // 21: runtime.v1.GraphService.CancelGraphExecution:input_type -> runtime.v1.CancelGraphExecutionRequest
-	12, // 22: runtime.v1.GraphService.ListNodeExecutions:input_type -> runtime.v1.ListNodeExecutionsRequest
-	21, // 23: runtime.v1.GraphService.GetNodeExecution:input_type -> runtime.v1.GetNodeExecutionRequest
-	0,  // 24: runtime.v1.GraphService.CreateGraph:output_type -> runtime.v1.Graph
-	0,  // 25: runtime.v1.GraphService.DeployGraph:output_type -> runtime.v1.Graph
-	0,  // 26: runtime.v1.GraphService.GetGraph:output_type -> runtime.v1.Graph
-	16, // 27: runtime.v1.GraphService.ListGraphs:output_type -> runtime.v1.ListGraphsResponse
-	18, // 28: runtime.v1.GraphService.DeleteGraph:output_type -> runtime.v1.DeleteGraphResponse
-	7,  // 29: runtime.v1.GraphService.ExecuteGraph:output_type -> runtime.v1.GraphExecution
-	7,  // 30: runtime.v1.GraphService.GetGraphExecution:output_type -> runtime.v1.GraphExecution
-	20, // 31: runtime.v1.GraphService.ListGraphExecutions:output_type -> runtime.v1.ListGraphExecutionsResponse
-	10, // 32: runtime.v1.GraphService.CancelGraphExecution:output_type -> runtime.v1.CancelGraphExecutionResponse
-	13, // 33: runtime.v1.GraphService.ListNodeExecutions:output_type -> runtime.v1.ListNodeExecutionsResponse
-	11, // 34: runtime.v1.GraphService.GetNodeExecution:output_type -> runtime.v1.NodeExecution
-	24, // [24:35] is the sub-list for method output_type
-	13, // [13:24] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	23, // 5: runtime.v1.ExecuteGraphRequest.input:type_name -> google.protobuf.Struct
+	22, // 6: runtime.v1.ExecuteGraphRequest.seeded_outputs:type_name -> runtime.v1.ExecuteGraphRequest.SeededOutputsEntry
+	23, // 7: runtime.v1.GraphExecution.input:type_name -> google.protobuf.Struct
+	23, // 8: runtime.v1.GraphExecution.output:type_name -> google.protobuf.Struct
+	23, // 9: runtime.v1.NodeExecution.input:type_name -> google.protobuf.Struct
+	23, // 10: runtime.v1.NodeExecution.output:type_name -> google.protobuf.Struct
+	11, // 11: runtime.v1.ListNodeExecutionsResponse.items:type_name -> runtime.v1.NodeExecution
+	0,  // 12: runtime.v1.ListGraphsResponse.items:type_name -> runtime.v1.Graph
+	7,  // 13: runtime.v1.ListGraphExecutionsResponse.items:type_name -> runtime.v1.GraphExecution
+	23, // 14: runtime.v1.ExecuteGraphRequest.SeededOutputsEntry.value:type_name -> google.protobuf.Struct
+	4,  // 15: runtime.v1.GraphService.CreateGraph:input_type -> runtime.v1.CreateGraphRequest
+	5,  // 16: runtime.v1.GraphService.DeployGraph:input_type -> runtime.v1.DeployGraphRequest
+	14, // 17: runtime.v1.GraphService.GetGraph:input_type -> runtime.v1.GetGraphRequest
+	15, // 18: runtime.v1.GraphService.ListGraphs:input_type -> runtime.v1.ListGraphsRequest
+	17, // 19: runtime.v1.GraphService.DeleteGraph:input_type -> runtime.v1.DeleteGraphRequest
+	6,  // 20: runtime.v1.GraphService.ExecuteGraph:input_type -> runtime.v1.ExecuteGraphRequest
+	8,  // 21: runtime.v1.GraphService.GetGraphExecution:input_type -> runtime.v1.GetGraphExecutionRequest
+	19, // 22: runtime.v1.GraphService.ListGraphExecutions:input_type -> runtime.v1.ListGraphExecutionsRequest
+	9,  // 23: runtime.v1.GraphService.CancelGraphExecution:input_type -> runtime.v1.CancelGraphExecutionRequest
+	12, // 24: runtime.v1.GraphService.ListNodeExecutions:input_type -> runtime.v1.ListNodeExecutionsRequest
+	21, // 25: runtime.v1.GraphService.GetNodeExecution:input_type -> runtime.v1.GetNodeExecutionRequest
+	0,  // 26: runtime.v1.GraphService.CreateGraph:output_type -> runtime.v1.Graph
+	0,  // 27: runtime.v1.GraphService.DeployGraph:output_type -> runtime.v1.Graph
+	0,  // 28: runtime.v1.GraphService.GetGraph:output_type -> runtime.v1.Graph
+	16, // 29: runtime.v1.GraphService.ListGraphs:output_type -> runtime.v1.ListGraphsResponse
+	18, // 30: runtime.v1.GraphService.DeleteGraph:output_type -> runtime.v1.DeleteGraphResponse
+	7,  // 31: runtime.v1.GraphService.ExecuteGraph:output_type -> runtime.v1.GraphExecution
+	7,  // 32: runtime.v1.GraphService.GetGraphExecution:output_type -> runtime.v1.GraphExecution
+	20, // 33: runtime.v1.GraphService.ListGraphExecutions:output_type -> runtime.v1.ListGraphExecutionsResponse
+	10, // 34: runtime.v1.GraphService.CancelGraphExecution:output_type -> runtime.v1.CancelGraphExecutionResponse
+	13, // 35: runtime.v1.GraphService.ListNodeExecutions:output_type -> runtime.v1.ListNodeExecutionsResponse
+	11, // 36: runtime.v1.GraphService.GetNodeExecution:output_type -> runtime.v1.NodeExecution
+	26, // [26:37] is the sub-list for method output_type
+	15, // [15:26] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_proto_runtime_v1_graph_proto_init() }
@@ -1768,7 +1797,7 @@ func file_proto_runtime_v1_graph_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_runtime_v1_graph_proto_rawDesc), len(file_proto_runtime_v1_graph_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   22,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

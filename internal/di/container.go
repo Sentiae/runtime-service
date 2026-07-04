@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	httphandler "github.com/sentiae/runtime-service/internal/handler/http"
 	"github.com/sentiae/runtime-service/internal/infrastructure/agent"
 	"github.com/sentiae/runtime-service/internal/infrastructure/canvasservice"
+	"github.com/sentiae/runtime-service/internal/infrastructure/compiler"
 	"github.com/sentiae/runtime-service/internal/infrastructure/container"
 	"github.com/sentiae/runtime-service/internal/infrastructure/executors"
 	"github.com/sentiae/runtime-service/internal/infrastructure/executors/a11y"
@@ -33,6 +35,7 @@ import (
 	"github.com/sentiae/runtime-service/internal/infrastructure/foundry"
 	"github.com/sentiae/runtime-service/internal/infrastructure/gitservice"
 	"github.com/sentiae/runtime-service/internal/infrastructure/messaging"
+	"github.com/sentiae/runtime-service/internal/infrastructure/objectstore"
 	"github.com/sentiae/runtime-service/internal/infrastructure/simulated"
 	"github.com/sentiae/runtime-service/internal/repository"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
@@ -101,6 +104,11 @@ type Container struct {
 	// Pause→CreateSnapshot→Resume from Boot-time registration.
 	FCCheckpointScheduler *firecracker.CheckpointScheduler
 
+	// Warm-VM / snapshot-clone code-execution path. When wired (executor
+	// firecracker + APP_WARM_POOL_ENABLED), code nodes run on a fast warm
+	// clone (~160ms) instead of a single-shot cold boot. Nil → cold path.
+	WarmPool *firecracker.WarmPool
+
 	// Inbound event handler service (canvas → runtime execution requests).
 	InboundEventHandlerSvc *usecase.InboundEventHandlerService
 
@@ -131,6 +139,10 @@ type Container struct {
 	// against freshly acquired VMs. Wired here so the commit-added
 	// consumer can submit jobs as they arrive.
 	TestPool *usecase.PoolScheduler
+
+	// Multi-file project compile (ephemeral build container, no execution).
+	ProjectCompiler usecase.ProjectCompiler
+	CompileUC       *usecase.CompileProject
 
 	// Use Cases
 	ExecutionUC  usecase.ExecutionUseCase
@@ -261,24 +273,36 @@ func (c *Container) initInfrastructure(cfg *config.Config) {
 		// §9.3 — wire per-VM auto-snapshot scheduler.
 		c.initFirecrackerCheckpointScheduler(cfg)
 	case "simulated":
-		// Simulated provider — no Docker or Firecracker needed
+		// Simulated provider — no Docker or Firecracker needed. This is an
+		// EXPLICIT operator choice, but it still FAKES execution (echoes code
+		// back, exit 0) — code nodes do not really run and are not sandboxed.
 		simProv := simulated.NewProvider()
 		c.VMProvider = simProv
 		c.ExecutionRunner = simProv
-		log.Println("Simulated provider initialized (no Docker/Firecracker required)")
+		log.Println("WARNING: SIMULATED executor selected — code nodes are FAKED (not executed, not sandboxed).")
 	default:
 		// Default to container provider (works on macOS and Linux)
 		if dockerAvailable() {
 			c.ContainerProvider = container.NewProvider(cfg.Container)
 			c.VMProvider = c.ContainerProvider
 			c.ExecutionRunner = c.ContainerProvider
-			log.Println("Docker container provider initialized (dev mode)")
+			log.Println("Docker container provider initialized (hardened untrusted-code sandbox)")
 		} else {
-			log.Println("Warning: Docker is not available, falling back to simulated executor")
+			// FAIL LOUD: no Docker → no real sandbox. We deliberately do NOT
+			// fall back to in-process execution (running untrusted bodies in
+			// this process is forbidden). The simulated provider FAKES runs,
+			// so unsandboxed/unexecuted runs must never be mistaken for real
+			// ones — make that unmissable in the logs.
+			log.Println("================================================================")
+			log.Println("WARNING: Docker is NOT available — falling back to SIMULATED executor.")
+			log.Println("WARNING: code nodes are NOT really executing and NOT sandboxed.")
+			log.Println("WARNING: execution results are FAKE (code echoed back, exit code 0).")
+			log.Println("WARNING: install Docker or set APP_EXECUTOR_TYPE=firecracker for")
+			log.Println("WARNING: real, isolated code execution before serving users.")
+			log.Println("================================================================")
 			simProv := simulated.NewProvider()
 			c.VMProvider = simProv
 			c.ExecutionRunner = simProv
-			log.Println("Simulated provider initialized (Docker fallback)")
 		}
 	}
 
@@ -418,8 +442,31 @@ func (c *Container) initRepositories() {
 // initUseCases initializes all use cases
 func (c *Container) initUseCases(cfg *config.Config) {
 	c.VMUC = usecase.NewVMService(c.VMRepo, c.VMProvider)
-	c.SnapshotUC = usecase.NewSnapshotService(c.SnapshotRepo, c.VMRepo, c.VMProvider)
+
+	// Durable snapshot object-store backing. When enabled, build a
+	// CachingStore (S3/MinIO source of truth + local FilesystemStore warm
+	// cache) and inject it so snapshots survive host loss and restore on
+	// any host. When disabled (or on construction failure) the snapshot
+	// service stays on the local-only flow — nil store is the safe default.
+	snapSvc := usecase.NewSnapshotService(c.SnapshotRepo, c.VMRepo, c.VMProvider)
+	// Build the durable snapshot store once and reuse it for both the snapshot
+	// service and the warm-pool template persistence (don't double-build).
+	snapshotStore := c.buildSnapshotStore(cfg)
+	if snapshotStore != nil {
+		if injectable, ok := snapSvc.(usecase.SnapshotStoreInjectable); ok {
+			injectable.SetArtifactStore(snapshotStore)
+			log.Println("Snapshot durable object store wired (S3/MinIO + local cache)")
+		}
+	}
+	c.SnapshotUC = snapSvc
 	c.ExecutionUC = usecase.NewExecutionService(c.ExecutionRepo, c.MetricsRepo, c.VMUC, c.ExecutionRunner, c.VMProvider)
+
+	// Multi-file project compile. Backed by an ephemeral `docker run --rm`
+	// build container — independent of the Firecracker execution pool.
+	// When docker is unavailable the compiler self-reports
+	// ErrCompileToolchainUnavailable at call time (Unavailable to callers).
+	c.ProjectCompiler = compiler.NewDockerCompiler()
+	c.CompileUC = usecase.NewCompileProject(c.ProjectCompiler)
 
 	// Wire event publisher for execution events (cross-service integration)
 	type eventPublishable interface {
@@ -465,6 +512,29 @@ func (c *Container) initUseCases(cfg *config.Config) {
 		c.ExecutionUC, c.EventPublisher,
 	)
 	c.GraphEngine.SetTraceRecorder(c.TraceRecorder)
+
+	// Wire the warm-clone code runner when enabled. Gated on executor
+	// firecracker + a live FCProvider so the WarmManager has the FC config
+	// (binary/kernel/rootfs/socket/snapshot paths) it needs. Disabled →
+	// engine.warm stays nil → code nodes run the cold single-shot path.
+	if cfg.App.ExecutorType == "firecracker" && cfg.Firecracker.WarmPoolEnabled && c.FCProvider != nil {
+		warmMgr := firecracker.NewWarmManager(c.FCProvider)
+		warmAgent := firecracker.NewAgentClient(10 * time.Second)
+		// Reuse the same durable store the snapshot service uses (nil ⇒ the
+		// pool stays local-only). Pulled/persisted template files land under a
+		// stable per-language path inside the FC snapshot dir.
+		templateDir := filepath.Join(cfg.Firecracker.SnapshotPath, "templates")
+		// readyN > 0 keeps a pre-warmed buffer of restored clones per language so
+		// an execution grabs one instantly; 0 ⇒ on-demand only (no goroutines).
+		readyN := cfg.Firecracker.WarmPoolReady
+		c.WarmPool = firecracker.NewWarmPool(warmMgr, warmAgent, snapshotStore, templateDir, readyN)
+		c.GraphEngine.SetWarmRunner(c.WarmPool)
+		if snapshotStore != nil {
+			log.Printf("[WARM-POOL] enabled — code nodes run on fast warm clones (durable template persistence on, prewarm_ready=%d)", readyN)
+		} else {
+			log.Printf("[WARM-POOL] enabled — code nodes run on fast warm clones (prewarm_ready=%d)", readyN)
+		}
+	}
 
 	// Initialize graph debug service
 	c.GraphDebugUC = usecase.NewGraphDebugService(
@@ -665,6 +735,11 @@ func (c *Container) initHandlers() {
 	// 9.4 — agent registry + dispatcher HTTP surface.
 	c.HTTPServer.SetRuntimeAgentHandler(httphandler.NewRuntimeAgentHandler(c.AgentRegistry, c.RuntimeAgentRepo))
 
+	// Warm-VM fleet visibility + control. c.WarmPool may be nil (warm pool
+	// disabled); NewFleetHandler accepts nil and reports the fleet as disabled,
+	// so we register the routes unconditionally.
+	c.HTTPServer.SetFleetHandler(httphandler.NewFleetHandler(c.WarmPool))
+
 	// §9.4 — customer-agent enrolment endpoint. Signs CSRs submitted
 	// by freshly-installed customer-hosted agents. Unwired when the CA
 	// paths aren't set (dev deployments / tenants not using the agent).
@@ -765,6 +840,8 @@ func (c *Container) initHandlers() {
 			VMUC:             c.VMUC,
 			ExecutionsLister: c.ExecutionUC,
 		})
+		// Wire the multi-file project compile RPC (ephemeral build container).
+		c.GRPCServer.ExecutionServer().WithCompiler(c.CompileUC)
 	}
 
 	// Register routes now that every Set*Handler has fired. NewServer
@@ -856,6 +933,14 @@ func (c *Container) Close() error {
 	for _, pool := range c.FCPools {
 		if pool != nil {
 			pool.Close(context.Background())
+		}
+	}
+	// Pre-warm clone buffer: cancel the replenisher goroutines and destroy
+	// every buffered ready clone (freeing its index) so no warm VMs / netns
+	// leak past shutdown. No-op when readyN==0 (nothing was started).
+	if c.WarmPool != nil {
+		if err := c.WarmPool.Close(); err != nil {
+			log.Printf("Warning: failed to close warm pool: %v", err)
 		}
 	}
 	// §9.3 — stop the per-VM snapshot scheduler.
@@ -953,6 +1038,47 @@ func (c *Container) initFirecrackerCheckpointScheduler(cfg *config.Config) {
 		interval = firecracker.DefaultCheckpointIntervalMinutes
 	}
 	log.Printf("[FC-CHECKPOINT] scheduler wired (interval=%dm)", interval)
+}
+
+// buildSnapshotStore constructs the durable snapshot ArtifactStore when
+// snapshot_store.enabled is set: an S3/MinIO backend (source of truth)
+// fronted by a local FilesystemStore cache (fast restore path). Any
+// construction failure is logged and yields nil so the snapshot service
+// degrades to the local-only flow rather than failing service start.
+func (c *Container) buildSnapshotStore(cfg *config.Config) usecase.ArtifactStore {
+	sc := cfg.SnapshotStore
+	if !sc.Enabled {
+		return nil
+	}
+	remote, err := objectstore.NewS3ArtifactStore(objectstore.S3Config{
+		Endpoint:  sc.Endpoint,
+		Region:    sc.Region,
+		Bucket:    sc.Bucket,
+		AccessKey: sc.AccessKey,
+		SecretKey: sc.SecretKey,
+		UseSSL:    sc.UseSSL,
+		PathStyle: sc.PathStyle,
+	})
+	if err != nil {
+		log.Printf("[snapshot-store] disabled: failed to init S3 backend: %v", err)
+		return nil
+	}
+	cacheDir := sc.CacheDir
+	if cacheDir == "" {
+		cacheDir = filepath.Join(cfg.Firecracker.SnapshotPath, "cache")
+	}
+	local, err := usecase.NewFilesystemStore(cacheDir)
+	if err != nil {
+		log.Printf("[snapshot-store] disabled: failed to init local cache at %s: %v", cacheDir, err)
+		return nil
+	}
+	caching, err := objectstore.NewCachingStore(local, remote)
+	if err != nil {
+		log.Printf("[snapshot-store] disabled: failed to wire caching store: %v", err)
+		return nil
+	}
+	log.Printf("[snapshot-store] enabled (bucket=%s, endpoint=%s, cache=%s)", sc.Bucket, sc.Endpoint, cacheDir)
+	return caching
 }
 
 // dockerAvailable returns true if the Docker CLI is installed and the daemon

@@ -25,11 +25,19 @@ type Snapshot struct {
 	Language       Language   `json:"language" gorm:"type:varchar(20);not null;index"`
 	MemoryFilePath string     `json:"memory_file_path" gorm:"type:varchar(500);not null"`
 	StateFilePath  string     `json:"state_file_path" gorm:"type:varchar(500);not null"`
-	SizeBytes      int64      `json:"size_bytes" gorm:"not null"`
-	VCPU           int        `json:"vcpu" gorm:"not null"`
-	MemoryMB       int        `json:"memory_mb" gorm:"not null"`
-	Description    string     `json:"description,omitempty" gorm:"type:text"`
-	IsBaseImage    bool       `json:"is_base_image" gorm:"not null;default:false;index"`
+	// MemoryObjectKey / StateObjectKey are the durable object-store keys
+	// (e.g. snapshots/<id>/mem) where the mem/state files were uploaded
+	// after creation. Empty when no object store is configured (local-only
+	// flow). On restore, a missing local file is re-fetched from the
+	// object store using these keys, making the snapshot restorable on any
+	// host — the Fly.io/e2b "object store of record" pattern.
+	MemoryObjectKey string `json:"memory_object_key,omitempty" gorm:"type:varchar(500)"`
+	StateObjectKey  string `json:"state_object_key,omitempty" gorm:"type:varchar(500)"`
+	SizeBytes       int64  `json:"size_bytes" gorm:"not null"`
+	VCPU            int    `json:"vcpu" gorm:"not null"`
+	MemoryMB        int    `json:"memory_mb" gorm:"not null"`
+	Description     string `json:"description,omitempty" gorm:"type:text"`
+	IsBaseImage     bool   `json:"is_base_image" gorm:"not null;default:false;index"`
 	// Kind distinguishes user-triggered snapshots from automatic
 	// checkpoints. Indexed so the scheduler can quickly find "the latest
 	// checkpoint for VM X" without scanning manual snapshots.

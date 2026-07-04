@@ -1985,6 +1985,275 @@ func (x *VMUsage) GetEstimatedCostUsd() float64 {
 	return 0
 }
 
+type CompileRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	OrganizationId string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
+	RequestedBy    string                 `protobuf:"bytes,2,opt,name=requested_by,json=requestedBy,proto3" json:"requested_by,omitempty"`
+	Language       string                 `protobuf:"bytes,3,opt,name=language,proto3" json:"language,omitempty"`
+	// files is the full project file set. Paths are repo-relative and may
+	// contain subdirectories (e.g. "internal/domain/user.go").
+	Files []*CompileSourceFile `protobuf:"bytes,4,rep,name=files,proto3" json:"files,omitempty"`
+	// timeout_sec bounds the whole build. Zero → server default.
+	TimeoutSec    int32 `protobuf:"varint,5,opt,name=timeout_sec,json=timeoutSec,proto3" json:"timeout_sec,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CompileRequest) Reset() {
+	*x = CompileRequest{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompileRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompileRequest) ProtoMessage() {}
+
+func (x *CompileRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompileRequest.ProtoReflect.Descriptor instead.
+func (*CompileRequest) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *CompileRequest) GetOrganizationId() string {
+	if x != nil {
+		return x.OrganizationId
+	}
+	return ""
+}
+
+func (x *CompileRequest) GetRequestedBy() string {
+	if x != nil {
+		return x.RequestedBy
+	}
+	return ""
+}
+
+func (x *CompileRequest) GetLanguage() string {
+	if x != nil {
+		return x.Language
+	}
+	return ""
+}
+
+func (x *CompileRequest) GetFiles() []*CompileSourceFile {
+	if x != nil {
+		return x.Files
+	}
+	return nil
+}
+
+func (x *CompileRequest) GetTimeoutSec() int32 {
+	if x != nil {
+		return x.TimeoutSec
+	}
+	return 0
+}
+
+type CompileSourceFile struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	Content       string                 `protobuf:"bytes,2,opt,name=content,proto3" json:"content,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CompileSourceFile) Reset() {
+	*x = CompileSourceFile{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompileSourceFile) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompileSourceFile) ProtoMessage() {}
+
+func (x *CompileSourceFile) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompileSourceFile.ProtoReflect.Descriptor instead.
+func (*CompileSourceFile) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *CompileSourceFile) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
+func (x *CompileSourceFile) GetContent() string {
+	if x != nil {
+		return x.Content
+	}
+	return ""
+}
+
+type CompileResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// ok is true when the project compiled without error (exit 0).
+	Ok          bool                 `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`
+	Diagnostics []*CompileDiagnostic `protobuf:"bytes,2,rep,name=diagnostics,proto3" json:"diagnostics,omitempty"`
+	// raw_output is the combined stdout+stderr of the build, truncated.
+	RawOutput     string `protobuf:"bytes,3,opt,name=raw_output,json=rawOutput,proto3" json:"raw_output,omitempty"`
+	CompileTimeMs int64  `protobuf:"varint,4,opt,name=compile_time_ms,json=compileTimeMs,proto3" json:"compile_time_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CompileResponse) Reset() {
+	*x = CompileResponse{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompileResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompileResponse) ProtoMessage() {}
+
+func (x *CompileResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompileResponse.ProtoReflect.Descriptor instead.
+func (*CompileResponse) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *CompileResponse) GetOk() bool {
+	if x != nil {
+		return x.Ok
+	}
+	return false
+}
+
+func (x *CompileResponse) GetDiagnostics() []*CompileDiagnostic {
+	if x != nil {
+		return x.Diagnostics
+	}
+	return nil
+}
+
+func (x *CompileResponse) GetRawOutput() string {
+	if x != nil {
+		return x.RawOutput
+	}
+	return ""
+}
+
+func (x *CompileResponse) GetCompileTimeMs() int64 {
+	if x != nil {
+		return x.CompileTimeMs
+	}
+	return 0
+}
+
+type CompileDiagnostic struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	File          string                 `protobuf:"bytes,1,opt,name=file,proto3" json:"file,omitempty"`
+	Line          int32                  `protobuf:"varint,2,opt,name=line,proto3" json:"line,omitempty"`
+	Column        int32                  `protobuf:"varint,3,opt,name=column,proto3" json:"column,omitempty"`
+	Message       string                 `protobuf:"bytes,4,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CompileDiagnostic) Reset() {
+	*x = CompileDiagnostic{}
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompileDiagnostic) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompileDiagnostic) ProtoMessage() {}
+
+func (x *CompileDiagnostic) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_runtime_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompileDiagnostic.ProtoReflect.Descriptor instead.
+func (*CompileDiagnostic) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_runtime_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *CompileDiagnostic) GetFile() string {
+	if x != nil {
+		return x.File
+	}
+	return ""
+}
+
+func (x *CompileDiagnostic) GetLine() int32 {
+	if x != nil {
+		return x.Line
+	}
+	return 0
+}
+
+func (x *CompileDiagnostic) GetColumn() int32 {
+	if x != nil {
+		return x.Column
+	}
+	return 0
+}
+
+func (x *CompileDiagnostic) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
 var File_proto_runtime_v1_runtime_proto protoreflect.FileDescriptor
 
 const file_proto_runtime_v1_runtime_proto_rawDesc = "" +
@@ -2166,7 +2435,28 @@ const file_proto_runtime_v1_runtime_proto_rawDesc = "" +
 	"\x0fexecution_count\x18\x05 \x01(\x05R\x0eexecutionCount\x12\x1d\n" +
 	"\n" +
 	"active_vms\x18\x06 \x01(\x05R\tactiveVms\x12,\n" +
-	"\x12estimated_cost_usd\x18\a \x01(\x01R\x10estimatedCostUsd2\xfd\b\n" +
+	"\x12estimated_cost_usd\x18\a \x01(\x01R\x10estimatedCostUsd\"\xce\x01\n" +
+	"\x0eCompileRequest\x12'\n" +
+	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\x12!\n" +
+	"\frequested_by\x18\x02 \x01(\tR\vrequestedBy\x12\x1a\n" +
+	"\blanguage\x18\x03 \x01(\tR\blanguage\x123\n" +
+	"\x05files\x18\x04 \x03(\v2\x1d.runtime.v1.CompileSourceFileR\x05files\x12\x1f\n" +
+	"\vtimeout_sec\x18\x05 \x01(\x05R\n" +
+	"timeoutSec\"A\n" +
+	"\x11CompileSourceFile\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\x12\x18\n" +
+	"\acontent\x18\x02 \x01(\tR\acontent\"\xa9\x01\n" +
+	"\x0fCompileResponse\x12\x0e\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\x12?\n" +
+	"\vdiagnostics\x18\x02 \x03(\v2\x1d.runtime.v1.CompileDiagnosticR\vdiagnostics\x12\x1d\n" +
+	"\n" +
+	"raw_output\x18\x03 \x01(\tR\trawOutput\x12&\n" +
+	"\x0fcompile_time_ms\x18\x04 \x01(\x03R\rcompileTimeMs\"m\n" +
+	"\x11CompileDiagnostic\x12\x12\n" +
+	"\x04file\x18\x01 \x01(\tR\x04file\x12\x12\n" +
+	"\x04line\x18\x02 \x01(\x05R\x04line\x12\x16\n" +
+	"\x06column\x18\x03 \x01(\x05R\x06column\x12\x18\n" +
+	"\amessage\x18\x04 \x01(\tR\amessage2\xc1\t\n" +
 	"\x0eRuntimeService\x12Z\n" +
 	"\x0fCreateExecution\x12\".runtime.v1.CreateExecutionRequest\x1a#.runtime.v1.CreateExecutionResponse\x12Q\n" +
 	"\fGetExecution\x12\x1f.runtime.v1.GetExecutionRequest\x1a .runtime.v1.GetExecutionResponse\x12W\n" +
@@ -2181,7 +2471,8 @@ const file_proto_runtime_v1_runtime_proto_rawDesc = "" +
 	"\x0fGetTestCoverage\x12\".runtime.v1.GetTestCoverageRequest\x1a\x18.runtime.v1.TestCoverage\x12^\n" +
 	"\x14GetTestCoverageDelta\x12'.runtime.v1.GetTestCoverageDeltaRequest\x1a\x1d.runtime.v1.TestCoverageDelta\x12@\n" +
 	"\n" +
-	"GetVMUsage\x12\x1d.runtime.v1.GetVMUsageRequest\x1a\x13.runtime.v1.VMUsageBCZAgithub.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1b\x06proto3"
+	"GetVMUsage\x12\x1d.runtime.v1.GetVMUsageRequest\x1a\x13.runtime.v1.VMUsage\x12B\n" +
+	"\aCompile\x12\x1a.runtime.v1.CompileRequest\x1a\x1b.runtime.v1.CompileResponseBCZAgithub.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1b\x06proto3"
 
 var (
 	file_proto_runtime_v1_runtime_proto_rawDescOnce sync.Once
@@ -2195,7 +2486,7 @@ func file_proto_runtime_v1_runtime_proto_rawDescGZIP() []byte {
 	return file_proto_runtime_v1_runtime_proto_rawDescData
 }
 
-var file_proto_runtime_v1_runtime_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
+var file_proto_runtime_v1_runtime_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
 var file_proto_runtime_v1_runtime_proto_goTypes = []any{
 	(*CreateExecutionRequest)(nil),      // 0: runtime.v1.CreateExecutionRequest
 	(*CreateExecutionResponse)(nil),     // 1: runtime.v1.CreateExecutionResponse
@@ -2224,6 +2515,10 @@ var file_proto_runtime_v1_runtime_proto_goTypes = []any{
 	(*TestCoverageDelta)(nil),           // 24: runtime.v1.TestCoverageDelta
 	(*GetVMUsageRequest)(nil),           // 25: runtime.v1.GetVMUsageRequest
 	(*VMUsage)(nil),                     // 26: runtime.v1.VMUsage
+	(*CompileRequest)(nil),              // 27: runtime.v1.CompileRequest
+	(*CompileSourceFile)(nil),           // 28: runtime.v1.CompileSourceFile
+	(*CompileResponse)(nil),             // 29: runtime.v1.CompileResponse
+	(*CompileDiagnostic)(nil),           // 30: runtime.v1.CompileDiagnostic
 }
 var file_proto_runtime_v1_runtime_proto_depIdxs = []int32{
 	10, // 0: runtime.v1.CreateExecutionResponse.execution:type_name -> runtime.v1.Execution
@@ -2231,37 +2526,41 @@ var file_proto_runtime_v1_runtime_proto_depIdxs = []int32{
 	10, // 2: runtime.v1.ListExecutionsResponse.executions:type_name -> runtime.v1.Execution
 	11, // 3: runtime.v1.GetExecutionMetricsResponse.metrics:type_name -> runtime.v1.ExecutionMetrics
 	10, // 4: runtime.v1.ExecuteResponse.execution:type_name -> runtime.v1.Execution
-	0,  // 5: runtime.v1.RuntimeService.CreateExecution:input_type -> runtime.v1.CreateExecutionRequest
-	2,  // 6: runtime.v1.RuntimeService.GetExecution:input_type -> runtime.v1.GetExecutionRequest
-	4,  // 7: runtime.v1.RuntimeService.ListExecutions:input_type -> runtime.v1.ListExecutionsRequest
-	6,  // 8: runtime.v1.RuntimeService.CancelExecution:input_type -> runtime.v1.CancelExecutionRequest
-	8,  // 9: runtime.v1.RuntimeService.GetExecutionMetrics:input_type -> runtime.v1.GetExecutionMetricsRequest
-	12, // 10: runtime.v1.RuntimeService.Execute:input_type -> runtime.v1.ExecuteRequest
-	12, // 11: runtime.v1.RuntimeService.ExecuteAsync:input_type -> runtime.v1.ExecuteRequest
-	15, // 12: runtime.v1.RuntimeService.GetExecutionStatus:input_type -> runtime.v1.GetExecutionStatusRequest
-	17, // 13: runtime.v1.RuntimeService.GetExecutionResult:input_type -> runtime.v1.GetExecutionResultRequest
-	19, // 14: runtime.v1.RuntimeService.DispatchTestRun:input_type -> runtime.v1.DispatchTestRunRequest
-	21, // 15: runtime.v1.RuntimeService.GetTestCoverage:input_type -> runtime.v1.GetTestCoverageRequest
-	23, // 16: runtime.v1.RuntimeService.GetTestCoverageDelta:input_type -> runtime.v1.GetTestCoverageDeltaRequest
-	25, // 17: runtime.v1.RuntimeService.GetVMUsage:input_type -> runtime.v1.GetVMUsageRequest
-	1,  // 18: runtime.v1.RuntimeService.CreateExecution:output_type -> runtime.v1.CreateExecutionResponse
-	3,  // 19: runtime.v1.RuntimeService.GetExecution:output_type -> runtime.v1.GetExecutionResponse
-	5,  // 20: runtime.v1.RuntimeService.ListExecutions:output_type -> runtime.v1.ListExecutionsResponse
-	7,  // 21: runtime.v1.RuntimeService.CancelExecution:output_type -> runtime.v1.CancelExecutionResponse
-	9,  // 22: runtime.v1.RuntimeService.GetExecutionMetrics:output_type -> runtime.v1.GetExecutionMetricsResponse
-	13, // 23: runtime.v1.RuntimeService.Execute:output_type -> runtime.v1.ExecuteResponse
-	14, // 24: runtime.v1.RuntimeService.ExecuteAsync:output_type -> runtime.v1.ExecuteAsyncResponse
-	16, // 25: runtime.v1.RuntimeService.GetExecutionStatus:output_type -> runtime.v1.GetExecutionStatusResponse
-	18, // 26: runtime.v1.RuntimeService.GetExecutionResult:output_type -> runtime.v1.GetExecutionResultResponse
-	20, // 27: runtime.v1.RuntimeService.DispatchTestRun:output_type -> runtime.v1.TestRunHandle
-	22, // 28: runtime.v1.RuntimeService.GetTestCoverage:output_type -> runtime.v1.TestCoverage
-	24, // 29: runtime.v1.RuntimeService.GetTestCoverageDelta:output_type -> runtime.v1.TestCoverageDelta
-	26, // 30: runtime.v1.RuntimeService.GetVMUsage:output_type -> runtime.v1.VMUsage
-	18, // [18:31] is the sub-list for method output_type
-	5,  // [5:18] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	28, // 5: runtime.v1.CompileRequest.files:type_name -> runtime.v1.CompileSourceFile
+	30, // 6: runtime.v1.CompileResponse.diagnostics:type_name -> runtime.v1.CompileDiagnostic
+	0,  // 7: runtime.v1.RuntimeService.CreateExecution:input_type -> runtime.v1.CreateExecutionRequest
+	2,  // 8: runtime.v1.RuntimeService.GetExecution:input_type -> runtime.v1.GetExecutionRequest
+	4,  // 9: runtime.v1.RuntimeService.ListExecutions:input_type -> runtime.v1.ListExecutionsRequest
+	6,  // 10: runtime.v1.RuntimeService.CancelExecution:input_type -> runtime.v1.CancelExecutionRequest
+	8,  // 11: runtime.v1.RuntimeService.GetExecutionMetrics:input_type -> runtime.v1.GetExecutionMetricsRequest
+	12, // 12: runtime.v1.RuntimeService.Execute:input_type -> runtime.v1.ExecuteRequest
+	12, // 13: runtime.v1.RuntimeService.ExecuteAsync:input_type -> runtime.v1.ExecuteRequest
+	15, // 14: runtime.v1.RuntimeService.GetExecutionStatus:input_type -> runtime.v1.GetExecutionStatusRequest
+	17, // 15: runtime.v1.RuntimeService.GetExecutionResult:input_type -> runtime.v1.GetExecutionResultRequest
+	19, // 16: runtime.v1.RuntimeService.DispatchTestRun:input_type -> runtime.v1.DispatchTestRunRequest
+	21, // 17: runtime.v1.RuntimeService.GetTestCoverage:input_type -> runtime.v1.GetTestCoverageRequest
+	23, // 18: runtime.v1.RuntimeService.GetTestCoverageDelta:input_type -> runtime.v1.GetTestCoverageDeltaRequest
+	25, // 19: runtime.v1.RuntimeService.GetVMUsage:input_type -> runtime.v1.GetVMUsageRequest
+	27, // 20: runtime.v1.RuntimeService.Compile:input_type -> runtime.v1.CompileRequest
+	1,  // 21: runtime.v1.RuntimeService.CreateExecution:output_type -> runtime.v1.CreateExecutionResponse
+	3,  // 22: runtime.v1.RuntimeService.GetExecution:output_type -> runtime.v1.GetExecutionResponse
+	5,  // 23: runtime.v1.RuntimeService.ListExecutions:output_type -> runtime.v1.ListExecutionsResponse
+	7,  // 24: runtime.v1.RuntimeService.CancelExecution:output_type -> runtime.v1.CancelExecutionResponse
+	9,  // 25: runtime.v1.RuntimeService.GetExecutionMetrics:output_type -> runtime.v1.GetExecutionMetricsResponse
+	13, // 26: runtime.v1.RuntimeService.Execute:output_type -> runtime.v1.ExecuteResponse
+	14, // 27: runtime.v1.RuntimeService.ExecuteAsync:output_type -> runtime.v1.ExecuteAsyncResponse
+	16, // 28: runtime.v1.RuntimeService.GetExecutionStatus:output_type -> runtime.v1.GetExecutionStatusResponse
+	18, // 29: runtime.v1.RuntimeService.GetExecutionResult:output_type -> runtime.v1.GetExecutionResultResponse
+	20, // 30: runtime.v1.RuntimeService.DispatchTestRun:output_type -> runtime.v1.TestRunHandle
+	22, // 31: runtime.v1.RuntimeService.GetTestCoverage:output_type -> runtime.v1.TestCoverage
+	24, // 32: runtime.v1.RuntimeService.GetTestCoverageDelta:output_type -> runtime.v1.TestCoverageDelta
+	26, // 33: runtime.v1.RuntimeService.GetVMUsage:output_type -> runtime.v1.VMUsage
+	29, // 34: runtime.v1.RuntimeService.Compile:output_type -> runtime.v1.CompileResponse
+	21, // [21:35] is the sub-list for method output_type
+	7,  // [7:21] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_proto_runtime_v1_runtime_proto_init() }
@@ -2275,7 +2574,7 @@ func file_proto_runtime_v1_runtime_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_runtime_v1_runtime_proto_rawDesc), len(file_proto_runtime_v1_runtime_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   27,
+			NumMessages:   31,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

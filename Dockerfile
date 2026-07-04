@@ -42,12 +42,15 @@ RUN mkdir -p /build/migrations /build/configs
 # Runtime Stage - Minimal Production Image
 FROM alpine:3.19
 
-# Install runtime dependencies (includes openssh-client for VM communication)
+# Install runtime dependencies (includes openssh-client for VM communication, and
+# docker-cli so the ProjectCompiler can `docker run` an ephemeral build container
+# against the host daemon via the mounted /var/run/docker.sock — docker-out-of-docker).
 RUN apk --no-cache add \
     ca-certificates \
     tzdata \
     wget \
     openssh-client \
+    docker-cli \
     && update-ca-certificates
 
 # Create non-root user for security
