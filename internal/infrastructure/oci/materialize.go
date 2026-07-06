@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // ImageRef is a registry-neutral OCI image reference.
@@ -75,8 +76,9 @@ func (m *Materializer) Stage(ctx context.Context, req MaterializeRequest, stagin
 		return ImageConfig{}, fmt.Errorf("create staging dir: %w", err)
 	}
 
+	var unpacked int64 // per-call decompression-bomb budget (concurrent-safe)
 	for _, layer := range man.layers {
-		if err := m.applyLayer(ctx, req.Image.Repository, layer.Digest, stagingDir); err != nil {
+		if err := m.applyLayer(ctx, req.Image.Repository, layer.Digest, stagingDir, &unpacked); err != nil {
 			return ImageConfig{}, fmt.Errorf("apply layer %s: %w", layer.Digest, err)
 		}
 	}
@@ -93,7 +95,7 @@ func (m *Materializer) Stage(ctx context.Context, req MaterializeRequest, stagin
 // applyLayer pulls a layer blob and unpacks it into stagingDir with OCI
 // whiteout semantics. gzip is detected from the blob's magic bytes so it works
 // regardless of the declared mediaType.
-func (m *Materializer) applyLayer(ctx context.Context, repo, digest, stagingDir string) error {
+func (m *Materializer) applyLayer(ctx context.Context, repo, digest, stagingDir string, budget *int64) error {
 	rc, err := m.client.FetchBlob(ctx, repo, digest)
 	if err != nil {
 		return err
@@ -111,13 +113,30 @@ func (m *Materializer) applyLayer(ctx context.Context, repo, digest, stagingDir 
 		src = gz
 	}
 
-	return unpackTar(src, stagingDir)
+	return unpackTar(src, stagingDir, budget)
 }
+
+// maxUnpackedBytes caps the total DECOMPRESSED bytes written across all of an
+// image's layers — a decompression bomb must not fill the fleet host's disk
+// before the post-extraction size check runs.
+const maxUnpackedBytes = 8 << 30 // 8 GiB
 
 // unpackTar applies one tar stream into dir with whiteout semantics and path
 // traversal guarding. Exported logic lives here so the materializer test can
-// drive it directly.
-func unpackTar(r io.Reader, dir string) error {
+// drive it directly. budget is the cross-layer decompressed-bytes counter
+// (nil = uncapped, tests only).
+//
+// Threat model: a hostile IMAGE. Lexical target checks stop "../" escapes; the
+// symlink class (an earlier entry plants a symlink to a host path, a later
+// entry writes THROUGH it) is stopped by safeParent — every filesystem
+// operation first proves the entry's parent chain still physically resolves
+// inside dir. Symlink CONTENTS stay unrestricted (absolute in-guest links like
+// /dev/stdout are legitimate and never followed on the host).
+func unpackTar(r io.Reader, dir string, budget *int64) error {
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return fmt.Errorf("resolve staging dir: %w", err)
+	}
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -142,6 +161,12 @@ func unpackTar(r io.Reader, dir string) error {
 
 		base := filepath.Base(target)
 		parent := filepath.Dir(target)
+
+		// Symlink-parent guard: the parent chain must still physically resolve
+		// inside dir BEFORE anything is created/removed through it.
+		if err := safeParent(realDir, parent); err != nil {
+			return fmt.Errorf("tar entry %s: %w", hdr.Name, err)
+		}
 
 		// Whiteout handling.
 		if base == ".wh..wh..opq" {
@@ -171,14 +196,25 @@ func unpackTar(r io.Reader, dir string) error {
 			}
 		case tar.TypeReg, tar.TypeRegA:
 			// Overwrite any prior file at this path (later layer wins).
+			// O_NOFOLLOW: if the path itself is a planted symlink the open
+			// fails instead of writing through it (RemoveAll deletes a link,
+			// not its referent, so this is belt-and-braces).
 			_ = os.RemoveAll(target)
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode)&0o777)
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY|syscall.O_NOFOLLOW, os.FileMode(hdr.Mode)&0o777)
 			if err != nil {
 				return fmt.Errorf("create %s: %w", name, err)
 			}
-			if _, err := io.Copy(f, tr); err != nil {
+			n, err := io.Copy(f, tr)
+			if err != nil {
 				_ = f.Close()
 				return fmt.Errorf("write %s: %w", name, err)
+			}
+			if budget != nil {
+				*budget += n
+				if *budget > maxUnpackedBytes {
+					_ = f.Close()
+					return fmt.Errorf("image exceeds the %d-byte unpacked ceiling (decompression bomb guard)", int64(maxUnpackedBytes))
+				}
 			}
 			if err := f.Close(); err != nil {
 				return fmt.Errorf("close %s: %w", name, err)
@@ -228,6 +264,40 @@ func clearDirContents(dir string) error {
 }
 
 // withinDir reports whether target is dir or lives under dir.
+// safeParent proves the entry's parent directory chain still physically
+// resolves inside realDir — i.e. no earlier tar entry planted a symlink that a
+// later entry would write THROUGH onto the host (the classic tar-extraction
+// escape). realDir must already be symlink-resolved.
+func safeParent(realDir, parent string) error {
+	anc, err := resolveExistingAncestor(parent)
+	if err != nil {
+		return fmt.Errorf("resolve parent %s: %w", parent, err)
+	}
+	if !withinDir(realDir, anc) {
+		return fmt.Errorf("parent path resolves outside the staging dir (symlink traversal): %s -> %s", parent, anc)
+	}
+	return nil
+}
+
+// resolveExistingAncestor walks p upward to its deepest existing path and
+// returns that path with every symlink resolved.
+func resolveExistingAncestor(p string) (string, error) {
+	for cur := p; ; {
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			return resolved, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		next := filepath.Dir(cur)
+		if next == cur {
+			return cur, nil
+		}
+		cur = next
+	}
+}
+
 func withinDir(dir, target string) bool {
 	rel, err := filepath.Rel(dir, target)
 	if err != nil {

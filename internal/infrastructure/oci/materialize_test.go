@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -229,7 +230,7 @@ func TestUnpackTarPathTraversal(t *testing.T) {
 	evil := gzTar([]tarEntry{{name: "../escape.txt", body: "x"}})
 	gz, _ := gzip.NewReader(bytes.NewReader(evil))
 	dir := t.TempDir()
-	err := unpackTar(gz, dir)
+	err := unpackTar(gz, dir, nil)
 	if err == nil {
 		t.Fatal("expected path-traversal rejection, got nil")
 	}
@@ -249,7 +250,7 @@ func TestUnpackTarOpaqueWhiteout(t *testing.T) {
 		{name: "data/new.txt", body: "new"},
 	})
 	gz, _ := gzip.NewReader(bytes.NewReader(layer))
-	if err := unpackTar(gz, dir); err != nil {
+	if err := unpackTar(gz, dir, nil); err != nil {
 		t.Fatalf("unpackTar: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "data", "old.txt")); !os.IsNotExist(err) {
@@ -294,4 +295,72 @@ func readFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// TestUnpackTarSymlinkParentTraversal is the classic tar-extraction escape: an
+// earlier entry plants a symlink to a directory OUTSIDE the staging dir; a
+// later entry writes a file THROUGH it. safeParent must reject the write and
+// the outside directory must stay untouched.
+func TestUnpackTarSymlinkParentTraversal(t *testing.T) {
+	outside := t.TempDir() // the "host" directory the attack targets
+	dir := t.TempDir()
+
+	evil := gzTar([]tarEntry{
+		{name: "x", typeflag: tar.TypeSymlink, linkname: outside},
+		{name: "x/passwd", body: "owned"},
+	})
+	gz, _ := gzip.NewReader(bytes.NewReader(evil))
+	err := unpackTar(gz, dir, nil)
+	if err == nil {
+		t.Fatal("expected symlink-parent traversal rejection, got nil")
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "passwd")); !os.IsNotExist(statErr) {
+		t.Fatalf("attack escaped: %s/passwd exists (unpack err was %v)", outside, err)
+	}
+}
+
+// TestUnpackTarRelativeSymlinkParentTraversal: same escape via a relative
+// linkname climbing out of the staging dir.
+func TestUnpackTarRelativeSymlinkParentTraversal(t *testing.T) {
+	dir := t.TempDir()
+	evil := gzTar([]tarEntry{
+		{name: "up", typeflag: tar.TypeSymlink, linkname: "../../"},
+		{name: "up/owned.txt", body: "x"},
+	})
+	gz, _ := gzip.NewReader(bytes.NewReader(evil))
+	if err := unpackTar(gz, dir, nil); err == nil {
+		t.Fatal("expected relative symlink-parent traversal rejection, got nil")
+	}
+}
+
+// TestUnpackTarLegitAbsoluteSymlink: absolute in-guest symlinks (nginx's
+// access.log -> /dev/stdout) are legitimate image content — they must extract
+// (they are never followed on the host unless written through, which the
+// parent guard blocks).
+func TestUnpackTarLegitAbsoluteSymlink(t *testing.T) {
+	dir := t.TempDir()
+	ok := gzTar([]tarEntry{
+		{name: "var/log/", typeflag: tar.TypeDir, mode: 0o755},
+		{name: "var/log/access.log", typeflag: tar.TypeSymlink, linkname: "/dev/stdout"},
+	})
+	gz, _ := gzip.NewReader(bytes.NewReader(ok))
+	if err := unpackTar(gz, dir, nil); err != nil {
+		t.Fatalf("legit absolute symlink rejected: %v", err)
+	}
+	fi, err := os.Lstat(filepath.Join(dir, "var", "log", "access.log"))
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink not created: %v", err)
+	}
+}
+
+// TestUnpackTarDecompressionBudget: total unpacked bytes past the budget abort
+// the extraction.
+func TestUnpackTarDecompressionBudget(t *testing.T) {
+	dir := t.TempDir()
+	big := gzTar([]tarEntry{{name: "blob.bin", body: strings.Repeat("A", 4096)}})
+	gz, _ := gzip.NewReader(bytes.NewReader(big))
+	budget := int64(maxUnpackedBytes - 1024) // 1KB left of the ceiling
+	if err := unpackTar(gz, dir, &budget); err == nil {
+		t.Fatal("expected decompression-budget rejection, got nil")
+	}
 }
