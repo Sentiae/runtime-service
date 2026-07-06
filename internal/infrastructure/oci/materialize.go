@@ -226,7 +226,11 @@ func unpackTar(r io.Reader, dir string, budget *int64) error {
 			}
 		case tar.TypeLink:
 			linkTarget := filepath.Join(dir, filepath.Clean(hdr.Linkname))
-			if !withinDir(dir, linkTarget) {
+			// Resolve symlinks in the source path too: a planted symlink in the
+			// link's parent chain would otherwise let os.Link hardlink a HOST
+			// file's content into the image (read disclosure). Re-check the
+			// physically-resolved source stays inside realDir.
+			if resolved, rerr := resolveExistingAncestor(linkTarget); rerr != nil || !withinDir(realDir, resolved) {
 				return fmt.Errorf("hardlink target escapes staging dir: %s", hdr.Linkname)
 			}
 			_ = os.RemoveAll(target)

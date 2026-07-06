@@ -364,3 +364,25 @@ func TestUnpackTarDecompressionBudget(t *testing.T) {
 		t.Fatal("expected decompression-budget rejection, got nil")
 	}
 }
+
+// TestUnpackTarHardlinkThroughSymlink: a planted symlink in the hardlink
+// source's parent must not let os.Link pull a host file into the image.
+func TestUnpackTarHardlinkThroughSymlink(t *testing.T) {
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret")
+	if err := os.WriteFile(secret, []byte("host-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	evil := gzTar([]tarEntry{
+		{name: "s", typeflag: tar.TypeSymlink, linkname: outside},
+		{name: "steal", typeflag: tar.TypeLink, linkname: "s/secret"},
+	})
+	gz, _ := gzip.NewReader(bytes.NewReader(evil))
+	if err := unpackTar(gz, dir, nil); err == nil {
+		t.Fatal("expected hardlink-through-symlink rejection, got nil")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "steal")); !os.IsNotExist(err) {
+		t.Fatalf("host file was hardlinked into the image via a symlinked parent")
+	}
+}
