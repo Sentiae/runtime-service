@@ -12,12 +12,17 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
+
+// testServiceAPIKey is the shared service token the test server validates and
+// the test client presents as x-api-key (service-principal path).
+const testServiceAPIKey = "test-service-key"
 
 // ─────────────────────────────────────────────────────────────────────
 // Fakes
@@ -114,7 +119,7 @@ func (f *fakeExecutionUC) ExecuteSync(ctx context.Context, in usecase.CreateExec
 func newTestServerExec(t *testing.T) (runtimev1.RuntimeServiceClient, *fakeExecutionUC, *Server, func()) {
 	t.Helper()
 	uc := newFakeExecUC()
-	srv := NewServer(ServerConfig{EnableRecovery: true}, uc, nil, nil)
+	srv := NewServer(ServerConfig{EnableRecovery: true, ServiceAPIKey: testServiceAPIKey}, uc, nil, nil)
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -122,7 +127,16 @@ func newTestServerExec(t *testing.T) (runtimev1.RuntimeServiceClient, *fakeExecu
 	}
 	go func() { _ = srv.GetGRPCServer().Serve(lis) }()
 
-	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Present a valid service credential on every unary call so the mandatory
+	// auth interceptor authenticates the caller as a trusted service.
+	injectAuth := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		ctx = metadata.AppendToOutgoingContext(ctx, "x-api-key", testServiceAPIKey, "x-service-name", "runtime-test")
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+	conn, err := grpc.NewClient(lis.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithChainUnaryInterceptor(injectAuth),
+	)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

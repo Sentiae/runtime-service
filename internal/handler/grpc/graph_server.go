@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 
+	"github.com/sentiae/platform-kit/tenant"
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
@@ -34,24 +35,41 @@ func NewGraphServer(graphUC usecase.GraphUseCase, execEng *usecase.GraphExecutio
 
 // --- helpers --------------------------------------------------------
 
+// graphOrgIDFromCtx resolves the org for a graph RPC under Layer-2 tenant
+// isolation. Precedence: (a) an explicit x-organization-id the caller is
+// authorized for (service principals pass; users must be members) — keeping
+// service callers like canvas→runtime working; else (b) the org on a verified
+// user principal's claims; else uuid.Nil so the call site raises its own
+// missing-org error.
 func graphOrgIDFromCtx(ctx context.Context) uuid.UUID {
 	md, _ := metadata.FromIncomingContext(ctx)
-	for _, k := range []string{"x-organization-id"} {
-		if vals := md.Get(k); len(vals) > 0 && vals[0] != "" {
-			if id, err := uuid.Parse(vals[0]); err == nil {
+	if vals := md.Get("x-organization-id"); len(vals) > 0 && vals[0] != "" {
+		if id, err := uuid.Parse(vals[0]); err == nil {
+			if err := tenant.AuthorizeOrg(ctx, id); err == nil {
 				return id
 			}
+		}
+	}
+	if p, ok := tenant.FromContext(ctx); ok && p.Claims != nil && p.Claims.OrganizationID != "" {
+		if id, err := uuid.Parse(p.Claims.OrganizationID); err == nil {
+			return id
 		}
 	}
 	return uuid.Nil
 }
 
+// graphUserIDFromCtx resolves the acting user. A verified user principal uses
+// its own subject (the request-supplied x-user-id is ignored); a trusted
+// service principal may attribute the action to the x-user-id it supplies.
+// Returns uuid.Nil when neither yields a usable id.
 func graphUserIDFromCtx(ctx context.Context) uuid.UUID {
 	md, _ := metadata.FromIncomingContext(ctx)
-	if vals := md.Get("x-user-id"); len(vals) > 0 && vals[0] != "" {
-		if id, err := uuid.Parse(vals[0]); err == nil {
-			return id
-		}
+	requested := ""
+	if vals := md.Get("x-user-id"); len(vals) > 0 {
+		requested = vals[0]
+	}
+	if id, ok := tenant.ActorIDOrRequested(ctx, requested); ok {
+		return id
 	}
 	return uuid.Nil
 }
@@ -334,6 +352,11 @@ func (s *GraphServer) ListGraphs(ctx context.Context, req *runtimev1.ListGraphsR
 	}
 	if orgID == uuid.Nil {
 		return nil, status.Error(codes.InvalidArgument, "organization_id required")
+	}
+	// Layer-2 tenant isolation: authorize the resolved org — covers the
+	// request-supplied organization_id path that bypasses graphOrgIDFromCtx.
+	if err := tenant.AuthorizeOrg(ctx, orgID); err != nil {
+		return nil, err
 	}
 	page := int(req.Page)
 	if page <= 0 {

@@ -1,19 +1,15 @@
 package grpc
 
 import (
-	"context"
-	"log"
-	"runtime/debug"
-	"time"
+	"log/slog"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
-	"google.golang.org/grpc/status"
 
+	"github.com/sentiae/platform-kit/interceptor"
+	"github.com/sentiae/platform-kit/tenant"
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
@@ -32,6 +28,15 @@ type ServerConfig struct {
 
 	// EnableRecovery enables panic recovery interceptor.
 	EnableRecovery bool
+
+	// ServiceAPIKey is the shared service-to-service token validated as the
+	// x-api-key header; a match marks the caller as a trusted service principal.
+	ServiceAPIKey string
+
+	// JWKSURL + JWTIssuer configure the JWKS-backed user-token validator so
+	// handlers derive the trusted actor + org from the verified principal.
+	JWKSURL   string
+	JWTIssuer string
 }
 
 // NewServer creates a new gRPC server with interceptors and service registrations.
@@ -41,33 +46,39 @@ func NewServer(
 	graphUC usecase.GraphUseCase,
 	execEngine *usecase.GraphExecutionEngine,
 ) *Server {
-	// Build interceptor chain
-	var unaryInterceptors []grpc.UnaryServerInterceptor
-	var streamInterceptors []grpc.StreamServerInterceptor
-
-	// Add recovery interceptor first (outermost)
-	if config.EnableRecovery {
-		unaryInterceptors = append(unaryInterceptors, recoveryUnaryInterceptor())
-		streamInterceptors = append(streamInterceptors, recoveryStreamInterceptor())
+	// Mandatory server interceptor chain (CLAUDE.md §23): Recovery → Logging →
+	// Auth, built by interceptor.NewChain. Auth layers a service-token
+	// (x-api-key) validator with a JWKS-backed user-token validator so handlers
+	// derive the trusted actor/org from the verified principal (tenant.FromContext)
+	// instead of the spoofable x-user-id/x-organization-id metadata. Health +
+	// reflection are skipped so k8s probes and grpcurl keep working unauthenticated.
+	svcToken := tenant.ServiceTokenValidator{Expected: config.ServiceAPIKey}
+	jwks, err := tenant.NewJWKSValidator(tenant.JWKSConfig{JWKSURL: config.JWKSURL, Issuer: config.JWTIssuer})
+	if err != nil {
+		// api-key-only fallback: user JWTs can't be verified, but service callers
+		// still authenticate. Never fail boot on a JWKS build error.
+		slog.Default().Warn("runtime gRPC: JWKS user-token validator unavailable, falling back to api-key-only auth", "err", err)
+		jwks = nil
 	}
-
-	// Add logging interceptor
-	if config.EnableLogging {
-		unaryInterceptors = append(unaryInterceptors, loggingUnaryInterceptor())
-		streamInterceptors = append(streamInterceptors, loggingStreamInterceptor())
-	}
-
-	// Add dev auth interceptor to extract user/org info from metadata
-	unaryInterceptors = append(unaryInterceptors, devAuthUnaryInterceptor())
-	streamInterceptors = append(streamInterceptors, devAuthStreamInterceptor())
+	unary, stream := interceptor.NewChain(interceptor.Config{
+		Logger: slog.Default(),
+		Auth: &interceptor.AuthConfig{
+			APIKeyValidator: svcToken,
+			TokenValidator:  jwks,
+			SkipMethods: []string{
+				"/grpc.health.v1.Health/Check",
+				"/grpc.health.v1.Health/Watch",
+				"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+				"/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo",
+			},
+		},
+	})
 
 	// Create gRPC server with interceptors
-	opts := []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(unaryInterceptors...),
-		grpc.ChainStreamInterceptor(streamInterceptors...),
-	}
-
-	grpcServer := grpc.NewServer(opts...)
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(unary...),
+		grpc.ChainStreamInterceptor(stream...),
+	)
 
 	// Register health check service
 	healthServer := health.NewServer()
@@ -110,161 +121,4 @@ func (s *Server) ExecutionServer() *ExecutionServer {
 // Shutdown gracefully shuts down the gRPC server.
 func (s *Server) Shutdown() {
 	s.grpcServer.GracefulStop()
-}
-
-// loggingUnaryInterceptor logs all unary RPC calls.
-func loggingUnaryInterceptor() grpc.UnaryServerInterceptor {
-	return func(
-		ctx context.Context,
-		req any,
-		info *grpc.UnaryServerInfo,
-		handler grpc.UnaryHandler,
-	) (any, error) {
-		start := time.Now()
-
-		userID := getUserIDFromContext(ctx)
-
-		log.Printf("[gRPC] --> %s | user: %s", info.FullMethod, userID)
-
-		resp, err := handler(ctx, req)
-
-		duration := time.Since(start)
-		statusCode := codes.OK
-		if err != nil {
-			statusCode = status.Code(err)
-		}
-
-		log.Printf("[gRPC] <-- %s | status: %s | duration: %v | user: %s",
-			info.FullMethod, statusCode, duration, userID)
-
-		return resp, err
-	}
-}
-
-// loggingStreamInterceptor logs all streaming RPC calls.
-func loggingStreamInterceptor() grpc.StreamServerInterceptor {
-	return func(
-		srv any,
-		ss grpc.ServerStream,
-		info *grpc.StreamServerInfo,
-		handler grpc.StreamHandler,
-	) error {
-		start := time.Now()
-
-		userID := getUserIDFromContext(ss.Context())
-
-		log.Printf("[gRPC Stream] --> %s | user: %s", info.FullMethod, userID)
-
-		err := handler(srv, ss)
-
-		duration := time.Since(start)
-		statusCode := codes.OK
-		if err != nil {
-			statusCode = status.Code(err)
-		}
-
-		log.Printf("[gRPC Stream] <-- %s | status: %s | duration: %v | user: %s",
-			info.FullMethod, statusCode, duration, userID)
-
-		return err
-	}
-}
-
-// recoveryUnaryInterceptor recovers from panics in unary RPCs.
-func recoveryUnaryInterceptor() grpc.UnaryServerInterceptor {
-	return func(
-		ctx context.Context,
-		req any,
-		info *grpc.UnaryServerInfo,
-		handler grpc.UnaryHandler,
-	) (resp any, err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[gRPC Recovery] panic in %s: %v\n%s", info.FullMethod, r, debug.Stack())
-				err = status.Errorf(codes.Internal, "internal server error: %v", r)
-			}
-		}()
-
-		return handler(ctx, req)
-	}
-}
-
-// recoveryStreamInterceptor recovers from panics in streaming RPCs.
-func recoveryStreamInterceptor() grpc.StreamServerInterceptor {
-	return func(
-		srv any,
-		ss grpc.ServerStream,
-		info *grpc.StreamServerInfo,
-		handler grpc.StreamHandler,
-	) (err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[gRPC Recovery] panic in %s: %v\n%s", info.FullMethod, r, debug.Stack())
-				err = status.Errorf(codes.Internal, "internal server error: %v", r)
-			}
-		}()
-
-		return handler(srv, ss)
-	}
-}
-
-// devAuthUnaryInterceptor extracts user ID from x-user-id metadata in development mode.
-func devAuthUnaryInterceptor() grpc.UnaryServerInterceptor {
-	return func(
-		ctx context.Context,
-		req any,
-		info *grpc.UnaryServerInfo,
-		handler grpc.UnaryHandler,
-	) (any, error) {
-		md, ok := metadata.FromIncomingContext(ctx)
-		if ok {
-			if userIDs := md.Get("x-user-id"); len(userIDs) > 0 {
-				ctx = context.WithValue(ctx, userIDKey{}, userIDs[0])
-			}
-		}
-		return handler(ctx, req)
-	}
-}
-
-// devAuthStreamInterceptor extracts user ID from x-user-id metadata in development mode.
-func devAuthStreamInterceptor() grpc.StreamServerInterceptor {
-	return func(
-		srv any,
-		ss grpc.ServerStream,
-		info *grpc.StreamServerInfo,
-		handler grpc.StreamHandler,
-	) error {
-		md, ok := metadata.FromIncomingContext(ss.Context())
-		if ok {
-			if userIDs := md.Get("x-user-id"); len(userIDs) > 0 {
-				ctx := context.WithValue(ss.Context(), userIDKey{}, userIDs[0])
-				wrapped := &wrappedServerStream{ServerStream: ss, ctx: ctx}
-				return handler(srv, wrapped)
-			}
-		}
-		return handler(srv, ss)
-	}
-}
-
-// userIDKey is used as a key for storing user ID in context.
-type userIDKey struct{}
-
-// getUserIDFromContext extracts user ID from context.
-func getUserIDFromContext(ctx context.Context) string {
-	userID, ok := ctx.Value(userIDKey{}).(string)
-	if !ok {
-		return "anonymous"
-	}
-	return userID
-}
-
-// wrappedServerStream wraps grpc.ServerStream with a custom context.
-type wrappedServerStream struct {
-	grpc.ServerStream
-	ctx context.Context
-}
-
-// Context returns the wrapped context.
-func (w *wrappedServerStream) Context() context.Context {
-	return w.ctx
 }

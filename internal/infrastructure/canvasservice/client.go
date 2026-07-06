@@ -67,7 +67,11 @@ type TestResultPayload struct {
 func (c *Client) outCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	md := metadata.MD{}
 	if c.ServiceToken != "" {
-		md.Set("authorization", "Bearer "+c.ServiceToken)
+		// Authenticate as a trusted service principal via x-api-key, not a Bearer
+		// JWT: canvas rejects a present-but-invalid Bearer once it validates JWTs,
+		// so we must not send a static token as authorization.
+		md.Set("x-api-key", c.ServiceToken)
+		md.Set("x-service-name", "runtime-service")
 	}
 	if c.ServiceUserID != "" {
 		md.Set("x-user-id", c.ServiceUserID)

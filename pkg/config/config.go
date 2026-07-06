@@ -90,6 +90,16 @@ type GRPCConfig struct {
 	// RPC hitting the /fleet control endpoints). Empty ⇒ in-cluster traffic is
 	// trusted (dev parity); non-empty ⇒ a constant-time match is required.
 	ServiceAPIKey string `mapstructure:"service_api_key"`
+
+	// JWKSURL is the JWKS endpoint backing the gRPC user-token (RS256)
+	// validator (identity-service). Consumed by the platform-kit tenant auth
+	// interceptor; an invalid/unreachable value degrades to api-key-only auth
+	// rather than failing boot.
+	JWKSURL string `mapstructure:"jwks_url"`
+
+	// JWTIssuer is the expected `iss` claim on inbound user tokens validated
+	// by the JWKS-backed validator above.
+	JWTIssuer string `mapstructure:"jwt_issuer"`
 }
 
 // DatabaseConfig contains database configuration.
@@ -266,6 +276,8 @@ func Load() (*Config, error) {
 			"server.grpc.host":            "0.0.0.0",
 			"server.grpc.port":            "50062",
 			"server.grpc.service_api_key": "",
+			"server.grpc.jwks_url":        "http://identity-service:8080/.well-known/jwks.json",
+			"server.grpc.jwt_issuer":      "identity-service",
 
 			// Database defaults
 			"database.postgres.host":                    "localhost",
@@ -385,6 +397,8 @@ func Load() (*Config, error) {
 			{"server.grpc.host", "APP_SERVER_GRPC_HOST"},
 			{"server.grpc.port", "APP_GRPC_PORT"},
 			{"server.grpc.service_api_key", "APP_GRPC_SERVICE_API_KEY"},
+			{"server.grpc.jwks_url", "APP_AUTH_JWKS_URL"},
+			{"server.grpc.jwt_issuer", "APP_AUTH_JWT_ISSUER"},
 
 			// Database bindings
 			{"database.postgres.host", "APP_DATABASE_HOST"},

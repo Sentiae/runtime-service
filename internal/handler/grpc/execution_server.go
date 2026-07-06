@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/sentiae/platform-kit/tenant"
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
@@ -46,6 +47,11 @@ func (s *ExecutionServer) CreateExecution(ctx context.Context, req *runtimev1.Cr
 	orgID, err := uuid.Parse(req.GetOrganizationId())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "invalid organization_id")
+	}
+	// Layer-2 tenant isolation: the caller must be permitted in the target org
+	// (service principals pass; users must be members).
+	if err := tenant.AuthorizeOrg(ctx, orgID); err != nil {
+		return nil, err
 	}
 
 	// Parse requested_by user ID
@@ -118,6 +124,10 @@ func (s *ExecutionServer) ListExecutions(ctx context.Context, req *runtimev1.Lis
 	orgID, err := uuid.Parse(req.GetOrganizationId())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "invalid organization_id")
+	}
+	// Layer-2 tenant isolation: the caller must be permitted in the target org.
+	if err := tenant.AuthorizeOrg(ctx, orgID); err != nil {
+		return nil, err
 	}
 
 	page := int(req.GetPage())

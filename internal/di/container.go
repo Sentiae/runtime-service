@@ -726,7 +726,13 @@ func (c *Container) initHandlers() {
 	// CANVAS_SERVICE_URL empty disables the push (Kafka still delivers).
 	if canvasURL := os.Getenv("CANVAS_SERVICE_URL"); canvasURL != "" {
 		canvasClient := canvasservice.NewClient(canvasURL, 10*time.Second)
-		canvasClient.ServiceToken = os.Getenv("CANVAS_SERVICE_TOKEN")
+		// x-api-key value: prefer the shared service API key; fall back to the
+		// legacy CANVAS_SERVICE_TOKEN only when the API key is unset.
+		serviceToken := c.Config.Server.GRPC.ServiceAPIKey
+		if serviceToken == "" {
+			serviceToken = os.Getenv("CANVAS_SERVICE_TOKEN")
+		}
+		canvasClient.ServiceToken = serviceToken
 		canvasClient.ServiceUserID = os.Getenv("SERVICE_USER_ID")
 		c.HTTPServer.SetTestRunCanvasClient(canvasClient)
 		log.Printf("canvas-service HTTP push enabled (url: %s)", canvasURL)
@@ -826,6 +832,9 @@ func (c *Container) initHandlers() {
 			grpchandler.ServerConfig{
 				EnableLogging:  c.Config.App.Environment == "development",
 				EnableRecovery: true,
+				ServiceAPIKey:  c.Config.Server.GRPC.ServiceAPIKey,
+				JWKSURL:        c.Config.Server.GRPC.JWKSURL,
+				JWTIssuer:      c.Config.Server.GRPC.JWTIssuer,
 			},
 			c.ExecutionUC,
 			c.GraphUC,
