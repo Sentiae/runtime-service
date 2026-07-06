@@ -787,6 +787,12 @@ func (p *WarmPool) KillClone(id int) (bool, error) {
 // entry is cleared. Always returns nil today — the signature carries an error
 // for forward compatibility (e.g. a future variant that also evicts files).
 func (p *WarmPool) RefreshTemplate(language domain.Language) error {
+	// Reject an out-of-allowlist language before any object-store key / local
+	// path helper derives a template location from it (path-traversal guard),
+	// regardless of caller.
+	if !language.IsValid() {
+		return fmt.Errorf("refresh template %q: %w", language, domain.ErrInvalidLanguage)
+	}
 	p.mu.Lock()
 	delete(p.templates, language)
 	delete(p.templateSource, language)

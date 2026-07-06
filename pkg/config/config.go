@@ -84,6 +84,12 @@ type GRPCConfig struct {
 	Enabled bool   `mapstructure:"enabled"`
 	Host    string `mapstructure:"host"`
 	Port    string `mapstructure:"port"`
+
+	// ServiceAPIKey is the shared service-to-service token presented as the
+	// x-api-key header by internal callers (e.g. deployment-service's Fleet
+	// RPC hitting the /fleet control endpoints). Empty ⇒ in-cluster traffic is
+	// trusted (dev parity); non-empty ⇒ a constant-time match is required.
+	ServiceAPIKey string `mapstructure:"service_api_key"`
 }
 
 // DatabaseConfig contains database configuration.
@@ -256,9 +262,10 @@ func Load() (*Config, error) {
 			"server.http.timeouts.shutdown": "30s",
 
 			// gRPC server defaults
-			"server.grpc.enabled": true,
-			"server.grpc.host":    "0.0.0.0",
-			"server.grpc.port":    "50062",
+			"server.grpc.enabled":         true,
+			"server.grpc.host":            "0.0.0.0",
+			"server.grpc.port":            "50062",
+			"server.grpc.service_api_key": "",
 
 			// Database defaults
 			"database.postgres.host":                    "localhost",
@@ -377,6 +384,7 @@ func Load() (*Config, error) {
 			{"server.grpc.enabled", "APP_SERVER_GRPC_ENABLED"},
 			{"server.grpc.host", "APP_SERVER_GRPC_HOST"},
 			{"server.grpc.port", "APP_GRPC_PORT"},
+			{"server.grpc.service_api_key", "APP_GRPC_SERVICE_API_KEY"},
 
 			// Database bindings
 			{"database.postgres.host", "APP_DATABASE_HOST"},

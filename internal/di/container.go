@@ -738,7 +738,7 @@ func (c *Container) initHandlers() {
 	// Warm-VM fleet visibility + control. c.WarmPool may be nil (warm pool
 	// disabled); NewFleetHandler accepts nil and reports the fleet as disabled,
 	// so we register the routes unconditionally.
-	c.HTTPServer.SetFleetHandler(httphandler.NewFleetHandler(c.WarmPool))
+	c.HTTPServer.SetFleetHandler(httphandler.NewFleetHandler(c.WarmPool, c.Config.Server.GRPC.ServiceAPIKey))
 
 	// §9.4 — customer-agent enrolment endpoint. Signs CSRs submitted
 	// by freshly-installed customer-hosted agents. Unwired when the CA
