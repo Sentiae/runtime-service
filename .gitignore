@@ -2,3 +2,4 @@
 /server
 /guest-agent
 /bin/
+.build/

@@ -36,6 +36,7 @@ import (
 	"github.com/sentiae/runtime-service/internal/infrastructure/gitservice"
 	"github.com/sentiae/runtime-service/internal/infrastructure/messaging"
 	"github.com/sentiae/runtime-service/internal/infrastructure/objectstore"
+	"github.com/sentiae/runtime-service/internal/infrastructure/oci"
 	"github.com/sentiae/runtime-service/internal/infrastructure/simulated"
 	"github.com/sentiae/runtime-service/internal/repository"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
@@ -144,6 +145,12 @@ type Container struct {
 	ProjectCompiler usecase.ProjectCompiler
 	CompileUC       *usecase.CompileProject
 
+	// runtime-fleet CP3 — OCI→ext4 image boot + FleetOrchestration.
+	ImageWorkloadRepo repository.ImageWorkloadRepository
+	ImageBooter       usecase.ImageBooter
+	ImageMaterializer usecase.ImageMaterializer
+	FleetProvisionUC  *usecase.FleetProvision
+
 	// Use Cases
 	ExecutionUC  usecase.ExecutionUseCase
 	VMUC         usecase.VMUseCase
@@ -199,7 +206,66 @@ func NewContainer(cfg *config.Config) (*Container, error) {
 	// Initialize handlers
 	c.initHandlers()
 
+	// runtime-fleet CP3 — image-boot materializer, booter, FleetOrchestration.
+	c.initFleet(cfg)
+
 	return c, nil
+}
+
+// initFleet wires the OCI→ext4 image-boot path and the FleetOrchestration gRPC
+// service (runtime-fleet CP3). The Firecracker ImageBooter is only constructed
+// when the firecracker executor is selected and a live FCProvider exists;
+// otherwise the fail-loud booter rejects every call so image boot is never
+// silently faked on a host without KVM.
+func (c *Container) initFleet(cfg *config.Config) {
+	client := oci.NewClient(oci.Config{
+		Host:     cfg.Registry.Host,
+		Password: cfg.Registry.ServiceKey,
+	})
+	c.ImageMaterializer = oci.NewMaterializerAdapter(
+		oci.NewMaterializer(client, cfg.ImageBoot.InitPath),
+	)
+
+	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
+		booter := firecracker.NewImageBooter(
+			c.FCProvider,
+			cfg.ImageBoot.AdvertiseHost,
+			cfg.ImageBoot.HostPortMin,
+			cfg.ImageBoot.HostPortMax,
+		)
+		// Seed the allocator from any workloads still active in the store so a
+		// restart never double-allocates a /30 index or a host port.
+		if active, err := c.ImageWorkloadRepo.FindActive(context.Background()); err == nil {
+			indices := make([]int, 0, len(active))
+			ports := make([]int, 0, len(active))
+			for i := range active {
+				indices = append(indices, active[i].NetIndex)
+				ports = append(ports, active[i].HostPort)
+			}
+			booter.Seed(indices, ports)
+		} else {
+			log.Printf("Warning: image-boot seed from active workloads failed: %v", err)
+		}
+		c.ImageBooter = booter
+		log.Println("Image-boot Firecracker booter initialized")
+	} else {
+		c.ImageBooter = usecase.FailLoudImageBooter{}
+		log.Println("Image-boot booter: fail-loud (firecracker executor not selected)")
+	}
+
+	c.FleetProvisionUC = usecase.NewFleetProvision(
+		context.Background(),
+		c.ImageWorkloadRepo,
+		c.ImageMaterializer,
+		c.ImageBooter,
+		cfg.ImageBoot.WorkDir,
+		cfg.ImageBoot.AdvertiseHost,
+	)
+
+	if c.GRPCServer != nil {
+		c.GRPCServer.RegisterFleet(grpchandler.NewFleetServer(c.FleetProvisionUC))
+		log.Println("FleetOrchestration gRPC service registered")
+	}
 }
 
 // initDatabase initializes the database connection
@@ -435,6 +501,9 @@ func (c *Container) initRepositories() {
 
 	// 9.4 — remote agent registry
 	c.RuntimeAgentRepo = postgres.NewRuntimeAgentRepository(c.DB)
+
+	// runtime-fleet CP3 — image-boot workloads
+	c.ImageWorkloadRepo = postgres.NewImageWorkloadRepository(c.DB)
 
 	log.Println("Repositories initialized (PostgreSQL)")
 }
@@ -935,6 +1004,12 @@ func (c *Container) Close() error {
 	// jobs complete their dispatch path.
 	if c.TestPool != nil {
 		c.TestPool.Stop()
+	}
+
+	// runtime-fleet CP3 — wait for detached image-boot test runs to finish so
+	// their results are persisted before the DB pool closes.
+	if c.FleetProvisionUC != nil {
+		c.FleetProvisionUC.Wait()
 	}
 
 	// §9.1 — drain every warm pool before releasing upstream resources

@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option go_package = "github.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1";
+
+// FleetOrchestration is the P7 DeployTarget provider seam (docs/program/02-pillars/runtime-fleet/README.md §4).
+// CP3 implements Provision/Health/Decommission for workload classes "test" and "resident";
+// Scale and Cutover land with the CP4 fleet control plane and return Unimplemented until then.
+service FleetOrchestration {
+    rpc Provision(ProvisionRequest) returns (ProvisionResponse);
+    rpc Health(FleetHealthRequest) returns (FleetHealthResponse);
+    rpc Scale(FleetScaleRequest) returns (FleetScaleResponse);
+    rpc Cutover(FleetCutoverRequest) returns (FleetCutoverResponse);
+    rpc Decommission(FleetDecommissionRequest) returns (FleetDecommissionResponse);
+}
+
+message OCIImageRef {
+    string registry = 1;   // e.g. "10.0.10.20:8089"
+    string repository = 2; // e.g. "org/component"
+    string digest = 3;     // "sha256:..."
+    string change_id = 4;  // provenance (D-016); informational here
+}
+message ResourceSpec { int32 vcpu = 1; int32 memory_mb = 2; }
+message RouteSpec { string host_pattern = 1; string path_prefix = 2; }   // unused in CP3, shape frozen
+message VolumeSpec { string id = 1; int32 size_mb = 2; }                 // unused in CP3, shape frozen
+message DeploymentDescriptor {
+    string component_id = 1;
+    string env = 2;
+    OCIImageRef image = 3;
+    ResourceSpec resources = 4;          // 0 values → defaults (1 vcpu, 512 MB)
+    map<string, string> env_vars = 5;
+    repeated string secret_refs = 6;     // MUST be empty in CP3 (secrets contract open) — reject InvalidArgument if set
+    repeated RouteSpec routes = 7;       // ignored in CP3
+    repeated VolumeSpec volumes = 8;     // ignored in CP3
+    int32 port = 9;                      // guest port the workload listens on (resident class)
+    string workload_class = 10;          // "test" | "resident"
+    string test_command = 11;            // test class only: overrides the image entrypoint when non-empty (run via /bin/sh -c)
+    int64 timeout_seconds = 12;          // test class: max run time (default 300)
+}
+message ProvisionRequest { DeploymentDescriptor descriptor = 1; }
+message ProvisionResponse { string handle = 1; string url = 2; } // url set for resident class ("http://<advertise_host>:<host_port>"), empty for test
+message FleetHealthRequest { string handle = 1; }
+message FleetHealthResponse {
+    string state = 1;        // "booting" | "running" | "exited" | "failed"
+    bool healthy = 2;        // resident: TCP dial guest port ok; test: state==exited && exit_code==0
+    int32 exit_code = 3;     // meaningful when state=="exited"
+    string message = 4;
+    string stdout_tail = 5;  // last <=8KB, test class
+    string stderr_tail = 6;
+    string url = 7;
+}
+message FleetScaleRequest { string handle = 1; int32 replicas = 2; }
+message FleetScaleResponse {}
+message FleetCutoverRequest { string from_handle = 1; string to_handle = 2; }
+message FleetCutoverResponse {}
+message FleetDecommissionRequest { string handle = 1; }
+message FleetDecommissionResponse {}

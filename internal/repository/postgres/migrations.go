@@ -38,6 +38,11 @@ func AutoMigrate(db *gorm.DB) error {
 		&domain.HermeticBuild{},
 		&domain.HermeticBuildStep{},
 		&domain.StepArtifactHash{},
+
+		// runtime-fleet CP3 — microVMs booted from a compiled OCI image
+		// (the I1 boot-the-image model). Persisted so Health/Decommission
+		// survive a process restart.
+		&domain.ImageWorkload{},
 	}
 
 	if err := db.AutoMigrate(models...); err != nil {

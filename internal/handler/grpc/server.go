@@ -19,6 +19,7 @@ type Server struct {
 	grpcServer      *grpc.Server
 	executionServer *ExecutionServer
 	graphServer     *GraphServer
+	healthServer    *health.Server
 }
 
 // ServerConfig holds configuration for the gRPC server.
@@ -104,6 +105,17 @@ func NewServer(
 		grpcServer:      grpcServer,
 		executionServer: executionServer,
 		graphServer:     graphServer,
+		healthServer:    healthServer,
+	}
+}
+
+// RegisterFleet registers the FleetOrchestration service (runtime-fleet CP3).
+// Safe to call after NewServer but before Serve; the shared auth interceptor
+// applies (service principals present the x-api-key like every other RPC).
+func (s *Server) RegisterFleet(fleet *FleetServer) {
+	runtimev1.RegisterFleetOrchestrationServer(s.grpcServer, fleet)
+	if s.healthServer != nil {
+		s.healthServer.SetServingStatus("runtime.v1.FleetOrchestration", grpc_health_v1.HealthCheckResponse_SERVING)
 	}
 }
 

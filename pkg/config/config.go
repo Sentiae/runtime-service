@@ -19,6 +19,30 @@ type Config struct {
 	Kafka         KafkaConfig         `mapstructure:"kafka"`
 	Hermetic      HermeticConfig      `mapstructure:"hermetic"`
 	SnapshotStore SnapshotStoreConfig `mapstructure:"snapshot_store"`
+	Registry      RegistryConfig      `mapstructure:"registry"`
+	ImageBoot     ImageBootConfig     `mapstructure:"imageboot"`
+}
+
+// RegistryConfig configures the OCI registry the image-boot path pulls compiled
+// images from (vcs OCI-on-CAS, D-016). Plain HTTP on the homelab.
+type RegistryConfig struct {
+	Host       string `mapstructure:"host"`
+	ServiceKey string `mapstructure:"service_key"`
+}
+
+// ImageBootConfig configures the OCI→ext4 image-boot path (runtime-fleet CP3).
+type ImageBootConfig struct {
+	// WorkDir is the root under which per-workload staging dirs + rootfs images
+	// are materialized.
+	WorkDir string `mapstructure:"work_dir"`
+	// InitPath is the host path to the prebuilt image-init binary copied into
+	// each rootfs as /sentiae/init.
+	InitPath string `mapstructure:"init_path"`
+	// HostPortMin/Max bound the host-port range published for resident workloads.
+	HostPortMin int `mapstructure:"host_port_min"`
+	HostPortMax int `mapstructure:"host_port_max"`
+	// AdvertiseHost is the host advertised in resident URLs.
+	AdvertiseHost string `mapstructure:"advertise_host"`
 }
 
 // SnapshotStoreConfig configures the durable object-store backing for
@@ -368,6 +392,17 @@ func Load() (*Config, error) {
 			"snapshot_store.use_ssl":    false,
 			"snapshot_store.path_style": true,
 			"snapshot_store.cache_dir":  "/var/lib/firecracker/snapshot-cache",
+
+			// OCI registry (image-boot pull source, D-016).
+			"registry.host":        "10.0.10.20:8089",
+			"registry.service_key": "",
+
+			// Image-boot (runtime-fleet CP3).
+			"imageboot.work_dir":       "/var/lib/sentiae/images",
+			"imageboot.init_path":      "/usr/local/bin/image-init",
+			"imageboot.host_port_min":  20000,
+			"imageboot.host_port_max":  20999,
+			"imageboot.advertise_host": "10.0.10.244",
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -486,6 +521,17 @@ func Load() (*Config, error) {
 			{"snapshot_store.use_ssl", "APP_SNAPSHOT_STORE_USE_SSL"},
 			{"snapshot_store.path_style", "APP_SNAPSHOT_STORE_PATH_STYLE"},
 			{"snapshot_store.cache_dir", "APP_SNAPSHOT_STORE_CACHE_DIR"},
+
+			// OCI registry
+			{"registry.host", "APP_REGISTRY_HOST"},
+			{"registry.service_key", "APP_REGISTRY_SERVICE_KEY"},
+
+			// Image-boot (runtime-fleet CP3)
+			{"imageboot.work_dir", "APP_IMAGEBOOT_WORKDIR"},
+			{"imageboot.init_path", "APP_IMAGEBOOT_INIT_PATH"},
+			{"imageboot.host_port_min", "APP_IMAGEBOOT_HOST_PORT_MIN"},
+			{"imageboot.host_port_max", "APP_IMAGEBOOT_HOST_PORT_MAX"},
+			{"imageboot.advertise_host", "APP_IMAGEBOOT_ADVERTISE_HOST"},
 		},
 	})
 	if err != nil {

@@ -141,3 +141,13 @@ type TerminalSessionRepository interface {
 	FindActive(ctx context.Context) ([]domain.TerminalSession, error)
 	Delete(ctx context.Context, id uuid.UUID) error
 }
+
+// ImageWorkloadRepository defines the interface for image-boot workload
+// persistence (runtime-fleet CP3). Workloads booted from a compiled OCI image.
+type ImageWorkloadRepository interface {
+	Create(ctx context.Context, workload *domain.ImageWorkload) error
+	Update(ctx context.Context, workload *domain.ImageWorkload) error
+	FindByID(ctx context.Context, id uuid.UUID) (*domain.ImageWorkload, error)
+	FindActive(ctx context.Context) ([]domain.ImageWorkload, error)
+	Delete(ctx context.Context, id uuid.UUID) error
+}
