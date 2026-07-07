@@ -151,3 +151,60 @@ type ImageWorkloadRepository interface {
 	FindActive(ctx context.Context) ([]domain.ImageWorkload, error)
 	Delete(ctx context.Context, id uuid.UUID) error
 }
+
+// HostRepository persists fleet hosts (runtime-fleet CP4 durable control plane).
+type HostRepository interface {
+	Create(ctx context.Context, host *domain.Host) error
+	Update(ctx context.Context, host *domain.Host) error
+	FindByID(ctx context.Context, id uuid.UUID) (*domain.Host, error)
+	ListActive(ctx context.Context) ([]domain.Host, error)
+	ListByStatus(ctx context.Context, status domain.HostStatus) ([]domain.Host, error)
+	Delete(ctx context.Context, id uuid.UUID) error
+}
+
+// FleetAppRepository persists fleet apps (desired state per component+env).
+type FleetAppRepository interface {
+	Create(ctx context.Context, app *domain.FleetApp) error
+	Update(ctx context.Context, app *domain.FleetApp) error
+	FindByID(ctx context.Context, id uuid.UUID) (*domain.FleetApp, error)
+	FindByComponentEnv(ctx context.Context, componentID, env string) (*domain.FleetApp, error)
+	Delete(ctx context.Context, id uuid.UUID) error
+}
+
+// ReplicaRepository persists resident replicas (actual state per app).
+type ReplicaRepository interface {
+	Create(ctx context.Context, replica *domain.Replica) error
+	Update(ctx context.Context, replica *domain.Replica) error
+	FindByID(ctx context.Context, id uuid.UUID) (*domain.Replica, error)
+	ListByApp(ctx context.Context, appID uuid.UUID) ([]domain.Replica, error)
+	ListByHost(ctx context.Context, hostID uuid.UUID) ([]domain.Replica, error)
+	ListByState(ctx context.Context, state domain.ReplicaState) ([]domain.Replica, error)
+	Delete(ctx context.Context, id uuid.UUID) error
+}
+
+// PlacementRepository persists replica-to-host placements.
+type PlacementRepository interface {
+	Upsert(ctx context.Context, placement *domain.Placement) error
+	FindByReplica(ctx context.Context, replicaID uuid.UUID) (*domain.Placement, error)
+	Delete(ctx context.Context, replicaID uuid.UUID) error
+}
+
+// RouteRepository persists ingress routes for fleet apps.
+type RouteRepository interface {
+	Create(ctx context.Context, route *domain.Route) error
+	ListByApp(ctx context.Context, appID uuid.UUID) ([]domain.Route, error)
+	DeleteByApp(ctx context.Context, appID uuid.UUID) error
+}
+
+// VolumeRepository persists volumes for fleet apps.
+type VolumeRepository interface {
+	Create(ctx context.Context, volume *domain.Volume) error
+	ListByApp(ctx context.Context, appID uuid.UUID) ([]domain.Volume, error)
+}
+
+// SecretBindingRepository persists secret bindings for fleet apps.
+type SecretBindingRepository interface {
+	Create(ctx context.Context, binding *domain.SecretBinding) error
+	ListByApp(ctx context.Context, appID uuid.UUID) ([]domain.SecretBinding, error)
+	DeleteByApp(ctx context.Context, appID uuid.UUID) error
+}

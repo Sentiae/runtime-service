@@ -147,6 +147,15 @@ type Container struct {
 
 	// runtime-fleet CP3 — OCI→ext4 image boot + FleetOrchestration.
 	ImageWorkloadRepo repository.ImageWorkloadRepository
+
+	// runtime-fleet CP4 — durable fleet control-plane store.
+	HostRepo          repository.HostRepository
+	FleetAppRepo      repository.FleetAppRepository
+	ReplicaRepo       repository.ReplicaRepository
+	PlacementRepo     repository.PlacementRepository
+	RouteRepo         repository.RouteRepository
+	VolumeRepo        repository.VolumeRepository
+	SecretBindingRepo repository.SecretBindingRepository
 	ImageBooter       usecase.ImageBooter
 	ImageMaterializer usecase.ImageMaterializer
 	FleetProvisionUC  *usecase.FleetProvision
@@ -301,6 +310,14 @@ func (c *Container) initDatabase(cfg *config.Config) error {
 
 	c.DB = db
 	log.Println("Database connection initialized successfully")
+
+	// Run golang-migrate migrations (durable path, idempotent) — owns the
+	// fleet control-plane DDL. Runs unconditionally before AutoMigrate.
+	version, applied, err := postgres.RunMigrations(db)
+	if err != nil {
+		return fmt.Errorf("failed to run migrations: %w", err)
+	}
+	log.Printf("Migrations complete (version=%d applied=%t)", version, applied)
 
 	// Run auto-migrations if enabled
 	if cfg.Database.Postgres.Migrations.AutoMigrate {
@@ -504,6 +521,15 @@ func (c *Container) initRepositories() {
 
 	// runtime-fleet CP3 — image-boot workloads
 	c.ImageWorkloadRepo = postgres.NewImageWorkloadRepository(c.DB)
+
+	// runtime-fleet CP4 — durable fleet control-plane store
+	c.HostRepo = postgres.NewHostRepository(c.DB)
+	c.FleetAppRepo = postgres.NewFleetAppRepository(c.DB)
+	c.ReplicaRepo = postgres.NewReplicaRepository(c.DB)
+	c.PlacementRepo = postgres.NewPlacementRepository(c.DB)
+	c.RouteRepo = postgres.NewRouteRepository(c.DB)
+	c.VolumeRepo = postgres.NewVolumeRepository(c.DB)
+	c.SecretBindingRepo = postgres.NewSecretBindingRepository(c.DB)
 
 	log.Println("Repositories initialized (PostgreSQL)")
 }
