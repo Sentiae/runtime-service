@@ -42,8 +42,12 @@ type Replica struct {
 	GuestIP         string        `json:"guest_ip" gorm:"type:varchar(45);not null;default:''"`
 	HostPort        int           `json:"host_port" gorm:"not null;default:0"`
 	NetIndex        int           `json:"net_index" gorm:"not null;default:0"`
-	PID             *int          `json:"pid,omitempty"`
-	ExitCode        *int          `json:"exit_code,omitempty"`
+	RootfsPath      string        `json:"rootfs_path" gorm:"column:rootfs_path;type:varchar(512);not null;default:''"`
+	SocketPath      string        `json:"socket_path" gorm:"column:socket_path;type:varchar(512);not null;default:''"`
+	TapName         string        `json:"tap_name" gorm:"column:tap_name;type:varchar(32);not null;default:''"`
+	Port            int           `json:"port" gorm:"column:port;not null;default:0"`
+	PID             *int          `json:"pid,omitempty" gorm:"column:pid"`
+	ExitCode        *int          `json:"exit_code,omitempty" gorm:"column:exit_code"`
 	RestartPolicy   RestartPolicy `json:"restart_policy" gorm:"type:varchar(20);not null;default:'always'"`
 	Message         string        `json:"message" gorm:"type:text;not null;default:''"`
 	CreatedAt       time.Time     `json:"created_at" gorm:"not null"`

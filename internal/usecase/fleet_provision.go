@@ -166,9 +166,19 @@ type FleetProvision struct {
 	workDir      string
 	advertise    string
 
+	// orchestrator is the CP4 durable app→replicas path for the resident class.
+	// When nil (non-firecracker / unwired builds) resident provisioning falls
+	// back to the CP3 single-workload runResident path so behavior is preserved.
+	orchestrator *FleetOrchestrator
+
 	baseCtx context.Context
 	wg      sync.WaitGroup
 }
+
+// SetOrchestrator wires the CP4 reconciler-backed app model. Resident-class
+// provision/health/scale/decommission then route through it; the test class is
+// unaffected.
+func (uc *FleetProvision) SetOrchestrator(orch *FleetOrchestrator) { uc.orchestrator = orch }
 
 // NewFleetProvision constructs the use case. baseCtx is the service root context
 // used for detached test-run goroutines (they must outlive the Provision RPC).
@@ -242,13 +252,48 @@ func (uc *FleetProvision) Provision(ctx context.Context, in FleetProvisionInput)
 		return FleetProvisionOutput{Handle: wl.ID.String()}, nil
 	}
 
-	// Resident: materialize + boot synchronously so the URL is known on return.
+	// Resident: the CP4 orchestrator owns a durable app→replicas model driven by
+	// the reconciler. The CP3 single-workload row persisted above is not used for
+	// the resident class when the orchestrator is wired — drop it.
+	if uc.orchestrator != nil {
+		if delErr := uc.repo.Delete(ctx, wl.ID); delErr != nil {
+			logger.FromContext(ctx).Warn("fleet: drop placeholder workload row", "workload_id", wl.ID, "err", delErr)
+		}
+		handle, url, err := uc.orchestrator.ProvisionApp(ctx, in)
+		if err != nil {
+			return FleetProvisionOutput{}, err
+		}
+		return FleetProvisionOutput{Handle: handle, URL: url}, nil
+	}
+
+	// Fallback (no orchestrator wired): materialize + boot one workload
+	// synchronously so the URL is known on return.
 	url, err := uc.runResident(ctx, wl, matIn, in.VCPU, in.MemoryMB)
 	if err != nil {
 		uc.markFailed(ctx, wl, err)
 		return FleetProvisionOutput{}, err
 	}
 	return FleetProvisionOutput{Handle: wl.ID.String(), URL: url}, nil
+}
+
+// Scale sets the desired replica count for a resident app (routed to the CP4
+// orchestrator). A handle that is not a known app returns ErrWorkloadNotFound.
+func (uc *FleetProvision) Scale(ctx context.Context, handle string, replicas int) error {
+	id, err := uuid.Parse(handle)
+	if err != nil {
+		return domain.ErrWorkloadNotFound
+	}
+	if uc.orchestrator == nil {
+		return domain.ErrWorkloadNotFound
+	}
+	isApp, serr := uc.orchestrator.ScaleApp(ctx, id, replicas)
+	if serr != nil {
+		return serr
+	}
+	if !isApp {
+		return domain.ErrWorkloadNotFound
+	}
+	return nil
 }
 
 // startTestRun launches the detached test boot. Provision has already returned
@@ -353,6 +398,15 @@ func (uc *FleetProvision) Health(ctx context.Context, handle string) (FleetHealt
 	if err != nil {
 		return FleetHealthOutput{}, domain.ErrWorkloadNotFound
 	}
+	if uc.orchestrator != nil {
+		out, isApp, herr := uc.orchestrator.HealthApp(ctx, id)
+		if herr != nil {
+			return FleetHealthOutput{}, herr
+		}
+		if isApp {
+			return out, nil
+		}
+	}
 	wl, err := uc.repo.FindByID(ctx, id)
 	if err != nil {
 		return FleetHealthOutput{}, err
@@ -410,6 +464,15 @@ func (uc *FleetProvision) Decommission(ctx context.Context, handle string) error
 	id, err := uuid.Parse(handle)
 	if err != nil {
 		return domain.ErrWorkloadNotFound
+	}
+	if uc.orchestrator != nil {
+		isApp, derr := uc.orchestrator.DecommissionApp(ctx, id)
+		if derr != nil {
+			return derr
+		}
+		if isApp {
+			return nil
+		}
 	}
 	wl, err := uc.repo.FindByID(ctx, id)
 	if err != nil {

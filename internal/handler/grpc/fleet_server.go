@@ -95,9 +95,15 @@ func (s *FleetServer) Decommission(ctx context.Context, req *runtimev1.FleetDeco
 	return &runtimev1.FleetDecommissionResponse{}, nil
 }
 
-// Scale lands with the CP4 fleet control plane.
-func (s *FleetServer) Scale(context.Context, *runtimev1.FleetScaleRequest) (*runtimev1.FleetScaleResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "lands with the CP4 fleet control plane")
+// Scale sets the desired replica count for a resident fleet app (CP4 §9#7).
+func (s *FleetServer) Scale(ctx context.Context, req *runtimev1.FleetScaleRequest) (*runtimev1.FleetScaleResponse, error) {
+	if s.provision == nil {
+		return nil, status.Error(codes.Unavailable, "fleet provision use case not configured")
+	}
+	if err := s.provision.Scale(ctx, req.GetHandle(), int(req.GetReplicas())); err != nil {
+		return nil, fleetError(err)
+	}
+	return &runtimev1.FleetScaleResponse{}, nil
 }
 
 // Cutover lands with the CP4 fleet control plane.

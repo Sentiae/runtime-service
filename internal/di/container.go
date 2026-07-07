@@ -160,6 +160,10 @@ type Container struct {
 	ImageMaterializer usecase.ImageMaterializer
 	FleetProvisionUC  *usecase.FleetProvision
 
+	// runtime-fleet CP4 §9#6 — resident replica boot/teardown/health. Non-nil
+	// only on the firecracker executor (the fleet host); nil otherwise.
+	FleetReplicaRuntimeUC *usecase.FleetReplicaRuntime
+
 	// runtime-fleet CP4 §9#4 — host registry + this instance's self-host.
 	FleetHostRegistry   *usecase.FleetHostRegistry
 	fleetSelf           *domain.Host // non-nil only on the firecracker executor
@@ -168,6 +172,10 @@ type Container struct {
 	// runtime-fleet CP4 §9#5 — placement decision function (bin_pack / spread /
 	// affinity). Read-only; the #7 reconciler calls SelectHost.
 	FleetScheduler *usecase.FleetScheduler
+
+	// runtime-fleet CP4 §9#7 — reconciler-backed app→replicas orchestrator.
+	// Non-nil only on the firecracker executor (needs the replica runtime).
+	FleetOrchestratorUC *usecase.FleetOrchestrator
 
 	// Use Cases
 	ExecutionUC  usecase.ExecutionUseCase
@@ -264,6 +272,20 @@ func (c *Container) initFleet(cfg *config.Config) {
 		} else {
 			log.Printf("Warning: image-boot seed from active workloads failed: %v", err)
 		}
+		// Also seed from live replicas (resident + booting) so the CP4 replica
+		// path and the CP3 workload path never collide on a /30 index or port.
+		// Seed is additive (merges into the used-set), so a second call is safe.
+		if replicas, err := activeReplicas(c.ReplicaRepo); err == nil {
+			indices := make([]int, 0, len(replicas))
+			ports := make([]int, 0, len(replicas))
+			for i := range replicas {
+				indices = append(indices, replicas[i].NetIndex)
+				ports = append(ports, replicas[i].HostPort)
+			}
+			booter.Seed(indices, ports)
+		} else {
+			log.Printf("Warning: image-boot seed from live replicas failed: %v", err)
+		}
 		c.ImageBooter = booter
 		log.Println("Image-boot Firecracker booter initialized")
 	} else {
@@ -280,6 +302,19 @@ func (c *Container) initFleet(cfg *config.Config) {
 		cfg.ImageBoot.AdvertiseHost,
 	)
 
+	// CP4 §9#6 — resident replica runtime (firecracker host only; the fail-loud
+	// booter would reject every boot off-host so it stays nil there).
+	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
+		c.FleetReplicaRuntimeUC = usecase.NewFleetReplicaRuntime(
+			c.ImageMaterializer,
+			c.ImageBooter,
+			c.ReplicaRepo,
+			c.FleetAppRepo,
+			cfg.ImageBoot.WorkDir,
+			cfg.ImageBoot.AdvertiseHost,
+		)
+	}
+
 	// CP4 §9#4 — durable host registry + this instance's self-registration.
 	c.FleetHostRegistry = usecase.NewFleetHostRegistry(c.HostRepo)
 
@@ -291,6 +326,19 @@ func (c *Container) initFleet(cfg *config.Config) {
 	}
 	c.FleetScheduler = usecase.NewFleetScheduler(c.FleetHostRegistry, c.ReplicaRepo, c.FleetAppRepo, schedStaleness)
 
+	// CP4 §9#7 — reconciler-backed app→replicas model. Firecracker host only
+	// (needs the replica runtime); off-host the resident class falls back to the
+	// CP3 single-workload path in FleetProvision.
+	if c.FleetReplicaRuntimeUC != nil {
+		c.FleetOrchestratorUC = usecase.NewFleetOrchestrator(
+			c.FleetAppRepo,
+			c.ReplicaRepo,
+			c.FleetScheduler,
+			c.FleetReplicaRuntimeUC,
+		)
+		c.FleetProvisionUC.SetOrchestrator(c.FleetOrchestratorUC)
+	}
+
 	if cfg.App.ExecutorType == "firecracker" {
 		c.registerSelfHost(cfg)
 	} else {
@@ -301,6 +349,22 @@ func (c *Container) initFleet(cfg *config.Config) {
 		c.GRPCServer.RegisterFleet(grpchandler.NewFleetServer(c.FleetProvisionUC, c.FleetHostRegistry))
 		log.Println("FleetOrchestration gRPC service registered")
 	}
+}
+
+// activeReplicas returns replicas currently holding a /30 index + host port
+// (resident or mid-boot) so the image-boot allocator can be seeded from them on
+// restart. Any query error aborts (the caller logs a warning).
+func activeReplicas(repo repository.ReplicaRepository) ([]domain.Replica, error) {
+	ctx := context.Background()
+	resident, err := repo.ListByState(ctx, domain.ReplicaStateResident)
+	if err != nil {
+		return nil, err
+	}
+	booting, err := repo.ListByState(ctx, domain.ReplicaStateBooting)
+	if err != nil {
+		return nil, err
+	}
+	return append(resident, booting...), nil
 }
 
 // registerSelfHost registers this runtime-service instance as a fleet host and
@@ -1075,7 +1139,39 @@ func (c *Container) StartBackgroundControllers(ctx context.Context) {
 		log.Printf("[FC-POOL] %d warm pool(s) started", len(c.FCPools))
 	}
 	c.startFleetHeartbeat(ctx)
+	c.startFleetReconciler(ctx)
 	c.StartConsumers(ctx)
+}
+
+// startFleetReconciler runs the CP4 §9#7 fleet reconcile loop, driving every
+// app's replica set toward its desired count every 10s. Firecracker host only
+// (the orchestrator is nil otherwise). ctx-aware + panic-recovering.
+func (c *Container) startFleetReconciler(ctx context.Context) {
+	if c.FleetOrchestratorUC == nil {
+		return
+	}
+	orch := c.FleetOrchestratorUC
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[FLEET-RECONCILE] reconcile loop panicked: %v", r)
+			}
+		}()
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		log.Println("[FLEET-RECONCILE] reconcile loop started (interval=10s)")
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("[FLEET-RECONCILE] reconcile loop stopped (context cancelled)")
+				return
+			case <-ticker.C:
+				if err := orch.ReconcileAll(ctx); err != nil {
+					log.Printf("[FLEET-RECONCILE] reconcile error: %v", err)
+				}
+			}
+		}
+	}()
 }
 
 // startFleetHeartbeat runs the self-host heartbeat loop (runtime-fleet CP4

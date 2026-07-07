@@ -64,6 +64,13 @@ func (f *fakeAppRepo) Update(context.Context, *domain.FleetApp) error { return n
 func (f *fakeAppRepo) FindByComponentEnv(context.Context, string, string) (*domain.FleetApp, error) {
 	return nil, domain.ErrFleetAppNotFound
 }
+func (f *fakeAppRepo) List(context.Context) ([]domain.FleetApp, error) {
+	out := make([]domain.FleetApp, 0, len(f.apps))
+	for _, a := range f.apps {
+		out = append(out, *a)
+	}
+	return out, nil
+}
 func (f *fakeAppRepo) Delete(context.Context, uuid.UUID) error { return nil }
 
 // host builds a live host with capacity + optional labels.

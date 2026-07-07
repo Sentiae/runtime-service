@@ -169,6 +169,7 @@ type FleetAppRepository interface {
 	Update(ctx context.Context, app *domain.FleetApp) error
 	FindByID(ctx context.Context, id uuid.UUID) (*domain.FleetApp, error)
 	FindByComponentEnv(ctx context.Context, componentID, env string) (*domain.FleetApp, error)
+	List(ctx context.Context) ([]domain.FleetApp, error)
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 

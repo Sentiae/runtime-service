@@ -56,6 +56,14 @@ func (r *fleetAppRepository) FindByComponentEnv(ctx context.Context, componentID
 	return &app, nil
 }
 
+func (r *fleetAppRepository) List(ctx context.Context) ([]domain.FleetApp, error) {
+	var apps []domain.FleetApp
+	if err := r.db.WithContext(ctx).Find(&apps).Error; err != nil {
+		return nil, err
+	}
+	return apps, nil
+}
+
 func (r *fleetAppRepository) Delete(ctx context.Context, id uuid.UUID) error {
 	return r.db.WithContext(ctx).Where("id = ?", id).Delete(&domain.FleetApp{}).Error
 }
