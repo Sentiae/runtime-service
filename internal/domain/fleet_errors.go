@@ -22,4 +22,7 @@ var (
 	// ErrInvalidHostHealth is returned when a heartbeat reports a health value
 	// the fleet does not recognize (see HostHealth.IsValid).
 	ErrInvalidHostHealth = errors.New("invalid fleet host health")
+	// ErrNoSchedulableHost is returned when the scheduler finds no live host
+	// that satisfies a placement request's resource + constraint filters.
+	ErrNoSchedulableHost = errors.New("no schedulable host")
 )

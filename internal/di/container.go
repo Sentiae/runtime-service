@@ -165,6 +165,10 @@ type Container struct {
 	fleetSelf           *domain.Host // non-nil only on the firecracker executor
 	fleetHeartbeatEvery time.Duration
 
+	// runtime-fleet CP4 §9#5 — placement decision function (bin_pack / spread /
+	// affinity). Read-only; the #7 reconciler calls SelectHost.
+	FleetScheduler *usecase.FleetScheduler
+
 	// Use Cases
 	ExecutionUC  usecase.ExecutionUseCase
 	VMUC         usecase.VMUseCase
@@ -278,6 +282,15 @@ func (c *Container) initFleet(cfg *config.Config) {
 
 	// CP4 §9#4 — durable host registry + this instance's self-registration.
 	c.FleetHostRegistry = usecase.NewFleetHostRegistry(c.HostRepo)
+
+	// CP4 §9#5 — placement scheduler. Staleness = 3× the heartbeat interval so a
+	// host that misses a couple of beats drops out of the candidate set.
+	schedStaleness := 3 * cfg.Fleet.HeartbeatInterval
+	if schedStaleness <= 0 {
+		schedStaleness = 3 * 30 * time.Second
+	}
+	c.FleetScheduler = usecase.NewFleetScheduler(c.FleetHostRegistry, c.ReplicaRepo, c.FleetAppRepo, schedStaleness)
+
 	if cfg.App.ExecutorType == "firecracker" {
 		c.registerSelfHost(cfg)
 	} else {
