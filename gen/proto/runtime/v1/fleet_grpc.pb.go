@@ -24,6 +24,9 @@ const (
 	FleetOrchestration_Scale_FullMethodName        = "/runtime.v1.FleetOrchestration/Scale"
 	FleetOrchestration_Cutover_FullMethodName      = "/runtime.v1.FleetOrchestration/Cutover"
 	FleetOrchestration_Decommission_FullMethodName = "/runtime.v1.FleetOrchestration/Decommission"
+	FleetOrchestration_RegisterHost_FullMethodName = "/runtime.v1.FleetOrchestration/RegisterHost"
+	FleetOrchestration_Heartbeat_FullMethodName    = "/runtime.v1.FleetOrchestration/Heartbeat"
+	FleetOrchestration_ListHosts_FullMethodName    = "/runtime.v1.FleetOrchestration/ListHosts"
 )
 
 // FleetOrchestrationClient is the client API for FleetOrchestration service.
@@ -39,6 +42,10 @@ type FleetOrchestrationClient interface {
 	Scale(ctx context.Context, in *FleetScaleRequest, opts ...grpc.CallOption) (*FleetScaleResponse, error)
 	Cutover(ctx context.Context, in *FleetCutoverRequest, opts ...grpc.CallOption) (*FleetCutoverResponse, error)
 	Decommission(ctx context.Context, in *FleetDecommissionRequest, opts ...grpc.CallOption) (*FleetDecommissionResponse, error)
+	// CP4 fleet control plane — host registry + inventory + heartbeat (§9#4).
+	RegisterHost(ctx context.Context, in *RegisterHostRequest, opts ...grpc.CallOption) (*RegisterHostResponse, error)
+	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
+	ListHosts(ctx context.Context, in *ListHostsRequest, opts ...grpc.CallOption) (*ListHostsResponse, error)
 }
 
 type fleetOrchestrationClient struct {
@@ -99,6 +106,36 @@ func (c *fleetOrchestrationClient) Decommission(ctx context.Context, in *FleetDe
 	return out, nil
 }
 
+func (c *fleetOrchestrationClient) RegisterHost(ctx context.Context, in *RegisterHostRequest, opts ...grpc.CallOption) (*RegisterHostResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegisterHostResponse)
+	err := c.cc.Invoke(ctx, FleetOrchestration_RegisterHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *fleetOrchestrationClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HeartbeatResponse)
+	err := c.cc.Invoke(ctx, FleetOrchestration_Heartbeat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *fleetOrchestrationClient) ListHosts(ctx context.Context, in *ListHostsRequest, opts ...grpc.CallOption) (*ListHostsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListHostsResponse)
+	err := c.cc.Invoke(ctx, FleetOrchestration_ListHosts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // FleetOrchestrationServer is the server API for FleetOrchestration service.
 // All implementations must embed UnimplementedFleetOrchestrationServer
 // for forward compatibility.
@@ -112,6 +149,10 @@ type FleetOrchestrationServer interface {
 	Scale(context.Context, *FleetScaleRequest) (*FleetScaleResponse, error)
 	Cutover(context.Context, *FleetCutoverRequest) (*FleetCutoverResponse, error)
 	Decommission(context.Context, *FleetDecommissionRequest) (*FleetDecommissionResponse, error)
+	// CP4 fleet control plane — host registry + inventory + heartbeat (§9#4).
+	RegisterHost(context.Context, *RegisterHostRequest) (*RegisterHostResponse, error)
+	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
+	ListHosts(context.Context, *ListHostsRequest) (*ListHostsResponse, error)
 	mustEmbedUnimplementedFleetOrchestrationServer()
 }
 
@@ -136,6 +177,15 @@ func (UnimplementedFleetOrchestrationServer) Cutover(context.Context, *FleetCuto
 }
 func (UnimplementedFleetOrchestrationServer) Decommission(context.Context, *FleetDecommissionRequest) (*FleetDecommissionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Decommission not implemented")
+}
+func (UnimplementedFleetOrchestrationServer) RegisterHost(context.Context, *RegisterHostRequest) (*RegisterHostResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RegisterHost not implemented")
+}
+func (UnimplementedFleetOrchestrationServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
+}
+func (UnimplementedFleetOrchestrationServer) ListHosts(context.Context, *ListHostsRequest) (*ListHostsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListHosts not implemented")
 }
 func (UnimplementedFleetOrchestrationServer) mustEmbedUnimplementedFleetOrchestrationServer() {}
 func (UnimplementedFleetOrchestrationServer) testEmbeddedByValue()                            {}
@@ -248,6 +298,60 @@ func _FleetOrchestration_Decommission_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _FleetOrchestration_RegisterHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FleetOrchestrationServer).RegisterHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FleetOrchestration_RegisterHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FleetOrchestrationServer).RegisterHost(ctx, req.(*RegisterHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FleetOrchestration_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HeartbeatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FleetOrchestrationServer).Heartbeat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FleetOrchestration_Heartbeat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FleetOrchestrationServer).Heartbeat(ctx, req.(*HeartbeatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FleetOrchestration_ListHosts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListHostsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FleetOrchestrationServer).ListHosts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FleetOrchestration_ListHosts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FleetOrchestrationServer).ListHosts(ctx, req.(*ListHostsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // FleetOrchestration_ServiceDesc is the grpc.ServiceDesc for FleetOrchestration service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -274,6 +378,18 @@ var FleetOrchestration_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Decommission",
 			Handler:    _FleetOrchestration_Decommission_Handler,
+		},
+		{
+			MethodName: "RegisterHost",
+			Handler:    _FleetOrchestration_RegisterHost_Handler,
+		},
+		{
+			MethodName: "Heartbeat",
+			Handler:    _FleetOrchestration_Heartbeat_Handler,
+		},
+		{
+			MethodName: "ListHosts",
+			Handler:    _FleetOrchestration_ListHosts_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -18,11 +19,12 @@ import (
 type FleetServer struct {
 	runtimev1.UnimplementedFleetOrchestrationServer
 	provision *usecase.FleetProvision
+	registry  *usecase.FleetHostRegistry
 }
 
 // NewFleetServer constructs the handler.
-func NewFleetServer(provision *usecase.FleetProvision) *FleetServer {
-	return &FleetServer{provision: provision}
+func NewFleetServer(provision *usecase.FleetProvision, registry *usecase.FleetHostRegistry) *FleetServer {
+	return &FleetServer{provision: provision, registry: registry}
 }
 
 // Provision boots a workload from a compiled OCI image.
@@ -103,6 +105,97 @@ func (s *FleetServer) Cutover(context.Context, *runtimev1.FleetCutoverRequest) (
 	return nil, status.Error(codes.Unimplemented, "lands with the CP4 fleet control plane")
 }
 
+// RegisterHost registers (or refreshes) a fleet host in the durable inventory.
+func (s *FleetServer) RegisterHost(ctx context.Context, req *runtimev1.RegisterHostRequest) (*runtimev1.RegisterHostResponse, error) {
+	if s.registry == nil {
+		return nil, status.Error(codes.Unavailable, "fleet host registry not configured")
+	}
+	spec := req.GetHost()
+	if spec == nil {
+		return nil, status.Error(codes.InvalidArgument, "host spec is required")
+	}
+	var id uuid.UUID
+	if spec.GetHostId() != "" {
+		parsed, err := uuid.Parse(spec.GetHostId())
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "host_id is not a valid uuid")
+		}
+		id = parsed
+	}
+	host, err := s.registry.RegisterHost(ctx, domain.Host{
+		ID:             id,
+		Region:         spec.GetRegion(),
+		Labels:         spec.GetLabels(),
+		CapacityVCPU:   int(spec.GetCapacityVcpu()),
+		CapacityMemMB:  spec.GetCapacityMemMb(),
+		CapacityDiskMB: spec.GetCapacityDiskMb(),
+		Endpoint:       spec.GetEndpoint(),
+	})
+	if err != nil {
+		return nil, fleetError(err)
+	}
+	return &runtimev1.RegisterHostResponse{HostId: host.ID.String()}, nil
+}
+
+// Heartbeat refreshes a host's liveness and allocatable capacity.
+func (s *FleetServer) Heartbeat(ctx context.Context, req *runtimev1.HeartbeatRequest) (*runtimev1.HeartbeatResponse, error) {
+	if s.registry == nil {
+		return nil, status.Error(codes.Unavailable, "fleet host registry not configured")
+	}
+	id, err := uuid.Parse(req.GetHostId())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "host_id is not a valid uuid")
+	}
+	if err := s.registry.Heartbeat(ctx, id,
+		int(req.GetAllocatableVcpu()),
+		req.GetAllocatableMemMb(),
+		req.GetAllocatableDiskMb(),
+		req.GetHealth(),
+	); err != nil {
+		return nil, fleetError(err)
+	}
+	return &runtimev1.HeartbeatResponse{}, nil
+}
+
+// ListHosts returns the full fleet host inventory.
+func (s *FleetServer) ListHosts(ctx context.Context, _ *runtimev1.ListHostsRequest) (*runtimev1.ListHostsResponse, error) {
+	if s.registry == nil {
+		return nil, status.Error(codes.Unavailable, "fleet host registry not configured")
+	}
+	hosts, err := s.registry.ListHosts(ctx)
+	if err != nil {
+		return nil, fleetError(err)
+	}
+	out := make([]*runtimev1.HostInfo, 0, len(hosts))
+	for i := range hosts {
+		out = append(out, hostToProto(&hosts[i]))
+	}
+	return &runtimev1.ListHostsResponse{Hosts: out}, nil
+}
+
+// hostToProto maps a domain Host to the wire HostInfo.
+func hostToProto(h *domain.Host) *runtimev1.HostInfo {
+	var lastHB int64
+	if h.LastHeartbeat != nil {
+		lastHB = h.LastHeartbeat.Unix()
+	}
+	return &runtimev1.HostInfo{
+		HostId:            h.ID.String(),
+		Region:            h.Region,
+		Labels:            h.Labels,
+		CapacityVcpu:      int32(h.CapacityVCPU),
+		CapacityMemMb:     h.CapacityMemMB,
+		CapacityDiskMb:    h.CapacityDiskMB,
+		AllocatableVcpu:   int32(h.AllocatableVCPU),
+		AllocatableMemMb:  h.AllocatableMemMB,
+		AllocatableDiskMb: h.AllocatableDiskMB,
+		Health:            string(h.Health),
+		Status:            string(h.Status),
+		Endpoint:          h.Endpoint,
+		LastHeartbeatUnix: lastHB,
+	}
+}
+
 // fleetError maps fleet domain errors to gRPC status codes.
 func fleetError(err error) error {
 	switch {
@@ -118,6 +211,10 @@ func fleetError(err error) error {
 		return status.Error(codes.InvalidArgument, "resident workload requires a guest port")
 	case errors.Is(err, domain.ErrImageBootUnavailable):
 		return status.Error(codes.FailedPrecondition, "image boot requires the firecracker host")
+	case errors.Is(err, domain.ErrFleetHostNotFound):
+		return status.Error(codes.NotFound, "fleet host not found")
+	case errors.Is(err, domain.ErrInvalidHostHealth):
+		return status.Error(codes.InvalidArgument, "invalid host health (want healthy|degraded|unhealthy|unknown)")
 	default:
 		return status.Error(codes.Internal, "internal server error")
 	}

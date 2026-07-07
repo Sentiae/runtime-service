@@ -38,7 +38,7 @@ type FleetApp struct {
 	MaxReplicas     int           `json:"max_replicas" gorm:"not null;default:1"`
 	ScaleToZero     bool          `json:"scale_to_zero" gorm:"not null;default:false"`
 	Port            int           `json:"port" gorm:"not null;default:0"`
-	ResourcesVCPU   int           `json:"resources_vcpu" gorm:"not null;default:1"`
+	ResourcesVCPU   int           `json:"resources_vcpu" gorm:"column:resources_vcpu;not null;default:1"`
 	ResourcesMemMB  int64         `json:"resources_mem_mb" gorm:"not null;default:512"`
 	RestartPolicy   RestartPolicy `json:"restart_policy" gorm:"type:varchar(20);not null;default:'always'"`
 	CreatedAt       time.Time     `json:"created_at" gorm:"not null"`

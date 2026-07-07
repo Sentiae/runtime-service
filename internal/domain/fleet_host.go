@@ -52,10 +52,10 @@ type Host struct {
 	ID                uuid.UUID         `json:"id" gorm:"type:uuid;primary_key"`
 	Region            string            `json:"region" gorm:"type:varchar(64);not null"`
 	Labels            map[string]string `json:"labels,omitempty" gorm:"type:jsonb;serializer:json"`
-	CapacityVCPU      int               `json:"capacity_vcpu" gorm:"not null"`
+	CapacityVCPU      int               `json:"capacity_vcpu" gorm:"column:capacity_vcpu;not null"`
 	CapacityMemMB     int64             `json:"capacity_mem_mb" gorm:"not null"`
 	CapacityDiskMB    int64             `json:"capacity_disk_mb" gorm:"not null"`
-	AllocatableVCPU   int               `json:"allocatable_vcpu" gorm:"not null"`
+	AllocatableVCPU   int               `json:"allocatable_vcpu" gorm:"column:allocatable_vcpu;not null"`
 	AllocatableMemMB  int64             `json:"allocatable_mem_mb" gorm:"not null"`
 	AllocatableDiskMB int64             `json:"allocatable_disk_mb" gorm:"not null"`
 	Health            HostHealth        `json:"health" gorm:"type:varchar(20);not null;default:'unknown';index"`

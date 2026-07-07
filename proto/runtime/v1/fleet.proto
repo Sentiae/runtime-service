@@ -13,6 +13,11 @@ service FleetOrchestration {
     rpc Scale(FleetScaleRequest) returns (FleetScaleResponse);
     rpc Cutover(FleetCutoverRequest) returns (FleetCutoverResponse);
     rpc Decommission(FleetDecommissionRequest) returns (FleetDecommissionResponse);
+
+    // CP4 fleet control plane — host registry + inventory + heartbeat (§9#4).
+    rpc RegisterHost(RegisterHostRequest) returns (RegisterHostResponse);
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+    rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
 }
 
 message OCIImageRef {
@@ -56,3 +61,41 @@ message FleetCutoverRequest { string from_handle = 1; string to_handle = 2; }
 message FleetCutoverResponse {}
 message FleetDecommissionRequest { string handle = 1; }
 message FleetDecommissionResponse {}
+
+// ── CP4 host registry (§9#4) ──────────────────────────────────────────
+message HostSpec {
+    string host_id = 1;                // empty → registry assigns a uuid
+    string region = 2;
+    map<string, string> labels = 3;
+    int32 capacity_vcpu = 4;
+    int64 capacity_mem_mb = 5;
+    int64 capacity_disk_mb = 6;
+    string endpoint = 7;               // host:port the fleet dials
+}
+message RegisterHostRequest { HostSpec host = 1; }
+message RegisterHostResponse { string host_id = 1; }
+message HeartbeatRequest {
+    string host_id = 1;
+    int32 allocatable_vcpu = 2;
+    int64 allocatable_mem_mb = 3;
+    int64 allocatable_disk_mb = 4;
+    string health = 5;                 // "healthy" | "degraded" | "unhealthy" | "unknown"
+}
+message HeartbeatResponse {}
+message HostInfo {
+    string host_id = 1;
+    string region = 2;
+    map<string, string> labels = 3;
+    int32 capacity_vcpu = 4;
+    int64 capacity_mem_mb = 5;
+    int64 capacity_disk_mb = 6;
+    int32 allocatable_vcpu = 7;
+    int64 allocatable_mem_mb = 8;
+    int64 allocatable_disk_mb = 9;
+    string health = 10;
+    string status = 11;                // "active" | "draining" | "cordoned" | "decommissioned"
+    string endpoint = 12;
+    int64 last_heartbeat_unix = 13;    // 0 when never heartbeated
+}
+message ListHostsRequest {}
+message ListHostsResponse { repeated HostInfo hosts = 1; }

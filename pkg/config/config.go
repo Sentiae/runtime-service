@@ -21,6 +21,22 @@ type Config struct {
 	SnapshotStore SnapshotStoreConfig `mapstructure:"snapshot_store"`
 	Registry      RegistryConfig      `mapstructure:"registry"`
 	ImageBoot     ImageBootConfig     `mapstructure:"imageboot"`
+	Fleet         FleetConfig         `mapstructure:"fleet"`
+}
+
+// FleetConfig configures this runtime-service instance's self-registration as a
+// fleet host + its heartbeat loop (runtime-fleet CP4 §9#4). Only active when the
+// firecracker executor is selected (a compose instance cannot boot images).
+type FleetConfig struct {
+	// HostID pins this host's fleet id. Empty ⇒ a stable UUIDv5 is derived from
+	// the advertise host so restarts re-register the same row.
+	HostID string `mapstructure:"host_id"`
+	// Region is the placement region label reported to the registry.
+	Region string `mapstructure:"region"`
+	// HostDiskMB is the advertised disk capacity for image rootfs staging.
+	HostDiskMB int64 `mapstructure:"host_disk_mb"`
+	// HeartbeatInterval is how often the self-host heartbeats the registry.
+	HeartbeatInterval time.Duration `mapstructure:"heartbeat_interval"`
 }
 
 // RegistryConfig configures the OCI registry the image-boot path pulls compiled
@@ -403,6 +419,12 @@ func Load() (*Config, error) {
 			"imageboot.host_port_min":  20000,
 			"imageboot.host_port_max":  20999,
 			"imageboot.advertise_host": "10.0.10.244",
+
+			// Fleet self-registration + heartbeat (runtime-fleet CP4 §9#4).
+			"fleet.host_id":            "",
+			"fleet.region":             "homelab",
+			"fleet.host_disk_mb":       51200,
+			"fleet.heartbeat_interval": "10s",
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -532,6 +554,12 @@ func Load() (*Config, error) {
 			{"imageboot.host_port_min", "APP_IMAGEBOOT_HOST_PORT_MIN"},
 			{"imageboot.host_port_max", "APP_IMAGEBOOT_HOST_PORT_MAX"},
 			{"imageboot.advertise_host", "APP_IMAGEBOOT_ADVERTISE_HOST"},
+
+			// Fleet self-registration + heartbeat (runtime-fleet CP4)
+			{"fleet.host_id", "APP_FLEET_HOST_ID"},
+			{"fleet.region", "APP_FLEET_REGION"},
+			{"fleet.host_disk_mb", "APP_FLEET_HOST_DISK_MB"},
+			{"fleet.heartbeat_interval", "APP_FLEET_HEARTBEAT_INTERVAL"},
 		},
 	})
 	if err != nil {

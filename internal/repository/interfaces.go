@@ -157,6 +157,7 @@ type HostRepository interface {
 	Create(ctx context.Context, host *domain.Host) error
 	Update(ctx context.Context, host *domain.Host) error
 	FindByID(ctx context.Context, id uuid.UUID) (*domain.Host, error)
+	List(ctx context.Context) ([]domain.Host, error)
 	ListActive(ctx context.Context) ([]domain.Host, error)
 	ListByStatus(ctx context.Context, status domain.HostStatus) ([]domain.Host, error)
 	Delete(ctx context.Context, id uuid.UUID) error

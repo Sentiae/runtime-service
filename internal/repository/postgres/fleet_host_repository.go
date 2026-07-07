@@ -42,6 +42,14 @@ func (r *hostRepository) FindByID(ctx context.Context, id uuid.UUID) (*domain.Ho
 	return &host, nil
 }
 
+func (r *hostRepository) List(ctx context.Context) ([]domain.Host, error) {
+	var hosts []domain.Host
+	err := r.db.WithContext(ctx).
+		Order("created_at ASC").
+		Find(&hosts).Error
+	return hosts, err
+}
+
 func (r *hostRepository) ListActive(ctx context.Context) ([]domain.Host, error) {
 	var hosts []domain.Host
 	err := r.db.WithContext(ctx).

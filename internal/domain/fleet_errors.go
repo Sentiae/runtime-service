@@ -19,4 +19,7 @@ var (
 	ErrVolumeNotFound = errors.New("fleet volume not found")
 	// ErrSecretBindingNotFound is returned when no secret binding matches an id.
 	ErrSecretBindingNotFound = errors.New("fleet secret binding not found")
+	// ErrInvalidHostHealth is returned when a heartbeat reports a health value
+	// the fleet does not recognize (see HostHealth.IsValid).
+	ErrInvalidHostHealth = errors.New("invalid fleet host health")
 )

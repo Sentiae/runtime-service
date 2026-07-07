@@ -865,6 +865,519 @@ func (*FleetDecommissionResponse) Descriptor() ([]byte, []int) {
 	return file_proto_runtime_v1_fleet_proto_rawDescGZIP(), []int{14}
 }
 
+// ── CP4 host registry (§9#4) ──────────────────────────────────────────
+type HostSpec struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	HostId         string                 `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"` // empty → registry assigns a uuid
+	Region         string                 `protobuf:"bytes,2,opt,name=region,proto3" json:"region,omitempty"`
+	Labels         map[string]string      `protobuf:"bytes,3,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	CapacityVcpu   int32                  `protobuf:"varint,4,opt,name=capacity_vcpu,json=capacityVcpu,proto3" json:"capacity_vcpu,omitempty"`
+	CapacityMemMb  int64                  `protobuf:"varint,5,opt,name=capacity_mem_mb,json=capacityMemMb,proto3" json:"capacity_mem_mb,omitempty"`
+	CapacityDiskMb int64                  `protobuf:"varint,6,opt,name=capacity_disk_mb,json=capacityDiskMb,proto3" json:"capacity_disk_mb,omitempty"`
+	Endpoint       string                 `protobuf:"bytes,7,opt,name=endpoint,proto3" json:"endpoint,omitempty"` // host:port the fleet dials
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *HostSpec) Reset() {
+	*x = HostSpec{}
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HostSpec) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HostSpec) ProtoMessage() {}
+
+func (x *HostSpec) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HostSpec.ProtoReflect.Descriptor instead.
+func (*HostSpec) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_fleet_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *HostSpec) GetHostId() string {
+	if x != nil {
+		return x.HostId
+	}
+	return ""
+}
+
+func (x *HostSpec) GetRegion() string {
+	if x != nil {
+		return x.Region
+	}
+	return ""
+}
+
+func (x *HostSpec) GetLabels() map[string]string {
+	if x != nil {
+		return x.Labels
+	}
+	return nil
+}
+
+func (x *HostSpec) GetCapacityVcpu() int32 {
+	if x != nil {
+		return x.CapacityVcpu
+	}
+	return 0
+}
+
+func (x *HostSpec) GetCapacityMemMb() int64 {
+	if x != nil {
+		return x.CapacityMemMb
+	}
+	return 0
+}
+
+func (x *HostSpec) GetCapacityDiskMb() int64 {
+	if x != nil {
+		return x.CapacityDiskMb
+	}
+	return 0
+}
+
+func (x *HostSpec) GetEndpoint() string {
+	if x != nil {
+		return x.Endpoint
+	}
+	return ""
+}
+
+type RegisterHostRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Host          *HostSpec              `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegisterHostRequest) Reset() {
+	*x = RegisterHostRequest{}
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegisterHostRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegisterHostRequest) ProtoMessage() {}
+
+func (x *RegisterHostRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegisterHostRequest.ProtoReflect.Descriptor instead.
+func (*RegisterHostRequest) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_fleet_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *RegisterHostRequest) GetHost() *HostSpec {
+	if x != nil {
+		return x.Host
+	}
+	return nil
+}
+
+type RegisterHostResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	HostId        string                 `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegisterHostResponse) Reset() {
+	*x = RegisterHostResponse{}
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegisterHostResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegisterHostResponse) ProtoMessage() {}
+
+func (x *RegisterHostResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegisterHostResponse.ProtoReflect.Descriptor instead.
+func (*RegisterHostResponse) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_fleet_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *RegisterHostResponse) GetHostId() string {
+	if x != nil {
+		return x.HostId
+	}
+	return ""
+}
+
+type HeartbeatRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	HostId            string                 `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
+	AllocatableVcpu   int32                  `protobuf:"varint,2,opt,name=allocatable_vcpu,json=allocatableVcpu,proto3" json:"allocatable_vcpu,omitempty"`
+	AllocatableMemMb  int64                  `protobuf:"varint,3,opt,name=allocatable_mem_mb,json=allocatableMemMb,proto3" json:"allocatable_mem_mb,omitempty"`
+	AllocatableDiskMb int64                  `protobuf:"varint,4,opt,name=allocatable_disk_mb,json=allocatableDiskMb,proto3" json:"allocatable_disk_mb,omitempty"`
+	Health            string                 `protobuf:"bytes,5,opt,name=health,proto3" json:"health,omitempty"` // "healthy" | "degraded" | "unhealthy" | "unknown"
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *HeartbeatRequest) Reset() {
+	*x = HeartbeatRequest{}
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatRequest) ProtoMessage() {}
+
+func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
+func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_fleet_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *HeartbeatRequest) GetHostId() string {
+	if x != nil {
+		return x.HostId
+	}
+	return ""
+}
+
+func (x *HeartbeatRequest) GetAllocatableVcpu() int32 {
+	if x != nil {
+		return x.AllocatableVcpu
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetAllocatableMemMb() int64 {
+	if x != nil {
+		return x.AllocatableMemMb
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetAllocatableDiskMb() int64 {
+	if x != nil {
+		return x.AllocatableDiskMb
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetHealth() string {
+	if x != nil {
+		return x.Health
+	}
+	return ""
+}
+
+type HeartbeatResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatResponse) Reset() {
+	*x = HeartbeatResponse{}
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatResponse) ProtoMessage() {}
+
+func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
+func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_fleet_proto_rawDescGZIP(), []int{19}
+}
+
+type HostInfo struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	HostId            string                 `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
+	Region            string                 `protobuf:"bytes,2,opt,name=region,proto3" json:"region,omitempty"`
+	Labels            map[string]string      `protobuf:"bytes,3,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	CapacityVcpu      int32                  `protobuf:"varint,4,opt,name=capacity_vcpu,json=capacityVcpu,proto3" json:"capacity_vcpu,omitempty"`
+	CapacityMemMb     int64                  `protobuf:"varint,5,opt,name=capacity_mem_mb,json=capacityMemMb,proto3" json:"capacity_mem_mb,omitempty"`
+	CapacityDiskMb    int64                  `protobuf:"varint,6,opt,name=capacity_disk_mb,json=capacityDiskMb,proto3" json:"capacity_disk_mb,omitempty"`
+	AllocatableVcpu   int32                  `protobuf:"varint,7,opt,name=allocatable_vcpu,json=allocatableVcpu,proto3" json:"allocatable_vcpu,omitempty"`
+	AllocatableMemMb  int64                  `protobuf:"varint,8,opt,name=allocatable_mem_mb,json=allocatableMemMb,proto3" json:"allocatable_mem_mb,omitempty"`
+	AllocatableDiskMb int64                  `protobuf:"varint,9,opt,name=allocatable_disk_mb,json=allocatableDiskMb,proto3" json:"allocatable_disk_mb,omitempty"`
+	Health            string                 `protobuf:"bytes,10,opt,name=health,proto3" json:"health,omitempty"`
+	Status            string                 `protobuf:"bytes,11,opt,name=status,proto3" json:"status,omitempty"` // "active" | "draining" | "cordoned" | "decommissioned"
+	Endpoint          string                 `protobuf:"bytes,12,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
+	LastHeartbeatUnix int64                  `protobuf:"varint,13,opt,name=last_heartbeat_unix,json=lastHeartbeatUnix,proto3" json:"last_heartbeat_unix,omitempty"` // 0 when never heartbeated
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *HostInfo) Reset() {
+	*x = HostInfo{}
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HostInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HostInfo) ProtoMessage() {}
+
+func (x *HostInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HostInfo.ProtoReflect.Descriptor instead.
+func (*HostInfo) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_fleet_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *HostInfo) GetHostId() string {
+	if x != nil {
+		return x.HostId
+	}
+	return ""
+}
+
+func (x *HostInfo) GetRegion() string {
+	if x != nil {
+		return x.Region
+	}
+	return ""
+}
+
+func (x *HostInfo) GetLabels() map[string]string {
+	if x != nil {
+		return x.Labels
+	}
+	return nil
+}
+
+func (x *HostInfo) GetCapacityVcpu() int32 {
+	if x != nil {
+		return x.CapacityVcpu
+	}
+	return 0
+}
+
+func (x *HostInfo) GetCapacityMemMb() int64 {
+	if x != nil {
+		return x.CapacityMemMb
+	}
+	return 0
+}
+
+func (x *HostInfo) GetCapacityDiskMb() int64 {
+	if x != nil {
+		return x.CapacityDiskMb
+	}
+	return 0
+}
+
+func (x *HostInfo) GetAllocatableVcpu() int32 {
+	if x != nil {
+		return x.AllocatableVcpu
+	}
+	return 0
+}
+
+func (x *HostInfo) GetAllocatableMemMb() int64 {
+	if x != nil {
+		return x.AllocatableMemMb
+	}
+	return 0
+}
+
+func (x *HostInfo) GetAllocatableDiskMb() int64 {
+	if x != nil {
+		return x.AllocatableDiskMb
+	}
+	return 0
+}
+
+func (x *HostInfo) GetHealth() string {
+	if x != nil {
+		return x.Health
+	}
+	return ""
+}
+
+func (x *HostInfo) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *HostInfo) GetEndpoint() string {
+	if x != nil {
+		return x.Endpoint
+	}
+	return ""
+}
+
+func (x *HostInfo) GetLastHeartbeatUnix() int64 {
+	if x != nil {
+		return x.LastHeartbeatUnix
+	}
+	return 0
+}
+
+type ListHostsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListHostsRequest) Reset() {
+	*x = ListHostsRequest{}
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListHostsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListHostsRequest) ProtoMessage() {}
+
+func (x *ListHostsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListHostsRequest.ProtoReflect.Descriptor instead.
+func (*ListHostsRequest) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_fleet_proto_rawDescGZIP(), []int{21}
+}
+
+type ListHostsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Hosts         []*HostInfo            `protobuf:"bytes,1,rep,name=hosts,proto3" json:"hosts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListHostsResponse) Reset() {
+	*x = ListHostsResponse{}
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListHostsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListHostsResponse) ProtoMessage() {}
+
+func (x *ListHostsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_runtime_v1_fleet_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListHostsResponse.ProtoReflect.Descriptor instead.
+func (*ListHostsResponse) Descriptor() ([]byte, []int) {
+	return file_proto_runtime_v1_fleet_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *ListHostsResponse) GetHosts() []*HostInfo {
+	if x != nil {
+		return x.Hosts
+	}
+	return nil
+}
+
 var File_proto_runtime_v1_fleet_proto protoreflect.FileDescriptor
 
 const file_proto_runtime_v1_fleet_proto_rawDesc = "" +
@@ -937,13 +1450,59 @@ const file_proto_runtime_v1_fleet_proto_rawDesc = "" +
 	"\x14FleetCutoverResponse\"2\n" +
 	"\x18FleetDecommissionRequest\x12\x16\n" +
 	"\x06handle\x18\x01 \x01(\tR\x06handle\"\x1b\n" +
-	"\x19FleetDecommissionResponse2\x9c\x03\n" +
+	"\x19FleetDecommissionResponse\"\xc3\x02\n" +
+	"\bHostSpec\x12\x17\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x16\n" +
+	"\x06region\x18\x02 \x01(\tR\x06region\x128\n" +
+	"\x06labels\x18\x03 \x03(\v2 .runtime.v1.HostSpec.LabelsEntryR\x06labels\x12#\n" +
+	"\rcapacity_vcpu\x18\x04 \x01(\x05R\fcapacityVcpu\x12&\n" +
+	"\x0fcapacity_mem_mb\x18\x05 \x01(\x03R\rcapacityMemMb\x12(\n" +
+	"\x10capacity_disk_mb\x18\x06 \x01(\x03R\x0ecapacityDiskMb\x12\x1a\n" +
+	"\bendpoint\x18\a \x01(\tR\bendpoint\x1a9\n" +
+	"\vLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"?\n" +
+	"\x13RegisterHostRequest\x12(\n" +
+	"\x04host\x18\x01 \x01(\v2\x14.runtime.v1.HostSpecR\x04host\"/\n" +
+	"\x14RegisterHostResponse\x12\x17\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xcc\x01\n" +
+	"\x10HeartbeatRequest\x12\x17\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12)\n" +
+	"\x10allocatable_vcpu\x18\x02 \x01(\x05R\x0fallocatableVcpu\x12,\n" +
+	"\x12allocatable_mem_mb\x18\x03 \x01(\x03R\x10allocatableMemMb\x12.\n" +
+	"\x13allocatable_disk_mb\x18\x04 \x01(\x03R\x11allocatableDiskMb\x12\x16\n" +
+	"\x06health\x18\x05 \x01(\tR\x06health\"\x13\n" +
+	"\x11HeartbeatResponse\"\xac\x04\n" +
+	"\bHostInfo\x12\x17\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x16\n" +
+	"\x06region\x18\x02 \x01(\tR\x06region\x128\n" +
+	"\x06labels\x18\x03 \x03(\v2 .runtime.v1.HostInfo.LabelsEntryR\x06labels\x12#\n" +
+	"\rcapacity_vcpu\x18\x04 \x01(\x05R\fcapacityVcpu\x12&\n" +
+	"\x0fcapacity_mem_mb\x18\x05 \x01(\x03R\rcapacityMemMb\x12(\n" +
+	"\x10capacity_disk_mb\x18\x06 \x01(\x03R\x0ecapacityDiskMb\x12)\n" +
+	"\x10allocatable_vcpu\x18\a \x01(\x05R\x0fallocatableVcpu\x12,\n" +
+	"\x12allocatable_mem_mb\x18\b \x01(\x03R\x10allocatableMemMb\x12.\n" +
+	"\x13allocatable_disk_mb\x18\t \x01(\x03R\x11allocatableDiskMb\x12\x16\n" +
+	"\x06health\x18\n" +
+	" \x01(\tR\x06health\x12\x16\n" +
+	"\x06status\x18\v \x01(\tR\x06status\x12\x1a\n" +
+	"\bendpoint\x18\f \x01(\tR\bendpoint\x12.\n" +
+	"\x13last_heartbeat_unix\x18\r \x01(\x03R\x11lastHeartbeatUnix\x1a9\n" +
+	"\vLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x12\n" +
+	"\x10ListHostsRequest\"?\n" +
+	"\x11ListHostsResponse\x12*\n" +
+	"\x05hosts\x18\x01 \x03(\v2\x14.runtime.v1.HostInfoR\x05hosts2\x83\x05\n" +
 	"\x12FleetOrchestration\x12H\n" +
 	"\tProvision\x12\x1c.runtime.v1.ProvisionRequest\x1a\x1d.runtime.v1.ProvisionResponse\x12I\n" +
 	"\x06Health\x12\x1e.runtime.v1.FleetHealthRequest\x1a\x1f.runtime.v1.FleetHealthResponse\x12F\n" +
 	"\x05Scale\x12\x1d.runtime.v1.FleetScaleRequest\x1a\x1e.runtime.v1.FleetScaleResponse\x12L\n" +
 	"\aCutover\x12\x1f.runtime.v1.FleetCutoverRequest\x1a .runtime.v1.FleetCutoverResponse\x12[\n" +
-	"\fDecommission\x12$.runtime.v1.FleetDecommissionRequest\x1a%.runtime.v1.FleetDecommissionResponseBCZAgithub.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1b\x06proto3"
+	"\fDecommission\x12$.runtime.v1.FleetDecommissionRequest\x1a%.runtime.v1.FleetDecommissionResponse\x12Q\n" +
+	"\fRegisterHost\x12\x1f.runtime.v1.RegisterHostRequest\x1a .runtime.v1.RegisterHostResponse\x12H\n" +
+	"\tHeartbeat\x12\x1c.runtime.v1.HeartbeatRequest\x1a\x1d.runtime.v1.HeartbeatResponse\x12H\n" +
+	"\tListHosts\x12\x1c.runtime.v1.ListHostsRequest\x1a\x1d.runtime.v1.ListHostsResponseBCZAgithub.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1b\x06proto3"
 
 var (
 	file_proto_runtime_v1_fleet_proto_rawDescOnce sync.Once
@@ -957,7 +1516,7 @@ func file_proto_runtime_v1_fleet_proto_rawDescGZIP() []byte {
 	return file_proto_runtime_v1_fleet_proto_rawDescData
 }
 
-var file_proto_runtime_v1_fleet_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_proto_runtime_v1_fleet_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
 var file_proto_runtime_v1_fleet_proto_goTypes = []any{
 	(*OCIImageRef)(nil),               // 0: runtime.v1.OCIImageRef
 	(*ResourceSpec)(nil),              // 1: runtime.v1.ResourceSpec
@@ -974,30 +1533,50 @@ var file_proto_runtime_v1_fleet_proto_goTypes = []any{
 	(*FleetCutoverResponse)(nil),      // 12: runtime.v1.FleetCutoverResponse
 	(*FleetDecommissionRequest)(nil),  // 13: runtime.v1.FleetDecommissionRequest
 	(*FleetDecommissionResponse)(nil), // 14: runtime.v1.FleetDecommissionResponse
-	nil,                               // 15: runtime.v1.DeploymentDescriptor.EnvVarsEntry
+	(*HostSpec)(nil),                  // 15: runtime.v1.HostSpec
+	(*RegisterHostRequest)(nil),       // 16: runtime.v1.RegisterHostRequest
+	(*RegisterHostResponse)(nil),      // 17: runtime.v1.RegisterHostResponse
+	(*HeartbeatRequest)(nil),          // 18: runtime.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),         // 19: runtime.v1.HeartbeatResponse
+	(*HostInfo)(nil),                  // 20: runtime.v1.HostInfo
+	(*ListHostsRequest)(nil),          // 21: runtime.v1.ListHostsRequest
+	(*ListHostsResponse)(nil),         // 22: runtime.v1.ListHostsResponse
+	nil,                               // 23: runtime.v1.DeploymentDescriptor.EnvVarsEntry
+	nil,                               // 24: runtime.v1.HostSpec.LabelsEntry
+	nil,                               // 25: runtime.v1.HostInfo.LabelsEntry
 }
 var file_proto_runtime_v1_fleet_proto_depIdxs = []int32{
 	0,  // 0: runtime.v1.DeploymentDescriptor.image:type_name -> runtime.v1.OCIImageRef
 	1,  // 1: runtime.v1.DeploymentDescriptor.resources:type_name -> runtime.v1.ResourceSpec
-	15, // 2: runtime.v1.DeploymentDescriptor.env_vars:type_name -> runtime.v1.DeploymentDescriptor.EnvVarsEntry
+	23, // 2: runtime.v1.DeploymentDescriptor.env_vars:type_name -> runtime.v1.DeploymentDescriptor.EnvVarsEntry
 	2,  // 3: runtime.v1.DeploymentDescriptor.routes:type_name -> runtime.v1.RouteSpec
 	3,  // 4: runtime.v1.DeploymentDescriptor.volumes:type_name -> runtime.v1.VolumeSpec
 	4,  // 5: runtime.v1.ProvisionRequest.descriptor:type_name -> runtime.v1.DeploymentDescriptor
-	5,  // 6: runtime.v1.FleetOrchestration.Provision:input_type -> runtime.v1.ProvisionRequest
-	7,  // 7: runtime.v1.FleetOrchestration.Health:input_type -> runtime.v1.FleetHealthRequest
-	9,  // 8: runtime.v1.FleetOrchestration.Scale:input_type -> runtime.v1.FleetScaleRequest
-	11, // 9: runtime.v1.FleetOrchestration.Cutover:input_type -> runtime.v1.FleetCutoverRequest
-	13, // 10: runtime.v1.FleetOrchestration.Decommission:input_type -> runtime.v1.FleetDecommissionRequest
-	6,  // 11: runtime.v1.FleetOrchestration.Provision:output_type -> runtime.v1.ProvisionResponse
-	8,  // 12: runtime.v1.FleetOrchestration.Health:output_type -> runtime.v1.FleetHealthResponse
-	10, // 13: runtime.v1.FleetOrchestration.Scale:output_type -> runtime.v1.FleetScaleResponse
-	12, // 14: runtime.v1.FleetOrchestration.Cutover:output_type -> runtime.v1.FleetCutoverResponse
-	14, // 15: runtime.v1.FleetOrchestration.Decommission:output_type -> runtime.v1.FleetDecommissionResponse
-	11, // [11:16] is the sub-list for method output_type
-	6,  // [6:11] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	24, // 6: runtime.v1.HostSpec.labels:type_name -> runtime.v1.HostSpec.LabelsEntry
+	15, // 7: runtime.v1.RegisterHostRequest.host:type_name -> runtime.v1.HostSpec
+	25, // 8: runtime.v1.HostInfo.labels:type_name -> runtime.v1.HostInfo.LabelsEntry
+	20, // 9: runtime.v1.ListHostsResponse.hosts:type_name -> runtime.v1.HostInfo
+	5,  // 10: runtime.v1.FleetOrchestration.Provision:input_type -> runtime.v1.ProvisionRequest
+	7,  // 11: runtime.v1.FleetOrchestration.Health:input_type -> runtime.v1.FleetHealthRequest
+	9,  // 12: runtime.v1.FleetOrchestration.Scale:input_type -> runtime.v1.FleetScaleRequest
+	11, // 13: runtime.v1.FleetOrchestration.Cutover:input_type -> runtime.v1.FleetCutoverRequest
+	13, // 14: runtime.v1.FleetOrchestration.Decommission:input_type -> runtime.v1.FleetDecommissionRequest
+	16, // 15: runtime.v1.FleetOrchestration.RegisterHost:input_type -> runtime.v1.RegisterHostRequest
+	18, // 16: runtime.v1.FleetOrchestration.Heartbeat:input_type -> runtime.v1.HeartbeatRequest
+	21, // 17: runtime.v1.FleetOrchestration.ListHosts:input_type -> runtime.v1.ListHostsRequest
+	6,  // 18: runtime.v1.FleetOrchestration.Provision:output_type -> runtime.v1.ProvisionResponse
+	8,  // 19: runtime.v1.FleetOrchestration.Health:output_type -> runtime.v1.FleetHealthResponse
+	10, // 20: runtime.v1.FleetOrchestration.Scale:output_type -> runtime.v1.FleetScaleResponse
+	12, // 21: runtime.v1.FleetOrchestration.Cutover:output_type -> runtime.v1.FleetCutoverResponse
+	14, // 22: runtime.v1.FleetOrchestration.Decommission:output_type -> runtime.v1.FleetDecommissionResponse
+	17, // 23: runtime.v1.FleetOrchestration.RegisterHost:output_type -> runtime.v1.RegisterHostResponse
+	19, // 24: runtime.v1.FleetOrchestration.Heartbeat:output_type -> runtime.v1.HeartbeatResponse
+	22, // 25: runtime.v1.FleetOrchestration.ListHosts:output_type -> runtime.v1.ListHostsResponse
+	18, // [18:26] is the sub-list for method output_type
+	10, // [10:18] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_proto_runtime_v1_fleet_proto_init() }
@@ -1011,7 +1590,7 @@ func file_proto_runtime_v1_fleet_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_runtime_v1_fleet_proto_rawDesc), len(file_proto_runtime_v1_fleet_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   16,
+			NumMessages:   26,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -160,6 +160,11 @@ type Container struct {
 	ImageMaterializer usecase.ImageMaterializer
 	FleetProvisionUC  *usecase.FleetProvision
 
+	// runtime-fleet CP4 §9#4 — host registry + this instance's self-host.
+	FleetHostRegistry   *usecase.FleetHostRegistry
+	fleetSelf           *domain.Host // non-nil only on the firecracker executor
+	fleetHeartbeatEvery time.Duration
+
 	// Use Cases
 	ExecutionUC  usecase.ExecutionUseCase
 	VMUC         usecase.VMUseCase
@@ -271,10 +276,71 @@ func (c *Container) initFleet(cfg *config.Config) {
 		cfg.ImageBoot.AdvertiseHost,
 	)
 
+	// CP4 §9#4 — durable host registry + this instance's self-registration.
+	c.FleetHostRegistry = usecase.NewFleetHostRegistry(c.HostRepo)
+	if cfg.App.ExecutorType == "firecracker" {
+		c.registerSelfHost(cfg)
+	} else {
+		log.Println("Fleet self-registration skipped (executor is not firecracker)")
+	}
+
 	if c.GRPCServer != nil {
-		c.GRPCServer.RegisterFleet(grpchandler.NewFleetServer(c.FleetProvisionUC))
+		c.GRPCServer.RegisterFleet(grpchandler.NewFleetServer(c.FleetProvisionUC, c.FleetHostRegistry))
 		log.Println("FleetOrchestration gRPC service registered")
 	}
+}
+
+// registerSelfHost registers this runtime-service instance as a fleet host and
+// records the self-host + heartbeat cadence for the background loop. A failure
+// is logged but never crashes the process — fleet self-registration is not on
+// the boot critical path.
+func (c *Container) registerSelfHost(cfg *config.Config) {
+	vcpu := cfg.Firecracker.MaxVCPU
+	memMB := int64(cfg.Firecracker.MaxMemMB)
+	if vcpu <= 0 {
+		vcpu = 8
+	}
+	if memMB <= 0 {
+		memMB = 8192
+	}
+
+	// A stable host id keeps restarts on the same registry row. An explicit
+	// APP_FLEET_HOST_ID wins; otherwise derive a UUIDv5 from the advertise host.
+	var hostID uuid.UUID
+	if cfg.Fleet.HostID != "" {
+		parsed, err := uuid.Parse(cfg.Fleet.HostID)
+		if err != nil {
+			log.Printf("Warning: APP_FLEET_HOST_ID %q is not a valid uuid, deriving one instead: %v", cfg.Fleet.HostID, err)
+		} else {
+			hostID = parsed
+		}
+	}
+	if hostID == uuid.Nil {
+		hostID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("sentiae-fleet-host:"+cfg.ImageBoot.AdvertiseHost))
+	}
+
+	endpoint := fmt.Sprintf("%s:%s", cfg.ImageBoot.AdvertiseHost, cfg.Server.GRPC.Port)
+	self := domain.Host{
+		ID:             hostID,
+		Region:         cfg.Fleet.Region,
+		CapacityVCPU:   vcpu,
+		CapacityMemMB:  memMB,
+		CapacityDiskMB: cfg.Fleet.HostDiskMB,
+		Endpoint:       endpoint,
+	}
+
+	registered, err := c.FleetHostRegistry.RegisterHost(context.Background(), self)
+	if err != nil {
+		log.Printf("Warning: fleet self-registration failed (continuing without it): %v", err)
+		return
+	}
+	c.fleetSelf = &registered
+	c.fleetHeartbeatEvery = cfg.Fleet.HeartbeatInterval
+	if c.fleetHeartbeatEvery <= 0 {
+		c.fleetHeartbeatEvery = 10 * time.Second
+	}
+	log.Printf("Fleet self-registered: host_id=%s region=%s capacity=%dvcpu/%dMB/%dMB endpoint=%s",
+		registered.ID, registered.Region, vcpu, memMB, cfg.Fleet.HostDiskMB, endpoint)
 }
 
 // initDatabase initializes the database connection
@@ -995,7 +1061,43 @@ func (c *Container) StartBackgroundControllers(ctx context.Context) {
 	if len(c.FCPools) > 0 {
 		log.Printf("[FC-POOL] %d warm pool(s) started", len(c.FCPools))
 	}
+	c.startFleetHeartbeat(ctx)
 	c.StartConsumers(ctx)
+}
+
+// startFleetHeartbeat runs the self-host heartbeat loop (runtime-fleet CP4
+// §9#4). Only active when this instance self-registered (firecracker executor).
+// Allocatable == full capacity until the §9#5 scheduler tracks precise usage.
+func (c *Container) startFleetHeartbeat(ctx context.Context) {
+	if c.fleetSelf == nil || c.FleetHostRegistry == nil {
+		return
+	}
+	self := c.fleetSelf
+	every := c.fleetHeartbeatEvery
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[FLEET-HB] heartbeat loop panicked: %v", r)
+			}
+		}()
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		log.Printf("[FLEET-HB] heartbeat loop started (host_id=%s interval=%s)", self.ID, every)
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("[FLEET-HB] heartbeat loop stopped (context cancelled)")
+				return
+			case <-ticker.C:
+				if err := c.FleetHostRegistry.Heartbeat(ctx, self.ID,
+					self.CapacityVCPU, self.CapacityMemMB, self.CapacityDiskMB,
+					string(domain.HostHealthHealthy),
+				); err != nil {
+					log.Printf("[FLEET-HB] heartbeat failed: %v", err)
+				}
+			}
+		}
+	}()
 }
 
 // StartConsumers launches any inbound Kafka consumers in background
