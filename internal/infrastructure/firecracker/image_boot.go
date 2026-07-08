@@ -172,6 +172,21 @@ func (b *ImageBooter) ensureNAT() error {
 				}
 			}
 		}
+		// Tenant isolation: the two accepts above would also permit guest→guest
+		// traffic (both endpoints in the flat /16, one host root netns). Deny any
+		// flow whose source AND destination are both in the img subnet so one
+		// resident tenant's microVM cannot reach another's. Inserted at the TOP
+		// (after the accepts, so -I 1 lands it above them) → evaluated first;
+		// ingress (src=host/external) and egress (dst=external) each have only
+		// one side in the subnet and are unaffected. (Mirrors the 172.16/24 rule.)
+		denyRule := []string{"-s", imgSubnet16, "-d", imgSubnet16, "-j", "DROP"}
+		check := append([]string{"-C", "FORWARD"}, denyRule...)
+		if exec.Command("iptables", check...).Run() != nil {
+			insert := append([]string{"-I", "FORWARD", "1"}, denyRule...)
+			if out, err := exec.Command("iptables", insert...).CombinedOutput(); err != nil && b.natErr == nil {
+				b.natErr = fmt.Errorf("install image-boot cross-tenant deny: %s: %w", string(out), err)
+			}
+		}
 	})
 	return b.natErr
 }
