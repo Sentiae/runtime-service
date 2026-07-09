@@ -67,11 +67,18 @@ func NewServer(
 		slog.Default().Warn("runtime gRPC: JWKS user-token validator unavailable, falling back to api-key-only auth", "err", err)
 		jwks = nil
 	}
+	// SVID-authz mesh policy (T-SEC-FND Wave 4): governs Principal.CanActInOrg for
+	// SVID/api-key service callers consulted by the tenant.* org checks. Neutral at
+	// default env (strict=false).
+	tenant.SetServiceGrants(tenant.LoadMeshPolicy())
+	tenant.SetMeshSVIDAuthzStrict(pkconfig.MeshSVIDAuthzStrict())
 	unary, stream := interceptor.NewChain(interceptor.Config{
 		Logger: slog.Default(),
 		Auth: &interceptor.AuthConfig{
 			APIKeyValidator: svcToken,
 			TokenValidator:  jwks,
+			AcceptAPIKey:    pkconfig.AcceptAPIKey(),
+			RequirePeerSVID: pkconfig.RequirePeerSVID(),
 			SkipMethods: []string{
 				"/grpc.health.v1.Health/Check",
 				"/grpc.health.v1.Health/Watch",
