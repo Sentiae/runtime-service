@@ -1,25 +1,31 @@
 package grpc
 
 import (
+	"context"
 	"log/slog"
+	"net"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/reflection"
 
+	pkconfig "github.com/sentiae/platform-kit/config"
+	"github.com/sentiae/platform-kit/grpcserver"
 	"github.com/sentiae/platform-kit/interceptor"
+	"github.com/sentiae/platform-kit/spiffe"
 	"github.com/sentiae/platform-kit/tenant"
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
 	"github.com/sentiae/runtime-service/internal/usecase"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
 )
 
 // Server represents the gRPC server with all service implementations.
 type Server struct {
-	grpcServer      *grpc.Server
+	builder         *grpcserver.Builder
 	executionServer *ExecutionServer
 	graphServer     *GraphServer
 	healthServer    *health.Server
+	source          *workloadapi.X509Source
 }
 
 // ServerConfig holds configuration for the gRPC server.
@@ -75,15 +81,33 @@ func NewServer(
 		},
 	})
 
-	// Create gRPC server with interceptors
-	grpcServer := grpc.NewServer(
+	// Phase 2 mTLS mesh: build a dual-mode server. Mode "off" (default) yields
+	// one plaintext server identical to before. When a mode is requested but
+	// SPIRE is unreachable, the builder degrades to plaintext-only rather than
+	// crash. Reflection is registered by the builder at Serve time (grpcurl /
+	// grpcui can still introspect in dev + staging).
+	var src *workloadapi.X509Source
+	if pkconfig.MTLSMode() != pkconfig.MTLSModeOff {
+		s, srcErr := spiffe.NewSource(context.Background())
+		if srcErr != nil {
+			slog.Default().Warn("runtime gRPC: SPIFFE source unavailable, degrading to plaintext", "err", srcErr)
+		} else {
+			src = s
+		}
+	}
+
+	b := grpcserver.New(grpcserver.Config{
+		Mode:        pkconfig.MTLSMode(),
+		Source:      src,
+		ServiceName: "runtime",
+	},
 		grpc.ChainUnaryInterceptor(unary...),
 		grpc.ChainStreamInterceptor(stream...),
 	)
 
 	// Register health check service
 	healthServer := health.NewServer()
-	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
+	grpc_health_v1.RegisterHealthServer(b.Registrar(), healthServer)
 	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 	healthServer.SetServingStatus("runtime.v1.RuntimeService", grpc_health_v1.HealthCheckResponse_SERVING)
 
@@ -92,20 +116,16 @@ func NewServer(
 	graphServer := NewGraphServer(graphUC, execEngine)
 
 	// Register services
-	runtimev1.RegisterRuntimeServiceServer(grpcServer, executionServer)
-	runtimev1.RegisterGraphServiceServer(grpcServer, graphServer)
+	runtimev1.RegisterRuntimeServiceServer(b.Registrar(), executionServer)
+	runtimev1.RegisterGraphServiceServer(b.Registrar(), graphServer)
 	healthServer.SetServingStatus("runtime.v1.GraphService", grpc_health_v1.HealthCheckResponse_SERVING)
 
-	// Enable server reflection so grpcurl / grpcui can introspect the
-	// service in development + staging. Production can strip via build tag
-	// later if needed.
-	reflection.Register(grpcServer)
-
 	return &Server{
-		grpcServer:      grpcServer,
+		builder:         b,
 		executionServer: executionServer,
 		graphServer:     graphServer,
 		healthServer:    healthServer,
+		source:          src,
 	}
 }
 
@@ -113,15 +133,22 @@ func NewServer(
 // Safe to call after NewServer but before Serve; the shared auth interceptor
 // applies (service principals present the x-api-key like every other RPC).
 func (s *Server) RegisterFleet(fleet *FleetServer) {
-	runtimev1.RegisterFleetOrchestrationServer(s.grpcServer, fleet)
+	runtimev1.RegisterFleetOrchestrationServer(s.builder.Registrar(), fleet)
 	if s.healthServer != nil {
 		s.healthServer.SetServingStatus("runtime.v1.FleetOrchestration", grpc_health_v1.HealthCheckResponse_SERVING)
 	}
 }
 
-// GetGRPCServer returns the underlying gRPC server.
+// GetGRPCServer returns a primary underlying gRPC server for introspection.
+// Use Serve for the real listen path so every configured transport is served.
 func (s *Server) GetGRPCServer() *grpc.Server {
-	return s.grpcServer
+	return s.builder.Server()
+}
+
+// Serve serves every configured transport on lis (plaintext and, in
+// permissive/strict modes, mTLS via cmux). Blocks until the listener closes.
+func (s *Server) Serve(lis net.Listener) error {
+	return s.builder.Serve(lis)
 }
 
 // ExecutionServer returns the underlying ExecutionServer so callers (DI)
@@ -132,5 +159,8 @@ func (s *Server) ExecutionServer() *ExecutionServer {
 
 // Shutdown gracefully shuts down the gRPC server.
 func (s *Server) Shutdown() {
-	s.grpcServer.GracefulStop()
+	s.builder.GracefulStop()
+	if s.source != nil {
+		_ = s.source.Close()
+	}
 }

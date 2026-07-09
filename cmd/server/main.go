@@ -122,7 +122,7 @@ func main() {
 				log.Fatalf("Failed to listen for gRPC: %v", err)
 			}
 			log.Printf("gRPC server starting on %s", grpcAddr)
-			if err := container.GRPCServer.GetGRPCServer().Serve(lis); err != nil {
+			if err := container.GRPCServer.Serve(lis); err != nil {
 				log.Fatalf("gRPC server failed: %v", err)
 			}
 		}()
