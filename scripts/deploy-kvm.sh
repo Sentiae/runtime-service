@@ -77,26 +77,29 @@ if [[ "${APP_GRPC_MTLS_MODE:-off}" != off ]]; then
     exit 1
   fi
 
-  echo "==> extracting pinned spire-agent binary"
-  EXTRACT_CTR="sentiae-spire-agent-extract-$$"
-  docker create --name "$EXTRACT_CTR" ghcr.io/spiffe/spire-agent:1.11.2 >/dev/null
-  docker cp "$EXTRACT_CTR":/opt/spire/bin/spire-agent .build/spire-agent
-  docker rm "$EXTRACT_CTR" >/dev/null
-
-  echo "==> shipping agent artifacts to $HOST"
-  "${SCP[@]}" .build/spire-agent \
+  echo "==> shipping agent config to $HOST"
+  "${SCP[@]}" \
     "$REPO_ROOT/infrastructure/spire/kvm/agent.conf" \
     "$REPO_ROOT/infrastructure/spire/kvm/spire-agent.service" \
     .build/bootstrap.crt \
     "$HOST":/tmp/
 
-  echo "==> installing spire-agent on $HOST"
-  "${SSH[@]}" 'sudo install -m 0755 /tmp/spire-agent /usr/local/bin/spire-agent \
-    && sudo install -d -m 0755 /etc/spire /var/lib/spire/agent \
-    && sudo install -m 0644 /tmp/agent.conf /etc/spire/agent.conf \
-    && sudo install -m 0644 /tmp/bootstrap.crt /etc/spire/bootstrap.crt \
-    && sudo install -m 0644 /tmp/spire-agent.service /etc/systemd/system/spire-agent.service \
-    && rm -f /tmp/spire-agent /tmp/agent.conf /tmp/bootstrap.crt /tmp/spire-agent.service'
+  # Install the pinned spire-agent by downloading the official static (musl)
+  # release ON the KVM host — no local Docker daemon required. Idempotent: skip
+  # if the pinned version is already installed.
+  echo "==> installing spire-agent 1.11.2 + config on $HOST"
+  "${SSH[@]}" 'set -e
+    if ! /usr/local/bin/spire-agent --version 2>&1 | grep -q 1.11.2; then
+      curl -fsSL https://github.com/spiffe/spire/releases/download/v1.11.2/spire-1.11.2-linux-amd64-musl.tar.gz -o /tmp/spire-agent.tgz
+      sudo tar -xzf /tmp/spire-agent.tgz -C /usr/local/bin --strip-components=2 spire-1.11.2/bin/spire-agent
+      sudo chmod 0755 /usr/local/bin/spire-agent
+      rm -f /tmp/spire-agent.tgz
+    fi
+    sudo install -d -m 0755 /etc/spire /var/lib/spire/agent
+    sudo install -m 0644 /tmp/agent.conf /etc/spire/agent.conf
+    sudo install -m 0644 /tmp/bootstrap.crt /etc/spire/bootstrap.crt
+    sudo install -m 0644 /tmp/spire-agent.service /etc/systemd/system/spire-agent.service
+    rm -f /tmp/agent.conf /tmp/bootstrap.crt /tmp/spire-agent.service'
 
   echo "==> writing join token (tmpfs, 0600)"
   "${SSH[@]}" "sudo install -d -m 0755 /run/spire/agent \
