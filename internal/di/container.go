@@ -15,8 +15,11 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	pkconfig "github.com/sentiae/platform-kit/config"
 	kafka "github.com/sentiae/platform-kit/kafka"
+	"github.com/sentiae/platform-kit/spiffe"
 	timetravel "github.com/sentiae/platform-kit/timetravel"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
 
 	"github.com/sentiae/runtime-service/internal/domain"
 
@@ -51,6 +54,12 @@ type Container struct {
 
 	// Configuration
 	Config *config.Config
+
+	// Phase 2 mTLS mesh — shared SPIFFE X509 source for OUTBOUND client dials
+	// (canvas-service push). Built only when APP_GRPC_MTLS_MODE != "off";
+	// nil on any error (degrade to insecure) or when mode is off. Distinct
+	// from the gRPC server's source — do not share across that boundary.
+	canvasClientSource *workloadapi.X509Source
 
 	// Repositories
 	ExecutionRepo       repository.ExecutionRepository
@@ -963,7 +972,20 @@ func (c *Container) initHandlers() {
 	// alongside the Kafka emit so badges update at the latency floor.
 	// CANVAS_SERVICE_URL empty disables the push (Kafka still delivers).
 	if canvasURL := os.Getenv("CANVAS_SERVICE_URL"); canvasURL != "" {
-		canvasClient := canvasservice.NewClient(canvasURL, 10*time.Second)
+		// Phase 2 mTLS: build one shared client-side SPIFFE source for the
+		// outbound canvas dial. Mode off (default) skips it → insecure dial,
+		// behavior-identical to before. A source error degrades to nil (the
+		// dial then falls back to insecure) rather than disabling the push.
+		mtlsMode := pkconfig.MTLSMode()
+		if mtlsMode != pkconfig.MTLSModeOff && c.canvasClientSource == nil {
+			src, srcErr := spiffe.NewSource(context.Background())
+			if srcErr != nil {
+				log.Printf("Warning: canvas-service client SPIFFE source unavailable, dialing insecure: %v", srcErr)
+			} else {
+				c.canvasClientSource = src
+			}
+		}
+		canvasClient := canvasservice.NewClient(context.Background(), canvasURL, mtlsMode, c.canvasClientSource, 10*time.Second)
 		// x-api-key value: prefer the shared service API key; fall back to the
 		// legacy CANVAS_SERVICE_TOKEN only when the API key is unset.
 		serviceToken := c.Config.Server.GRPC.ServiceAPIKey
@@ -1280,6 +1302,13 @@ func (c *Container) Close() error {
 	if c.EventPublisher != nil {
 		if err := c.EventPublisher.Close(); err != nil {
 			log.Printf("Warning: failed to close event publisher: %v", err)
+		}
+	}
+
+	// Phase 2 mTLS — release the outbound canvas client's SPIFFE source.
+	if c.canvasClientSource != nil {
+		if err := c.canvasClientSource.Close(); err != nil {
+			log.Printf("Warning: failed to close canvas client SPIFFE source: %v", err)
 		}
 	}
 

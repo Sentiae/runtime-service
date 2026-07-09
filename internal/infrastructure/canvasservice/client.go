@@ -12,8 +12,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/grpcclient"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 
 	canvasv1 "github.com/sentiae/canvas-service/gen/proto/canvas/v1"
@@ -31,17 +32,23 @@ type Client struct {
 }
 
 // NewClient dials canvas-service's gRPC listener. An empty grpcAddr
-// disables the push path.
-func NewClient(grpcAddr string, timeout time.Duration) *Client {
+// disables the push path. With mode off (default) or a nil source the dial
+// uses insecure credentials exactly as before; otherwise it dials mTLS to
+// canvas-service's SVID, presenting runtime's SVID via the shared source.
+func NewClient(ctx context.Context, grpcAddr, mode string, source *workloadapi.X509Source, timeout time.Duration) *Client {
 	if grpcAddr == "" {
 		return &Client{}
 	}
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	conn, err := grpc.NewClient(grpcAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
+	conn, err := grpcclient.Dial(ctx, grpcclient.Config{
+		Endpoint:      grpcAddr,
+		Mode:          mode,
+		Source:        source,
+		ServerService: "canvas",
+		Timeout:       timeout,
+	})
 	if err != nil {
 		return &Client{timeout: timeout}
 	}
