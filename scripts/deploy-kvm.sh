@@ -109,11 +109,13 @@ if [[ "${APP_GRPC_MTLS_MODE:-off}" != off ]]; then
   echo "==> enabling spire-agent.service"
   "${SSH[@]}" 'sudo systemctl daemon-reload && sudo systemctl enable --now spire-agent'
 
-  echo "==> ensuring runtime-service.env mesh keys"
+  # Upsert the mesh keys authoritatively (not add-if-absent) so the KVM runtime's
+  # mode matches this deploy's APP_GRPC_MTLS_MODE on every run — no host drift.
+  echo "==> setting runtime-service.env mesh keys (mode=$APP_GRPC_MTLS_MODE)"
   "${SSH[@]}" 'grep -q "^SPIFFE_ENDPOINT_SOCKET=" /etc/runtime-service.env \
     || echo "SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/agent-sockets/api.sock" | sudo tee -a /etc/runtime-service.env >/dev/null'
-  "${SSH[@]}" 'grep -q "^APP_GRPC_MTLS_MODE=" /etc/runtime-service.env \
-    || echo "APP_GRPC_MTLS_MODE=permissive" | sudo tee -a /etc/runtime-service.env >/dev/null'
+  "${SSH[@]}" "sudo sed -i '/^APP_GRPC_MTLS_MODE=/d' /etc/runtime-service.env \
+    && echo 'APP_GRPC_MTLS_MODE=${APP_GRPC_MTLS_MODE}' | sudo tee -a /etc/runtime-service.env >/dev/null"
 fi
 # --- end SPIRE agent provisioning -------------------------------------------
 
