@@ -328,7 +328,7 @@ func writeRuntimeJSON(stagingDir string, req MaterializeRequest, cfg ImageConfig
 	if err != nil {
 		return fmt.Errorf("marshal runtime spec: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), body, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), body, 0o600); err != nil {
 		return fmt.Errorf("write runtime.json: %w", err)
 	}
 	return nil

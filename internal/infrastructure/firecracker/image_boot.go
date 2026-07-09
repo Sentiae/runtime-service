@@ -345,6 +345,7 @@ func (b *ImageBooter) killVM(cmd *exec.Cmd, socketPath string) {
 	}
 	if socketPath != "" {
 		_ = os.Remove(socketPath)
+		_ = os.Remove(socketPath + ".vsock")
 	}
 }
 
@@ -498,6 +499,7 @@ func (b *ImageBooter) Decommission(_ context.Context, in usecase.ImageDecommissi
 	b.freePort(in.HostPort)
 	if in.SocketPath != "" {
 		_ = os.Remove(in.SocketPath)
+		_ = os.Remove(in.SocketPath + ".vsock")
 	}
 	if in.RootfsPath != "" {
 		_ = os.Remove(in.RootfsPath)
