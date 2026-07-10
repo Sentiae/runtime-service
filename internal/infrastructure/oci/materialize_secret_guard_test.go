@@ -14,25 +14,40 @@ import (
 // is the sole secret channel and it is blocked before boot; runtime.json at rest
 // must never become a secret-bearing channel. Guard test only — no new behavior.
 func TestRuntimeJSONHasNoSecretChannel(t *testing.T) {
-	// runtimeSpec is what lands on disk. It must expose no secret-bearing field:
-	// there is no inject-as-env secret path in the image-boot codepath.
+	// runtimeSpec is what lands on disk. It must expose no secret-VALUE-bearing
+	// field: there is no inject-as-env secret path in the image-boot codepath.
+	// A boolean flag (e.g. ExpectSecrets — the vsock-listener toggle) carries no
+	// value and is permitted; only string/slice/map secret fields would be a
+	// plaintext-at-rest channel and are forbidden.
 	specType := reflect.TypeOf(runtimeSpec{})
 	for i := 0; i < specType.NumField(); i++ {
 		f := specType.Field(i)
 		name := strings.ToLower(f.Name + " " + f.Tag.Get("json"))
-		if strings.Contains(name, "secret") {
-			t.Fatalf("runtimeSpec exposes a secret-bearing field %q — runtime.json must carry no secret channel", f.Name)
+		if strings.Contains(name, "secret") && isValueBearing(f.Type) {
+			t.Fatalf("runtimeSpec exposes a secret-value-bearing field %q — runtime.json must carry no secret channel", f.Name)
 		}
 	}
 
 	// MaterializeRequest is the descriptor input. env_vars must be plain descriptor
-	// env only; there must be no secret field feeding the materialize path.
+	// env only; there must be no secret-value field feeding the materialize path.
 	reqType := reflect.TypeOf(MaterializeRequest{})
 	for i := 0; i < reqType.NumField(); i++ {
 		f := reqType.Field(i)
-		if strings.Contains(strings.ToLower(f.Name), "secret") {
-			t.Fatalf("MaterializeRequest exposes a secret field %q — secrets must not flow through env_vars", f.Name)
+		if strings.Contains(strings.ToLower(f.Name), "secret") && isValueBearing(f.Type) {
+			t.Fatalf("MaterializeRequest exposes a secret-value field %q — secrets must not flow through env_vars", f.Name)
 		}
+	}
+}
+
+// isValueBearing reports whether t could carry a secret PLAINTEXT (string, byte
+// slice, or a collection thereof). A bool/int flag cannot, so a boolean toggle
+// like ExpectSecrets is not a secret channel.
+func isValueBearing(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.String, reflect.Slice, reflect.Array, reflect.Map, reflect.Struct, reflect.Ptr, reflect.Interface:
+		return true
+	default:
+		return false
 	}
 }
 

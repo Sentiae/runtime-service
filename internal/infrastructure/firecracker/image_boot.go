@@ -268,7 +268,7 @@ func imageBootArgs(guestIP, hostIP string) string {
 // startVM starts a Firecracker process configured to boot the given rootfs on
 // the given TAP. It returns the running process and socket path. The caller is
 // responsible for killing the process and cleaning the socket.
-func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath string, nw imgNet, vcpu, memMB int) (*exec.Cmd, string, error) {
+func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath string, nw imgNet, vcpu, memMB int, expectSecrets bool) (*exec.Cmd, string, error) {
 	socketPath := b.p.socketPath(vmID)
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o750); err != nil {
 		return nil, "", fmt.Errorf("create socket dir: %w", err)
@@ -330,6 +330,19 @@ func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath st
 		b.killVM(cmd, socketPath)
 		return nil, "", fmt.Errorf("configure network: %w", err)
 	}
+	// Secret channel: attach a vsock device so the host can push the secret
+	// bundle to the guest after start (invariant I32). Unlike the warm path this
+	// must NOT warn-and-continue — a secret workload must not boot without its
+	// channel, so a /vsock config failure fails the boot.
+	if expectSecrets {
+		if err := b.p.apiPut(ctx, client, "/vsock", map[string]any{
+			"guest_cid": 3,
+			"uds_path":  socketPath + ".vsock",
+		}); err != nil {
+			b.killVM(cmd, socketPath)
+			return nil, "", fmt.Errorf("configure vsock secret channel: %w", err)
+		}
+	}
 	if err := b.p.startInstance(ctx, socketPath); err != nil {
 		b.killVM(cmd, socketPath)
 		return nil, "", fmt.Errorf("start instance: %w", err)
@@ -360,11 +373,20 @@ func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (
 	defer func() { _ = os.Remove(in.RootfsPath) }()
 
 	vcpu, memMB := normalizeResources(in.VCPU, in.MemoryMB)
-	cmd, socketPath, err := b.startVM(ctx, in.WorkloadID, in.RootfsPath, nw, vcpu, memMB)
+	cmd, socketPath, err := b.startVM(ctx, in.WorkloadID, in.RootfsPath, nw, vcpu, memMB, in.ExpectSecrets)
 	if err != nil {
 		return usecase.ImageTestResult{}, err
 	}
 	defer func() { _ = os.Remove(socketPath) }()
+
+	// Push secrets over vsock before the guest execs its workload. Fail-closed:
+	// a push failure kills the VM and aborts the test (invariant I32).
+	if in.ExpectSecrets {
+		if err := pushSecrets(ctx, socketPath, in.Secrets, secretPushTimeout); err != nil {
+			b.killVM(cmd, socketPath)
+			return usecase.ImageTestResult{}, fmt.Errorf("push secrets: %w", err)
+		}
+	}
 
 	timeout := time.Duration(in.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
@@ -440,11 +462,22 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 	}
 
 	vcpu, memMB := normalizeResources(in.VCPU, in.MemoryMB)
-	cmd, socketPath, err := b.startVM(ctx, in.WorkloadID, in.RootfsPath, nw, vcpu, memMB)
+	cmd, socketPath, err := b.startVM(ctx, in.WorkloadID, in.RootfsPath, nw, vcpu, memMB, in.ExpectSecrets)
 	if err != nil {
 		cleanupNet()
 		b.freePort(hostPort)
 		return usecase.ImageResidentResult{}, err
+	}
+
+	// Push secrets over vsock before the guest execs its workload. Fail-closed:
+	// a push failure kills the VM and tears down the net plumbing (invariant I32).
+	if in.ExpectSecrets {
+		if err := pushSecrets(ctx, socketPath, in.Secrets, secretPushTimeout); err != nil {
+			b.killVM(cmd, socketPath)
+			cleanupNet()
+			b.freePort(hostPort)
+			return usecase.ImageResidentResult{}, fmt.Errorf("push secrets: %w", err)
+		}
 	}
 
 	// Reap the process if it dies while we wait (defensive — a resident VM that

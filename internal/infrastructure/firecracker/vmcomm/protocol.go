@@ -28,7 +28,13 @@ func sendMessage(conn net.Conn, msg proto.Message) error {
 	if err != nil {
 		return fmt.Errorf("marshal message: %w", err)
 	}
+	return WriteFrame(conn, data)
+}
 
+// WriteFrame writes an already-marshaled payload with the standard 4-byte
+// big-endian length prefix. Exported so the host->guest secret pusher can own
+// (and zero) the plaintext buffer it sends while still using this framing.
+func WriteFrame(conn net.Conn, data []byte) error {
 	lenBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
 
@@ -40,6 +46,11 @@ func sendMessage(conn net.Conn, msg proto.Message) error {
 	}
 	return nil
 }
+
+// RecvMessage reads a length-prefixed protobuf message from conn. Exported
+// wrapper around the package's framing for out-of-package callers (the secret
+// pusher reads its Ack with it).
+func RecvMessage(conn net.Conn, msg proto.Message) error { return recvMessage(conn, msg) }
 
 // recvMessage reads a length-prefixed protobuf message from conn.
 func recvMessage(conn net.Conn, msg proto.Message) error {

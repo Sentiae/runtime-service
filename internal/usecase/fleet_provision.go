@@ -41,6 +41,9 @@ type ImageMaterializeInput struct {
 	Mode        string // "test" | "resident"
 	TestCommand string
 	Port        int
+	// ExpectSecrets tells the guest (via runtime.json) to open the vsock secret
+	// listener at boot and block on a host push before exec (invariant I32).
+	ExpectSecrets bool
 }
 
 // ImageMaterializeOutput is the materialize result.
@@ -55,6 +58,15 @@ type ImageBooter interface {
 	Decommission(ctx context.Context, in ImageDecommissionInput) error
 }
 
+// HostSecret is one plaintext secret the host pushes to the guest over vsock at
+// boot. Val is a plain string at this boot layer; the real resolver's
+// secret.SecretValue is unwrapped by the caller only at push time (Phase 3.4).
+// It NEVER touches the host rootfs, logs, or DB (invariant I32).
+type HostSecret struct {
+	Name string
+	Val  string
+}
+
 // ImageBootInput is the common boot request.
 type ImageBootInput struct {
 	WorkloadID     uuid.UUID
@@ -63,6 +75,12 @@ type ImageBootInput struct {
 	MemoryMB       int
 	Port           int
 	TimeoutSeconds int
+	// ExpectSecrets makes the booter attach a /vsock device and push Secrets to
+	// the guest after start but before the ready/power-off wait. A push failure
+	// fails the boot closed (the VM is killed) — a secret workload must not run
+	// without its channel.
+	ExpectSecrets bool
+	Secrets       []HostSecret
 }
 
 // ImageTestResult is the outcome of a single-shot test boot.
@@ -121,6 +139,16 @@ func (FailLoudImageBooter) Decommission(context.Context, ImageDecommissionInput)
 // stdoutTailBytes bounds the stdout/stderr tail stored + returned (spec: <=8KB).
 const stdoutTailBytes = 8 * 1024
 
+// selfTestSecretName / selfTestSecretValue are the NON-SECRET marker injected by
+// the gated self-test (APP_FLEET_SECRET_SELFTEST) so a secret-ref-less deploy
+// exercises the full host->guest vsock path end-to-end without any real secret
+// resolution. Orthogonal to the real ErrSecretsNotSupported gate; removed/gated
+// at Phase 3.4 when real secret resolution lands.
+const (
+	selfTestSecretName  = "__selftest__"
+	selfTestSecretValue = "FLEET-VSOCK-SELFTEST-OK"
+)
+
 // FleetProvisionInput is the wire-agnostic provision request.
 type FleetProvisionInput struct {
 	ComponentID    string
@@ -171,8 +199,28 @@ type FleetProvision struct {
 	// back to the CP3 single-workload runResident path so behavior is preserved.
 	orchestrator *FleetOrchestrator
 
+	// secretSelfTest, when set (APP_FLEET_SECRET_SELFTEST), injects a NON-SECRET
+	// marker over the vsock secret channel on secret-ref-less provisions so the
+	// I32 mechanism is verifiable without any real secret. Off by default →
+	// behavior-neutral (no /vsock, no push, guest skips the receive).
+	secretSelfTest bool
+
 	baseCtx context.Context
 	wg      sync.WaitGroup
+}
+
+// SetSecretSelfTest enables the gated vsock self-test marker injection (Phase
+// 3.3 verification only). Wired from APP_FLEET_SECRET_SELFTEST in the container.
+func (uc *FleetProvision) SetSecretSelfTest(on bool) { uc.secretSelfTest = on }
+
+// selfTestSecrets returns the injected marker secret when the self-test flag is
+// on AND the provision carries no real secret_refs (the real gate still rejects
+// those upstream). It returns nil otherwise, keeping the default path untouched.
+func (uc *FleetProvision) selfTestSecrets(in FleetProvisionInput) []HostSecret {
+	if !uc.secretSelfTest || len(in.SecretRefs) > 0 {
+		return nil
+	}
+	return []HostSecret{{Name: selfTestSecretName, Val: selfTestSecretValue}}
 }
 
 // SetOrchestrator wires the CP4 reconciler-backed app model. Resident-class
@@ -235,20 +283,22 @@ func (uc *FleetProvision) Provision(ctx context.Context, in FleetProvisionInput)
 		return FleetProvisionOutput{}, fmt.Errorf("persist workload: %w", err)
 	}
 
+	secrets := uc.selfTestSecrets(in)
 	matIn := ImageMaterializeInput{
-		Registry:    in.Registry,
-		Repository:  in.Repository,
-		Digest:      in.Digest,
-		ChangeID:    in.ChangeID,
-		WorkDir:     filepath.Join(uc.workDir, wl.ID.String()),
-		EnvVars:     in.EnvVars,
-		Mode:        string(class),
-		TestCommand: in.TestCommand,
-		Port:        in.Port,
+		Registry:      in.Registry,
+		Repository:    in.Repository,
+		Digest:        in.Digest,
+		ChangeID:      in.ChangeID,
+		WorkDir:       filepath.Join(uc.workDir, wl.ID.String()),
+		EnvVars:       in.EnvVars,
+		Mode:          string(class),
+		TestCommand:   in.TestCommand,
+		Port:          in.Port,
+		ExpectSecrets: len(secrets) > 0,
 	}
 
 	if class == domain.ImageWorkloadClassTest {
-		uc.startTestRun(wl, matIn, in.VCPU, in.MemoryMB, int(in.TimeoutSeconds))
+		uc.startTestRun(wl, matIn, in.VCPU, in.MemoryMB, int(in.TimeoutSeconds), secrets)
 		return FleetProvisionOutput{Handle: wl.ID.String()}, nil
 	}
 
@@ -268,7 +318,7 @@ func (uc *FleetProvision) Provision(ctx context.Context, in FleetProvisionInput)
 
 	// Fallback (no orchestrator wired): materialize + boot one workload
 	// synchronously so the URL is known on return.
-	url, err := uc.runResident(ctx, wl, matIn, in.VCPU, in.MemoryMB)
+	url, err := uc.runResident(ctx, wl, matIn, in.VCPU, in.MemoryMB, secrets)
 	if err != nil {
 		uc.markFailed(ctx, wl, err)
 		return FleetProvisionOutput{}, err
@@ -298,7 +348,7 @@ func (uc *FleetProvision) Scale(ctx context.Context, handle string, replicas int
 
 // startTestRun launches the detached test boot. Provision has already returned
 // the handle by the time this runs.
-func (uc *FleetProvision) startTestRun(wl *domain.ImageWorkload, matIn ImageMaterializeInput, vcpu, memMB, timeoutSec int) {
+func (uc *FleetProvision) startTestRun(wl *domain.ImageWorkload, matIn ImageMaterializeInput, vcpu, memMB, timeoutSec int, secrets []HostSecret) {
 	if timeoutSec <= 0 {
 		timeoutSec = 300
 	}
@@ -330,6 +380,8 @@ func (uc *FleetProvision) startTestRun(wl *domain.ImageWorkload, matIn ImageMate
 			VCPU:           vcpu,
 			MemoryMB:       memMB,
 			TimeoutSeconds: timeoutSec,
+			ExpectSecrets:  matIn.ExpectSecrets,
+			Secrets:        secrets,
 		})
 		if err != nil {
 			uc.markFailed(ctx, wl, fmt.Errorf("boot test: %w", err))
@@ -352,7 +404,7 @@ func (uc *FleetProvision) startTestRun(wl *domain.ImageWorkload, matIn ImageMate
 }
 
 // runResident materializes + boots a resident workload synchronously.
-func (uc *FleetProvision) runResident(ctx context.Context, wl *domain.ImageWorkload, matIn ImageMaterializeInput, vcpu, memMB int) (string, error) {
+func (uc *FleetProvision) runResident(ctx context.Context, wl *domain.ImageWorkload, matIn ImageMaterializeInput, vcpu, memMB int, secrets []HostSecret) (string, error) {
 	mat, err := uc.materializer.Materialize(ctx, matIn)
 	if err != nil {
 		return "", fmt.Errorf("materialize: %w", err)
@@ -362,11 +414,13 @@ func (uc *FleetProvision) runResident(ctx context.Context, wl *domain.ImageWorkl
 	_ = uc.repo.Update(ctx, wl)
 
 	res, err := uc.booter.BootResident(ctx, ImageBootInput{
-		WorkloadID: wl.ID,
-		RootfsPath: mat.RootfsPath,
-		VCPU:       vcpu,
-		MemoryMB:   memMB,
-		Port:       wl.Port,
+		WorkloadID:    wl.ID,
+		RootfsPath:    mat.RootfsPath,
+		VCPU:          vcpu,
+		MemoryMB:      memMB,
+		Port:          wl.Port,
+		ExpectSecrets: matIn.ExpectSecrets,
+		Secrets:       secrets,
 	})
 	if err != nil {
 		return "", fmt.Errorf("boot resident: %w", err)

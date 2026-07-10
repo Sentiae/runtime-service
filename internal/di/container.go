@@ -310,6 +310,10 @@ func (c *Container) initFleet(cfg *config.Config) {
 		cfg.ImageBoot.WorkDir,
 		cfg.ImageBoot.AdvertiseHost,
 	)
+	if cfg.Fleet.SecretSelfTest {
+		c.FleetProvisionUC.SetSecretSelfTest(true)
+		log.Println("Fleet secret vsock self-test ENABLED (APP_FLEET_SECRET_SELFTEST) — non-secret marker injected on provisions")
+	}
 
 	// CP4 §9#6 — resident replica runtime (firecracker host only; the fail-loud
 	// booter would reject every boot off-host so it stays nil there).

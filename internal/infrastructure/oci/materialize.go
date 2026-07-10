@@ -31,6 +31,10 @@ type MaterializeRequest struct {
 	Mode    string            // "test" | "resident"
 	TestCmd string            // test class: overrides the image entrypoint when non-empty
 	Port    int               // resident class: guest port
+	// ExpectSecrets is a boolean FLAG (never a secret value) written to
+	// runtime.json so the guest opens its vsock secret listener at boot and
+	// blocks on the host push before exec (invariant I32). No plaintext at rest.
+	ExpectSecrets bool
 }
 
 // MaterializeResult is the output of Materialize.
@@ -48,6 +52,10 @@ type runtimeSpec struct {
 	Mode        string   `json:"mode"`
 	TestCommand string   `json:"test_command"`
 	Port        int      `json:"port"`
+	// ExpectSecrets is a boolean flag (NOT a secret value): it tells the guest
+	// image-init to open the vsock secret listener and block on the host push
+	// before exec. runtime.json carries no secret plaintext (invariant I32).
+	ExpectSecrets bool `json:"expect_secrets,omitempty"`
 }
 
 // Materializer pulls an OCI image and lays it down as a Firecracker ext4 rootfs.
@@ -313,12 +321,13 @@ func withinDir(dir, target string) bool {
 // writeRuntimeJSON writes /sentiae/runtime.json into the staging tree.
 func writeRuntimeJSON(stagingDir string, req MaterializeRequest, cfg ImageConfig) error {
 	spec := runtimeSpec{
-		Entrypoint:  buildEntrypoint(cfg),
-		Env:         buildEnv(cfg.Env, req.EnvVars),
-		WorkDir:     cfg.WorkingDir,
-		Mode:        req.Mode,
-		TestCommand: req.TestCmd,
-		Port:        req.Port,
+		Entrypoint:    buildEntrypoint(cfg),
+		Env:           buildEnv(cfg.Env, req.EnvVars),
+		WorkDir:       cfg.WorkingDir,
+		Mode:          req.Mode,
+		TestCommand:   req.TestCmd,
+		Port:          req.Port,
+		ExpectSecrets: req.ExpectSecrets,
 	}
 	dir := filepath.Join(stagingDir, "sentiae")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

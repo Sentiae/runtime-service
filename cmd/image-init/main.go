@@ -43,6 +43,10 @@ type runtimeSpec struct {
 	Mode        string   `json:"mode"`
 	TestCommand string   `json:"test_command"`
 	Port        int      `json:"port"`
+	// ExpectSecrets tells this init to open the vsock secret listener and block
+	// on the host push before exec (invariant I32). Boolean flag only — no
+	// secret plaintext is ever carried in runtime.json.
+	ExpectSecrets bool `json:"expect_secrets"`
 }
 
 func main() {
@@ -60,11 +64,19 @@ func main() {
 		return
 	}
 
+	// Secret channel (invariant I32): when the descriptor expects secrets, receive
+	// them over vsock into a tmpfs BEFORE exec. Fail-closed — any failure powers
+	// off without running the workload (receiveSecrets never returns on failure).
+	var secretEnv []string
+	if spec.ExpectSecrets {
+		secretEnv = receiveSecrets()
+	}
+
 	switch spec.Mode {
 	case "resident":
-		runResident(spec)
+		runResident(spec, secretEnv)
 	default: // "test" and anything else default to single-shot
-		runTest(spec)
+		runTest(spec, secretEnv)
 	}
 }
 
@@ -128,7 +140,7 @@ func loadSpec() (*runtimeSpec, error) {
 }
 
 // runTest runs the workload once and writes stdout/stderr/exit_code to /sentiae/out.
-func runTest(spec *runtimeSpec) {
+func runTest(spec *runtimeSpec, secretEnv []string) {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "image-init: mkdir out: %v\n", err)
 	}
@@ -154,7 +166,7 @@ func runTest(spec *runtimeSpec) {
 		cmd = exec.Command(spec.Entrypoint[0], spec.Entrypoint[1:]...)
 	}
 
-	applyEnv(cmd, spec)
+	applyEnv(cmd, spec, secretEnv)
 
 	stdoutF, _ := os.OpenFile(filepath.Join(outDir, "stdout.txt"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	stderrF, _ := os.OpenFile(filepath.Join(outDir, "stderr.txt"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
@@ -185,7 +197,7 @@ func runTest(spec *runtimeSpec) {
 
 // runResident starts the workload as a child and stays PID 1, reaping zombies
 // until the child exits, then powers off.
-func runResident(spec *runtimeSpec) {
+func runResident(spec *runtimeSpec, secretEnv []string) {
 	if len(spec.Entrypoint) == 0 {
 		fmt.Fprintln(os.Stderr, "image-init: resident image has no entrypoint")
 		syncAndPowerOff()
@@ -198,7 +210,7 @@ func runResident(spec *runtimeSpec) {
 	}
 
 	cmd := exec.Command(spec.Entrypoint[0], spec.Entrypoint[1:]...)
-	applyEnv(cmd, spec)
+	applyEnv(cmd, spec, secretEnv)
 	cmd.Stdout = console
 	cmd.Stderr = console
 
@@ -232,9 +244,14 @@ func runResident(spec *runtimeSpec) {
 }
 
 // applyEnv sets the child's environment and working directory from the spec.
-func applyEnv(cmd *exec.Cmd, spec *runtimeSpec) {
-	if len(spec.Env) > 0 {
-		cmd.Env = spec.Env
+// Received secret env is merged AFTER spec.Env (secret wins) — spec.Env stays
+// non-secret; the secret values arrived only over the vsock channel.
+func applyEnv(cmd *exec.Cmd, spec *runtimeSpec, secretEnv []string) {
+	env := make([]string, 0, len(spec.Env)+len(secretEnv))
+	env = append(env, spec.Env...)
+	env = append(env, secretEnv...)
+	if len(env) > 0 {
+		cmd.Env = env
 	}
 	if spec.WorkDir != "" {
 		cmd.Dir = spec.WorkDir

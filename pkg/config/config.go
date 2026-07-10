@@ -37,6 +37,11 @@ type FleetConfig struct {
 	HostDiskMB int64 `mapstructure:"host_disk_mb"`
 	// HeartbeatInterval is how often the self-host heartbeats the registry.
 	HeartbeatInterval time.Duration `mapstructure:"heartbeat_interval"`
+	// SecretSelfTest gates the host->guest vsock self-test (Phase 3.3): when set,
+	// a secret-ref-less provision injects a NON-SECRET marker over the vsock
+	// secret channel so the I32 mechanism is verifiable end-to-end. Off by
+	// default; orthogonal to the real ErrSecretsNotSupported gate.
+	SecretSelfTest bool `mapstructure:"secret_selftest"`
 }
 
 // RegistryConfig configures the OCI registry the image-boot path pulls compiled
@@ -425,6 +430,7 @@ func Load() (*Config, error) {
 			"fleet.region":             "homelab",
 			"fleet.host_disk_mb":       51200,
 			"fleet.heartbeat_interval": "10s",
+			"fleet.secret_selftest":    false,
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -560,6 +566,7 @@ func Load() (*Config, error) {
 			{"fleet.region", "APP_FLEET_REGION"},
 			{"fleet.host_disk_mb", "APP_FLEET_HOST_DISK_MB"},
 			{"fleet.heartbeat_interval", "APP_FLEET_HEARTBEAT_INTERVAL"},
+			{"fleet.secret_selftest", "APP_FLEET_SECRET_SELFTEST"},
 		},
 	})
 	if err != nil {
