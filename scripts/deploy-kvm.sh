@@ -123,6 +123,15 @@ if [[ "${APP_GRPC_MTLS_MODE:-off}" != off ]]; then
     || echo "SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/agent-sockets/api.sock" | sudo tee -a /etc/runtime-service.env >/dev/null'
   "${SSH[@]}" "sudo sed -i '/^APP_GRPC_MTLS_MODE=/d' /etc/runtime-service.env \
     && echo 'APP_GRPC_MTLS_MODE=${APP_GRPC_MTLS_MODE}' | sudo tee -a /etc/runtime-service.env >/dev/null"
+
+  # Secret resolution (P3.4): the fleet host authenticates to Vault as svc/runtime
+  # (via its JWT-SVID) to resolve + decrypt per-tenant secrets for resident deploys.
+  # Only meaningful with the SPIRE agent above; secret-less deploys ignore these.
+  echo "==> setting runtime-service.env Vault resolver keys"
+  for _kv in "VAULT_ADDR=https://10.0.10.20:8200" "VAULT_AUTH_MODE=svid" "VAULT_SVID_ROLE=runtime"; do
+    _k="${_kv%%=*}"
+    "${SSH[@]}" "sudo sed -i '/^${_k}=/d' /etc/runtime-service.env && echo '${_kv}' | sudo tee -a /etc/runtime-service.env >/dev/null"
+  done
 fi
 # --- end SPIRE agent provisioning -------------------------------------------
 
