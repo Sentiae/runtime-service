@@ -35,7 +35,7 @@ message DeploymentDescriptor {
     OCIImageRef image = 3;
     ResourceSpec resources = 4;          // 0 values → defaults (1 vcpu, 512 MB)
     map<string, string> env_vars = 5;
-    repeated string secret_refs = 6;     // MUST be empty in CP3 (secrets contract open) — reject InvalidArgument if set
+    repeated string secret_refs = 6;     // resident class: tenant-namespaced refs ("tenants/<org-uuid>/<subpath>#<field>") resolved per-tenant at boot (P14/I32); test class rejects them
     repeated RouteSpec routes = 7;       // ignored in CP3
     repeated VolumeSpec volumes = 8;     // ignored in CP3
     int32 port = 9;                      // guest port the workload listens on (resident class)
@@ -43,7 +43,15 @@ message DeploymentDescriptor {
     string test_command = 11;            // test class only: overrides the image entrypoint when non-empty (run via /bin/sh -c)
     int64 timeout_seconds = 12;          // test class: max run time (default 300)
 }
-message ProvisionRequest { DeploymentDescriptor descriptor = 1; }
+message ProvisionRequest {
+    DeploymentDescriptor descriptor = 1;
+    // owner_org is the attested tenant (org uuid) that owns this deployment's
+    // secrets (D-069). It is the verified anchor the fleet scopes every
+    // secret_ref resolution to (I28): a resident replica's secrets resolve only
+    // for this org's per-tenant KEK. Empty is allowed only when secret_refs is
+    // empty; a secret-bearing resident deploy without owner_org fails closed.
+    string owner_org = 7;
+}
 message ProvisionResponse { string handle = 1; string url = 2; } // url set for resident class ("http://<advertise_host>:<host_port>"), empty for test
 message FleetHealthRequest { string handle = 1; }
 message FleetHealthResponse {

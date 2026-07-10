@@ -17,6 +17,13 @@
 #   APP_REGISTRY_HOST=10.0.10.20:8089
 #   APP_REGISTRY_SERVICE_KEY=<same shared service key — the OCI registry accepts it>
 #   APP_IMAGEBOOT_ADVERTISE_HOST=10.0.10.244   (defaults exist for the other APP_IMAGEBOOT_*)
+#
+# Secret resolution (P3.4 — required only for resident deploys with secret_refs;
+# unset ⇒ secret-less deploys still boot, secret-bearing ones fail closed):
+#   VAULT_ADDR=https://10.0.10.20:8200
+#   VAULT_AUTH_MODE=svid          # authenticate as svc/runtime via the KVM SPIRE agent's JWT-SVID
+#   VAULT_SVID_ROLE=runtime       # Vault jwt-backend role → svc-runtime-resolver policy (pre-provisioned)
+#   (needs mTLS/SPIRE on: APP_GRPC_MTLS_MODE!=off, so the SPIFFE socket exists)
 set -euo pipefail
 
 HOST="${KVM_HOST:-ubuntu@10.0.10.244}"

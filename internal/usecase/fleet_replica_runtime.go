@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/sentiae/platform-kit/logger"
+	"github.com/sentiae/platform-kit/secret"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/repository"
 )
@@ -25,6 +27,12 @@ type FleetReplicaRuntime struct {
 	workDir      string
 	advertise    string
 
+	// resolver turns each app.SecretRefs entry into a concrete secret value at
+	// boot, scoped to the app's owner org (I28). Nil on a host where no Vault
+	// resolver could be built (degrade-not-crash): a secret-less app still boots,
+	// but a secret-bearing app fails closed (ErrSecretResolverUnavailable).
+	resolver secret.Resolver
+
 	// secretSelfTest, when set (APP_FLEET_SECRET_SELFTEST), injects a NON-SECRET
 	// marker over the vsock secret channel on secret-ref-less resident boots so
 	// the I32 mechanism is verifiable on the live orchestrator path without any
@@ -38,22 +46,56 @@ type FleetReplicaRuntime struct {
 // APP_FLEET_SECRET_SELFTEST in the container.
 func (uc *FleetReplicaRuntime) SetSecretSelfTest(on bool) { uc.secretSelfTest = on }
 
+// SetSecretResolver wires the per-tenant secret resolver (P14). Nil is a valid
+// state — a host that could not reach Vault at boot leaves it nil and only
+// secret-less apps can boot there (secret-bearing apps fail closed).
+func (uc *FleetReplicaRuntime) SetSecretResolver(r secret.Resolver) { uc.resolver = r }
+
 // bootSecrets derives the secrets to push to a replica's microVM at boot. It is
 // re-evaluated on every BootReplica (crash-recovery, scale) so secrets are
 // re-supplied per boot and never persisted plaintext.
 //
-// TODO(P3.4): resolve app.SecretRefs via secret.Resolver into Secrets here — the
-// resolver output replaces the self-test marker below. Real secret_refs are
-// still rejected at the provision gate today (ErrSecretsNotSupported), so this
-// path only ever yields the gated non-secret marker.
-func (uc *FleetReplicaRuntime) bootSecrets(app *domain.FleetApp) []HostSecret {
+// For an app with secret_refs it resolves each ref through the per-tenant
+// resolver, scoped to the app's owner org (I28), and fails closed on ANY error
+// (nil resolver, missing owner org, cross-tenant denial, missing KEK, decrypt
+// failure, not-found): the boot aborts rather than run a VM with missing or
+// partial secrets (I32). A resolved value is revealed only into the HostSecret
+// the caller pushes over vsock — never logged, never persisted.
+func (uc *FleetReplicaRuntime) bootSecrets(ctx context.Context, app *domain.FleetApp) ([]HostSecret, error) {
 	if len(app.SecretRefs) > 0 {
-		return nil
+		if uc.resolver == nil {
+			return nil, domain.ErrSecretResolverUnavailable
+		}
+		if app.OwnerOrg == "" {
+			return nil, domain.ErrSecretOwnerOrgMissing
+		}
+		p := secret.Principal{Service: "runtime-fleet", OrgID: app.OwnerOrg}
+		secrets := make([]HostSecret, 0, len(app.SecretRefs))
+		for _, ref := range app.SecretRefs {
+			sv, err := uc.resolver.Resolve(ctx, ref, p)
+			if err != nil {
+				// ref is a reference (not the secret); safe to surface. The value
+				// is never touched here.
+				return nil, fmt.Errorf("resolve secret %q: %w", ref, err)
+			}
+			secrets = append(secrets, HostSecret{Name: fieldName(ref), Val: sv.Reveal()})
+		}
+		return secrets, nil
 	}
 	if uc.secretSelfTest {
-		return []HostSecret{{Name: selfTestSecretName, Val: selfTestSecretValue}}
+		return []HostSecret{{Name: selfTestSecretName, Val: selfTestSecretValue}}, nil
 	}
-	return nil
+	return nil, nil
+}
+
+// fieldName extracts the "<field>" tail of a "<path>#<field>" secret_ref — the
+// name the guest binds the secret to. Falls back to the whole ref when there is
+// no "#" (a malformed ref the resolver would already have rejected).
+func fieldName(ref string) string {
+	if i := strings.LastIndex(ref, "#"); i >= 0 && i < len(ref)-1 {
+		return ref[i+1:]
+	}
+	return ref
 }
 
 // NewFleetReplicaRuntime constructs the use case. workDir is the per-replica
@@ -103,8 +145,12 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 	// Secrets are re-derived on every boot (never persisted plaintext) so a
 	// reconciler re-boot re-injects them (invariant I32). ExpectSecrets tells both
 	// the guest (via runtime.json) to listen and the booter to open + push over
-	// the vsock channel, failing closed if the push fails.
-	secrets := uc.bootSecrets(app)
+	// the vsock channel, failing closed if the push fails. A resolution failure
+	// aborts the boot (fail closed) — no VM runs with missing/partial secrets.
+	secrets, err := uc.bootSecrets(ctx, app)
+	if err != nil {
+		return uc.markDead(ctx, replica, fmt.Errorf("resolve secrets: %w", err))
+	}
 	expectSecrets := len(secrets) > 0
 
 	matIn := ImageMaterializeInput{

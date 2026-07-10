@@ -252,7 +252,7 @@ type DeploymentDescriptor struct {
 	Image          *OCIImageRef           `protobuf:"bytes,3,opt,name=image,proto3" json:"image,omitempty"`
 	Resources      *ResourceSpec          `protobuf:"bytes,4,opt,name=resources,proto3" json:"resources,omitempty"` // 0 values → defaults (1 vcpu, 512 MB)
 	EnvVars        map[string]string      `protobuf:"bytes,5,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	SecretRefs     []string               `protobuf:"bytes,6,rep,name=secret_refs,json=secretRefs,proto3" json:"secret_refs,omitempty"`               // MUST be empty in CP3 (secrets contract open) — reject InvalidArgument if set
+	SecretRefs     []string               `protobuf:"bytes,6,rep,name=secret_refs,json=secretRefs,proto3" json:"secret_refs,omitempty"`               // resident class: tenant-namespaced refs ("tenants/<org-uuid>/<subpath>#<field>") resolved per-tenant at boot (P14/I32); test class rejects them
 	Routes         []*RouteSpec           `protobuf:"bytes,7,rep,name=routes,proto3" json:"routes,omitempty"`                                         // ignored in CP3
 	Volumes        []*VolumeSpec          `protobuf:"bytes,8,rep,name=volumes,proto3" json:"volumes,omitempty"`                                       // ignored in CP3
 	Port           int32                  `protobuf:"varint,9,opt,name=port,proto3" json:"port,omitempty"`                                            // guest port the workload listens on (resident class)
@@ -378,8 +378,14 @@ func (x *DeploymentDescriptor) GetTimeoutSeconds() int64 {
 }
 
 type ProvisionRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Descriptor_   *DeploymentDescriptor  `protobuf:"bytes,1,opt,name=descriptor,proto3" json:"descriptor,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Descriptor_ *DeploymentDescriptor  `protobuf:"bytes,1,opt,name=descriptor,proto3" json:"descriptor,omitempty"`
+	// owner_org is the attested tenant (org uuid) that owns this deployment's
+	// secrets (D-069). It is the verified anchor the fleet scopes every
+	// secret_ref resolution to (I28): a resident replica's secrets resolve only
+	// for this org's per-tenant KEK. Empty is allowed only when secret_refs is
+	// empty; a secret-bearing resident deploy without owner_org fails closed.
+	OwnerOrg      string `protobuf:"bytes,7,opt,name=owner_org,json=ownerOrg,proto3" json:"owner_org,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -419,6 +425,13 @@ func (x *ProvisionRequest) GetDescriptor_() *DeploymentDescriptor {
 		return x.Descriptor_
 	}
 	return nil
+}
+
+func (x *ProvisionRequest) GetOwnerOrg() string {
+	if x != nil {
+		return x.OwnerOrg
+	}
+	return ""
 }
 
 type ProvisionResponse struct {
@@ -1419,11 +1432,12 @@ const file_proto_runtime_v1_fleet_proto_rawDesc = "" +
 	"\x0ftimeout_seconds\x18\f \x01(\x03R\x0etimeoutSeconds\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"T\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"q\n" +
 	"\x10ProvisionRequest\x12@\n" +
 	"\n" +
 	"descriptor\x18\x01 \x01(\v2 .runtime.v1.DeploymentDescriptorR\n" +
-	"descriptor\"=\n" +
+	"descriptor\x12\x1b\n" +
+	"\towner_org\x18\a \x01(\tR\bownerOrg\"=\n" +
 	"\x11ProvisionResponse\x12\x16\n" +
 	"\x06handle\x18\x01 \x01(\tR\x06handle\x12\x10\n" +
 	"\x03url\x18\x02 \x01(\tR\x03url\",\n" +

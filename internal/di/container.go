@@ -17,6 +17,7 @@ import (
 
 	pkconfig "github.com/sentiae/platform-kit/config"
 	kafka "github.com/sentiae/platform-kit/kafka"
+	"github.com/sentiae/platform-kit/secret"
 	"github.com/sentiae/platform-kit/spiffe"
 	timetravel "github.com/sentiae/platform-kit/timetravel"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
@@ -172,6 +173,12 @@ type Container struct {
 	// runtime-fleet CP4 §9#6 — resident replica boot/teardown/health. Non-nil
 	// only on the firecracker executor (the fleet host); nil otherwise.
 	FleetReplicaRuntimeUC *usecase.FleetReplicaRuntime
+
+	// runtime-fleet P3.4 — the Vault client backing the per-tenant secret
+	// resolver on the fleet host. Non-nil only when the firecracker executor is
+	// selected AND VAULT_ADDR/VAULT_AUTH_MODE are set and the client built.
+	// Closed by Close.
+	vaultClient *pkconfig.VaultClient
 
 	// runtime-fleet CP4 §9#4 — host registry + this instance's self-host.
 	FleetHostRegistry   *usecase.FleetHostRegistry
@@ -330,6 +337,16 @@ func (c *Container) initFleet(cfg *config.Config) {
 			c.FleetReplicaRuntimeUC.SetSecretSelfTest(true)
 			log.Println("Fleet secret vsock self-test ENABLED on resident replica runtime (APP_FLEET_SECRET_SELFTEST) — non-secret marker injected on resident boots")
 		}
+
+		// runtime-fleet P3.4 — wire the per-tenant secret resolver (P14/I28/I29)
+		// into the resident boot path. Degrade-not-crash: if Vault is not
+		// configured or unreachable at boot, the resolver stays nil and only
+		// secret-less apps boot here — a secret-bearing app then fails closed at
+		// resolve time (ErrSecretResolverUnavailable), never silently secret-less.
+		if resolver := c.buildSecretResolver(); resolver != nil {
+			c.FleetReplicaRuntimeUC.SetSecretResolver(resolver)
+			log.Println("Fleet per-tenant secret resolver wired on resident replica runtime (P14)")
+		}
 	}
 
 	// CP4 §9#4 — durable host registry + this instance's self-registration.
@@ -366,6 +383,38 @@ func (c *Container) initFleet(cfg *config.Config) {
 		c.GRPCServer.RegisterFleet(grpchandler.NewFleetServer(c.FleetProvisionUC, c.FleetHostRegistry))
 		log.Println("FleetOrchestration gRPC service registered")
 	}
+}
+
+// buildSecretResolver constructs the per-tenant envelope resolver used to
+// resolve a resident app's secret_refs at boot (P14). It authenticates to Vault
+// via SPIFFE JWT-SVID (as svc/runtime) using the standard VAULT_* env vars, then
+// wraps a KV getter + a decrypt-only per-tenant Transit KEK (transit-tenants,
+// AutoCreate:false → decrypt fails closed, I29). It returns nil (never crashes)
+// when Vault is unconfigured or unreachable at boot: a secret-less app still
+// boots, and a secret-bearing app then fails closed at resolve time. The built
+// VaultClient is retained on the container so Close stops its lease renewer.
+func (c *Container) buildSecretResolver() secret.Resolver {
+	if os.Getenv("VAULT_ADDR") == "" || os.Getenv("VAULT_AUTH_MODE") == "" {
+		log.Println("Fleet secret resolver: VAULT_ADDR/VAULT_AUTH_MODE unset — resident secret_refs will fail closed")
+		return nil
+	}
+	vc, err := pkconfig.NewFromEnv(context.Background())
+	if err != nil {
+		log.Printf("Warning: fleet secret resolver: build Vault client failed (%v) — resident secret_refs will fail closed", err)
+		return nil
+	}
+	kek, err := secret.NewTenantTransit(vc.Raw(), secret.TransitConfig{
+		Mount:      "transit-tenants",
+		KeyPrefix:  "tenant-",
+		AutoCreate: false,
+	})
+	if err != nil {
+		log.Printf("Warning: fleet secret resolver: build tenant KEK failed (%v) — resident secret_refs will fail closed", err)
+		_ = vc.Close()
+		return nil
+	}
+	c.vaultClient = vc
+	return secret.NewEnvelopeVaultResolver(vc, kek)
 }
 
 // activeReplicas returns replicas currently holding a /30 index + host port
@@ -1277,6 +1326,11 @@ func (c *Container) Close() error {
 	// their results are persisted before the DB pool closes.
 	if c.FleetProvisionUC != nil {
 		c.FleetProvisionUC.Wait()
+	}
+
+	// runtime-fleet P3.4 — stop the Vault client's background lease renewer.
+	if c.vaultClient != nil {
+		_ = c.vaultClient.Close()
 	}
 
 	// §9.1 — drain every warm pool before releasing upstream resources

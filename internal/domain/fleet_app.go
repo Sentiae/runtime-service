@@ -33,6 +33,12 @@ type FleetApp struct {
 	Env             string        `json:"env" gorm:"type:varchar(64);not null;uniqueIndex:uq_fleet_apps_component_env"`
 	ImageRepository string        `json:"image_repository" gorm:"type:varchar(512);not null"`
 	ImageDigest     string        `json:"image_digest" gorm:"type:varchar(255);not null"`
+	// OwnerOrg is the attested tenant (org uuid) that owns this app's secrets
+	// (D-069). The resident replica runtime scopes every secret_ref resolution to
+	// it (I28): secrets resolve only under this org's per-tenant KEK. Empty is
+	// valid only when SecretRefs is empty — a secret-bearing app without an owner
+	// org fails closed at boot (no org to scope to).
+	OwnerOrg        string        `json:"owner_org" gorm:"type:text;not null;default:''"`
 	DesiredReplicas int           `json:"desired_replicas" gorm:"not null;default:1"`
 	MinReplicas     int           `json:"min_replicas" gorm:"not null;default:0"`
 	MaxReplicas     int           `json:"max_replicas" gorm:"not null;default:1"`

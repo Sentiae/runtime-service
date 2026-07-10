@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/secret"
 	"github.com/sentiae/runtime-service/internal/domain"
 )
 
@@ -171,10 +172,11 @@ func TestBootReplica_Success(t *testing.T) {
 }
 
 // TestBootReplica_SecretSelfTest verifies the P3.3 vsock self-test marker is
-// threaded onto the live resident-orchestrator boot: with the flag on and no
-// real secret_refs the boot carries ExpectSecrets + the injected marker; off,
-// the boot is behavior-neutral (no ExpectSecrets, no secrets); real secret_refs
-// (rejected at the provision gate today) yield no marker.
+// threaded onto the live resident-orchestrator boot for the SECRET-REF-LESS
+// case only: with the flag on and no real secret_refs the boot carries
+// ExpectSecrets + the injected marker; off, the boot is behavior-neutral (no
+// ExpectSecrets, no secrets). Apps WITH real secret_refs go through the resolver
+// path instead (TestBootReplica_SecretResolution).
 func TestBootReplica_SecretSelfTest(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -185,8 +187,6 @@ func TestBootReplica_SecretSelfTest(t *testing.T) {
 	}{
 		{"flag off → neutral", false, nil, false, false},
 		{"flag on, no refs → marker", true, nil, true, true},
-		{"flag on, real refs → no marker", true, []string{"db"}, false, false},
-		{"flag off, real refs → neutral", false, []string{"db"}, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -315,6 +315,132 @@ func TestDecommissionReplica_TearsDownAndDeletes(t *testing.T) {
 	if _, err := replicas.FindByID(context.Background(), rep.ID); !errors.Is(err, domain.ErrReplicaNotFound) {
 		t.Fatalf("replica row should be deleted, got %v", err)
 	}
+}
+
+// stubKV + stubKEK implement the (unexported) vaultGetter + tenantKEK surfaces
+// secret.NewEnvelopeVaultResolver depends on, so these tests drive a REAL
+// EnvelopeVaultResolver end to end (its SecretValue is otherwise
+// unconstructable from outside the secret package). This exercises the actual
+// I28 authorize + I29 unseal codepath, not a hand-rolled stand-in.
+type stubKV struct {
+	val string
+	err error
+}
+
+func (s stubKV) GetSecret(context.Context, string, string) (string, error) { return s.val, s.err }
+
+type stubKEK struct {
+	pt  []byte
+	err error
+}
+
+func (s stubKEK) Decrypt(context.Context, uuid.UUID, string) ([]byte, error) { return s.pt, s.err }
+
+// TestBootReplica_SecretResolution proves the P3.4 fail-closed contract: a
+// resident app with secret_refs resolves each ref through the per-tenant
+// resolver (scoped to its owner org) and pushes the revealed value; ANY resolve
+// failure aborts the boot BEFORE BootResident — no HostSecret with an empty or
+// foreign value ever reaches the booter.
+func TestBootReplica_SecretResolution(t *testing.T) {
+	org := uuid.New()
+	ref := secret.TenantRef(org, "prod/app", "db_password") // tenants/<org>/prod/app#db_password
+
+	// boot builds a fresh replica + runtime, wires the resolver, boots once, and
+	// returns the booter (to inspect what — if anything — reached BootResident).
+	boot := func(app *domain.FleetApp, resolver secret.Resolver) (*recordingBooter, error) {
+		rep := newTestReplica(app.ID)
+		replicas := newRTReplicaRepo()
+		_ = replicas.Create(context.Background(), rep)
+		booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5", HostPort: 20001}}
+		uc := NewFleetReplicaRuntime(
+			fakeMaterializer{rootfs: "/work/rep/rootfs.ext4"},
+			booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9",
+		)
+		if resolver != nil {
+			uc.SetSecretResolver(resolver)
+		}
+		return booter, uc.BootReplica(context.Background(), rep.ID)
+	}
+
+	okResolver := func() secret.Resolver {
+		return secret.NewEnvelopeVaultResolver(stubKV{val: "vault:v1:ct"}, stubKEK{pt: []byte("s3cr3t")})
+	}
+
+	t.Run("real refs, nil resolver → fail closed", func(t *testing.T) {
+		app := newTestApp()
+		app.OwnerOrg = org.String()
+		app.SecretRefs = []string{ref}
+		booter, err := boot(app, nil)
+		if !errors.Is(err, domain.ErrSecretResolverUnavailable) {
+			t.Fatalf("err = %v, want ErrSecretResolverUnavailable", err)
+		}
+		if booter.bootInput != nil {
+			t.Fatal("BootResident must not be called — no VM may run without its secrets")
+		}
+	})
+
+	t.Run("refs, empty owner org → fail closed", func(t *testing.T) {
+		app := newTestApp()
+		app.OwnerOrg = ""
+		app.SecretRefs = []string{ref}
+		booter, err := boot(app, okResolver())
+		if !errors.Is(err, domain.ErrSecretOwnerOrgMissing) {
+			t.Fatalf("err = %v, want ErrSecretOwnerOrgMissing", err)
+		}
+		if booter.bootInput != nil {
+			t.Fatal("BootResident must not be called with no org to scope to")
+		}
+	})
+
+	t.Run("cross-tenant ref → fail closed", func(t *testing.T) {
+		app := newTestApp()
+		app.OwnerOrg = uuid.New().String() // owner org != ref org
+		app.SecretRefs = []string{ref}
+		booter, err := boot(app, okResolver())
+		if !errors.Is(err, secret.ErrCrossTenantSecret) {
+			t.Fatalf("err = %v, want ErrCrossTenantSecret", err)
+		}
+		if booter.bootInput != nil {
+			t.Fatal("BootResident must not be called for a cross-tenant ref")
+		}
+	})
+
+	t.Run("resolver error → fail closed", func(t *testing.T) {
+		app := newTestApp()
+		app.OwnerOrg = org.String()
+		app.SecretRefs = []string{ref}
+		bad := secret.NewEnvelopeVaultResolver(stubKV{val: "vault:v1:ct"}, stubKEK{err: errors.New("kek missing")})
+		booter, err := boot(app, bad)
+		if err == nil {
+			t.Fatal("want error when the KEK decrypt fails")
+		}
+		if booter.bootInput != nil {
+			t.Fatal("BootResident must not be called on a resolve failure")
+		}
+	})
+
+	t.Run("resolves + pushes the secret", func(t *testing.T) {
+		app := newTestApp()
+		app.OwnerOrg = org.String()
+		app.SecretRefs = []string{ref}
+		booter, err := boot(app, okResolver())
+		if err != nil {
+			t.Fatalf("BootReplica: %v", err)
+		}
+		if booter.bootInput == nil || !booter.bootInput.ExpectSecrets {
+			t.Fatalf("ExpectSecrets should be set, got %+v", booter.bootInput)
+		}
+		if len(booter.bootInput.Secrets) != 1 {
+			t.Fatalf("want 1 pushed secret, got %d", len(booter.bootInput.Secrets))
+		}
+		got := booter.bootInput.Secrets[0]
+		if got.Name != "db_password" {
+			t.Fatalf("secret name = %q, want db_password", got.Name)
+		}
+		if got.Val != "s3cr3t" {
+			t.Fatalf("secret val = %q, want the resolved plaintext", got.Val)
+		}
+	})
 }
 
 func TestDecommissionReplica_MissingIsNoop(t *testing.T) {

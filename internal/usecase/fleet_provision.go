@@ -153,6 +153,7 @@ const (
 type FleetProvisionInput struct {
 	ComponentID    string
 	Env            string
+	OwnerOrg       string
 	Registry       string
 	Repository     string
 	Digest         string
@@ -256,7 +257,11 @@ func (uc *FleetProvision) Provision(ctx context.Context, in FleetProvisionInput)
 	if !class.IsValid() {
 		return FleetProvisionOutput{}, domain.ErrUnsupportedClass
 	}
-	if len(in.SecretRefs) > 0 {
+	// The resident class resolves + delivers secret_refs per boot (via the
+	// orchestrator → replica runtime → resolver, invariant I32). The test class
+	// has no resolver wired, so it rejects secret_refs rather than silently
+	// booting a workload without the secrets it declared.
+	if class == domain.ImageWorkloadClassTest && len(in.SecretRefs) > 0 {
 		return FleetProvisionOutput{}, domain.ErrSecretsNotSupported
 	}
 	if in.Registry == "" || in.Repository == "" || in.Digest == "" {

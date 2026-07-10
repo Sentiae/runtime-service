@@ -45,6 +45,7 @@ func (s *FleetServer) Provision(ctx context.Context, req *runtimev1.ProvisionReq
 	out, err := s.provision.Provision(ctx, usecase.FleetProvisionInput{
 		ComponentID:    d.GetComponentId(),
 		Env:            d.GetEnv(),
+		OwnerOrg:       req.GetOwnerOrg(),
 		Registry:       img.GetRegistry(),
 		Repository:     img.GetRepository(),
 		Digest:         img.GetDigest(),
@@ -210,7 +211,7 @@ func fleetError(err error) error {
 	case errors.Is(err, domain.ErrUnsupportedClass):
 		return status.Error(codes.InvalidArgument, "unsupported workload class (want test|resident)")
 	case errors.Is(err, domain.ErrSecretsNotSupported):
-		return status.Error(codes.InvalidArgument, "secret_refs are not supported in CP3")
+		return status.Error(codes.InvalidArgument, "secret_refs are only supported for resident workloads")
 	case errors.Is(err, domain.ErrImageRefIncomplete):
 		return status.Error(codes.InvalidArgument, "image reference requires registry, repository, and digest")
 	case errors.Is(err, domain.ErrResidentPortRequired):

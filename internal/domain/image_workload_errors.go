@@ -8,10 +8,20 @@ var (
 	ErrWorkloadNotFound = errors.New("image workload not found")
 	// ErrUnsupportedClass is returned for a workload_class outside {test, resident}.
 	ErrUnsupportedClass = errors.New("unsupported workload class")
-	// ErrSecretsNotSupported is returned when secret_refs are set — the secrets
-	// injection contract (P14) is still open, so CP3 rejects any request that
-	// asks for them rather than silently dropping them.
-	ErrSecretsNotSupported = errors.New("secret refs not supported yet")
+	// ErrSecretsNotSupported is returned when a TEST-class workload sets
+	// secret_refs. The resident class resolves + delivers them (P14/I32); the
+	// test class has no resolver wired, so it rejects them rather than silently
+	// booting a workload without the secrets it declared.
+	ErrSecretsNotSupported = errors.New("secret refs are only supported for resident workloads")
+	// ErrSecretResolverUnavailable is returned when a resident app declares
+	// secret_refs but no secret resolver is wired on this host (Vault
+	// unreachable at boot). The boot fails closed — a workload never runs
+	// without the secrets it declared (I32).
+	ErrSecretResolverUnavailable = errors.New("secret resolver unavailable")
+	// ErrSecretOwnerOrgMissing is returned when a resident app declares
+	// secret_refs but carries no owner org to scope resolution to (D-069/I28).
+	// The boot fails closed rather than resolve against an unattested tenant.
+	ErrSecretOwnerOrgMissing = errors.New("secret refs require an owner org")
 	// ErrImageRefIncomplete is returned when the OCI image reference is missing
 	// a registry, repository, or digest.
 	ErrImageRefIncomplete = errors.New("image reference incomplete")
