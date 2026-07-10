@@ -57,6 +57,7 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 		app.Port = in.Port
 		app.ResourcesVCPU = vcpu
 		app.ResourcesMemMB = memMB
+		app.SecretRefs = in.SecretRefs
 		if app.DesiredReplicas < 1 {
 			app.DesiredReplicas = 1
 		}
@@ -72,6 +73,7 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 			Env:             in.Env,
 			ImageRepository: in.Repository,
 			ImageDigest:     in.Digest,
+			SecretRefs:      in.SecretRefs,
 			DesiredReplicas: 1,
 			MinReplicas:     0,
 			MaxReplicas:     1,

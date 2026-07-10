@@ -41,6 +41,12 @@ type FleetApp struct {
 	ResourcesVCPU   int           `json:"resources_vcpu" gorm:"column:resources_vcpu;not null;default:1"`
 	ResourcesMemMB  int64         `json:"resources_mem_mb" gorm:"not null;default:512"`
 	RestartPolicy   RestartPolicy `json:"restart_policy" gorm:"type:varchar(20);not null;default:'always'"`
+	// SecretRefs is the app's desired secret intent — the resolver-resolvable refs
+	// the reconciler re-supplies to every replica boot over the vsock channel
+	// (invariant I32). Real refs are still gate-rejected at provision today
+	// (ErrSecretsNotSupported); this carries the desired state the resolver (P3.4)
+	// will resolve into pushed secrets. ExpectSecrets is derived from it at boot.
+	SecretRefs      []string      `json:"secret_refs,omitempty" gorm:"type:jsonb;serializer:json"`
 	CreatedAt       time.Time     `json:"created_at" gorm:"not null"`
 	UpdatedAt       time.Time     `json:"updated_at" gorm:"not null"`
 }

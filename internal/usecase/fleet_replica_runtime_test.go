@@ -88,6 +88,7 @@ func (f *rtAppRepo) Delete(context.Context, uuid.UUID) error { return nil }
 type recordingBooter struct {
 	resident    ImageResidentResult
 	resErr      error
+	bootInput   *ImageBootInput
 	decommInput *ImageDecommissionInput
 	decommN     int
 }
@@ -95,7 +96,9 @@ type recordingBooter struct {
 func (b *recordingBooter) BootTest(context.Context, ImageBootInput) (ImageTestResult, error) {
 	return ImageTestResult{}, nil
 }
-func (b *recordingBooter) BootResident(context.Context, ImageBootInput) (ImageResidentResult, error) {
+func (b *recordingBooter) BootResident(_ context.Context, in ImageBootInput) (ImageResidentResult, error) {
+	cp := in
+	b.bootInput = &cp
 	return b.resident, b.resErr
 }
 func (b *recordingBooter) Decommission(_ context.Context, in ImageDecommissionInput) error {
@@ -164,6 +167,61 @@ func TestBootReplica_Success(t *testing.T) {
 	}
 	if got.Endpoint != "http://10.0.0.9:20001" {
 		t.Fatalf("endpoint = %q", got.Endpoint)
+	}
+}
+
+// TestBootReplica_SecretSelfTest verifies the P3.3 vsock self-test marker is
+// threaded onto the live resident-orchestrator boot: with the flag on and no
+// real secret_refs the boot carries ExpectSecrets + the injected marker; off,
+// the boot is behavior-neutral (no ExpectSecrets, no secrets); real secret_refs
+// (rejected at the provision gate today) yield no marker.
+func TestBootReplica_SecretSelfTest(t *testing.T) {
+	tests := []struct {
+		name       string
+		selfTest   bool
+		secretRefs []string
+		wantExpect bool
+		wantMarker bool
+	}{
+		{"flag off → neutral", false, nil, false, false},
+		{"flag on, no refs → marker", true, nil, true, true},
+		{"flag on, real refs → no marker", true, []string{"db"}, false, false},
+		{"flag off, real refs → neutral", false, []string{"db"}, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := newTestApp()
+			app.SecretRefs = tt.secretRefs
+			rep := newTestReplica(app.ID)
+			replicas := newRTReplicaRepo()
+			_ = replicas.Create(context.Background(), rep)
+
+			booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5", HostPort: 20001}}
+			uc := NewFleetReplicaRuntime(
+				fakeMaterializer{rootfs: "/work/rep/rootfs.ext4"},
+				booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9",
+			)
+			uc.SetSecretSelfTest(tt.selfTest)
+
+			if err := uc.BootReplica(context.Background(), rep.ID); err != nil {
+				t.Fatalf("BootReplica: %v", err)
+			}
+			if booter.bootInput == nil {
+				t.Fatal("BootResident not called")
+			}
+			if booter.bootInput.ExpectSecrets != tt.wantExpect {
+				t.Fatalf("ExpectSecrets = %v, want %v", booter.bootInput.ExpectSecrets, tt.wantExpect)
+			}
+			hasMarker := false
+			for _, s := range booter.bootInput.Secrets {
+				if s.Name == selfTestSecretName && s.Val == selfTestSecretValue {
+					hasMarker = true
+				}
+			}
+			if hasMarker != tt.wantMarker {
+				t.Fatalf("marker present = %v, want %v (secrets=%+v)", hasMarker, tt.wantMarker, booter.bootInput.Secrets)
+			}
+		})
 	}
 }
 

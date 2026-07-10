@@ -24,6 +24,36 @@ type FleetReplicaRuntime struct {
 	apps         repository.FleetAppRepository
 	workDir      string
 	advertise    string
+
+	// secretSelfTest, when set (APP_FLEET_SECRET_SELFTEST), injects a NON-SECRET
+	// marker over the vsock secret channel on secret-ref-less resident boots so
+	// the I32 mechanism is verifiable on the live orchestrator path without any
+	// real secret. Off by default → behavior-neutral (no /vsock, no push). Mirrors
+	// FleetProvision.secretSelfTest for the test/fallback path.
+	secretSelfTest bool
+}
+
+// SetSecretSelfTest enables the gated vsock self-test marker injection on the
+// resident replica boot path (Phase 3.3 verification only). Wired from
+// APP_FLEET_SECRET_SELFTEST in the container.
+func (uc *FleetReplicaRuntime) SetSecretSelfTest(on bool) { uc.secretSelfTest = on }
+
+// bootSecrets derives the secrets to push to a replica's microVM at boot. It is
+// re-evaluated on every BootReplica (crash-recovery, scale) so secrets are
+// re-supplied per boot and never persisted plaintext.
+//
+// TODO(P3.4): resolve app.SecretRefs via secret.Resolver into Secrets here — the
+// resolver output replaces the self-test marker below. Real secret_refs are
+// still rejected at the provision gate today (ErrSecretsNotSupported), so this
+// path only ever yields the gated non-secret marker.
+func (uc *FleetReplicaRuntime) bootSecrets(app *domain.FleetApp) []HostSecret {
+	if len(app.SecretRefs) > 0 {
+		return nil
+	}
+	if uc.secretSelfTest {
+		return []HostSecret{{Name: selfTestSecretName, Val: selfTestSecretValue}}
+	}
+	return nil
 }
 
 // NewFleetReplicaRuntime constructs the use case. workDir is the per-replica
@@ -70,12 +100,20 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 		return fmt.Errorf("persist booting replica: %w", err)
 	}
 
+	// Secrets are re-derived on every boot (never persisted plaintext) so a
+	// reconciler re-boot re-injects them (invariant I32). ExpectSecrets tells both
+	// the guest (via runtime.json) to listen and the booter to open + push over
+	// the vsock channel, failing closed if the push fails.
+	secrets := uc.bootSecrets(app)
+	expectSecrets := len(secrets) > 0
+
 	matIn := ImageMaterializeInput{
-		Repository: app.ImageRepository,
-		Digest:     app.ImageDigest,
-		WorkDir:    filepath.Join(uc.workDir, replica.ID.String()),
-		Mode:       string(domain.ImageWorkloadClassResident),
-		Port:       app.Port,
+		Repository:    app.ImageRepository,
+		Digest:        app.ImageDigest,
+		WorkDir:       filepath.Join(uc.workDir, replica.ID.String()),
+		Mode:          string(domain.ImageWorkloadClassResident),
+		Port:          app.Port,
+		ExpectSecrets: expectSecrets,
 	}
 	mat, err := uc.materializer.Materialize(ctx, matIn)
 	if err != nil {
@@ -83,11 +121,13 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 	}
 
 	res, err := uc.booter.BootResident(ctx, ImageBootInput{
-		WorkloadID: replica.ID,
-		RootfsPath: mat.RootfsPath,
-		VCPU:       app.ResourcesVCPU,
-		MemoryMB:   int(app.ResourcesMemMB),
-		Port:       app.Port,
+		WorkloadID:    replica.ID,
+		RootfsPath:    mat.RootfsPath,
+		VCPU:          app.ResourcesVCPU,
+		MemoryMB:      int(app.ResourcesMemMB),
+		Port:          app.Port,
+		ExpectSecrets: expectSecrets,
+		Secrets:       secrets,
 	})
 	if err != nil {
 		return uc.markDead(ctx, replica, fmt.Errorf("boot resident: %w", err))

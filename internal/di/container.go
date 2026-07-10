@@ -326,6 +326,10 @@ func (c *Container) initFleet(cfg *config.Config) {
 			cfg.ImageBoot.WorkDir,
 			cfg.ImageBoot.AdvertiseHost,
 		)
+		if cfg.Fleet.SecretSelfTest {
+			c.FleetReplicaRuntimeUC.SetSecretSelfTest(true)
+			log.Println("Fleet secret vsock self-test ENABLED on resident replica runtime (APP_FLEET_SECRET_SELFTEST) — non-secret marker injected on resident boots")
+		}
 	}
 
 	// CP4 §9#4 — durable host registry + this instance's self-registration.
