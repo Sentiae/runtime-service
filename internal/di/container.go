@@ -167,7 +167,6 @@ type Container struct {
 	PlacementRepo     repository.PlacementRepository
 	RouteRepo         repository.RouteRepository
 	VolumeRepo        repository.VolumeRepository
-	SecretBindingRepo repository.SecretBindingRepository
 	ImageBooter       usecase.ImageBooter
 	ImageMaterializer usecase.ImageMaterializer
 	FleetProvisionUC  *usecase.FleetProvision
@@ -789,7 +788,6 @@ func (c *Container) initRepositories() {
 	c.PlacementRepo = postgres.NewPlacementRepository(c.DB)
 	c.RouteRepo = postgres.NewRouteRepository(c.DB)
 	c.VolumeRepo = postgres.NewVolumeRepository(c.DB)
-	c.SecretBindingRepo = postgres.NewSecretBindingRepository(c.DB)
 
 	log.Println("Repositories initialized (PostgreSQL)")
 }

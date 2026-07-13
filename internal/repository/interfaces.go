@@ -211,10 +211,3 @@ type VolumeRepository interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 	ListByHost(ctx context.Context, hostID uuid.UUID) ([]domain.Volume, error)
 }
-
-// SecretBindingRepository persists secret bindings for fleet apps.
-type SecretBindingRepository interface {
-	Create(ctx context.Context, binding *domain.SecretBinding) error
-	ListByApp(ctx context.Context, appID uuid.UUID) ([]domain.SecretBinding, error)
-	DeleteByApp(ctx context.Context, appID uuid.UUID) error
-}

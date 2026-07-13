@@ -112,6 +112,43 @@ func TestFleetProvisionValidation(t *testing.T) {
 	}
 }
 
+// TestFleetProvisionSecretGateByClass asserts the secret_refs gate rejects only
+// the test class (no resolver wired) — the resident class flows through, since it
+// resolves + delivers secret_refs per boot (invariant I32).
+func TestFleetProvisionSecretGateByClass(t *testing.T) {
+	tests := []struct {
+		name          string
+		workloadClass string
+		wantRejected  bool
+	}{
+		{"test class rejects secret_refs", "test", true},
+		{"resident class allows secret_refs", "resident", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uc := newUC(newFakeWorkloadRepo(), fakeMaterializer{rootfs: "/tmp/rootfs.ext4"}, fakeBooter{
+				resident: ImageResidentResult{PID: 1, GuestIP: "10.201.0.6", HostPort: 20000, NetIndex: 1},
+			})
+			_, err := uc.Provision(context.Background(), FleetProvisionInput{
+				Registry:      "reg:8089",
+				Repository:    "org/app",
+				Digest:        "sha256:abc",
+				WorkloadClass: tt.workloadClass,
+				Port:          8080,
+				SecretRefs:    []string{"db"},
+			})
+			uc.Wait() // drain any detached run
+			if tt.wantRejected {
+				if !errors.Is(err, domain.ErrSecretsNotSupported) {
+					t.Fatalf("Provision err = %v, want ErrSecretsNotSupported", err)
+				}
+			} else if errors.Is(err, domain.ErrSecretsNotSupported) {
+				t.Fatalf("resident with secret_refs was rejected with ErrSecretsNotSupported; want it to flow through")
+			}
+		})
+	}
+}
+
 func TestFleetProvisionTestClassAsync(t *testing.T) {
 	repo := newFakeWorkloadRepo()
 	uc := newUC(repo, fakeMaterializer{rootfs: "/tmp/rootfs.ext4"}, fakeBooter{
