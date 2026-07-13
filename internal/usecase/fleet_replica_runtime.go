@@ -33,6 +33,10 @@ type FleetReplicaRuntime struct {
 	// but a secret-bearing app fails closed (ErrSecretResolverUnavailable).
 	resolver secret.Resolver
 
+	// volumes resolves + attaches the app's persistent data disk at boot (rt#9).
+	// Nil leaves the replica stateless (no data disk attached).
+	volumes *FleetVolumeManager
+
 	// secretSelfTest, when set (APP_FLEET_SECRET_SELFTEST), injects a NON-SECRET
 	// marker over the vsock secret channel on secret-ref-less resident boots so
 	// the I32 mechanism is verifiable on the live orchestrator path without any
@@ -50,6 +54,10 @@ func (uc *FleetReplicaRuntime) SetSecretSelfTest(on bool) { uc.secretSelfTest = 
 // state — a host that could not reach Vault at boot leaves it nil and only
 // secret-less apps can boot there (secret-bearing apps fail closed).
 func (uc *FleetReplicaRuntime) SetSecretResolver(r secret.Resolver) { uc.resolver = r }
+
+// SetVolumeManager wires the persistent-volume manager so a stateful replica
+// attaches its data disk at boot (rt#9). Optional: nil leaves replicas stateless.
+func (uc *FleetReplicaRuntime) SetVolumeManager(vm *FleetVolumeManager) { uc.volumes = vm }
 
 // bootSecrets derives the secrets to push to a replica's microVM at boot. It is
 // re-evaluated on every BootReplica (crash-recovery, scale) so secrets are
@@ -153,6 +161,22 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 	}
 	expectSecrets := len(secrets) > 0
 
+	// rt#9 — resolve the app's persistent data volume so the boot attaches its
+	// backing file as a 2nd virtio-blk device and the guest mounts it at boot.
+	var dataDiskPath, dataMountPath string
+	var dataVolume bool
+	if uc.volumes != nil {
+		vol, ok, verr := uc.volumes.PrimaryVolume(ctx, app.ID)
+		if verr != nil {
+			return uc.markDead(ctx, replica, fmt.Errorf("resolve volume: %w", verr))
+		}
+		if ok {
+			dataVolume = true
+			dataDiskPath = vol.BackingPath
+			dataMountPath = vol.MountPath
+		}
+	}
+
 	matIn := ImageMaterializeInput{
 		Repository:    app.ImageRepository,
 		Digest:        app.ImageDigest,
@@ -160,6 +184,7 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 		Mode:          string(domain.ImageWorkloadClassResident),
 		Port:          app.Port,
 		ExpectSecrets: expectSecrets,
+		DataMountPath: dataMountPath,
 	}
 	mat, err := uc.materializer.Materialize(ctx, matIn)
 	if err != nil {
@@ -174,6 +199,8 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 		Port:          app.Port,
 		ExpectSecrets: expectSecrets,
 		Secrets:       secrets,
+		DataDiskPath:  dataDiskPath,
+		DataMountPath: dataMountPath,
 	})
 	if err != nil {
 		return uc.markDead(ctx, replica, fmt.Errorf("boot resident: %w", err))
@@ -197,6 +224,13 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 		_ = uc.booter.Decommission(ctx, replicaDecommissionInput(replica))
 		return fmt.Errorf("persist resident replica: %w", err)
 	}
+
+	// rt#9 — the data volume is now held by this replica (single-writer).
+	if dataVolume {
+		if aerr := uc.volumes.AttachTo(ctx, app.ID, replica.ID); aerr != nil {
+			logger.FromContext(ctx).Warn("fleet replica: attach volume", "replica_id", replica.ID, "err", aerr)
+		}
+	}
 	return nil
 }
 
@@ -214,6 +248,13 @@ func (uc *FleetReplicaRuntime) DecommissionReplica(ctx context.Context, replicaI
 		if err := uc.booter.Decommission(ctx, replicaDecommissionInput(replica)); err != nil {
 			// Best-effort: a half-gone VM must still clear its row.
 			logger.FromContext(ctx).Warn("fleet replica decommission teardown", "replica_id", replica.ID, "err", err)
+		}
+	}
+	// rt#9 — release the data volume (the backing file survives; only
+	// VolumeManager.Delete removes it). A degraded volume stays degraded.
+	if uc.volumes != nil {
+		if derr := uc.volumes.DetachFrom(ctx, replica.AppID); derr != nil {
+			logger.FromContext(ctx).Warn("fleet replica: detach volume", "replica_id", replica.ID, "err", derr)
 		}
 	}
 	if err := uc.replicas.Delete(ctx, replica.ID); err != nil {

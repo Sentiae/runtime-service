@@ -35,6 +35,10 @@ type MaterializeRequest struct {
 	// runtime.json so the guest opens its vsock secret listener at boot and
 	// blocks on the host push before exec (invariant I32). No plaintext at rest.
 	ExpectSecrets bool
+	// DataMountPath is the in-guest mount point for the persistent data volume
+	// (2nd virtio-blk /dev/vdb). Empty when the workload has no volume; written to
+	// runtime.json so image-init mounts /dev/vdb there at boot (rt#9).
+	DataMountPath string
 }
 
 // MaterializeResult is the output of Materialize.
@@ -56,6 +60,9 @@ type runtimeSpec struct {
 	// image-init to open the vsock secret listener and block on the host push
 	// before exec. runtime.json carries no secret plaintext (invariant I32).
 	ExpectSecrets bool `json:"expect_secrets,omitempty"`
+	// DataMountPath is the in-guest mount point for the persistent data volume
+	// (/dev/vdb). Empty when the workload has no volume (rt#9).
+	DataMountPath string `json:"data_mount_path,omitempty"`
 }
 
 // Materializer pulls an OCI image and lays it down as a Firecracker ext4 rootfs.
@@ -328,6 +335,7 @@ func writeRuntimeJSON(stagingDir string, req MaterializeRequest, cfg ImageConfig
 		TestCommand:   req.TestCmd,
 		Port:          req.Port,
 		ExpectSecrets: req.ExpectSecrets,
+		DataMountPath: req.DataMountPath,
 	}
 	dir := filepath.Join(stagingDir, "sentiae")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

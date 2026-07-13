@@ -353,6 +353,54 @@ func TestOrchestrator_UnknownAppReturnsFalse(t *testing.T) {
 	}
 }
 
+func TestOrchestrator_ProvisionNilSecretRefsPersistsNonNil(t *testing.T) {
+	origAlive := processAlive
+	processAlive = func(int) bool { return true }
+	defer func() { processAlive = origAlive }()
+
+	h := newOrchHarness(oneLiveHost())
+	// No SecretRefs — the every-secret-less-provision path that wrote SQL NULL into
+	// the JSONB NOT NULL secret_refs column before the nil→[] normalization.
+	in := FleetProvisionInput{
+		ComponentID: "comp-1", Env: "prod",
+		Registry: "reg", Repository: "org/app", Digest: "sha256:abc",
+		VCPU: 2, MemoryMB: 1024, Port: 8080,
+	}
+	handle, _, err := h.orch.ProvisionApp(context.Background(), in)
+	if err != nil {
+		t.Fatalf("ProvisionApp: %v", err)
+	}
+	appID, err := uuid.Parse(handle)
+	if err != nil {
+		t.Fatalf("handle is not a uuid: %v", err)
+	}
+
+	// Create-site: persisted SecretRefs must be non-nil so GORM writes [] not NULL.
+	app, err := h.apps.FindByID(context.Background(), appID)
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if app.SecretRefs == nil {
+		t.Fatalf("SecretRefs persisted nil on create; want non-nil empty slice")
+	}
+	if len(app.SecretRefs) != 0 {
+		t.Fatalf("SecretRefs = %v, want empty", app.SecretRefs)
+	}
+
+	// Update-site: re-provision the same (component, env) with nil refs must also
+	// keep SecretRefs non-nil.
+	if _, _, err := h.orch.ProvisionApp(context.Background(), in); err != nil {
+		t.Fatalf("re-ProvisionApp: %v", err)
+	}
+	app, err = h.apps.FindByID(context.Background(), appID)
+	if err != nil {
+		t.Fatalf("FindByID after update: %v", err)
+	}
+	if app.SecretRefs == nil {
+		t.Fatalf("SecretRefs persisted nil on update; want non-nil empty slice")
+	}
+}
+
 func TestOrchestrator_ProvisionThenScaleThenDecommission(t *testing.T) {
 	origAlive := processAlive
 	processAlive = func(int) bool { return true }

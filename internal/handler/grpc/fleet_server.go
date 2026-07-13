@@ -58,6 +58,7 @@ func (s *FleetServer) Provision(ctx context.Context, req *runtimev1.ProvisionReq
 		WorkloadClass:  d.GetWorkloadClass(),
 		TestCommand:    d.GetTestCommand(),
 		TimeoutSeconds: d.GetTimeoutSeconds(),
+		Volumes:        volumesFromProto(d.GetVolumes()),
 	})
 	if err != nil {
 		return nil, fleetError(err)
@@ -180,6 +181,31 @@ func (s *FleetServer) ListHosts(ctx context.Context, _ *runtimev1.ListHostsReque
 	return &runtimev1.ListHostsResponse{Hosts: out}, nil
 }
 
+// volumesFromProto maps the descriptor's VolumeSpecs to the use case input. The
+// mount path is the hardcoded domain default (/data) — the proto carries none
+// this cycle (rt#9 scope). An unparseable/empty id gets a fresh uuid.
+func volumesFromProto(specs []*runtimev1.VolumeSpec) []usecase.VolumeSpecInput {
+	if len(specs) == 0 {
+		return nil
+	}
+	out := make([]usecase.VolumeSpecInput, 0, len(specs))
+	for _, v := range specs {
+		if v == nil {
+			continue
+		}
+		id, err := uuid.Parse(v.GetId())
+		if err != nil {
+			id = uuid.New()
+		}
+		out = append(out, usecase.VolumeSpecInput{
+			ID:        id,
+			SizeMB:    int64(v.GetSizeMb()),
+			MountPath: "/data",
+		})
+	}
+	return out
+}
+
 // hostToProto maps a domain Host to the wire HostInfo.
 func hostToProto(h *domain.Host) *runtimev1.HostInfo {
 	var lastHB int64
@@ -218,6 +244,12 @@ func fleetError(err error) error {
 		return status.Error(codes.InvalidArgument, "resident workload requires a guest port")
 	case errors.Is(err, domain.ErrImageBootUnavailable):
 		return status.Error(codes.FailedPrecondition, "image boot requires the firecracker host")
+	case errors.Is(err, domain.ErrVolumesNotSupported):
+		return status.Error(codes.InvalidArgument, "volumes are only supported for resident workloads")
+	case errors.Is(err, domain.ErrVolumeAppNotScalable):
+		return status.Error(codes.FailedPrecondition, "a volume-bearing app cannot scale beyond one replica")
+	case errors.Is(err, domain.ErrVolumeBackendUnavailable):
+		return status.Error(codes.FailedPrecondition, "volumes require the firecracker host")
 	case errors.Is(err, domain.ErrFleetHostNotFound):
 		return status.Error(codes.NotFound, "fleet host not found")
 	case errors.Is(err, domain.ErrInvalidHostHealth):

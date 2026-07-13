@@ -25,4 +25,17 @@ var (
 	// ErrNoSchedulableHost is returned when the scheduler finds no live host
 	// that satisfies a placement request's resource + constraint filters.
 	ErrNoSchedulableHost = errors.New("no schedulable host")
+	// ErrVolumeBackendUnavailable is returned when the volume backing-file backend
+	// is not available (non-firecracker host) so a volume is never silently faked.
+	ErrVolumeBackendUnavailable = errors.New("volume backend unavailable")
+	// ErrVolumeAppNotScalable is returned when a volume-bearing app is asked to run
+	// more than one replica — a persistent volume is single-writer this cycle.
+	ErrVolumeAppNotScalable = errors.New("volume-bearing app cannot scale beyond one replica")
+	// ErrVolumesNotSupported is returned when a workload class that has no volume
+	// path (the test class) is provisioned with volumes.
+	ErrVolumesNotSupported = errors.New("volumes are only supported for resident workloads")
+	// ErrStatefulHostUnavailable is a non-fatal signal that a stateful app's
+	// affinity host is dead/stale: the app is degraded rather than moved off its
+	// data (no cross-host restore this cycle).
+	ErrStatefulHostUnavailable = errors.New("stateful app affinity host unavailable")
 )

@@ -268,7 +268,7 @@ func imageBootArgs(guestIP, hostIP string) string {
 // startVM starts a Firecracker process configured to boot the given rootfs on
 // the given TAP. It returns the running process and socket path. The caller is
 // responsible for killing the process and cleaning the socket.
-func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath string, nw imgNet, vcpu, memMB int, expectSecrets bool) (*exec.Cmd, string, error) {
+func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath string, nw imgNet, vcpu, memMB int, expectSecrets bool, dataDiskPath string) (*exec.Cmd, string, error) {
 	socketPath := b.p.socketPath(vmID)
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o750); err != nil {
 		return nil, "", fmt.Errorf("create socket dir: %w", err)
@@ -322,6 +322,19 @@ func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath st
 		b.killVM(cmd, socketPath)
 		return nil, "", fmt.Errorf("configure rootfs: %w", err)
 	}
+	// rt#9 — attach the persistent data volume as a 2nd virtio-blk device. The
+	// guest sees it as /dev/vdb and mounts it at the runtime.json data_mount_path.
+	if dataDiskPath != "" {
+		if err := b.p.apiPut(ctx, client, "/drives/data", map[string]any{
+			"drive_id":       "data",
+			"path_on_host":   dataDiskPath,
+			"is_root_device": false,
+			"is_read_only":   false,
+		}); err != nil {
+			b.killVM(cmd, socketPath)
+			return nil, "", fmt.Errorf("configure data drive: %w", err)
+		}
+	}
 	if err := b.p.apiPut(ctx, client, "/network-interfaces/eth0", map[string]any{
 		"iface_id":      "eth0",
 		"guest_mac":     generateMAC(vmID),
@@ -373,7 +386,7 @@ func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (
 	defer func() { _ = os.Remove(in.RootfsPath) }()
 
 	vcpu, memMB := normalizeResources(in.VCPU, in.MemoryMB)
-	cmd, socketPath, err := b.startVM(ctx, in.WorkloadID, in.RootfsPath, nw, vcpu, memMB, in.ExpectSecrets)
+	cmd, socketPath, err := b.startVM(ctx, in.WorkloadID, in.RootfsPath, nw, vcpu, memMB, in.ExpectSecrets, "")
 	if err != nil {
 		return usecase.ImageTestResult{}, err
 	}
@@ -462,7 +475,7 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 	}
 
 	vcpu, memMB := normalizeResources(in.VCPU, in.MemoryMB)
-	cmd, socketPath, err := b.startVM(ctx, in.WorkloadID, in.RootfsPath, nw, vcpu, memMB, in.ExpectSecrets)
+	cmd, socketPath, err := b.startVM(ctx, in.WorkloadID, in.RootfsPath, nw, vcpu, memMB, in.ExpectSecrets, in.DataDiskPath)
 	if err != nil {
 		cleanupNet()
 		b.freePort(hostPort)

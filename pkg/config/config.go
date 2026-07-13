@@ -42,6 +42,9 @@ type FleetConfig struct {
 	// secret channel so the I32 mechanism is verifiable end-to-end. Off by
 	// default; orthogonal to the real ErrSecretsNotSupported gate.
 	SecretSelfTest bool `mapstructure:"secret_selftest"`
+	// VolumeDir is the host root under which per-volume ext4 backing files are
+	// materialized (rt#9). Empty ⇒ derived as <Firecracker.SnapshotPath>/volumes.
+	VolumeDir string `mapstructure:"volume_dir"`
 }
 
 // RegistryConfig configures the OCI registry the image-boot path pulls compiled
@@ -431,6 +434,7 @@ func Load() (*Config, error) {
 			"fleet.host_disk_mb":       51200,
 			"fleet.heartbeat_interval": "10s",
 			"fleet.secret_selftest":    false,
+			"fleet.volume_dir":         "",
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -567,6 +571,7 @@ func Load() (*Config, error) {
 			{"fleet.host_disk_mb", "APP_FLEET_HOST_DISK_MB"},
 			{"fleet.heartbeat_interval", "APP_FLEET_HEARTBEAT_INTERVAL"},
 			{"fleet.secret_selftest", "APP_FLEET_SECRET_SELFTEST"},
+			{"fleet.volume_dir", "APP_FLEET_VOLUME_DIR"},
 		},
 	})
 	if err != nil {

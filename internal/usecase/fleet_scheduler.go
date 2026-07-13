@@ -195,6 +195,22 @@ func (s *FleetScheduler) SelectHost(ctx context.Context, req PlacementRequest) (
 	return candidates[0].hostID, nil
 }
 
+// IsHostLive reports whether hostID is currently in the live-candidate set
+// (active + healthy + fresh heartbeat). Read-only; used by the reconciler to
+// decide whether a stateful app's affinity host can still host its replica.
+func (s *FleetScheduler) IsHostLive(ctx context.Context, hostID uuid.UUID) (bool, error) {
+	live, err := s.hosts.ListLive(ctx, s.staleness)
+	if err != nil {
+		return false, err
+	}
+	for i := range live {
+		if live[i].ID == hostID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // labelsSuperset reports whether have contains every key=value in want. An
 // empty want is trivially satisfied.
 func labelsSuperset(have, want map[string]string) bool {

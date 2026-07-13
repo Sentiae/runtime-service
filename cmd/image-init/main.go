@@ -47,6 +47,9 @@ type runtimeSpec struct {
 	// on the host push before exec (invariant I32). Boolean flag only — no
 	// secret plaintext is ever carried in runtime.json.
 	ExpectSecrets bool `json:"expect_secrets"`
+	// DataMountPath is the in-guest mount point for the persistent data volume
+	// (2nd virtio-blk /dev/vdb). Empty when the workload has no volume (rt#9).
+	DataMountPath string `json:"data_mount_path,omitempty"`
 }
 
 func main() {
@@ -62,6 +65,17 @@ func main() {
 		_ = os.WriteFile(filepath.Join(outDir, "exit_code.txt"), []byte("127"), 0o644)
 		syncAndPowerOff()
 		return
+	}
+
+	// rt#9 — mount the persistent data volume (2nd virtio-blk /dev/vdb) at the
+	// descriptor's mount path before the workload starts. Best-effort: a failure
+	// is logged to the console (like the pseudo-FS mounts) and the workload still
+	// runs — its data would then be ephemeral rather than crashing the boot.
+	if spec.DataMountPath != "" {
+		_ = os.MkdirAll(spec.DataMountPath, 0o755)
+		if err := syscall.Mount("/dev/vdb", spec.DataMountPath, "ext4", 0, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "image-init: mount data volume /dev/vdb at %s: %v\n", spec.DataMountPath, err)
+		}
 	}
 
 	// Secret channel (invariant I32): when the descriptor expects secrets, receive

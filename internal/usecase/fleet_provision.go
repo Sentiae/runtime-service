@@ -44,6 +44,10 @@ type ImageMaterializeInput struct {
 	// ExpectSecrets tells the guest (via runtime.json) to open the vsock secret
 	// listener at boot and block on a host push before exec (invariant I32).
 	ExpectSecrets bool
+	// DataMountPath is the in-guest mount point for the persistent data volume
+	// (2nd virtio-blk /dev/vdb). Empty when the workload has no volume; written to
+	// runtime.json so image-init mounts /dev/vdb there at boot.
+	DataMountPath string
 }
 
 // ImageMaterializeOutput is the materialize result.
@@ -81,6 +85,12 @@ type ImageBootInput struct {
 	// without its channel.
 	ExpectSecrets bool
 	Secrets       []HostSecret
+	// DataDiskPath is the host path of the ext4 backing file attached to the guest
+	// as a 2nd virtio-blk device (/dev/vdb). Empty when the workload has no volume.
+	DataDiskPath string
+	// DataMountPath is the in-guest mount point for the data disk (informational at
+	// the boot layer; the guest reads it from runtime.json).
+	DataMountPath string
 }
 
 // ImageTestResult is the outcome of a single-shot test boot.
@@ -166,6 +176,7 @@ type FleetProvisionInput struct {
 	WorkloadClass  string
 	TestCommand    string
 	TimeoutSeconds int64
+	Volumes        []VolumeSpecInput
 }
 
 // FleetProvisionOutput is the provision result.
@@ -263,6 +274,11 @@ func (uc *FleetProvision) Provision(ctx context.Context, in FleetProvisionInput)
 	// booting a workload without the secrets it declared.
 	if class == domain.ImageWorkloadClassTest && len(in.SecretRefs) > 0 {
 		return FleetProvisionOutput{}, domain.ErrSecretsNotSupported
+	}
+	// The test class is a single-shot ephemeral boot with no durable data path, so
+	// it rejects volumes rather than silently dropping them (mirrors secret_refs).
+	if class == domain.ImageWorkloadClassTest && len(in.Volumes) > 0 {
+		return FleetProvisionOutput{}, domain.ErrVolumesNotSupported
 	}
 	if in.Registry == "" || in.Repository == "" || in.Digest == "" {
 		return FleetProvisionOutput{}, domain.ErrImageRefIncomplete

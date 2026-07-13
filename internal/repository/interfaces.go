@@ -202,6 +202,10 @@ type RouteRepository interface {
 type VolumeRepository interface {
 	Create(ctx context.Context, volume *domain.Volume) error
 	ListByApp(ctx context.Context, appID uuid.UUID) ([]domain.Volume, error)
+	FindByID(ctx context.Context, id uuid.UUID) (*domain.Volume, error)
+	Update(ctx context.Context, volume *domain.Volume) error
+	Delete(ctx context.Context, id uuid.UUID) error
+	ListByHost(ctx context.Context, hostID uuid.UUID) ([]domain.Volume, error)
 }
 
 // SecretBindingRepository persists secret bindings for fleet apps.

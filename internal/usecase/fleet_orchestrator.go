@@ -24,6 +24,10 @@ type FleetOrchestrator struct {
 	replicas  repository.ReplicaRepository
 	scheduler *FleetScheduler
 	runtime   *FleetReplicaRuntime
+
+	// volumes drives the persistent-volume lifecycle (rt#9). Nil on a build with
+	// no volume support wired — the orchestrator then behaves statelessly.
+	volumes *FleetVolumeManager
 }
 
 // NewFleetOrchestrator constructs the reconciler.
@@ -35,6 +39,10 @@ func NewFleetOrchestrator(
 ) *FleetOrchestrator {
 	return &FleetOrchestrator{apps: apps, replicas: replicas, scheduler: scheduler, runtime: runtime}
 }
+
+// SetVolumeManager wires the persistent-volume manager (rt#9). Optional: a nil
+// manager leaves every app stateless.
+func (uc *FleetOrchestrator) SetVolumeManager(vm *FleetVolumeManager) { uc.volumes = vm }
 
 // ProvisionApp upserts the FleetApp for (ComponentID, Env) from the descriptor,
 // reconciles it once synchronously, and returns the app handle plus a resident
@@ -48,6 +56,14 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 	if memMB < 512 {
 		memMB = 512
 	}
+	// secret_refs is JSONB NOT NULL DEFAULT '[]' — GORM's serializer:json writes a
+	// nil slice as SQL NULL (the DB default never applies on an explicit write), so
+	// normalize before any create/update (mirrors the nil-labels guard in
+	// RegisterHost). Every secret-less provision (resident/volume) passes nil here.
+	refs := in.SecretRefs
+	if refs == nil {
+		refs = []string{}
+	}
 
 	app, err := uc.apps.FindByComponentEnv(ctx, in.ComponentID, in.Env)
 	switch {
@@ -58,7 +74,7 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 		app.ResourcesVCPU = vcpu
 		app.ResourcesMemMB = memMB
 		app.OwnerOrg = in.OwnerOrg
-		app.SecretRefs = in.SecretRefs
+		app.SecretRefs = refs
 		if app.DesiredReplicas < 1 {
 			app.DesiredReplicas = 1
 		}
@@ -75,7 +91,7 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 			OwnerOrg:        in.OwnerOrg,
 			ImageRepository: in.Repository,
 			ImageDigest:     in.Digest,
-			SecretRefs:      in.SecretRefs,
+			SecretRefs:      refs,
 			DesiredReplicas: 1,
 			MinReplicas:     0,
 			MaxReplicas:     1,
@@ -92,6 +108,19 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 		}
 	default:
 		return "", "", fmt.Errorf("lookup fleet app: %w", err)
+	}
+
+	// rt#9 — materialize the app's persistent volumes before the first placement
+	// so a replica can attach the data disk at boot. A volume-bearing app is
+	// single-writer: it must not run more than one replica.
+	if uc.volumes != nil {
+		vols, verr := uc.volumes.EnsureAppVolumes(ctx, app.ID, in.Volumes)
+		if verr != nil {
+			return "", "", fmt.Errorf("ensure volumes: %w", verr)
+		}
+		if len(vols) > 0 && app.DesiredReplicas > 1 {
+			return "", "", domain.ErrVolumeAppNotScalable
+		}
 	}
 
 	if err := uc.ReconcileApp(ctx, app.ID); err != nil {
@@ -125,6 +154,31 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 	replicas, err := uc.replicas.ListByApp(ctx, app.ID)
 	if err != nil {
 		return fmt.Errorf("list replicas: %w", err)
+	}
+
+	// rt#9 stateful safety — a volume-bearing app is pinned to the host that holds
+	// its data. If that host is DEAD/stale we must NOT reschedule the replica
+	// elsewhere (that would run it off empty disk): degrade the app and stop. The
+	// affinity host being LIVE means the normal dead→shortfall path below reboots
+	// the replica on the SAME host (the scheduler honors AffinityHostID), which
+	// re-attaches the same backing file. Stateless apps are unaffected.
+	if uc.volumes != nil {
+		affHost, pinned, aerr := uc.volumes.AffinityHost(ctx, app.ID)
+		if aerr != nil {
+			logger.FromContext(ctx).Warn("fleet reconcile: affinity host lookup", "app_id", app.ID, "err", aerr)
+		} else if pinned && affHost != nil {
+			live, lerr := uc.scheduler.IsHostLive(ctx, *affHost)
+			if lerr != nil {
+				logger.FromContext(ctx).Warn("fleet reconcile: affinity host liveness", "app_id", app.ID, "err", lerr)
+			} else if !live {
+				if derr := uc.volumes.MarkDegraded(ctx, app.ID); derr != nil {
+					logger.FromContext(ctx).Warn("fleet reconcile: mark degraded", "app_id", app.ID, "err", derr)
+				}
+				logger.FromContext(ctx).Warn("fleet reconcile: stateful affinity host unavailable, degrading",
+					"app_id", app.ID, "host_id", *affHost, "err", domain.ErrStatefulHostUnavailable)
+				return nil
+			}
+		}
 	}
 
 	// Dead replicas → decommission (frees the handle + deletes the row). With
@@ -167,20 +221,52 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 	switch {
 	case len(occupying) < app.DesiredReplicas:
 		shortfall := app.DesiredReplicas - len(occupying)
+		// rt#9 — a volume-bearing app is pinned to the host that holds its data:
+		// every replica placement targets the affinity host so the same backing
+		// file is re-attached. Resolved once per reconcile tick.
+		var affHostID *uuid.UUID
+		pinned := false
+		if uc.volumes != nil {
+			h, p, aerr := uc.volumes.AffinityHost(ctx, app.ID)
+			if aerr != nil {
+				logger.FromContext(ctx).Warn("fleet reconcile: affinity host lookup", "app_id", app.ID, "err", aerr)
+			} else {
+				affHostID, pinned = h, p
+			}
+		}
 		for n := 0; n < shortfall; n++ {
-			host, serr := uc.scheduler.SelectHost(ctx, PlacementRequest{
+			req := PlacementRequest{
 				AppID:      app.ID,
 				NeedVCPU:   app.ResourcesVCPU,
 				NeedMemMB:  app.ResourcesMemMB,
 				NeedDiskMB: 0,
 				Constraint: domain.PlacementConstraintBinPack,
-			})
+			}
+			if pinned && affHostID != nil {
+				req.AffinityHostID = affHostID
+			}
+			host, serr := uc.scheduler.SelectHost(ctx, req)
 			if serr != nil {
 				if errors.Is(serr, domain.ErrNoSchedulableHost) {
 					logger.FromContext(ctx).Warn("fleet reconcile: no schedulable host, deferring", "app_id", app.ID)
 					return nil
 				}
 				return fmt.Errorf("select host: %w", serr)
+			}
+			// First placement of a volume-bearing app: pin its data to this host
+			// (write-once). Subsequent placements this tick target the same host.
+			if uc.volumes != nil && !pinned {
+				hasVol, herr := uc.volumes.HasVolumes(ctx, app.ID)
+				if herr != nil {
+					logger.FromContext(ctx).Warn("fleet reconcile: has-volumes lookup", "app_id", app.ID, "err", herr)
+				} else if hasVol {
+					if berr := uc.volumes.BindToHost(ctx, app.ID, host); berr != nil {
+						logger.FromContext(ctx).Warn("fleet reconcile: bind volume host", "app_id", app.ID, "err", berr)
+					} else {
+						bound := host
+						affHostID, pinned = &bound, true
+					}
+				}
 			}
 			hostID := host
 			now := time.Now().UTC()
@@ -244,6 +330,21 @@ func (uc *FleetOrchestrator) HealthApp(ctx context.Context, appID uuid.UUID) (Fl
 		return FleetHealthOutput{}, false, fmt.Errorf("load app: %w", err)
 	}
 
+	// rt#9 — a degraded stateful app (its affinity host is gone) is terminal this
+	// cycle: surface it directly rather than reporting the dead replica set.
+	if uc.volumes != nil {
+		degraded, derr := uc.volumes.IsDegraded(ctx, app.ID)
+		if derr != nil {
+			logger.FromContext(ctx).Warn("fleet health: degraded lookup", "app_id", app.ID, "err", derr)
+		} else if degraded {
+			return FleetHealthOutput{
+				State:   "degraded",
+				Healthy: false,
+				Message: "stateful app affinity host unavailable",
+			}, true, nil
+		}
+	}
+
 	replicas, err := uc.replicas.ListByApp(ctx, app.ID)
 	if err != nil {
 		return FleetHealthOutput{}, true, fmt.Errorf("list replicas: %w", err)
@@ -303,6 +404,16 @@ func (uc *FleetOrchestrator) DecommissionApp(ctx context.Context, appID uuid.UUI
 	if err := uc.ReconcileApp(ctx, app.ID); err != nil {
 		return true, err
 	}
+	// rt#9 — reclaim the on-host ext4 backing files before the app row is deleted
+	// (the fleet_apps cascade drops only the fleet_volumes rows, never the backing
+	// files → they leak permanently otherwise). Must run while ListByApp still
+	// returns the volumes. Only the app-level decommission reclaims; a replica
+	// restart (DecommissionReplica) leaves the backing file so data survives.
+	if uc.volumes != nil {
+		if err := uc.volumes.DeleteAppVolumes(ctx, app.ID); err != nil {
+			return true, fmt.Errorf("delete app volumes: %w", err)
+		}
+	}
 	if err := uc.apps.Delete(ctx, app.ID); err != nil {
 		return true, fmt.Errorf("delete fleet app: %w", err)
 	}
@@ -322,6 +433,16 @@ func (uc *FleetOrchestrator) ScaleApp(ctx context.Context, appID uuid.UUID, repl
 
 	if replicas < 0 {
 		replicas = 0
+	}
+	// rt#9 — a volume-bearing app is single-writer: reject a scale beyond one.
+	if replicas > 1 && uc.volumes != nil {
+		hasVol, herr := uc.volumes.HasVolumes(ctx, app.ID)
+		if herr != nil {
+			return true, fmt.Errorf("has-volumes lookup: %w", herr)
+		}
+		if hasVol {
+			return true, domain.ErrVolumeAppNotScalable
+		}
 	}
 	app.DesiredReplicas = replicas
 	app.UpdatedAt = time.Now().UTC()

@@ -41,6 +41,7 @@ import (
 	"github.com/sentiae/runtime-service/internal/infrastructure/messaging"
 	"github.com/sentiae/runtime-service/internal/infrastructure/objectstore"
 	"github.com/sentiae/runtime-service/internal/infrastructure/oci"
+	volumebackend "github.com/sentiae/runtime-service/internal/infrastructure/volume"
 	"github.com/sentiae/runtime-service/internal/infrastructure/simulated"
 	"github.com/sentiae/runtime-service/internal/repository"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
@@ -169,6 +170,12 @@ type Container struct {
 	ImageBooter       usecase.ImageBooter
 	ImageMaterializer usecase.ImageMaterializer
 	FleetProvisionUC  *usecase.FleetProvision
+
+	// runtime-fleet CP4 rt#9 — persistent-volume backing-file backend + manager.
+	// The backend is fail-loud off the firecracker host so a volume is never
+	// silently faked.
+	VolumeBackend      usecase.VolumeBackend
+	FleetVolumeManager *usecase.FleetVolumeManager
 
 	// runtime-fleet CP4 §9#6 — resident replica boot/teardown/health. Non-nil
 	// only on the firecracker executor (the fleet host); nil otherwise.
@@ -309,6 +316,22 @@ func (c *Container) initFleet(cfg *config.Config) {
 		log.Println("Image-boot booter: fail-loud (firecracker executor not selected)")
 	}
 
+	// CP4 rt#9 — persistent-volume backing-file backend + manager. Real backend on
+	// the firecracker host (mkfs.ext4 backing files); fail-loud otherwise so a
+	// volume is never silently faked on a host without KVM.
+	volumeDir := cfg.Fleet.VolumeDir
+	if volumeDir == "" {
+		volumeDir = filepath.Join(cfg.Firecracker.SnapshotPath, "volumes")
+	}
+	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
+		c.VolumeBackend = volumebackend.NewBackingStore()
+		log.Printf("Fleet volume backend: backing files under %s", volumeDir)
+	} else {
+		c.VolumeBackend = usecase.FailLoudVolumeBackend{}
+		log.Println("Fleet volume backend: fail-loud (firecracker executor not selected)")
+	}
+	c.FleetVolumeManager = usecase.NewFleetVolumeManager(c.VolumeRepo, c.VolumeBackend, volumeDir)
+
 	c.FleetProvisionUC = usecase.NewFleetProvision(
 		context.Background(),
 		c.ImageWorkloadRepo,
@@ -333,6 +356,8 @@ func (c *Container) initFleet(cfg *config.Config) {
 			cfg.ImageBoot.WorkDir,
 			cfg.ImageBoot.AdvertiseHost,
 		)
+		// rt#9 — attach persistent data disks on resident boot.
+		c.FleetReplicaRuntimeUC.SetVolumeManager(c.FleetVolumeManager)
 		if cfg.Fleet.SecretSelfTest {
 			c.FleetReplicaRuntimeUC.SetSecretSelfTest(true)
 			log.Println("Fleet secret vsock self-test ENABLED on resident replica runtime (APP_FLEET_SECRET_SELFTEST) — non-secret marker injected on resident boots")
@@ -370,6 +395,8 @@ func (c *Container) initFleet(cfg *config.Config) {
 			c.FleetScheduler,
 			c.FleetReplicaRuntimeUC,
 		)
+		// rt#9 — persistent-volume lifecycle (ensure/affinity/attach/degrade).
+		c.FleetOrchestratorUC.SetVolumeManager(c.FleetVolumeManager)
 		c.FleetProvisionUC.SetOrchestrator(c.FleetOrchestratorUC)
 	}
 

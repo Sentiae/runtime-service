@@ -34,6 +34,7 @@ func (a *MaterializerAdapter) Materialize(ctx context.Context, in usecase.ImageM
 		TestCmd:       in.TestCommand,
 		Port:          in.Port,
 		ExpectSecrets: in.ExpectSecrets,
+		DataMountPath: in.DataMountPath,
 	})
 	if err != nil {
 		return usecase.ImageMaterializeOutput{}, err
