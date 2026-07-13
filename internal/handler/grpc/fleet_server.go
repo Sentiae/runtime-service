@@ -59,6 +59,10 @@ func (s *FleetServer) Provision(ctx context.Context, req *runtimev1.ProvisionReq
 		TestCommand:    d.GetTestCommand(),
 		TimeoutSeconds: d.GetTimeoutSeconds(),
 		Volumes:        volumesFromProto(d.GetVolumes()),
+		ScaleToZero:    d.GetScaleToZero(),
+		IdleTTLSeconds: int(d.GetIdleTtlSeconds()),
+		MinReplicas:    int(d.GetMinReplicas()),
+		MaxReplicas:    int(d.GetMaxReplicas()),
 	})
 	if err != nil {
 		return nil, fleetError(err)

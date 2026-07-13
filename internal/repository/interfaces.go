@@ -196,6 +196,10 @@ type RouteRepository interface {
 	Create(ctx context.Context, route *domain.Route) error
 	ListByApp(ctx context.Context, appID uuid.UUID) ([]domain.Route, error)
 	DeleteByApp(ctx context.Context, appID uuid.UUID) error
+	// FindByHost resolves the route matching an ingress host (host_pattern or
+	// custom_domain). Returns domain.ErrRouteNotFound when none matches. Used by
+	// the scale-to-zero activator to map a woken request's host to its app (rt#11).
+	FindByHost(ctx context.Context, host string) (*domain.Route, error)
 }
 
 // VolumeRepository persists volumes for fleet apps.

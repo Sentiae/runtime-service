@@ -42,6 +42,11 @@ message DeploymentDescriptor {
     string workload_class = 10;          // "test" | "resident"
     string test_command = 11;            // test class only: overrides the image entrypoint when non-empty (run via /bin/sh -c)
     int64 timeout_seconds = 12;          // test class: max run time (default 300)
+    // Scale-to-zero (rt#11, D-082). 0-defaults preserve today's behavior.
+    bool scale_to_zero = 13;             // resident class: allow the fleet to drain to zero replicas when idle
+    int32 idle_ttl_seconds = 14;         // resident class: seconds of inactivity before scale-to-zero (0 disables)
+    int32 min_replicas = 15;             // resident class: floor replica count (default 0)
+    int32 max_replicas = 16;             // resident class: ceiling replica count (0 → default 1)
 }
 message ProvisionRequest {
     DeploymentDescriptor descriptor = 1;

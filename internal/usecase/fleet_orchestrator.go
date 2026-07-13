@@ -188,6 +188,18 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 		refs = []string{}
 	}
 
+	// rt#11 — scale-to-zero bounds from the descriptor. A 0 max_replicas defaults
+	// to 1 (today's behavior); min_replicas defaults to 0. idle_ttl/scale_to_zero
+	// carry through verbatim (0/false disables idle scale-down).
+	maxReplicas := in.MaxReplicas
+	if maxReplicas < 1 {
+		maxReplicas = 1
+	}
+	minReplicas := in.MinReplicas
+	if minReplicas < 0 {
+		minReplicas = 0
+	}
+
 	app, err := uc.apps.FindByComponentEnv(ctx, in.ComponentID, in.Env)
 	switch {
 	case err == nil:
@@ -198,10 +210,18 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 		app.ResourcesMemMB = memMB
 		app.OwnerOrg = in.OwnerOrg
 		app.SecretRefs = refs
+		app.MinReplicas = minReplicas
+		app.MaxReplicas = maxReplicas
+		app.ScaleToZero = in.ScaleToZero
+		app.IdleTTLSeconds = in.IdleTTLSeconds
 		if app.DesiredReplicas < 1 {
 			app.DesiredReplicas = 1
 		}
-		app.UpdatedAt = time.Now().UTC()
+		now := time.Now().UTC()
+		// A re-provision is activity — refresh the idle clock so a freshly
+		// redeployed app is not immediately swept to zero.
+		app.LastActiveAt = now
+		app.UpdatedAt = now
 		if err := uc.apps.Update(ctx, app); err != nil {
 			return "", "", fmt.Errorf("update fleet app: %w", err)
 		}
@@ -216,9 +236,11 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 			ImageDigest:     in.Digest,
 			SecretRefs:      refs,
 			DesiredReplicas: 1,
-			MinReplicas:     0,
-			MaxReplicas:     1,
-			ScaleToZero:     false,
+			MinReplicas:     minReplicas,
+			MaxReplicas:     maxReplicas,
+			ScaleToZero:     in.ScaleToZero,
+			IdleTTLSeconds:  in.IdleTTLSeconds,
+			LastActiveAt:    now,
 			Port:            in.Port,
 			ResourcesVCPU:   vcpu,
 			ResourcesMemMB:  memMB,
@@ -449,6 +471,50 @@ func (uc *FleetOrchestrator) ReconcileAll(ctx context.Context) error {
 	for i := range apps {
 		if rerr := uc.ReconcileApp(ctx, apps[i].ID); rerr != nil {
 			logger.FromContext(ctx).Error("fleet reconcile: app failed", "app_id", apps[i].ID, "err", rerr)
+		}
+	}
+	return nil
+}
+
+// SweepIdle scales every eligible scale-to-zero app down to zero replicas
+// (rt#11, D-082). An app is eligible when it opts into scale-to-zero, has a
+// positive idle_ttl, has been inactive longer than that ttl (now-LastActiveAt),
+// AND still has a resident replica to drain. LastActiveAt is stamped at provision
+// and refreshed by the activator on each wake — nothing else refreshes it this
+// increment, so a busy app served directly through the gateway is at worst
+// scaled down and cold-woken on its next request (never a dropped request). A
+// per-app error is logged, never aborting the sweep. Called each reconcile tick.
+func (uc *FleetOrchestrator) SweepIdle(ctx context.Context) error {
+	apps, err := uc.apps.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list apps: %w", err)
+	}
+	now := time.Now().UTC()
+	for i := range apps {
+		app := &apps[i]
+		if !app.ScaleToZero || app.IdleTTLSeconds <= 0 {
+			continue
+		}
+		if now.Sub(app.LastActiveAt) <= time.Duration(app.IdleTTLSeconds)*time.Second {
+			continue
+		}
+		replicas, rerr := uc.replicas.ListByApp(ctx, app.ID)
+		if rerr != nil {
+			logger.FromContext(ctx).Warn("fleet sweep: list replicas", "app_id", app.ID, "err", rerr)
+			continue
+		}
+		hasResident := false
+		for j := range replicas {
+			if replicas[j].State == domain.ReplicaStateResident {
+				hasResident = true
+				break
+			}
+		}
+		if !hasResident {
+			continue
+		}
+		if _, serr := uc.ScaleApp(ctx, app.ID, 0); serr != nil {
+			logger.FromContext(ctx).Warn("fleet sweep: scale to zero", "app_id", app.ID, "err", serr)
 		}
 	}
 	return nil

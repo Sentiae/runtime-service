@@ -177,6 +177,12 @@ type FleetProvisionInput struct {
 	TestCommand    string
 	TimeoutSeconds int64
 	Volumes        []VolumeSpecInput
+	// Scale-to-zero desired state (rt#11, D-082). 0-defaults preserve today's
+	// behavior: ScaleToZero=false, MinReplicas=0, MaxReplicas defaults to 1.
+	ScaleToZero    bool
+	IdleTTLSeconds int
+	MinReplicas    int
+	MaxReplicas    int
 }
 
 // FleetProvisionOutput is the provision result.

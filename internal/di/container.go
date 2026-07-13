@@ -201,6 +201,10 @@ type Container struct {
 	// Non-nil only on the firecracker executor (needs the replica runtime).
 	FleetOrchestratorUC *usecase.FleetOrchestrator
 
+	// runtime-fleet CP4 rt#11 — scale-to-zero wake path. Non-nil only when the
+	// orchestrator is wired (firecracker executor).
+	FleetActivatorUC *usecase.FleetActivator
+
 	// Use Cases
 	ExecutionUC  usecase.ExecutionUseCase
 	VMUC         usecase.VMUseCase
@@ -253,11 +257,16 @@ func NewContainer(cfg *config.Config) (*Container, error) {
 	// Initialize use cases
 	c.initUseCases(cfg)
 
+	// runtime-fleet CP3 — image-boot materializer, booter, FleetOrchestration.
+	// Runs BEFORE initHandlers so FleetActivatorUC (rt#11) exists when
+	// initHandlers gates the /_activate mount and builds the chi router in
+	// SetupRoutes. The fleet's one back-edge into handlers — the FleetOrchestration
+	// gRPC registration, which needs the GRPCServer that initHandlers builds — is
+	// relocated to the end of initHandlers to break the init cycle.
+	c.initFleet(cfg)
+
 	// Initialize handlers
 	c.initHandlers()
-
-	// runtime-fleet CP3 — image-boot materializer, booter, FleetOrchestration.
-	c.initFleet(cfg)
 
 	return c, nil
 }
@@ -400,23 +409,30 @@ func (c *Container) initFleet(cfg *config.Config) {
 		// stable https URL.
 		var ingressSyncer usecase.IngressSyncer
 		if cfg.App.ExecutorType == "firecracker" {
-			ingressSyncer = caddy.NewSyncer(cfg.Fleet.Caddy.AdminEndpoint)
-			log.Printf("Fleet ingress: Caddy syncer wired (admin=%s, domain=%s)", cfg.Fleet.Caddy.AdminEndpoint, cfg.Fleet.IngressDomain)
+			ingressSyncer = caddy.NewSyncer(cfg.Fleet.Caddy.AdminEndpoint, cfg.Fleet.ActivatorEndpoint)
+			log.Printf("Fleet ingress: Caddy syncer wired (admin=%s, domain=%s, activator=%s)", cfg.Fleet.Caddy.AdminEndpoint, cfg.Fleet.IngressDomain, cfg.Fleet.ActivatorEndpoint)
 		}
 		c.FleetOrchestratorUC.SetIngress(c.RouteRepo, cfg.Fleet.IngressDomain, ingressSyncer)
 
 		c.FleetProvisionUC.SetOrchestrator(c.FleetOrchestratorUC)
+
+		// rt#11 — scale-to-zero wake path. The activator resolves a woken request's
+		// host to its app, scales it to one replica, and blocks until a resident
+		// replica is health-passing (ActivateTimeout budget). Mounted on the HTTP
+		// server in initHandlers.
+		c.FleetActivatorUC = usecase.NewFleetActivator(
+			c.RouteRepo,
+			c.FleetAppRepo,
+			c.ReplicaRepo,
+			c.FleetOrchestratorUC,
+			cfg.Fleet.ActivateTimeout,
+		)
 	}
 
 	if cfg.App.ExecutorType == "firecracker" {
 		c.registerSelfHost(cfg)
 	} else {
 		log.Println("Fleet self-registration skipped (executor is not firecracker)")
-	}
-
-	if c.GRPCServer != nil {
-		c.GRPCServer.RegisterFleet(grpchandler.NewFleetServer(c.FleetProvisionUC, c.FleetHostRegistry))
-		log.Println("FleetOrchestration gRPC service registered")
 	}
 }
 
@@ -1098,6 +1114,12 @@ func (c *Container) initHandlers() {
 	// so we register the routes unconditionally.
 	c.HTTPServer.SetFleetHandler(httphandler.NewFleetHandler(c.WarmPool, c.Config.Server.GRPC.ServiceAPIKey))
 
+	// rt#11 — scale-to-zero wake endpoint (/_activate). Mounted only when the
+	// activator is wired (firecracker host); the setter no-ops on a nil handler.
+	if c.FleetActivatorUC != nil {
+		c.HTTPServer.SetActivatorHandler(httphandler.NewActivatorHandler(c.FleetActivatorUC))
+	}
+
 	// §9.4 — customer-agent enrolment endpoint. Signs CSRs submitted
 	// by freshly-installed customer-hosted agents. Unwired when the CA
 	// paths aren't set (dev deployments / tenants not using the agent).
@@ -1205,6 +1227,15 @@ func (c *Container) initHandlers() {
 		c.GRPCServer.ExecutionServer().WithCompiler(c.CompileUC)
 	}
 
+	// runtime-fleet CP3 — FleetOrchestration gRPC registration. Relocated here
+	// from initFleet (which now runs first) because it is the fleet's only
+	// dependency on the GRPCServer that this method builds. FleetProvisionUC +
+	// FleetHostRegistry are already wired by initFleet.
+	if c.GRPCServer != nil {
+		c.GRPCServer.RegisterFleet(grpchandler.NewFleetServer(c.FleetProvisionUC, c.FleetHostRegistry))
+		log.Println("FleetOrchestration gRPC service registered")
+	}
+
 	// Register routes now that every Set*Handler has fired. NewServer
 	// deliberately skips this step so setupRoutes can see the full set
 	// of handlers. Mirrors foundry-service's SetupRoutes pattern.
@@ -1282,6 +1313,11 @@ func (c *Container) startFleetReconciler(ctx context.Context) {
 			case <-ticker.C:
 				if err := orch.ReconcileAll(ctx); err != nil {
 					log.Printf("[FLEET-RECONCILE] reconcile error: %v", err)
+				}
+				// rt#11 — scale idle scale-to-zero apps down to zero replicas.
+				// Log-and-continue: a sweep error must never stop reconcile.
+				if err := orch.SweepIdle(ctx); err != nil {
+					log.Printf("[FLEET-SWEEP] idle sweep error: %v", err)
 				}
 				// rt#8 — push the current route set to the ingress gateway.
 				// Log-and-continue: an unreachable Caddy must never stop reconcile.

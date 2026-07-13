@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 
 	"github.com/google/uuid"
 	"github.com/sentiae/runtime-service/internal/domain"
@@ -36,4 +37,18 @@ func (r *routeRepository) ListByApp(ctx context.Context, appID uuid.UUID) ([]dom
 
 func (r *routeRepository) DeleteByApp(ctx context.Context, appID uuid.UUID) error {
 	return r.db.WithContext(ctx).Where("app_id = ?", appID).Delete(&domain.Route{}).Error
+}
+
+func (r *routeRepository) FindByHost(ctx context.Context, host string) (*domain.Route, error) {
+	var route domain.Route
+	err := r.db.WithContext(ctx).
+		Where("host_pattern = ? OR custom_domain = ?", host, host).
+		First(&route).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, domain.ErrRouteNotFound
+		}
+		return nil, err
+	}
+	return &route, nil
 }

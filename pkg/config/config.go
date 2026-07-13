@@ -51,6 +51,14 @@ type FleetConfig struct {
 	// Caddy configures the co-located ingress gateway the fleet drives over its
 	// loopback admin API (rt#8). Only used on the firecracker host.
 	Caddy CaddyConfig `mapstructure:"caddy"`
+	// ActivateTimeout bounds the scale-to-zero wake path (rt#11): how long the
+	// activator blocks waiting for a woken replica to become resident + healthy
+	// before returning a retryable 503. Must stay under Caddy's upstream timeout.
+	ActivateTimeout time.Duration `mapstructure:"activate_timeout"`
+	// ActivatorEndpoint is the loopback "host:port" Caddy reverse-proxies a
+	// zero-upstream (scaled-to-zero) route to (rt#11). Matches the runtime HTTP
+	// listener; only used on the firecracker host.
+	ActivatorEndpoint string `mapstructure:"activator_endpoint"`
 }
 
 // CaddyConfig configures the embedded Caddy ingress gateway the fleet reconciler
@@ -451,6 +459,8 @@ func Load() (*Config, error) {
 			"fleet.volume_dir":           "",
 			"fleet.ingress_domain":       "fleet.sentiae.local",
 			"fleet.caddy.admin_endpoint": "http://127.0.0.1:2019",
+			"fleet.activate_timeout":     "30s",
+			"fleet.activator_endpoint":   "127.0.0.1:8090",
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -590,6 +600,8 @@ func Load() (*Config, error) {
 			{"fleet.volume_dir", "APP_FLEET_VOLUME_DIR"},
 			{"fleet.ingress_domain", "APP_FLEET_INGRESS_DOMAIN"},
 			{"fleet.caddy.admin_endpoint", "APP_FLEET_CADDY_ADMIN_ENDPOINT"},
+			{"fleet.activate_timeout", "APP_FLEET_ACTIVATE_TIMEOUT"},
+			{"fleet.activator_endpoint", "APP_FLEET_ACTIVATOR_ENDPOINT"},
 		},
 	})
 	if err != nil {

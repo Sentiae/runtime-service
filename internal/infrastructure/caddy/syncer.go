@@ -17,21 +17,34 @@ import (
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
 
+// defaultActivatorDial is the loopback dial target Caddy uses to reach the
+// runtime-service scale-to-zero activator when a route has no live upstream.
+const defaultActivatorDial = "127.0.0.1:8090"
+
 // Syncer pushes the desired ingress route set to a local Caddy admin endpoint.
 type Syncer struct {
 	admin string
-	http  *http.Client
+	// activator is the "host:port" Caddy dials for the scale-to-zero wake path
+	// (rt#11): a route with zero live upstreams reverse-proxies to this loopback
+	// activator instead of serving a dead 503.
+	activator string
+	http      *http.Client
 }
 
 var _ usecase.IngressSyncer = (*Syncer)(nil)
 
 // NewSyncer constructs a Syncer targeting the Caddy admin base URL (e.g.
-// http://127.0.0.1:2019). The 5s client timeout bounds a hung admin endpoint so
-// the reconcile tick never blocks.
-func NewSyncer(admin string) *Syncer {
+// http://127.0.0.1:2019). activatorDial is the loopback "host:port" of the
+// runtime-service scale-to-zero activator (empty → 127.0.0.1:8090). The 5s
+// client timeout bounds a hung admin endpoint so the reconcile tick never blocks.
+func NewSyncer(admin, activatorDial string) *Syncer {
+	if activatorDial == "" {
+		activatorDial = defaultActivatorDial
+	}
 	return &Syncer{
-		admin: admin,
-		http:  &http.Client{Timeout: 5 * time.Second},
+		admin:     admin,
+		activator: activatorDial,
+		http:      &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
@@ -39,7 +52,7 @@ func NewSyncer(admin string) *Syncer {
 // failure (unreachable admin, non-2xx) is returned wrapped for the caller to
 // log-and-continue — the reconciler must never crash on an ingress hiccup.
 func (s *Syncer) Sync(ctx context.Context, routes []usecase.IngressRoute) error {
-	cfg := buildConfig(routes)
+	cfg := buildConfig(routes, s.activator)
 	body, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal caddy config: %w", err)
@@ -67,11 +80,11 @@ func (s *Syncer) Sync(ctx context.Context, routes []usecase.IngressRoute) error 
 // automation policy issuing internal (local CA) certs for the platform
 // subdomains. Returned as a map because it is a wire document (JSON), not a
 // domain type.
-func buildConfig(routes []usecase.IngressRoute) map[string]any {
+func buildConfig(routes []usecase.IngressRoute, activatorDial string) map[string]any {
 	httpRoutes := make([]any, 0, len(routes))
 	platformHosts := make([]any, 0, len(routes))
 	for _, r := range routes {
-		httpRoutes = append(httpRoutes, buildRoute(r))
+		httpRoutes = append(httpRoutes, buildRoute(r, activatorDial))
 		if r.Host != "" {
 			platformHosts = append(platformHosts, r.Host)
 		}
@@ -108,8 +121,8 @@ func buildConfig(routes []usecase.IngressRoute) map[string]any {
 }
 
 // buildRoute builds one Caddy route: a host matcher over [Host, CustomDomain]
-// and a single handler from buildRouteHandler.
-func buildRoute(r usecase.IngressRoute) map[string]any {
+// and the handler chain from buildRouteHandler.
+func buildRoute(r usecase.IngressRoute, activatorDial string) map[string]any {
 	hosts := make([]any, 0, 2)
 	if r.Host != "" {
 		hosts = append(hosts, r.Host)
@@ -119,29 +132,45 @@ func buildRoute(r usecase.IngressRoute) map[string]any {
 	}
 	return map[string]any{
 		"match":  []any{map[string]any{"host": hosts}},
-		"handle": []any{buildRouteHandler(r)},
+		"handle": buildRouteHandler(r, activatorDial),
 	}
 }
 
-// buildRouteHandler centralizes the per-route handler. With upstreams it is a
-// reverse_proxy over each "ip:port" dial target. With ZERO upstreams the route
-// has no live replica yet, so it serves a 503 today.
-func buildRouteHandler(r usecase.IngressRoute) map[string]any {
+// buildRouteHandler centralizes the per-route handler chain. With upstreams it is
+// a single reverse_proxy over each "ip:port" dial target. With ZERO upstreams the
+// route has no live replica (scaled to zero / not yet booted): it rewrites the
+// request to /_activate, tags it with the requested host, and reverse-proxies to
+// the runtime-service activator (rt#11), which cold-wakes the app and streams the
+// original request through. The next reconcile tick republishes the route with
+// the live upstream, bypassing the activator.
+func buildRouteHandler(r usecase.IngressRoute, activatorDial string) []any {
 	if len(r.Upstreams) == 0 {
-		// rt#11: zero-upstream -> activator (scale-to-zero wake). Until then a
-		// route with no live replica returns 503 rather than a dead upstream.
-		return map[string]any{
-			"handler":     "static_response",
-			"status_code": 503,
-			"body":        "no upstream available",
+		return []any{
+			map[string]any{
+				"handler": "rewrite",
+				"uri":     "/_activate{http.request.uri}",
+			},
+			map[string]any{
+				"handler":   "reverse_proxy",
+				"upstreams": []any{map[string]any{"dial": activatorDial}},
+				"headers": map[string]any{
+					"request": map[string]any{
+						"set": map[string]any{
+							"X-Fleet-Host": []any{"{http.request.host}"},
+						},
+					},
+				},
+			},
 		}
 	}
 	ups := make([]any, 0, len(r.Upstreams))
 	for _, u := range r.Upstreams {
 		ups = append(ups, map[string]any{"dial": u})
 	}
-	return map[string]any{
-		"handler":   "reverse_proxy",
-		"upstreams": ups,
+	return []any{
+		map[string]any{
+			"handler":   "reverse_proxy",
+			"upstreams": ups,
+		},
 	}
 }

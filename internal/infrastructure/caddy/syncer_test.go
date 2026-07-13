@@ -51,14 +51,16 @@ func TestBuildConfig(t *testing.T) {
 			wantTLSPolicy: true,
 		},
 		{
-			name: "zero upstream serves 503",
+			name: "zero upstream routes to activator",
 			routes: []usecase.IngressRoute{
 				{Host: "app-prod.fleet.sentiae.local"},
 			},
-			wantRoutes:    1,
-			wantHosts:     []string{"app-prod.fleet.sentiae.local"},
-			wantContains:  []string{`"handler":"static_response"`, `"status_code":503`},
-			wantNotHave:   []string{`"handler":"reverse_proxy"`},
+			wantRoutes: 1,
+			wantHosts:  []string{"app-prod.fleet.sentiae.local"},
+			// rt#11 — a scaled-to-zero route rewrites to /_activate and reverse-proxies
+			// to the loopback activator with the requested host tagged.
+			wantContains:  []string{`"handler":"rewrite"`, `/_activate{http.request.uri}`, `"handler":"reverse_proxy"`, `"dial":"127.0.0.1:8090"`, `"X-Fleet-Host"`, `{http.request.host}`},
+			wantNotHave:   []string{`"handler":"static_response"`},
 			wantTLSPolicy: true,
 		},
 		{
@@ -70,7 +72,7 @@ func TestBuildConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := buildConfig(tt.routes)
+			cfg := buildConfig(tt.routes, "127.0.0.1:8090")
 			raw, err := json.Marshal(cfg)
 			if err != nil {
 				t.Fatalf("marshal: %v", err)

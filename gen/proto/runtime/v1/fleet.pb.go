@@ -259,6 +259,11 @@ type DeploymentDescriptor struct {
 	WorkloadClass  string                 `protobuf:"bytes,10,opt,name=workload_class,json=workloadClass,proto3" json:"workload_class,omitempty"`     // "test" | "resident"
 	TestCommand    string                 `protobuf:"bytes,11,opt,name=test_command,json=testCommand,proto3" json:"test_command,omitempty"`           // test class only: overrides the image entrypoint when non-empty (run via /bin/sh -c)
 	TimeoutSeconds int64                  `protobuf:"varint,12,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"` // test class: max run time (default 300)
+	// Scale-to-zero (rt#11, D-082). 0-defaults preserve today's behavior.
+	ScaleToZero    bool  `protobuf:"varint,13,opt,name=scale_to_zero,json=scaleToZero,proto3" json:"scale_to_zero,omitempty"`          // resident class: allow the fleet to drain to zero replicas when idle
+	IdleTtlSeconds int32 `protobuf:"varint,14,opt,name=idle_ttl_seconds,json=idleTtlSeconds,proto3" json:"idle_ttl_seconds,omitempty"` // resident class: seconds of inactivity before scale-to-zero (0 disables)
+	MinReplicas    int32 `protobuf:"varint,15,opt,name=min_replicas,json=minReplicas,proto3" json:"min_replicas,omitempty"`            // resident class: floor replica count (default 0)
+	MaxReplicas    int32 `protobuf:"varint,16,opt,name=max_replicas,json=maxReplicas,proto3" json:"max_replicas,omitempty"`            // resident class: ceiling replica count (0 → default 1)
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -373,6 +378,34 @@ func (x *DeploymentDescriptor) GetTestCommand() string {
 func (x *DeploymentDescriptor) GetTimeoutSeconds() int64 {
 	if x != nil {
 		return x.TimeoutSeconds
+	}
+	return 0
+}
+
+func (x *DeploymentDescriptor) GetScaleToZero() bool {
+	if x != nil {
+		return x.ScaleToZero
+	}
+	return false
+}
+
+func (x *DeploymentDescriptor) GetIdleTtlSeconds() int32 {
+	if x != nil {
+		return x.IdleTtlSeconds
+	}
+	return 0
+}
+
+func (x *DeploymentDescriptor) GetMinReplicas() int32 {
+	if x != nil {
+		return x.MinReplicas
+	}
+	return 0
+}
+
+func (x *DeploymentDescriptor) GetMaxReplicas() int32 {
+	if x != nil {
+		return x.MaxReplicas
 	}
 	return 0
 }
@@ -1414,7 +1447,7 @@ const file_proto_runtime_v1_fleet_proto_rawDesc = "" +
 	"\n" +
 	"VolumeSpec\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x17\n" +
-	"\asize_mb\x18\x02 \x01(\x05R\x06sizeMb\"\xc1\x04\n" +
+	"\asize_mb\x18\x02 \x01(\x05R\x06sizeMb\"\xd5\x05\n" +
 	"\x14DeploymentDescriptor\x12!\n" +
 	"\fcomponent_id\x18\x01 \x01(\tR\vcomponentId\x12\x10\n" +
 	"\x03env\x18\x02 \x01(\tR\x03env\x12-\n" +
@@ -1429,7 +1462,11 @@ const file_proto_runtime_v1_fleet_proto_rawDesc = "" +
 	"\x0eworkload_class\x18\n" +
 	" \x01(\tR\rworkloadClass\x12!\n" +
 	"\ftest_command\x18\v \x01(\tR\vtestCommand\x12'\n" +
-	"\x0ftimeout_seconds\x18\f \x01(\x03R\x0etimeoutSeconds\x1a:\n" +
+	"\x0ftimeout_seconds\x18\f \x01(\x03R\x0etimeoutSeconds\x12\"\n" +
+	"\rscale_to_zero\x18\r \x01(\bR\vscaleToZero\x12(\n" +
+	"\x10idle_ttl_seconds\x18\x0e \x01(\x05R\x0eidleTtlSeconds\x12!\n" +
+	"\fmin_replicas\x18\x0f \x01(\x05R\vminReplicas\x12!\n" +
+	"\fmax_replicas\x18\x10 \x01(\x05R\vmaxReplicas\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"q\n" +

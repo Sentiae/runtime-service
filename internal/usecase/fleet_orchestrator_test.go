@@ -204,6 +204,19 @@ func (f *orchRouteRepo) DeleteByApp(_ context.Context, appID uuid.UUID) error {
 	delete(f.store, appID)
 	return nil
 }
+func (f *orchRouteRepo) FindByHost(_ context.Context, host string) (*domain.Route, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, routes := range f.store {
+		for i := range routes {
+			if routes[i].HostPattern == host || routes[i].CustomDomain == host {
+				cp := routes[i]
+				return &cp, nil
+			}
+		}
+	}
+	return nil, domain.ErrRouteNotFound
+}
 
 // fakeIngressSyncer records the last route set pushed.
 type fakeIngressSyncer struct {

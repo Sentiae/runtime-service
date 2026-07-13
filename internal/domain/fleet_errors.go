@@ -38,4 +38,8 @@ var (
 	// affinity host is dead/stale: the app is degraded rather than moved off its
 	// data (no cross-host restore this cycle).
 	ErrStatefulHostUnavailable = errors.New("stateful app affinity host unavailable")
+	// ErrActivationTimeout is returned when the activator (scale-to-zero wake path,
+	// rt#11) does not observe a healthy resident replica within its budget. It maps
+	// to a retryable 503 so the caller retries rather than the request being dropped.
+	ErrActivationTimeout = errors.New("fleet activation timed out")
 )

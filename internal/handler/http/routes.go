@@ -30,6 +30,7 @@ type Server struct {
 	quarantineHandler    *TestQuarantineHandler    // §8.3 quarantine toggles
 	customerAgentHandler *CustomerAgentCertHandler // §9.4 agent enrolment
 	fleetHandler         *FleetHandler             // warm-VM fleet visibility + control
+	activatorHandler     *ActivatorHandler         // rt#11 scale-to-zero wake endpoint
 	permissionChecker    PermissionChecker
 }
 
@@ -100,6 +101,14 @@ func (s *Server) setupRoutes() {
 	// ⇒ GET /fleet reports {enabled:false}).
 	if s.fleetHandler != nil {
 		s.fleetHandler.RegisterRoutes(s.router)
+	}
+
+	// rt#11 scale-to-zero wake endpoint. Registered OUTSIDE the /api/v1 JWT group:
+	// its sole caller is the co-located Caddy gateway on loopback (zero-upstream
+	// route → reverse_proxy to :8090/_activate). Only mounted on the firecracker
+	// host where the orchestrator is wired.
+	if s.activatorHandler != nil {
+		s.activatorHandler.RegisterRoutes(s.router)
 	}
 
 	// API routes with authentication
@@ -231,6 +240,15 @@ func (s *Server) SetCustomerAgentCertHandler(h *CustomerAgentCertHandler) {
 func (s *Server) SetFleetHandler(h *FleetHandler) {
 	if s != nil && h != nil {
 		s.fleetHandler = h
+	}
+}
+
+// SetActivatorHandler installs the rt#11 scale-to-zero wake handler. Kept as a
+// setter so the DI container mounts it only on the firecracker host (where the
+// orchestrator + activator are wired); left nil elsewhere.
+func (s *Server) SetActivatorHandler(h *ActivatorHandler) {
+	if s != nil && h != nil {
+		s.activatorHandler = h
 	}
 }
 

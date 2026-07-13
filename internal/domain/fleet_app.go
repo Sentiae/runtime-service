@@ -53,8 +53,15 @@ type FleetApp struct {
 	// (ErrSecretsNotSupported); this carries the desired state the resolver (P3.4)
 	// will resolve into pushed secrets. ExpectSecrets is derived from it at boot.
 	SecretRefs      []string      `json:"secret_refs,omitempty" gorm:"type:jsonb;serializer:json"`
-	CreatedAt       time.Time     `json:"created_at" gorm:"not null"`
-	UpdatedAt       time.Time     `json:"updated_at" gorm:"not null"`
+	// IdleTTLSeconds is the inactivity window before a scale-to-zero app drains to
+	// zero replicas (rt#11, D-082). 0 disables idle scale-down.
+	IdleTTLSeconds int `json:"idle_ttl_seconds" gorm:"column:idle_ttl_seconds;not null;default:0"`
+	// LastActiveAt is the app's last observed activity: stamped at provision and
+	// refreshed by the activator on each wake. SweepIdle scales the app to zero
+	// once now-LastActiveAt exceeds IdleTTLSeconds (rt#11, D-082).
+	LastActiveAt time.Time `json:"last_active_at" gorm:"column:last_active_at;not null;default:now()"`
+	CreatedAt    time.Time `json:"created_at" gorm:"not null"`
+	UpdatedAt    time.Time `json:"updated_at" gorm:"not null"`
 }
 
 // TableName specifies the GORM table name.
