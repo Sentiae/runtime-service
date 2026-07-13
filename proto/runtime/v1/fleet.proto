@@ -6,12 +6,11 @@ option go_package = "github.com/sentiae/runtime-service/gen/proto/runtime/v1;run
 
 // FleetOrchestration is the P7 DeployTarget provider seam (docs/program/02-pillars/runtime-fleet/README.md §4).
 // CP3 implements Provision/Health/Decommission for workload classes "test" and "resident";
-// Scale and Cutover land with the CP4 fleet control plane and return Unimplemented until then.
+// Scale lands with the CP4 fleet control plane and returns Unimplemented until then.
 service FleetOrchestration {
     rpc Provision(ProvisionRequest) returns (ProvisionResponse);
     rpc Health(FleetHealthRequest) returns (FleetHealthResponse);
     rpc Scale(FleetScaleRequest) returns (FleetScaleResponse);
-    rpc Cutover(FleetCutoverRequest) returns (FleetCutoverResponse);
     rpc Decommission(FleetDecommissionRequest) returns (FleetDecommissionResponse);
 
     // CP4 fleet control plane — host registry + inventory + heartbeat (§9#4).
@@ -70,8 +69,6 @@ message FleetHealthResponse {
 }
 message FleetScaleRequest { string handle = 1; int32 replicas = 2; }
 message FleetScaleResponse {}
-message FleetCutoverRequest { string from_handle = 1; string to_handle = 2; }
-message FleetCutoverResponse {}
 message FleetDecommissionRequest { string handle = 1; }
 message FleetDecommissionResponse {}
 

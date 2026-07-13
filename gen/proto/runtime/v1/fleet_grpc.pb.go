@@ -22,7 +22,6 @@ const (
 	FleetOrchestration_Provision_FullMethodName    = "/runtime.v1.FleetOrchestration/Provision"
 	FleetOrchestration_Health_FullMethodName       = "/runtime.v1.FleetOrchestration/Health"
 	FleetOrchestration_Scale_FullMethodName        = "/runtime.v1.FleetOrchestration/Scale"
-	FleetOrchestration_Cutover_FullMethodName      = "/runtime.v1.FleetOrchestration/Cutover"
 	FleetOrchestration_Decommission_FullMethodName = "/runtime.v1.FleetOrchestration/Decommission"
 	FleetOrchestration_RegisterHost_FullMethodName = "/runtime.v1.FleetOrchestration/RegisterHost"
 	FleetOrchestration_Heartbeat_FullMethodName    = "/runtime.v1.FleetOrchestration/Heartbeat"
@@ -35,12 +34,11 @@ const (
 //
 // FleetOrchestration is the P7 DeployTarget provider seam (docs/program/02-pillars/runtime-fleet/README.md §4).
 // CP3 implements Provision/Health/Decommission for workload classes "test" and "resident";
-// Scale and Cutover land with the CP4 fleet control plane and return Unimplemented until then.
+// Scale lands with the CP4 fleet control plane and returns Unimplemented until then.
 type FleetOrchestrationClient interface {
 	Provision(ctx context.Context, in *ProvisionRequest, opts ...grpc.CallOption) (*ProvisionResponse, error)
 	Health(ctx context.Context, in *FleetHealthRequest, opts ...grpc.CallOption) (*FleetHealthResponse, error)
 	Scale(ctx context.Context, in *FleetScaleRequest, opts ...grpc.CallOption) (*FleetScaleResponse, error)
-	Cutover(ctx context.Context, in *FleetCutoverRequest, opts ...grpc.CallOption) (*FleetCutoverResponse, error)
 	Decommission(ctx context.Context, in *FleetDecommissionRequest, opts ...grpc.CallOption) (*FleetDecommissionResponse, error)
 	// CP4 fleet control plane — host registry + inventory + heartbeat (§9#4).
 	RegisterHost(ctx context.Context, in *RegisterHostRequest, opts ...grpc.CallOption) (*RegisterHostResponse, error)
@@ -80,16 +78,6 @@ func (c *fleetOrchestrationClient) Scale(ctx context.Context, in *FleetScaleRequ
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(FleetScaleResponse)
 	err := c.cc.Invoke(ctx, FleetOrchestration_Scale_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *fleetOrchestrationClient) Cutover(ctx context.Context, in *FleetCutoverRequest, opts ...grpc.CallOption) (*FleetCutoverResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(FleetCutoverResponse)
-	err := c.cc.Invoke(ctx, FleetOrchestration_Cutover_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -142,12 +130,11 @@ func (c *fleetOrchestrationClient) ListHosts(ctx context.Context, in *ListHostsR
 //
 // FleetOrchestration is the P7 DeployTarget provider seam (docs/program/02-pillars/runtime-fleet/README.md §4).
 // CP3 implements Provision/Health/Decommission for workload classes "test" and "resident";
-// Scale and Cutover land with the CP4 fleet control plane and return Unimplemented until then.
+// Scale lands with the CP4 fleet control plane and returns Unimplemented until then.
 type FleetOrchestrationServer interface {
 	Provision(context.Context, *ProvisionRequest) (*ProvisionResponse, error)
 	Health(context.Context, *FleetHealthRequest) (*FleetHealthResponse, error)
 	Scale(context.Context, *FleetScaleRequest) (*FleetScaleResponse, error)
-	Cutover(context.Context, *FleetCutoverRequest) (*FleetCutoverResponse, error)
 	Decommission(context.Context, *FleetDecommissionRequest) (*FleetDecommissionResponse, error)
 	// CP4 fleet control plane — host registry + inventory + heartbeat (§9#4).
 	RegisterHost(context.Context, *RegisterHostRequest) (*RegisterHostResponse, error)
@@ -171,9 +158,6 @@ func (UnimplementedFleetOrchestrationServer) Health(context.Context, *FleetHealt
 }
 func (UnimplementedFleetOrchestrationServer) Scale(context.Context, *FleetScaleRequest) (*FleetScaleResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Scale not implemented")
-}
-func (UnimplementedFleetOrchestrationServer) Cutover(context.Context, *FleetCutoverRequest) (*FleetCutoverResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Cutover not implemented")
 }
 func (UnimplementedFleetOrchestrationServer) Decommission(context.Context, *FleetDecommissionRequest) (*FleetDecommissionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Decommission not implemented")
@@ -258,24 +242,6 @@ func _FleetOrchestration_Scale_Handler(srv interface{}, ctx context.Context, dec
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(FleetOrchestrationServer).Scale(ctx, req.(*FleetScaleRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _FleetOrchestration_Cutover_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(FleetCutoverRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(FleetOrchestrationServer).Cutover(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: FleetOrchestration_Cutover_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(FleetOrchestrationServer).Cutover(ctx, req.(*FleetCutoverRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -370,10 +336,6 @@ var FleetOrchestration_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Scale",
 			Handler:    _FleetOrchestration_Scale_Handler,
-		},
-		{
-			MethodName: "Cutover",
-			Handler:    _FleetOrchestration_Cutover_Handler,
 		},
 		{
 			MethodName: "Decommission",

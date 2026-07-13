@@ -58,7 +58,7 @@ Intent is still inward (`handler → usecase → domain`; adapters under `infras
 
 ## How to add an RPC / provider / consumer
 
-- **New RPC:** edit `proto/runtime/v1/{runtime,graph}.proto` → `buf generate` → handler in `internal/handler/grpc/` → usecase → wire in `di/container.go`. The **net-new `FleetOrchestration`** gRPC (`Provision/Health/Scale/Cutover/Decommission` + `RegisterHost/Heartbeat`) is the seam delivery's P7 `fleet` adapter binds to (pillar §4/§9.12) — a NEW shared contract, coordinate before freezing.
+- **New RPC:** edit `proto/runtime/v1/{runtime,graph}.proto` → `buf generate` → handler in `internal/handler/grpc/` → usecase → wire in `di/container.go`. The **net-new `FleetOrchestration`** gRPC (`Provision/Health/Scale/Decommission` + `RegisterHost/Heartbeat`) is the seam delivery's P7 `fleet` adapter binds to (pillar §4/§9.12) — a NEW shared contract, coordinate before freezing.
 - **New DB state:** MUST introduce a `migrations/` dir with **golang-migrate** paired up/down (`add-migration` skill) — do NOT extend `repository/postgres/migrations.go` (`AutoMigrate`). The durable **fleet control plane** (host registry, resident-replica desired/actual, routes, volumes, secret bindings) is the first real migration set (I8: no console-only state).
 - **New execution provider:** implement the `VMProvider`/`ExecutionRunner` interfaces under `internal/infrastructure/<provider>/`; select it in `di/container.go` by `executor_type`.
 - **New inbound consumer:** `internal/infrastructure/messaging/<topic>_consumer.go`, thin → calls a usecase, idempotent.
@@ -66,7 +66,7 @@ Intent is still inward (`handler → usecase → domain`; adapters under `infras
 
 ## Ports & events
 
-**Provides (PROVIDER):** `DeployTarget` **P7** for the `fleet` (sentiae_fleet) and `test` classes — **net-new**; delivery's saga is the consumer (`Provision/Health/Scale/Cutover/Decommission`). `CompileVerifier` **P5** (sandboxed variant) — the existing `Compile` RPC; codegen consumes.
+**Provides (PROVIDER):** `DeployTarget` **P7** for the `fleet` (sentiae_fleet) and `test` classes — **net-new**; delivery's saga is the consumer (`Provision/Health/Scale/Decommission`; blue-green cutover is delivery-orchestrated across P7 adapters — the fleet `Cutover` RPC was removed, D-084). `CompileVerifier` **P5** (sandboxed variant) — the existing `Compile` RPC; codegen consumes.
 **Consumes (CONSUMER):** `ImageBuilder` **P6** output — the OCI `ImageRef`; runtime **boots the image** (OCI→ext4), never calls `BuildImage`. `NodeRegistry` **P1** — the preview interpreter reads `NodeDefinition.runtimeBinding` from node-service. `TelemetrySink` **P8** — resident apps + guest agent tail OTLP. `SecretResolver` **P14** — inject `secret_refs` into the VM at boot (net-new; no secrets path exists today).
 
 **RPC surface (frozen):** `RuntimeService` (`Execute`/`ExecuteAsync`, `GetExecution{Status,Result}`, `CreateExecution`, `DispatchTestRun`, `GetTestCoverage`/`Delta`, `GetVMUsage`, **`Compile`**); `GraphService` (`CreateGraph`, `DeployGraph`, `ExecuteGraph`, `Get/List/Cancel GraphExecution`, `List/GetNodeExecution` — the interpreter, **preview/debug ONLY**, I1). Per-host HTTP (retained): `GET /fleet`, `DELETE /fleet/clones/{id}`, `POST /fleet/templates/{lang}/refresh` — what delivery's `Fleet` RPC aggregates.

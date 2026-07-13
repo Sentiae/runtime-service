@@ -19,7 +19,7 @@ import (
 
 // FleetServer implements the FleetOrchestration gRPC service — the P7
 // DeployTarget provider seam for the "test" and "resident" workload classes
-// (runtime-fleet CP3). Scale/Cutover land with the CP4 control plane.
+// (runtime-fleet CP3). Scale lands with the CP4 control plane.
 type FleetServer struct {
 	runtimev1.UnimplementedFleetOrchestrationServer
 	provision *usecase.FleetProvision
@@ -143,11 +143,6 @@ func (s *FleetServer) Scale(ctx context.Context, req *runtimev1.FleetScaleReques
 		return nil, fleetError(err)
 	}
 	return &runtimev1.FleetScaleResponse{}, nil
-}
-
-// Cutover lands with the CP4 fleet control plane.
-func (s *FleetServer) Cutover(context.Context, *runtimev1.FleetCutoverRequest) (*runtimev1.FleetCutoverResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "lands with the CP4 fleet control plane")
 }
 
 // RegisterHost registers (or refreshes) a fleet host in the durable inventory.
