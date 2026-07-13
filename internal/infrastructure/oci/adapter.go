@@ -28,13 +28,14 @@ func (a *MaterializerAdapter) Materialize(ctx context.Context, in usecase.ImageM
 			Digest:     in.Digest,
 			ChangeID:   in.ChangeID,
 		},
-		WorkDir:       in.WorkDir,
-		EnvVars:       in.EnvVars,
-		Mode:          in.Mode,
-		TestCmd:       in.TestCommand,
-		Port:          in.Port,
-		ExpectSecrets: in.ExpectSecrets,
-		DataMountPath: in.DataMountPath,
+		WorkDir:        in.WorkDir,
+		EnvVars:        in.EnvVars,
+		Mode:           in.Mode,
+		TestCmd:        in.TestCommand,
+		Port:           in.Port,
+		ExpectSecrets:  in.ExpectSecrets,
+		BootstrapNonce: in.BootstrapNonce,
+		DataMountPath:  in.DataMountPath,
 	})
 	if err != nil {
 		return usecase.ImageMaterializeOutput{}, err

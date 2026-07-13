@@ -29,14 +29,20 @@ const secretPushTimeout = 30 * time.Second
 // secret lingers in host memory beyond the send. Any failure returns an error —
 // the caller kills the VM (fail-closed): a secret workload must never run
 // without its channel.
-func pushSecrets(ctx context.Context, socketPath string, items []usecase.HostSecret, timeout time.Duration) error {
+func pushSecrets(ctx context.Context, socketPath string, items []usecase.HostSecret, nonce string, timeout time.Duration) error {
 	udsPath := socketPath + ".vsock"
 	if timeout <= 0 {
 		timeout = secretPushTimeout
 	}
 	deadline := time.Now().Add(timeout)
 
-	bundle := &runtimev1.SecretBundle{Items: make([]*runtimev1.SecretItem, 0, len(items))}
+	// Present the per-boot bootstrap nonce (D-085 Layer 2) the guest wrote into
+	// runtime.json; the guest rejects the bundle fail-closed if it does not match,
+	// defeating a host-side spoof/replay of the push.
+	bundle := &runtimev1.SecretBundle{
+		Items:          make([]*runtimev1.SecretItem, 0, len(items)),
+		BootstrapNonce: nonce,
+	}
 	for i := range items {
 		bundle.Items = append(bundle.Items, &runtimev1.SecretItem{
 			Name:  items[i].Name,

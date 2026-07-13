@@ -328,7 +328,7 @@ func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (
 	// Push secrets over vsock before the guest execs its workload. Fail-closed:
 	// a push failure kills the VM and aborts the test (invariant I32).
 	if in.ExpectSecrets {
-		if err := pushSecrets(ctx, socketPath, in.Secrets, secretPushTimeout); err != nil {
+		if err := pushSecrets(ctx, socketPath, in.Secrets, in.BootstrapNonce, secretPushTimeout); err != nil {
 			b.killVM(cmd, socketPath)
 			return usecase.ImageTestResult{}, fmt.Errorf("push secrets: %w", err)
 		}
@@ -414,7 +414,7 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 	// Push secrets over vsock before the guest execs its workload. Fail-closed:
 	// a push failure kills the VM and tears down the net plumbing (invariant I32).
 	if in.ExpectSecrets {
-		if err := pushSecrets(ctx, socketPath, in.Secrets, secretPushTimeout); err != nil {
+		if err := pushSecrets(ctx, socketPath, in.Secrets, in.BootstrapNonce, secretPushTimeout); err != nil {
 			b.killVM(cmd, socketPath)
 			cleanupNet()
 			return usecase.ImageResidentResult{}, fmt.Errorf("push secrets: %w", err)

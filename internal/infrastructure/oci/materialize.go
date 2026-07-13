@@ -35,6 +35,10 @@ type MaterializeRequest struct {
 	// runtime.json so the guest opens its vsock secret listener at boot and
 	// blocks on the host push before exec (invariant I32). No plaintext at rest.
 	ExpectSecrets bool
+	// BootstrapNonce is the per-boot vsock attestation nonce (D-085 Layer 2),
+	// written into runtime.json so the guest can require the pusher to present it.
+	// NOT a secret. Empty when the boot expects no secrets.
+	BootstrapNonce string
 	// DataMountPath is the in-guest mount point for the persistent data volume
 	// (2nd virtio-blk /dev/vdb). Empty when the workload has no volume; written to
 	// runtime.json so image-init mounts /dev/vdb there at boot (rt#9).
@@ -60,6 +64,10 @@ type runtimeSpec struct {
 	// image-init to open the vsock secret listener and block on the host push
 	// before exec. runtime.json carries no secret plaintext (invariant I32).
 	ExpectSecrets bool `json:"expect_secrets,omitempty"`
+	// BootstrapNonce is the per-boot vsock attestation nonce (NOT a secret): the
+	// guest requires the pusher to present it before accepting the bundle (D-085
+	// Layer 2). Empty when the workload expects no secrets.
+	BootstrapNonce string `json:"bootstrap_nonce,omitempty"`
 	// DataMountPath is the in-guest mount point for the persistent data volume
 	// (/dev/vdb). Empty when the workload has no volume (rt#9).
 	DataMountPath string `json:"data_mount_path,omitempty"`
@@ -328,14 +336,15 @@ func withinDir(dir, target string) bool {
 // writeRuntimeJSON writes /sentiae/runtime.json into the staging tree.
 func writeRuntimeJSON(stagingDir string, req MaterializeRequest, cfg ImageConfig) error {
 	spec := runtimeSpec{
-		Entrypoint:    buildEntrypoint(cfg),
-		Env:           buildEnv(cfg.Env, req.EnvVars),
-		WorkDir:       cfg.WorkingDir,
-		Mode:          req.Mode,
-		TestCommand:   req.TestCmd,
-		Port:          req.Port,
-		ExpectSecrets: req.ExpectSecrets,
-		DataMountPath: req.DataMountPath,
+		Entrypoint:     buildEntrypoint(cfg),
+		Env:            buildEnv(cfg.Env, req.EnvVars),
+		WorkDir:        cfg.WorkingDir,
+		Mode:           req.Mode,
+		TestCommand:    req.TestCmd,
+		Port:           req.Port,
+		ExpectSecrets:  req.ExpectSecrets,
+		BootstrapNonce: req.BootstrapNonce,
+		DataMountPath:  req.DataMountPath,
 	}
 	dir := filepath.Join(stagingDir, "sentiae")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

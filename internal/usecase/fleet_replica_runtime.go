@@ -161,6 +161,17 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 	}
 	expectSecrets := len(secrets) > 0
 
+	// Per-boot vsock attestation nonce (D-085 Layer 2): minted once here, written
+	// into runtime.json (via matIn) AND presented on the push handshake (via the
+	// boot input). Only generated when the boot actually expects secrets.
+	var nonce string
+	if expectSecrets {
+		nonce, err = newBootstrapNonce()
+		if err != nil {
+			return uc.markDead(ctx, replica, fmt.Errorf("mint bootstrap nonce: %w", err))
+		}
+	}
+
 	// rt#9 — resolve the app's persistent data volume so the boot attaches its
 	// backing file as a 2nd virtio-blk device and the guest mounts it at boot.
 	var dataDiskPath, dataMountPath string
@@ -178,13 +189,14 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 	}
 
 	matIn := ImageMaterializeInput{
-		Repository:    app.ImageRepository,
-		Digest:        app.ImageDigest,
-		WorkDir:       filepath.Join(uc.workDir, replica.ID.String()),
-		Mode:          string(domain.ImageWorkloadClassResident),
-		Port:          app.Port,
-		ExpectSecrets: expectSecrets,
-		DataMountPath: dataMountPath,
+		Repository:     app.ImageRepository,
+		Digest:         app.ImageDigest,
+		WorkDir:        filepath.Join(uc.workDir, replica.ID.String()),
+		Mode:           string(domain.ImageWorkloadClassResident),
+		Port:           app.Port,
+		ExpectSecrets:  expectSecrets,
+		BootstrapNonce: nonce,
+		DataMountPath:  dataMountPath,
 	}
 	mat, err := uc.materializer.Materialize(ctx, matIn)
 	if err != nil {
@@ -192,15 +204,16 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 	}
 
 	res, err := uc.booter.BootResident(ctx, ImageBootInput{
-		WorkloadID:    replica.ID,
-		RootfsPath:    mat.RootfsPath,
-		VCPU:          app.ResourcesVCPU,
-		MemoryMB:      int(app.ResourcesMemMB),
-		Port:          app.Port,
-		ExpectSecrets: expectSecrets,
-		Secrets:       secrets,
-		DataDiskPath:  dataDiskPath,
-		DataMountPath: dataMountPath,
+		WorkloadID:     replica.ID,
+		RootfsPath:     mat.RootfsPath,
+		VCPU:           app.ResourcesVCPU,
+		MemoryMB:       int(app.ResourcesMemMB),
+		Port:           app.Port,
+		ExpectSecrets:  expectSecrets,
+		Secrets:        secrets,
+		BootstrapNonce: nonce,
+		DataDiskPath:   dataDiskPath,
+		DataMountPath:  dataMountPath,
 	})
 	if err != nil {
 		return uc.markDead(ctx, replica, fmt.Errorf("boot resident: %w", err))

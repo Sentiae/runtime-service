@@ -453,18 +453,13 @@ func (c *Container) buildSecretResolver() secret.Resolver {
 		log.Printf("Warning: fleet secret resolver: build Vault client failed (%v) — resident secret_refs will fail closed", err)
 		return nil
 	}
-	kek, err := secret.NewTenantTransit(vc.Raw(), secret.TransitConfig{
-		Mount:      "transit-tenants",
-		KeyPrefix:  "tenant-",
-		AutoCreate: false,
-	})
-	if err != nil {
-		log.Printf("Warning: fleet secret resolver: build tenant KEK failed (%v) — resident secret_refs will fail closed", err)
-		_ = vc.Close()
-		return nil
-	}
 	c.vaultClient = vc
-	return secret.NewEnvelopeVaultResolver(vc, kek)
+	// D-085 Phase-1: NO standing decrypt capability. The svc/runtime SVID token
+	// can only mint a per-org child token (via the `runtime-tenant` token role);
+	// each Resolve mints a child scoped to exactly one tenant's decrypt+KV
+	// policy, so a resolver bug cannot decrypt another tenant (403 at the Vault
+	// layer). The KEK is built per-resolution on the child client.
+	return secret.NewScopedEnvelopeVaultResolver(vc.Raw(), "runtime-tenant", "secret-tenant-", "secret", "transit-tenants")
 }
 
 // activeReplicas returns replicas currently holding a /30 index + host port

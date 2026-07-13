@@ -79,10 +79,18 @@ func (x *SecretItem) GetValue() string {
 
 // SecretBundle is the full set of secrets pushed to one guest at boot.
 type SecretBundle struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Items         []*SecretItem          `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Items []*SecretItem          `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
+	// bootstrap_nonce authenticates the pusher to the guest (invariant I32,
+	// D-085 Layer 2). The host mints a per-boot, cryptographically-random nonce,
+	// writes it into the guest's runtime.json, and echoes it here; the guest
+	// accepts the bundle only when this matches its expected nonce, defeating a
+	// host-side spoof/replay of the secret push. It is NOT a secret (it protects
+	// integrity of the pusher's identity, not confidentiality) but MUST be
+	// per-boot fresh and unpredictable. Empty when the boot expects no secrets.
+	BootstrapNonce string `protobuf:"bytes,2,opt,name=bootstrap_nonce,json=bootstrapNonce,proto3" json:"bootstrap_nonce,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *SecretBundle) Reset() {
@@ -120,6 +128,13 @@ func (x *SecretBundle) GetItems() []*SecretItem {
 		return x.Items
 	}
 	return nil
+}
+
+func (x *SecretBundle) GetBootstrapNonce() string {
+	if x != nil {
+		return x.BootstrapNonce
+	}
+	return ""
 }
 
 // Ack is the guest's reply after it has written the bundle to its tmpfs.
@@ -184,9 +199,10 @@ const file_proto_runtime_v1_guestsecrets_proto_rawDesc = "" +
 	"\n" +
 	"SecretItem\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value\"<\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\"e\n" +
 	"\fSecretBundle\x12,\n" +
-	"\x05items\x18\x01 \x03(\v2\x16.runtime.v1.SecretItemR\x05items\"+\n" +
+	"\x05items\x18\x01 \x03(\v2\x16.runtime.v1.SecretItemR\x05items\x12'\n" +
+	"\x0fbootstrap_nonce\x18\x02 \x01(\tR\x0ebootstrapNonce\"+\n" +
 	"\x03Ack\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05errorBCZAgithub.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1b\x06proto3"

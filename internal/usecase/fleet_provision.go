@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +19,22 @@ import (
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/repository"
 )
+
+// bootstrapNonceBytes is the length of the per-boot vsock attestation nonce
+// (D-085 Layer 2). 32 bytes of crypto/rand is unpredictable and collision-free.
+const bootstrapNonceBytes = 32
+
+// newBootstrapNonce mints a per-boot, cryptographically-random nonce the guest
+// requires the secret pusher to present before accepting the bundle. It is NOT a
+// secret (it authenticates the pusher, not confidentiality) but MUST be fresh +
+// unpredictable every boot — crypto/rand, never math/rand.
+func newBootstrapNonce() (string, error) {
+	b := make([]byte, bootstrapNonceBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate bootstrap nonce: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Ports the FleetProvision use case depends on (implemented under
@@ -44,6 +62,11 @@ type ImageMaterializeInput struct {
 	// ExpectSecrets tells the guest (via runtime.json) to open the vsock secret
 	// listener at boot and block on a host push before exec (invariant I32).
 	ExpectSecrets bool
+	// BootstrapNonce is the per-boot vsock attestation nonce (D-085 Layer 2),
+	// written into runtime.json so the guest can require the pusher to present it.
+	// Same value must be supplied to the booter's push (see ImageBootInput). Empty
+	// when the boot expects no secrets.
+	BootstrapNonce string
 	// DataMountPath is the in-guest mount point for the persistent data volume
 	// (2nd virtio-blk /dev/vdb). Empty when the workload has no volume; written to
 	// runtime.json so image-init mounts /dev/vdb there at boot.
@@ -85,6 +108,11 @@ type ImageBootInput struct {
 	// without its channel.
 	ExpectSecrets bool
 	Secrets       []HostSecret
+	// BootstrapNonce is the per-boot vsock attestation nonce (D-085 Layer 2)
+	// echoed to the guest in the push handshake; it MUST equal the nonce written
+	// into runtime.json (ImageMaterializeInput.BootstrapNonce). Empty when the
+	// boot expects no secrets.
+	BootstrapNonce string
 	// DataDiskPath is the host path of the ext4 backing file attached to the guest
 	// as a 2nd virtio-blk device (/dev/vdb). Empty when the workload has no volume.
 	DataDiskPath string
@@ -311,17 +339,25 @@ func (uc *FleetProvision) Provision(ctx context.Context, in FleetProvisionInput)
 	}
 
 	secrets := uc.selfTestSecrets(in)
+	var nonce string
+	if len(secrets) > 0 {
+		var nerr error
+		if nonce, nerr = newBootstrapNonce(); nerr != nil {
+			return FleetProvisionOutput{}, nerr
+		}
+	}
 	matIn := ImageMaterializeInput{
-		Registry:      in.Registry,
-		Repository:    in.Repository,
-		Digest:        in.Digest,
-		ChangeID:      in.ChangeID,
-		WorkDir:       filepath.Join(uc.workDir, wl.ID.String()),
-		EnvVars:       in.EnvVars,
-		Mode:          string(class),
-		TestCommand:   in.TestCommand,
-		Port:          in.Port,
-		ExpectSecrets: len(secrets) > 0,
+		Registry:       in.Registry,
+		Repository:     in.Repository,
+		Digest:         in.Digest,
+		ChangeID:       in.ChangeID,
+		WorkDir:        filepath.Join(uc.workDir, wl.ID.String()),
+		EnvVars:        in.EnvVars,
+		Mode:           string(class),
+		TestCommand:    in.TestCommand,
+		Port:           in.Port,
+		ExpectSecrets:  len(secrets) > 0,
+		BootstrapNonce: nonce,
 	}
 
 	if class == domain.ImageWorkloadClassTest {
@@ -409,6 +445,7 @@ func (uc *FleetProvision) startTestRun(wl *domain.ImageWorkload, matIn ImageMate
 			TimeoutSeconds: timeoutSec,
 			ExpectSecrets:  matIn.ExpectSecrets,
 			Secrets:        secrets,
+			BootstrapNonce: matIn.BootstrapNonce,
 		})
 		if err != nil {
 			uc.markFailed(ctx, wl, fmt.Errorf("boot test: %w", err))
@@ -441,13 +478,14 @@ func (uc *FleetProvision) runResident(ctx context.Context, wl *domain.ImageWorkl
 	_ = uc.repo.Update(ctx, wl)
 
 	res, err := uc.booter.BootResident(ctx, ImageBootInput{
-		WorkloadID:    wl.ID,
-		RootfsPath:    mat.RootfsPath,
-		VCPU:          vcpu,
-		MemoryMB:      memMB,
-		Port:          wl.Port,
-		ExpectSecrets: matIn.ExpectSecrets,
-		Secrets:       secrets,
+		WorkloadID:     wl.ID,
+		RootfsPath:     mat.RootfsPath,
+		VCPU:           vcpu,
+		MemoryMB:       memMB,
+		Port:           wl.Port,
+		ExpectSecrets:  matIn.ExpectSecrets,
+		Secrets:        secrets,
+		BootstrapNonce: matIn.BootstrapNonce,
 	})
 	if err != nil {
 		return "", fmt.Errorf("boot resident: %w", err)

@@ -47,6 +47,10 @@ type runtimeSpec struct {
 	// on the host push before exec (invariant I32). Boolean flag only — no
 	// secret plaintext is ever carried in runtime.json.
 	ExpectSecrets bool `json:"expect_secrets"`
+	// BootstrapNonce is the per-boot, host-minted nonce (NOT a secret) the guest
+	// requires the vsock pusher to present before accepting the secret bundle
+	// (D-085 Layer 2). Empty when the boot expects no secrets.
+	BootstrapNonce string `json:"bootstrap_nonce,omitempty"`
 	// DataMountPath is the in-guest mount point for the persistent data volume
 	// (2nd virtio-blk /dev/vdb). Empty when the workload has no volume (rt#9).
 	DataMountPath string `json:"data_mount_path,omitempty"`
@@ -78,19 +82,25 @@ func main() {
 		}
 	}
 
+	// Belt-and-suspenders (D-085 Layer 3): no core dumps / non-dumpable PID 1 so
+	// secret plaintext held transiently in this process (and none in the child,
+	// which now receives NO secret env) cannot leak via a core dump or ptrace.
+	hardenAgainstDumps()
+
 	// Secret channel (invariant I32): when the descriptor expects secrets, receive
 	// them over vsock into a tmpfs BEFORE exec. Fail-closed — any failure powers
 	// off without running the workload (receiveSecrets never returns on failure).
-	var secretEnv []string
+	// Secrets are written to tmpfs-0600 files ONLY; they are never placed in the
+	// workload env (D-085 Layer 3).
 	if spec.ExpectSecrets {
-		secretEnv = receiveSecrets()
+		receiveSecrets(spec)
 	}
 
 	switch spec.Mode {
 	case "resident":
-		runResident(spec, secretEnv)
+		runResident(spec)
 	default: // "test" and anything else default to single-shot
-		runTest(spec, secretEnv)
+		runTest(spec)
 	}
 }
 
@@ -154,7 +164,7 @@ func loadSpec() (*runtimeSpec, error) {
 }
 
 // runTest runs the workload once and writes stdout/stderr/exit_code to /sentiae/out.
-func runTest(spec *runtimeSpec, secretEnv []string) {
+func runTest(spec *runtimeSpec) {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "image-init: mkdir out: %v\n", err)
 	}
@@ -180,7 +190,7 @@ func runTest(spec *runtimeSpec, secretEnv []string) {
 		cmd = exec.Command(spec.Entrypoint[0], spec.Entrypoint[1:]...)
 	}
 
-	applyEnv(cmd, spec, secretEnv)
+	applyEnv(cmd, spec)
 
 	stdoutF, _ := os.OpenFile(filepath.Join(outDir, "stdout.txt"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	stderrF, _ := os.OpenFile(filepath.Join(outDir, "stderr.txt"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
@@ -211,7 +221,7 @@ func runTest(spec *runtimeSpec, secretEnv []string) {
 
 // runResident starts the workload as a child and stays PID 1, reaping zombies
 // until the child exits, then powers off.
-func runResident(spec *runtimeSpec, secretEnv []string) {
+func runResident(spec *runtimeSpec) {
 	if len(spec.Entrypoint) == 0 {
 		fmt.Fprintln(os.Stderr, "image-init: resident image has no entrypoint")
 		syncAndPowerOff()
@@ -224,7 +234,7 @@ func runResident(spec *runtimeSpec, secretEnv []string) {
 	}
 
 	cmd := exec.Command(spec.Entrypoint[0], spec.Entrypoint[1:]...)
-	applyEnv(cmd, spec, secretEnv)
+	applyEnv(cmd, spec)
 	cmd.Stdout = console
 	cmd.Stderr = console
 
@@ -258,14 +268,12 @@ func runResident(spec *runtimeSpec, secretEnv []string) {
 }
 
 // applyEnv sets the child's environment and working directory from the spec.
-// Received secret env is merged AFTER spec.Env (secret wins) — spec.Env stays
-// non-secret; the secret values arrived only over the vsock channel.
-func applyEnv(cmd *exec.Cmd, spec *runtimeSpec, secretEnv []string) {
-	env := make([]string, 0, len(spec.Env)+len(secretEnv))
-	env = append(env, spec.Env...)
-	env = append(env, secretEnv...)
-	if len(env) > 0 {
-		cmd.Env = env
+// It carries ONLY the non-secret env (image Env + descriptor env_vars, via the
+// materializer/runtime.json). Secrets are NEVER placed in the workload env
+// (D-085 Layer 3); they reach the workload solely as tmpfs-0600 files.
+func applyEnv(cmd *exec.Cmd, spec *runtimeSpec) {
+	if len(spec.Env) > 0 {
+		cmd.Env = spec.Env
 	}
 	if spec.WorkDir != "" {
 		cmd.Dir = spec.WorkDir
