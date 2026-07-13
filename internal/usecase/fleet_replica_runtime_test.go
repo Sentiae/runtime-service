@@ -166,7 +166,9 @@ func TestBootReplica_Success(t *testing.T) {
 	if got.RootfsPath != "/work/rep/rootfs.ext4" || got.Port != 8080 {
 		t.Fatalf("rootfs/port not stored: %+v", got)
 	}
-	if got.Endpoint != "http://10.0.0.9:20001" {
+	// rt#8 — the endpoint is the replica's PRIVATE address (guest IP + app port);
+	// per-VM host-port DNAT and the advertise host are retired (Caddy proxies).
+	if got.Endpoint != "http://10.0.0.5:8080" {
 		t.Fatalf("endpoint = %q", got.Endpoint)
 	}
 }

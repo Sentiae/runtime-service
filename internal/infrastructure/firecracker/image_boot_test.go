@@ -68,23 +68,16 @@ func TestNormalizeResources(t *testing.T) {
 	}
 }
 
-func TestAllocIndexAndPort(t *testing.T) {
-	b := NewImageBooter(nil, "10.0.0.1", 20000, 20001)
-	b.Seed([]int{1}, []int{20000})
+func TestAllocIndex(t *testing.T) {
+	// rt#8 retired per-VM host-port DNAT: only the /30 network index is allocated.
+	b := NewImageBooter(nil, "10.0.0.1")
+	b.Seed([]int{1})
 
 	n, err := b.allocIndex()
 	if err != nil || n != 2 {
 		t.Fatalf("allocIndex = %d,%v; want 2 (1 seeded used)", n, err)
 	}
-	p, err := b.allocPort()
-	if err != nil || p != 20001 {
-		t.Fatalf("allocPort = %d,%v; want 20001 (20000 seeded used)", p, err)
-	}
-	if _, err := b.allocPort(); err == nil {
-		t.Fatal("expected port exhaustion error")
-	}
 	b.freeIndex(2)
-	b.freePort(20001)
 	if n, _ := b.allocIndex(); n != 2 {
 		t.Fatalf("allocIndex after free = %d, want 2", n)
 	}

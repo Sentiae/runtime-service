@@ -176,6 +176,55 @@ func (f *orchAppRepo) has(id uuid.UUID) bool {
 	return ok
 }
 
+// orchRouteRepo is a stateful RouteRepository (rt#8).
+type orchRouteRepo struct {
+	mu    sync.Mutex
+	store map[uuid.UUID][]domain.Route
+}
+
+func newOrchRouteRepo() *orchRouteRepo {
+	return &orchRouteRepo{store: map[uuid.UUID][]domain.Route{}}
+}
+func (f *orchRouteRepo) Create(_ context.Context, r *domain.Route) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.store[r.AppID] = append(f.store[r.AppID], *r)
+	return nil
+}
+func (f *orchRouteRepo) ListByApp(_ context.Context, appID uuid.UUID) ([]domain.Route, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]domain.Route, len(f.store[appID]))
+	copy(out, f.store[appID])
+	return out, nil
+}
+func (f *orchRouteRepo) DeleteByApp(_ context.Context, appID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.store, appID)
+	return nil
+}
+
+// fakeIngressSyncer records the last route set pushed.
+type fakeIngressSyncer struct {
+	mu    sync.Mutex
+	last  []IngressRoute
+	calls int
+}
+
+func (f *fakeIngressSyncer) Sync(_ context.Context, routes []IngressRoute) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.last = routes
+	return nil
+}
+func (f *fakeIngressSyncer) snapshot() (int, []IngressRoute) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls, f.last
+}
+
 // orchHostLister returns a fixed live-host set for the scheduler.
 type orchHostLister struct {
 	hosts []domain.Host
@@ -398,6 +447,77 @@ func TestOrchestrator_ProvisionNilSecretRefsPersistsNonNil(t *testing.T) {
 	}
 	if app.SecretRefs == nil {
 		t.Fatalf("SecretRefs persisted nil on update; want non-nil empty slice")
+	}
+}
+
+func TestOrchestrator_IngressRouteAndSync(t *testing.T) {
+	origAlive := processAlive
+	processAlive = func(int) bool { return true }
+	defer func() { processAlive = origAlive }()
+
+	h := newOrchHarness(oneLiveHost())
+	routes := newOrchRouteRepo()
+	syncer := &fakeIngressSyncer{}
+	h.orch.SetIngress(routes, "fleet.sentiae.local", syncer)
+
+	in := FleetProvisionInput{
+		ComponentID: "urlshortener", Env: "prod",
+		Registry: "reg", Repository: "org/app", Digest: "sha256:abc",
+		VCPU: 2, MemoryMB: 1024, Port: 8080,
+	}
+	handle, url, err := h.orch.ProvisionApp(context.Background(), in)
+	if err != nil {
+		t.Fatalf("ProvisionApp: %v", err)
+	}
+	appID, err := uuid.Parse(handle)
+	if err != nil {
+		t.Fatalf("handle is not a uuid: %v", err)
+	}
+
+	// With ingress wired the URL is the stable Caddy host, not a replica endpoint.
+	const wantHost = "urlshortener-prod.fleet.sentiae.local"
+	if url != "https://"+wantHost {
+		t.Fatalf("ProvisionApp url = %q, want https://%s", url, wantHost)
+	}
+
+	// A route was recorded for the app.
+	rs, _ := routes.ListByApp(context.Background(), appID)
+	if len(rs) != 1 || rs[0].HostPattern != wantHost || rs[0].PathPrefix != "/" {
+		t.Fatalf("routes = %+v, want one host=%s path=/", rs, wantHost)
+	}
+
+	// Re-provision is idempotent: still exactly one route.
+	if _, _, err := h.orch.ProvisionApp(context.Background(), in); err != nil {
+		t.Fatalf("re-ProvisionApp: %v", err)
+	}
+	if rs, _ := routes.ListByApp(context.Background(), appID); len(rs) != 1 {
+		t.Fatalf("routes after re-provision = %d, want 1 (idempotent)", len(rs))
+	}
+
+	// SyncIngress pushes the route with the resident replica as an upstream.
+	if err := h.orch.SyncIngress(context.Background()); err != nil {
+		t.Fatalf("SyncIngress: %v", err)
+	}
+	calls, last := syncer.snapshot()
+	if calls != 1 {
+		t.Fatalf("syncer calls = %d, want 1", calls)
+	}
+	if len(last) != 1 {
+		t.Fatalf("synced routes = %d, want 1", len(last))
+	}
+	if last[0].Host != wantHost {
+		t.Fatalf("synced host = %q, want %q", last[0].Host, wantHost)
+	}
+	if len(last[0].Upstreams) != 1 {
+		t.Fatalf("synced upstreams = %v, want 1 resident", last[0].Upstreams)
+	}
+
+	// Decommission drops the routes.
+	if _, err := h.orch.DecommissionApp(context.Background(), appID); err != nil {
+		t.Fatalf("DecommissionApp: %v", err)
+	}
+	if rs, _ := routes.ListByApp(context.Background(), appID); len(rs) != 0 {
+		t.Fatalf("routes after decommission = %d, want 0", len(rs))
 	}
 }
 

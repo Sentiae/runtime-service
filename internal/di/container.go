@@ -28,6 +28,7 @@ import (
 	grpchandler "github.com/sentiae/runtime-service/internal/handler/grpc"
 	httphandler "github.com/sentiae/runtime-service/internal/handler/http"
 	"github.com/sentiae/runtime-service/internal/infrastructure/agent"
+	"github.com/sentiae/runtime-service/internal/infrastructure/caddy"
 	"github.com/sentiae/runtime-service/internal/infrastructure/canvasservice"
 	"github.com/sentiae/runtime-service/internal/infrastructure/compiler"
 	"github.com/sentiae/runtime-service/internal/infrastructure/container"
@@ -41,8 +42,8 @@ import (
 	"github.com/sentiae/runtime-service/internal/infrastructure/messaging"
 	"github.com/sentiae/runtime-service/internal/infrastructure/objectstore"
 	"github.com/sentiae/runtime-service/internal/infrastructure/oci"
-	volumebackend "github.com/sentiae/runtime-service/internal/infrastructure/volume"
 	"github.com/sentiae/runtime-service/internal/infrastructure/simulated"
+	volumebackend "github.com/sentiae/runtime-service/internal/infrastructure/volume"
 	"github.com/sentiae/runtime-service/internal/repository"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
 	"github.com/sentiae/runtime-service/internal/usecase"
@@ -279,33 +280,27 @@ func (c *Container) initFleet(cfg *config.Config) {
 		booter := firecracker.NewImageBooter(
 			c.FCProvider,
 			cfg.ImageBoot.AdvertiseHost,
-			cfg.ImageBoot.HostPortMin,
-			cfg.ImageBoot.HostPortMax,
 		)
 		// Seed the allocator from any workloads still active in the store so a
-		// restart never double-allocates a /30 index or a host port.
+		// restart never double-allocates a /30 index. rt#8 retired host-port DNAT.
 		if active, err := c.ImageWorkloadRepo.FindActive(context.Background()); err == nil {
 			indices := make([]int, 0, len(active))
-			ports := make([]int, 0, len(active))
 			for i := range active {
 				indices = append(indices, active[i].NetIndex)
-				ports = append(ports, active[i].HostPort)
 			}
-			booter.Seed(indices, ports)
+			booter.Seed(indices)
 		} else {
 			log.Printf("Warning: image-boot seed from active workloads failed: %v", err)
 		}
 		// Also seed from live replicas (resident + booting) so the CP4 replica
-		// path and the CP3 workload path never collide on a /30 index or port.
-		// Seed is additive (merges into the used-set), so a second call is safe.
+		// path and the CP3 workload path never collide on a /30 index. Seed is
+		// additive (merges into the used-set), so a second call is safe.
 		if replicas, err := activeReplicas(c.ReplicaRepo); err == nil {
 			indices := make([]int, 0, len(replicas))
-			ports := make([]int, 0, len(replicas))
 			for i := range replicas {
 				indices = append(indices, replicas[i].NetIndex)
-				ports = append(ports, replicas[i].HostPort)
 			}
-			booter.Seed(indices, ports)
+			booter.Seed(indices)
 		} else {
 			log.Printf("Warning: image-boot seed from live replicas failed: %v", err)
 		}
@@ -397,6 +392,19 @@ func (c *Container) initFleet(cfg *config.Config) {
 		)
 		// rt#9 — persistent-volume lifecycle (ensure/affinity/attach/degrade).
 		c.FleetOrchestratorUC.SetVolumeManager(c.FleetVolumeManager)
+
+		// rt#8 — fleet-owned ingress (D-079). The syncer drives a co-located Caddy
+		// over its loopback admin API; construct it only on the firecracker host
+		// (where Caddy runs), leaving it nil elsewhere. The route repo + base
+		// domain are always wired so ProvisionApp records the host and returns the
+		// stable https URL.
+		var ingressSyncer usecase.IngressSyncer
+		if cfg.App.ExecutorType == "firecracker" {
+			ingressSyncer = caddy.NewSyncer(cfg.Fleet.Caddy.AdminEndpoint)
+			log.Printf("Fleet ingress: Caddy syncer wired (admin=%s, domain=%s)", cfg.Fleet.Caddy.AdminEndpoint, cfg.Fleet.IngressDomain)
+		}
+		c.FleetOrchestratorUC.SetIngress(c.RouteRepo, cfg.Fleet.IngressDomain, ingressSyncer)
+
 		c.FleetProvisionUC.SetOrchestrator(c.FleetOrchestratorUC)
 	}
 
@@ -1274,6 +1282,11 @@ func (c *Container) startFleetReconciler(ctx context.Context) {
 			case <-ticker.C:
 				if err := orch.ReconcileAll(ctx); err != nil {
 					log.Printf("[FLEET-RECONCILE] reconcile error: %v", err)
+				}
+				// rt#8 — push the current route set to the ingress gateway.
+				// Log-and-continue: an unreachable Caddy must never stop reconcile.
+				if err := orch.SyncIngress(ctx); err != nil {
+					log.Printf("[FLEET-INGRESS] sync error: %v", err)
 				}
 			}
 		}

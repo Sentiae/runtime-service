@@ -40,47 +40,35 @@ const (
 type ImageBooter struct {
 	p             *Provider
 	advertiseHost string
-	hostPortMin   int
-	hostPortMax   int
 
 	natOnce sync.Once
 	natErr  error
 
 	mu        sync.Mutex
 	usedIndex map[int]bool
-	usedPort  map[int]bool
 }
 
 var _ usecase.ImageBooter = (*ImageBooter)(nil)
 
-// NewImageBooter constructs an ImageBooter over an existing Provider.
-func NewImageBooter(p *Provider, advertiseHost string, hostPortMin, hostPortMax int) *ImageBooter {
-	if hostPortMin <= 0 || hostPortMax < hostPortMin {
-		hostPortMin, hostPortMax = 20000, 20999
-	}
+// NewImageBooter constructs an ImageBooter over an existing Provider. rt#8
+// retired per-VM host-port DNAT (the fleet owns ingress via Caddy), so no host
+// port range is tracked — guests are reached directly on their routed /30.
+func NewImageBooter(p *Provider, advertiseHost string) *ImageBooter {
 	return &ImageBooter{
 		p:             p,
 		advertiseHost: advertiseHost,
-		hostPortMin:   hostPortMin,
-		hostPortMax:   hostPortMax,
 		usedIndex:     make(map[int]bool),
-		usedPort:      make(map[int]bool),
 	}
 }
 
-// Seed marks indices and ports already in use by active workloads so the
-// allocator (re)started from a persisted set never double-allocates.
-func (b *ImageBooter) Seed(indices []int, ports []int) {
+// Seed marks network indices already in use by active workloads so the allocator
+// (re)started from a persisted set never double-allocates a /30.
+func (b *ImageBooter) Seed(indices []int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, n := range indices {
 		if n > 0 {
 			b.usedIndex[n] = true
-		}
-	}
-	for _, p := range ports {
-		if p > 0 {
-			b.usedPort[p] = true
 		}
 	}
 }
@@ -103,27 +91,6 @@ func (b *ImageBooter) freeIndex(n int) {
 	}
 	b.mu.Lock()
 	delete(b.usedIndex, n)
-	b.mu.Unlock()
-}
-
-func (b *ImageBooter) allocPort() (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for p := b.hostPortMin; p <= b.hostPortMax; p++ {
-		if !b.usedPort[p] {
-			b.usedPort[p] = true
-			return p, nil
-		}
-	}
-	return 0, fmt.Errorf("image-boot host port range [%d,%d] exhausted", b.hostPortMin, b.hostPortMax)
-}
-
-func (b *ImageBooter) freePort(p int) {
-	if p <= 0 {
-		return
-	}
-	b.mu.Lock()
-	delete(b.usedPort, p)
 	b.mu.Unlock()
 }
 
@@ -219,40 +186,6 @@ func (b *ImageBooter) destroyTap(tapName string) {
 	}
 	if out, err := exec.Command("ip", "link", "del", tapName).CombinedOutput(); err != nil {
 		log.Printf("image-boot: warning: delete tap %s: %s: %v", tapName, string(out), err)
-	}
-}
-
-// installDNAT publishes hostPort → guestIP:guestPort for a resident workload,
-// on both the PREROUTING (external) and OUTPUT (host-local) chains.
-func (b *ImageBooter) installDNAT(hostPort int, guestIP string, guestPort int) error {
-	dest := fmt.Sprintf("%s:%d", guestIP, guestPort)
-	rules := b.dnatRuleSpecs(hostPort, dest)
-	for _, r := range rules {
-		args := append([]string{"-t", "nat", "-A"}, r...)
-		if out, err := exec.Command("iptables", args...).CombinedOutput(); err != nil {
-			b.removeDNAT(hostPort, guestIP, guestPort) // roll back partial install
-			return fmt.Errorf("install DNAT %v: %s: %w", args, string(out), err)
-		}
-	}
-	return nil
-}
-
-// removeDNAT deletes the DNAT rules for a resident workload (best-effort).
-func (b *ImageBooter) removeDNAT(hostPort int, guestIP string, guestPort int) {
-	dest := fmt.Sprintf("%s:%d", guestIP, guestPort)
-	for _, r := range b.dnatRuleSpecs(hostPort, dest) {
-		args := append([]string{"-t", "nat", "-D"}, r...)
-		_ = exec.Command("iptables", args...).Run()
-	}
-}
-
-// dnatRuleSpecs returns the iptables rule bodies (chain + match + target) for a
-// host-port → guest publish, used for both -A (install) and -D (remove).
-func (b *ImageBooter) dnatRuleSpecs(hostPort int, dest string) [][]string {
-	portStr := fmt.Sprintf("%d", hostPort)
-	return [][]string{
-		{"PREROUTING", "-p", "tcp", "--dport", portStr, "-j", "DNAT", "--to-destination", dest},
-		{"OUTPUT", "-p", "tcp", "-o", "lo", "--dport", portStr, "-j", "DNAT", "--to-destination", dest},
 	}
 }
 
@@ -378,7 +311,7 @@ func (b *ImageBooter) killVM(cmd *exec.Cmd, socketPath string) {
 // BootTest boots a single-shot VM, waits for it to power off (bounded by the
 // timeout), reads /sentiae/out/* from the rootfs, and tears everything down.
 func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (usecase.ImageTestResult, error) {
-	nw, cleanupNet, err := b.setupNet(false, 0, in.Port)
+	nw, cleanupNet, err := b.setupNet()
 	if err != nil {
 		return usecase.ImageTestResult{}, err
 	}
@@ -464,13 +397,10 @@ func (b *ImageBooter) readTestOutput(vmID uuid.UUID, rootfsPath string) (stdout,
 // BootResident boots a long-lived VM and returns once its port answers a TCP
 // dial (retried up to 60s). The VM keeps running; Decommission tears it down.
 func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInput) (usecase.ImageResidentResult, error) {
-	hostPort, err := b.allocPort()
+	// rt#8 — no host-port allocation: the fleet reaches the guest directly on its
+	// routed /30 (Caddy proxies the public host to guestIP:appPort).
+	nw, cleanupNet, err := b.setupNet()
 	if err != nil {
-		return usecase.ImageResidentResult{}, err
-	}
-	nw, cleanupNet, err := b.setupNet(true, hostPort, in.Port)
-	if err != nil {
-		b.freePort(hostPort)
 		return usecase.ImageResidentResult{}, err
 	}
 
@@ -478,7 +408,6 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 	cmd, socketPath, err := b.startVM(ctx, in.WorkloadID, in.RootfsPath, nw, vcpu, memMB, in.ExpectSecrets, in.DataDiskPath)
 	if err != nil {
 		cleanupNet()
-		b.freePort(hostPort)
 		return usecase.ImageResidentResult{}, err
 	}
 
@@ -488,7 +417,6 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 		if err := pushSecrets(ctx, socketPath, in.Secrets, secretPushTimeout); err != nil {
 			b.killVM(cmd, socketPath)
 			cleanupNet()
-			b.freePort(hostPort)
 			return usecase.ImageResidentResult{}, fmt.Errorf("push secrets: %w", err)
 		}
 	}
@@ -504,22 +432,22 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 		_ = cmd.Process.Kill()
 		_ = os.Remove(socketPath)
 		cleanupNet()
-		b.freePort(hostPort)
 		return usecase.ImageResidentResult{}, fmt.Errorf("resident workload did not serve %s:%d: %w", nw.guestIP, in.Port, err)
 	}
 
 	return usecase.ImageResidentResult{
 		PID:        cmd.Process.Pid,
 		GuestIP:    nw.guestIP,
-		HostPort:   hostPort,
+		HostPort:   0, // rt#8 — DNAT retired; endpoint is the private guest addr.
 		NetIndex:   nw.index,
 		TapName:    nw.tapName,
 		SocketPath: socketPath,
 	}, nil
 }
 
-// Decommission tears down a resident workload: kill process, remove DNAT + TAP,
-// free the index/port, delete the rootfs.
+// Decommission tears down a resident workload: kill process, remove the TAP,
+// free the index, delete the rootfs. rt#8 retired the per-VM DNAT so there is no
+// host-port rule or port to reclaim.
 func (b *ImageBooter) Decommission(_ context.Context, in usecase.ImageDecommissionInput) error {
 	if in.PID > 0 {
 		if proc, err := os.FindProcess(in.PID); err == nil {
@@ -537,12 +465,8 @@ func (b *ImageBooter) Decommission(_ context.Context, in usecase.ImageDecommissi
 			}
 		}
 	}
-	if in.HostPort > 0 && in.GuestIP != "" {
-		b.removeDNAT(in.HostPort, in.GuestIP, in.Port)
-	}
 	b.destroyTap(in.TapName)
 	b.freeIndex(in.NetIndex)
-	b.freePort(in.HostPort)
 	if in.SocketPath != "" {
 		_ = os.Remove(in.SocketPath)
 		_ = os.Remove(in.SocketPath + ".vsock")
@@ -553,10 +477,10 @@ func (b *ImageBooter) Decommission(_ context.Context, in usecase.ImageDecommissi
 	return nil
 }
 
-// setupNet allocates an index, creates the TAP, and (resident only) installs
-// the DNAT. It returns the derived addressing plus a cleanup func that reverses
-// exactly what it did.
-func (b *ImageBooter) setupNet(resident bool, hostPort, guestPort int) (imgNet, func(), error) {
+// setupNet allocates an index and creates the routed /30 TAP. It returns the
+// derived addressing plus a cleanup func that reverses exactly what it did. rt#8
+// retired the per-VM DNAT, so ingress is served by Caddy, not iptables rules.
+func (b *ImageBooter) setupNet() (imgNet, func(), error) {
 	idx, err := b.allocIndex()
 	if err != nil {
 		return imgNet{}, func() {}, err
@@ -566,17 +490,7 @@ func (b *ImageBooter) setupNet(resident bool, hostPort, guestPort int) (imgNet, 
 		b.freeIndex(idx)
 		return imgNet{}, func() {}, err
 	}
-	if resident {
-		if err := b.installDNAT(hostPort, nw.guestIP, guestPort); err != nil {
-			b.destroyTap(nw.tapName)
-			b.freeIndex(idx)
-			return imgNet{}, func() {}, err
-		}
-	}
 	cleanup := func() {
-		if resident {
-			b.removeDNAT(hostPort, nw.guestIP, guestPort)
-		}
 		b.destroyTap(nw.tapName)
 		b.freeIndex(idx)
 	}

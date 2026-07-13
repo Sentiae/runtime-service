@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,6 +29,13 @@ type FleetOrchestrator struct {
 	// volumes drives the persistent-volume lifecycle (rt#9). Nil on a build with
 	// no volume support wired — the orchestrator then behaves statelessly.
 	volumes *FleetVolumeManager
+
+	// routes + ingressDomain + ingress drive the fleet-owned ingress (rt#8,
+	// D-079). Nil routes/ingress leaves the app URL on the resident endpoint and
+	// pushes nothing to a gateway (non-firecracker / unwired builds, tests).
+	routes        repository.RouteRepository
+	ingressDomain string
+	ingress       IngressSyncer
 }
 
 // NewFleetOrchestrator constructs the reconciler.
@@ -43,6 +51,121 @@ func NewFleetOrchestrator(
 // SetVolumeManager wires the persistent-volume manager (rt#9). Optional: a nil
 // manager leaves every app stateless.
 func (uc *FleetOrchestrator) SetVolumeManager(vm *FleetVolumeManager) { uc.volumes = vm }
+
+// SetIngress wires the fleet-owned ingress (rt#8, D-079): the route repository
+// (durable host→app records), the base domain for platform-issued hostnames,
+// and the syncer that pushes the desired route set to the gateway. All optional
+// and nil-safe — a nil routes repo leaves the app URL on the resident endpoint
+// and SyncIngress a no-op.
+func (uc *FleetOrchestrator) SetIngress(routes repository.RouteRepository, ingressDomain string, ingress IngressSyncer) {
+	uc.routes = routes
+	uc.ingressDomain = ingressDomain
+	uc.ingress = ingress
+}
+
+// hostForApp derives the platform-issued hostname for an app:
+// <sanitize(componentID)>-<env>.<ingressDomain>.
+func (uc *FleetOrchestrator) hostForApp(app *domain.FleetApp) string {
+	return sanitizeSlug(app.ComponentID) + "-" + sanitizeSlug(app.Env) + "." + uc.ingressDomain
+}
+
+// sanitizeSlug lowercases and reduces a label to DNS-safe [a-z0-9-], collapsing
+// runs of other characters to a single '-' and trimming leading/trailing '-'.
+func sanitizeSlug(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	prevDash := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevDash = false
+			continue
+		}
+		if !prevDash && b.Len() > 0 {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// stripScheme reduces an "http://ip:port" endpoint to the "ip:port" dial target
+// the ingress gateway proxies to.
+func stripScheme(endpoint string) string {
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+	return endpoint
+}
+
+// ensureRoute makes sure the app has exactly one ingress route (idempotent): if
+// none exists it creates the platform-host route at path "/". No-op when the
+// route repo is not wired.
+func (uc *FleetOrchestrator) ensureRoute(ctx context.Context, app *domain.FleetApp) error {
+	if uc.routes == nil {
+		return nil
+	}
+	existing, err := uc.routes.ListByApp(ctx, app.ID)
+	if err != nil {
+		return fmt.Errorf("list routes: %w", err)
+	}
+	if len(existing) > 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	route := &domain.Route{
+		ID:          uuid.New(),
+		AppID:       app.ID,
+		HostPattern: uc.hostForApp(app),
+		PathPrefix:  "/",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := uc.routes.Create(ctx, route); err != nil {
+		return fmt.Errorf("create route: %w", err)
+	}
+	return nil
+}
+
+// SyncIngress builds the current desired route set (every app's routes mapped to
+// its resident replica endpoints) and pushes it to the gateway. No-op when the
+// ingress or route repo is not wired. Called each reconcile tick.
+func (uc *FleetOrchestrator) SyncIngress(ctx context.Context) error {
+	if uc.ingress == nil || uc.routes == nil {
+		return nil
+	}
+	apps, err := uc.apps.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list apps: %w", err)
+	}
+	desired := make([]IngressRoute, 0, len(apps))
+	for i := range apps {
+		routes, err := uc.routes.ListByApp(ctx, apps[i].ID)
+		if err != nil {
+			return fmt.Errorf("list routes: %w", err)
+		}
+		if len(routes) == 0 {
+			continue
+		}
+		replicas, err := uc.replicas.ListByApp(ctx, apps[i].ID)
+		if err != nil {
+			return fmt.Errorf("list replicas: %w", err)
+		}
+		upstreams := make([]string, 0, len(replicas))
+		for j := range replicas {
+			if replicas[j].State == domain.ReplicaStateResident && replicas[j].Endpoint != "" {
+				upstreams = append(upstreams, stripScheme(replicas[j].Endpoint))
+			}
+		}
+		for j := range routes {
+			desired = append(desired, IngressRoute{
+				Host:         routes[j].HostPattern,
+				CustomDomain: routes[j].CustomDomain,
+				Upstreams:    upstreams,
+			})
+		}
+	}
+	return uc.ingress.Sync(ctx, desired)
+}
 
 // ProvisionApp upserts the FleetApp for (ComponentID, Env) from the descriptor,
 // reconciles it once synchronously, and returns the app handle plus a resident
@@ -123,8 +246,21 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 		}
 	}
 
+	// rt#8 — ensure the app's ingress route exists before the first placement so
+	// the next reconcile tick's SyncIngress publishes it. Idempotent.
+	if err := uc.ensureRoute(ctx, app); err != nil {
+		return "", "", err
+	}
+
 	if err := uc.ReconcileApp(ctx, app.ID); err != nil {
 		return "", "", err
+	}
+
+	// rt#8 — when ingress is wired the public URL is the stable Caddy-served host
+	// (https), independent of which replica is resident. Non-ingress builds fall
+	// back to a resident replica's private endpoint (preserves the pre-rt#8 path).
+	if uc.routes != nil {
+		return app.ID.String(), "https://" + uc.hostForApp(app), nil
 	}
 
 	replicas, err := uc.replicas.ListByApp(ctx, app.ID)
@@ -381,6 +517,11 @@ func (uc *FleetOrchestrator) HealthApp(ctx context.Context, appID uuid.UUID) (Fl
 	default:
 		out.State = "failed"
 	}
+	// rt#8 — the public URL is the stable Caddy-served host when ingress is wired
+	// (matches ProvisionApp), not the private resident endpoint.
+	if uc.routes != nil {
+		out.URL = "https://" + uc.hostForApp(app)
+	}
 	out.Message = fmt.Sprintf("healthy=%d pending=%d desired=%d replicas=%d", healthy, pending, app.DesiredReplicas, len(replicas))
 	return out, true, nil
 }
@@ -412,6 +553,13 @@ func (uc *FleetOrchestrator) DecommissionApp(ctx context.Context, appID uuid.UUI
 	if uc.volumes != nil {
 		if err := uc.volumes.DeleteAppVolumes(ctx, app.ID); err != nil {
 			return true, fmt.Errorf("delete app volumes: %w", err)
+		}
+	}
+	// rt#8 — drop the app's ingress routes so the next SyncIngress stops serving
+	// its host (before the app row goes, mirroring the volume reclaim above).
+	if uc.routes != nil {
+		if err := uc.routes.DeleteByApp(ctx, app.ID); err != nil {
+			return true, fmt.Errorf("delete app routes: %w", err)
 		}
 	}
 	if err := uc.apps.Delete(ctx, app.ID); err != nil {

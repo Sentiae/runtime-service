@@ -215,7 +215,9 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 	replica.SocketPath = res.SocketPath
 	replica.RootfsPath = mat.RootfsPath
 	replica.Port = app.Port
-	replica.Endpoint = fmt.Sprintf("http://%s:%d", uc.advertise, res.HostPort)
+	// rt#8 — the endpoint is now the replica's PRIVATE address (guest IP + app
+	// port). Caddy proxies the public host to it; per-VM host-port DNAT is retired.
+	replica.Endpoint = fmt.Sprintf("http://%s:%d", res.GuestIP, app.Port)
 	replica.State = domain.ReplicaStateResident
 	replica.Message = ""
 	replica.UpdatedAt = time.Now().UTC()

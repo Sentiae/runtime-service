@@ -45,6 +45,20 @@ type FleetConfig struct {
 	// VolumeDir is the host root under which per-volume ext4 backing files are
 	// materialized (rt#9). Empty ⇒ derived as <Firecracker.SnapshotPath>/volumes.
 	VolumeDir string `mapstructure:"volume_dir"`
+	// IngressDomain is the base domain for platform-issued app hostnames (rt#8,
+	// D-079): a resident app is reachable at <slug>-<env>.<IngressDomain>.
+	IngressDomain string `mapstructure:"ingress_domain"`
+	// Caddy configures the co-located ingress gateway the fleet drives over its
+	// loopback admin API (rt#8). Only used on the firecracker host.
+	Caddy CaddyConfig `mapstructure:"caddy"`
+}
+
+// CaddyConfig configures the embedded Caddy ingress gateway the fleet reconciler
+// pushes the full route set to each tick (rt#8, D-079).
+type CaddyConfig struct {
+	// AdminEndpoint is the Caddy admin JSON API base URL (loopback-bound on the
+	// fleet host). The syncer POSTs the full config to <AdminEndpoint>/load.
+	AdminEndpoint string `mapstructure:"admin_endpoint"`
 }
 
 // RegistryConfig configures the OCI registry the image-boot path pulls compiled
@@ -429,12 +443,14 @@ func Load() (*Config, error) {
 			"imageboot.advertise_host": "10.0.10.244",
 
 			// Fleet self-registration + heartbeat (runtime-fleet CP4 §9#4).
-			"fleet.host_id":            "",
-			"fleet.region":             "homelab",
-			"fleet.host_disk_mb":       51200,
-			"fleet.heartbeat_interval": "10s",
-			"fleet.secret_selftest":    false,
-			"fleet.volume_dir":         "",
+			"fleet.host_id":              "",
+			"fleet.region":               "homelab",
+			"fleet.host_disk_mb":         51200,
+			"fleet.heartbeat_interval":   "10s",
+			"fleet.secret_selftest":      false,
+			"fleet.volume_dir":           "",
+			"fleet.ingress_domain":       "fleet.sentiae.local",
+			"fleet.caddy.admin_endpoint": "http://127.0.0.1:2019",
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -572,6 +588,8 @@ func Load() (*Config, error) {
 			{"fleet.heartbeat_interval", "APP_FLEET_HEARTBEAT_INTERVAL"},
 			{"fleet.secret_selftest", "APP_FLEET_SECRET_SELFTEST"},
 			{"fleet.volume_dir", "APP_FLEET_VOLUME_DIR"},
+			{"fleet.ingress_domain", "APP_FLEET_INGRESS_DOMAIN"},
+			{"fleet.caddy.admin_endpoint", "APP_FLEET_CADDY_ADMIN_ENDPOINT"},
 		},
 	})
 	if err != nil {
