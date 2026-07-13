@@ -6,8 +6,12 @@ import (
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	pkconfig "github.com/sentiae/platform-kit/config"
+	"github.com/sentiae/platform-kit/logger"
+	"github.com/sentiae/platform-kit/tenant"
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
@@ -39,6 +43,35 @@ func (s *FleetServer) Provision(ctx context.Context, req *runtimev1.ProvisionReq
 	img := d.GetImage()
 	if img == nil {
 		return nil, status.Error(codes.InvalidArgument, "descriptor.image is required")
+	}
+
+	// D-061 verified-org boundary (shadow → flip). The caller-supplied owner_org
+	// feeds secret.Principal.OrgID downstream (fleet_replica_runtime.go) — a
+	// spoofed owner_org would be a spoofed secret tenant. Cross-check it against
+	// the attested x-organization-id carriage, then shadow-authorize it: with
+	// APP_AUTH_ORG_ENFORCE unset this is a strict no-op (divergence logged only);
+	// once flipped, a foreign org is denied before the secret path runs.
+	ownerOrgRaw := req.GetOwnerOrg()
+	// Carriage cross-check (defense-in-depth for the delivery→runtime attested
+	// carriage, B3): a present, non-empty x-organization-id MUST match owner_org.
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if vals := md.Get("x-organization-id"); len(vals) > 0 && vals[0] != "" && vals[0] != ownerOrgRaw {
+			return nil, status.Error(codes.InvalidArgument, "owner_org / x-organization-id mismatch")
+		}
+	}
+	if ownerOrgRaw == "" {
+		// Empty-org provisions exist today (CP3 test-class boots) — pass through
+		// unchanged rather than hard-fail.
+		logger.FromContext(ctx).Debug("fleet provision: empty owner_org, skipping org authz")
+	} else {
+		ownerOrg, perr := uuid.Parse(ownerOrgRaw)
+		if perr != nil {
+			return nil, status.Error(codes.InvalidArgument, "owner_org is not a valid uuid")
+		}
+		if err := tenant.AuthorizeOrgShadow(ctx, ownerOrg, pkconfig.OrgEnforce()); err != nil {
+			return nil, err
+		}
+		ctx = tenant.WithActiveOrg(ctx, ownerOrg)
 	}
 
 	res := d.GetResources()
