@@ -135,6 +135,13 @@ if [[ "${APP_GRPC_MTLS_MODE:-off}" != off ]]; then
 fi
 # --- end SPIRE agent provisioning -------------------------------------------
 
+# --- D-061 Phase B: enforce the verified-org boundary on FleetOrchestration --
+# Provision authorizes owner_org + cross-checks the attested x-organization-id.
+# Shadow-verified flip-safe; upsert so a fresh fleet host reproduces enforce.
+echo "==> setting runtime-service.env APP_AUTH_ORG_ENFORCE=true (D-061)"
+"${SSH[@]}" "sudo sed -i '/^APP_AUTH_ORG_ENFORCE=/d' /etc/runtime-service.env \
+  && echo 'APP_AUTH_ORG_ENFORCE=true' | sudo tee -a /etc/runtime-service.env >/dev/null"
+
 # --- Caddy fleet ingress (rt#8, D-079) --------------------------------------
 # The fleet owns ingress: Caddy runs co-located on this KVM host, its admin API
 # bound to loopback (127.0.0.1:2019). The reconciler pushes the live route
