@@ -140,6 +140,21 @@ for _kv in "VAULT_ADDR=https://10.0.10.20:8200" "VAULT_AUTH_MODE=svid" "VAULT_SV
 done
 # --- end Vault per-tenant secret resolver -----------------------------------
 
+# --- Structured app logging (fleet-outage RCA enabler) ----------------------
+# The fleet warm-pool/provision paths log via platform-kit's slog logger;
+# cmd/server/main.go wires that as the slog default from APP_LOGGING_* so those
+# Info/Warn/Error lines reach journald (previously only GORM SQL was visible on
+# this host, hiding fleet provisioner failures). Stamp the keys UNCONDITIONALLY
+# + idempotently so a clean fleet-host deploy reproduces app logs with zero
+# manual env edits. No OTLP endpoint: the fleet host has no reachable collector,
+# so JSON-to-stdout (captured by journald) is the durable sink.
+echo "==> setting runtime-service.env structured-logging keys (unconditional)"
+for _kv in "APP_LOGGING_LEVEL=info" "APP_LOGGING_FORMAT=json" "APP_LOGGING_OUTPUT=stdout"; do
+  _k="${_kv%%=*}"
+  "${SSH[@]}" "sudo sed -i '/^${_k}=/d' /etc/runtime-service.env && echo '${_kv}' | sudo tee -a /etc/runtime-service.env >/dev/null"
+done
+# --- end structured app logging ---------------------------------------------
+
 # --- D-061 Phase B: enforce the verified-org boundary on FleetOrchestration --
 # Provision authorizes owner_org + cross-checks the attested x-organization-id.
 # Shadow-verified flip-safe; upsert so a fresh fleet host reproduces enforce.

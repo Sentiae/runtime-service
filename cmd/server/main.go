@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	pkdebug "github.com/sentiae/platform-kit/debug"
 	pkkafka "github.com/sentiae/platform-kit/kafka"
+	pklogger "github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/runtime-service/internal/di"
 	"github.com/sentiae/runtime-service/pkg/config"
 	"github.com/sentiae/runtime-service/pkg/logger"
@@ -59,6 +61,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	// Wire the shared structured logger as the slog default so every
+	// logger.FromContext(ctx) call in the fleet warm-pool/provision paths
+	// honors APP_LOGGING_LEVEL/FORMAT instead of silently falling back to
+	// slog's uncontrolled default handler. Without this the fleet
+	// provisioner's Info/Warn/Error lines never reach journald (only GORM
+	// SQL was visible), leaving fleet failures invisible for RCA.
+	slog.SetDefault(pklogger.New(pklogger.Config{
+		Level:  cfg.Logging.Level,
+		Format: cfg.Logging.Format,
+	}))
 
 	// Initialize logger
 	logger.Init()
