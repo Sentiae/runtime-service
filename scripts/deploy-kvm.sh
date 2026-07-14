@@ -14,7 +14,7 @@
 #   APP_EXECUTOR_TYPE=firecracker  APP_FC_* (binary/kernel/rootfs paths)
 #   APP_DATABASE_* (points at the 10.0.10.20 postgres, db runtime_service_fc)
 #   APP_GRPC_SERVICE_API_KEY=<shared service key>
-#   APP_REGISTRY_HOST=10.0.10.20:8089
+#   APP_REGISTRY_HOST=10.0.10.20:8078
 #   APP_REGISTRY_SERVICE_KEY=<same shared service key — the OCI registry accepts it>
 #   APP_IMAGEBOOT_ADVERTISE_HOST=10.0.10.244   (defaults exist for the other APP_IMAGEBOOT_*)
 #

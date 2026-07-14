@@ -440,7 +440,7 @@ func Load() (*Config, error) {
 			"snapshot_store.cache_dir":  "/var/lib/firecracker/snapshot-cache",
 
 			// OCI registry (image-boot pull source, D-016).
-			"registry.host":        "10.0.10.20:8089",
+			"registry.host":        "10.0.10.20:8078",
 			"registry.service_key": "",
 
 			// Image-boot (runtime-fleet CP3).
