@@ -43,6 +43,12 @@ type MaterializeRequest struct {
 	// (2nd virtio-blk /dev/vdb). Empty when the workload has no volume; written to
 	// runtime.json so image-init mounts /dev/vdb there at boot (rt#9).
 	DataMountPath string
+	// PullToken is the per-deployment, org-scoped registry PULL token (D-124)
+	// presented as the registry Basic-auth password for THIS pull, overriding the
+	// client's shared read-any-org service key. Empty → fall back to the shared
+	// service key (back-compat). A live credential: NEVER written to the rootfs,
+	// runtime.json, or a log.
+	PullToken string
 }
 
 // MaterializeResult is the output of Materialize.
@@ -90,7 +96,16 @@ func NewMaterializer(client *Client, initPath string) *Materializer {
 // applied with whiteout semantics, plus /sentiae/runtime.json and /sentiae/init).
 // It is the unit-testable core of Materialize — mkfs is not invoked here.
 func (m *Materializer) Stage(ctx context.Context, req MaterializeRequest, stagingDir string) (ImageConfig, error) {
-	man, err := m.client.FetchManifest(ctx, req.Image.Repository, req.Image.Digest)
+	// D-124: when the request carries a per-deployment pull token, present it as the
+	// registry Basic password for THIS pull (a shallow client clone sharing the http
+	// transport). Empty → the shared client (its configured service key) is used —
+	// back-compat.
+	cl := m.client
+	if req.PullToken != "" {
+		cl = m.client.withPassword(req.PullToken)
+	}
+
+	man, err := cl.FetchManifest(ctx, req.Image.Repository, req.Image.Digest)
 	if err != nil {
 		return ImageConfig{}, err
 	}
@@ -101,7 +116,7 @@ func (m *Materializer) Stage(ctx context.Context, req MaterializeRequest, stagin
 
 	var unpacked int64 // per-call decompression-bomb budget (concurrent-safe)
 	for _, layer := range man.layers {
-		if err := m.applyLayer(ctx, req.Image.Repository, layer.Digest, stagingDir, &unpacked); err != nil {
+		if err := m.applyLayer(ctx, cl, req.Image.Repository, layer.Digest, stagingDir, &unpacked); err != nil {
 			return ImageConfig{}, fmt.Errorf("apply layer %s: %w", layer.Digest, err)
 		}
 	}
@@ -118,8 +133,8 @@ func (m *Materializer) Stage(ctx context.Context, req MaterializeRequest, stagin
 // applyLayer pulls a layer blob and unpacks it into stagingDir with OCI
 // whiteout semantics. gzip is detected from the blob's magic bytes so it works
 // regardless of the declared mediaType.
-func (m *Materializer) applyLayer(ctx context.Context, repo, digest, stagingDir string, budget *int64) error {
-	rc, err := m.client.FetchBlob(ctx, repo, digest)
+func (m *Materializer) applyLayer(ctx context.Context, cl *Client, repo, digest, stagingDir string, budget *int64) error {
+	rc, err := cl.FetchBlob(ctx, repo, digest)
 	if err != nil {
 		return err
 	}

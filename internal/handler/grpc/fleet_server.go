@@ -96,6 +96,13 @@ func (s *FleetServer) Provision(ctx context.Context, req *runtimev1.ProvisionReq
 		IdleTTLSeconds: int(d.GetIdleTtlSeconds()),
 		MinReplicas:    int(d.GetMinReplicas()),
 		MaxReplicas:    int(d.GetMaxReplicas()),
+		// D-125: the handed per-deployment Vault token travels MEMORY-ONLY into the
+		// provision input — it is never persisted to the fleet_apps row (verified:
+		// ProvisionApp/FleetApp carry no token field) nor logged.
+		VaultToken: d.GetVaultToken(),
+		// D-124: the handed per-deployment registry pull token likewise travels
+		// MEMORY-ONLY into the provision input — never persisted to a row nor logged.
+		RegistryPullToken: d.GetRegistryPullToken(),
 	})
 	if err != nil {
 		return nil, fleetError(err)

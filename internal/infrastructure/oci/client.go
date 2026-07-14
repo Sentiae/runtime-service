@@ -99,6 +99,18 @@ func NewClient(cfg Config) *Client {
 	}
 }
 
+// withPassword returns a shallow clone of the client that presents pw as the
+// Basic-auth password (D-124: a per-deployment registry pull token overriding the
+// shared service key). The clone SHARES the underlying *http.Client (connection
+// pool) and keeps the configured username; only the credential differs, so a
+// concurrent pull with a different token cannot race on shared auth state. Passing
+// an empty pw is never done by the caller (it uses the base client instead).
+func (c *Client) withPassword(pw string) *Client {
+	cfg := c.cfg
+	cfg.Password = pw
+	return &Client{cfg: cfg, http: c.http}
+}
+
 // resolvedManifest is the fully-resolved single-platform manifest for an image.
 type resolvedManifest struct {
 	config ImageConfig

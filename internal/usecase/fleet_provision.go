@@ -71,6 +71,12 @@ type ImageMaterializeInput struct {
 	// (2nd virtio-blk /dev/vdb). Empty when the workload has no volume; written to
 	// runtime.json so image-init mounts /dev/vdb there at boot.
 	DataMountPath string
+	// RegistryPullToken is the per-deployment, org-scoped registry PULL token
+	// (D-124) the materializer presents as the registry Basic-auth password when
+	// pulling the image, replacing the shared read-any-org service key. Empty →
+	// fall back to the shared service key (back-compat). A live credential: NEVER
+	// written to the rootfs, runtime.json, or a log.
+	RegistryPullToken string
 }
 
 // ImageMaterializeOutput is the materialize result.
@@ -211,6 +217,23 @@ type FleetProvisionInput struct {
 	IdleTTLSeconds int
 	MinReplicas    int
 	MaxReplicas    int
+	// VaultToken is the per-deployment Vault secret-broker token delivery minted
+	// and handed to the fleet (D-125, resident class only). It is carried
+	// MEMORY-ONLY: stashed in the in-memory FleetSecretTokenStore keyed by app,
+	// used by the HandedTokenEnvelopeResolver at boot, renewed for the deployment
+	// lifetime, and revoked on Decommission. It is NEVER written to the fleet_apps
+	// row, rootfs, runtime.json, or any log.
+	VaultToken string
+	// RegistryPullToken is the per-deployment, org-scoped OCI registry PULL token
+	// delivery minted and handed to the fleet (D-124, fleet class only). It is
+	// carried MEMORY-ONLY: on the orchestrator path it is stashed in the in-memory
+	// FleetRegistryTokenStore keyed by app (the reconciler-driven materialize reads
+	// it there, since the reconciler reloads the app from the DB and the token is
+	// never a column); on the fallback/test path it flows straight into the
+	// materialize input. The materializer presents it as the registry Basic password
+	// when pulling the image, else falls back to the shared service key (back-compat).
+	// It is NEVER written to the fleet_apps row, rootfs, runtime.json, or any log.
+	RegistryPullToken string
 }
 
 // FleetProvisionOutput is the provision result.
@@ -358,6 +381,11 @@ func (uc *FleetProvision) Provision(ctx context.Context, in FleetProvisionInput)
 		Port:           in.Port,
 		ExpectSecrets:  len(secrets) > 0,
 		BootstrapNonce: nonce,
+		// D-124: the fallback/test materialize path takes the pull token straight
+		// from the provision input (the orchestrator resident path uses the token
+		// store instead — see runResident-vs-orchestrator below). Empty on the test
+		// leg → the materializer falls back to the shared service key (back-compat).
+		RegistryPullToken: in.RegistryPullToken,
 	}
 
 	if class == domain.ImageWorkloadClassTest {

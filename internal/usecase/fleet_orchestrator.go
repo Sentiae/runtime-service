@@ -43,6 +43,17 @@ type FleetOrchestrator struct {
 	// wrongly scaled to zero (#fleet-scale-to-zero-activity-feed, D-122). Nil on
 	// builds with no feed wired → SweepIdle keeps its pre-D-122 behavior.
 	activityFeed ActivityFeed
+
+	// tokenStore holds each app's handed per-deployment Vault token in memory
+	// (D-125): ProvisionApp stashes it, the replica runtime reads it at boot, and
+	// DecommissionApp revokes it. Nil where no handed-token path is wired.
+	tokenStore *FleetSecretTokenStore
+
+	// registryTokenStore holds each app's handed per-deployment registry PULL token
+	// in memory (D-124): ProvisionApp stashes it, the replica runtime reads it at
+	// materialize (the image pull), and DecommissionApp drops it. Nil leaves the
+	// materialize path on the shared registry service key (back-compat).
+	registryTokenStore *FleetRegistryTokenStore
 }
 
 // ActivityFeed reports per-host request activity observed at the ingress gateway
@@ -87,6 +98,17 @@ func (uc *FleetOrchestrator) SetIngress(routes repository.RouteRepository, ingre
 // SweepIdle (#fleet-scale-to-zero-activity-feed, D-122). Optional and nil-safe:
 // a nil feed leaves SweepIdle's pre-D-122 behavior intact.
 func (uc *FleetOrchestrator) SetActivityFeed(feed ActivityFeed) { uc.activityFeed = feed }
+
+// SetTokenStore wires the in-memory handed-token store (D-125). Optional and
+// nil-safe: a nil store keeps the pre-D-125 mint-on-host behavior.
+func (uc *FleetOrchestrator) SetTokenStore(ts *FleetSecretTokenStore) { uc.tokenStore = ts }
+
+// SetRegistryTokenStore wires the in-memory handed registry-pull-token store
+// (D-124). Optional and nil-safe: a nil store leaves the materialize path on the
+// shared registry service key (back-compat).
+func (uc *FleetOrchestrator) SetRegistryTokenStore(ts *FleetRegistryTokenStore) {
+	uc.registryTokenStore = ts
+}
 
 // hostForApp derives the platform-issued hostname for an app:
 // <sanitize(componentID)>-<env>.<ingressDomain>.
@@ -278,6 +300,23 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 		}
 	default:
 		return "", "", fmt.Errorf("lookup fleet app: %w", err)
+	}
+
+	// D-125 — stash the handed per-deployment Vault token in memory (never on the
+	// app row) keyed by app id, BEFORE the first reconcile boots a replica, so the
+	// boot's HandedTokenEnvelopeResolver has it. Empty (secret-less deploy / Vault
+	// unset) is a no-op. Renewed for the lifetime; revoked on DecommissionApp.
+	if uc.tokenStore != nil {
+		uc.tokenStore.Put(app.ID, in.VaultToken)
+	}
+
+	// D-124 — stash the handed per-deployment registry pull token in memory (never
+	// on the app row) keyed by app id, BEFORE the first reconcile pulls the image,
+	// so the materialize presents it as the registry Basic password. Empty
+	// (pre-cutover / non-fleet) is a no-op → the shared service key is used. Dropped
+	// on DecommissionApp.
+	if uc.registryTokenStore != nil {
+		uc.registryTokenStore.Put(app.ID, in.RegistryPullToken)
 	}
 
 	// rt#9 — materialize the app's persistent volumes before the first placement
@@ -735,6 +774,17 @@ func (uc *FleetOrchestrator) DecommissionApp(ctx context.Context, appID uuid.UUI
 	}
 	if err := uc.apps.Delete(ctx, app.ID); err != nil {
 		return true, fmt.Errorf("delete fleet app: %w", err)
+	}
+	// D-125 — the deployment is gone: revoke the handed Vault token (revoke-self)
+	// and stop its renewer. Best-effort (a Vault error is logged inside Revoke; the
+	// host still stops bearing the token).
+	if uc.tokenStore != nil {
+		uc.tokenStore.Revoke(ctx, app.ID)
+	}
+	// D-124 — the deployment is gone: drop the handed registry pull token so the
+	// host stops bearing it. Nil-safe / idempotent.
+	if uc.registryTokenStore != nil {
+		uc.registryTokenStore.Delete(app.ID)
 	}
 	return true, nil
 }

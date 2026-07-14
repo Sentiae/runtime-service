@@ -37,6 +37,19 @@ type FleetReplicaRuntime struct {
 	// Nil leaves the replica stateless (no data disk attached).
 	volumes *FleetVolumeManager
 
+	// tokenStore holds each app's handed per-deployment Vault token in memory
+	// (D-125). bootSecrets reads it to stamp secret.Principal.Token so the
+	// HandedTokenEnvelopeResolver decrypts under the handed token (no host mint).
+	// Nil where no handed-token path is wired (secret-bearing apps then fail
+	// closed at resolve time, as before).
+	tokenStore *FleetSecretTokenStore
+
+	// registryTokenStore holds each app's handed per-deployment registry PULL token
+	// in memory (D-124). The materialize step reads it (keyed by app id) and
+	// presents it as the registry Basic password when pulling the image. Nil leaves
+	// the pull on the shared registry service key (back-compat).
+	registryTokenStore *FleetRegistryTokenStore
+
 	// secretSelfTest, when set (APP_FLEET_SECRET_SELFTEST), injects a NON-SECRET
 	// marker over the vsock secret channel on secret-ref-less resident boots so
 	// the I32 mechanism is verifiable on the live orchestrator path without any
@@ -59,6 +72,18 @@ func (uc *FleetReplicaRuntime) SetSecretResolver(r secret.Resolver) { uc.resolve
 // attaches its data disk at boot (rt#9). Optional: nil leaves replicas stateless.
 func (uc *FleetReplicaRuntime) SetVolumeManager(vm *FleetVolumeManager) { uc.volumes = vm }
 
+// SetTokenStore wires the in-memory handed-token store (D-125). Optional: nil
+// keeps the pre-D-125 behavior (the resolver mints, or a secret-bearing app
+// fails closed if no resolver).
+func (uc *FleetReplicaRuntime) SetTokenStore(ts *FleetSecretTokenStore) { uc.tokenStore = ts }
+
+// SetRegistryTokenStore wires the in-memory handed registry-pull-token store
+// (D-124). Optional: nil leaves the image pull on the shared registry service
+// key (back-compat).
+func (uc *FleetReplicaRuntime) SetRegistryTokenStore(ts *FleetRegistryTokenStore) {
+	uc.registryTokenStore = ts
+}
+
 // bootSecrets derives the secrets to push to a replica's microVM at boot. It is
 // re-evaluated on every BootReplica (crash-recovery, scale) so secrets are
 // re-supplied per boot and never persisted plaintext.
@@ -78,6 +103,15 @@ func (uc *FleetReplicaRuntime) bootSecrets(ctx context.Context, app *domain.Flee
 			return nil, domain.ErrSecretOwnerOrgMissing
 		}
 		p := secret.Principal{Service: "runtime-fleet", OrgID: app.OwnerOrg}
+		// D-125: stamp the app's handed per-deployment token (memory-only) so the
+		// HandedTokenEnvelopeResolver decrypts under it instead of the host minting.
+		// A missing token with a handed-token resolver fails closed at Resolve
+		// (no host-side mint fallback), preserving I32.
+		if uc.tokenStore != nil {
+			if tok, ok := uc.tokenStore.Get(app.ID); ok {
+				p.Token = tok
+			}
+		}
 		secrets := make([]HostSecret, 0, len(app.SecretRefs))
 		for _, ref := range app.SecretRefs {
 			sv, err := uc.resolver.Resolve(ctx, ref, p)
@@ -188,15 +222,27 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 		}
 	}
 
+	// D-124 — read the app's handed registry pull token (memory-only, keyed by app
+	// id) so the materialize presents it as the registry Basic password. Missing
+	// (pre-cutover / no store) leaves matIn.RegistryPullToken empty → the shared
+	// service key is used (back-compat).
+	var registryPullToken string
+	if uc.registryTokenStore != nil {
+		if tok, ok := uc.registryTokenStore.Get(app.ID); ok {
+			registryPullToken = tok
+		}
+	}
+
 	matIn := ImageMaterializeInput{
-		Repository:     app.ImageRepository,
-		Digest:         app.ImageDigest,
-		WorkDir:        filepath.Join(uc.workDir, replica.ID.String()),
-		Mode:           string(domain.ImageWorkloadClassResident),
-		Port:           app.Port,
-		ExpectSecrets:  expectSecrets,
-		BootstrapNonce: nonce,
-		DataMountPath:  dataMountPath,
+		Repository:        app.ImageRepository,
+		Digest:            app.ImageDigest,
+		WorkDir:           filepath.Join(uc.workDir, replica.ID.String()),
+		Mode:              string(domain.ImageWorkloadClassResident),
+		Port:              app.Port,
+		ExpectSecrets:     expectSecrets,
+		BootstrapNonce:    nonce,
+		DataMountPath:     dataMountPath,
+		RegistryPullToken: registryPullToken,
 	}
 	mat, err := uc.materializer.Materialize(ctx, matIn)
 	if err != nil {

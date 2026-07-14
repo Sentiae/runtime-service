@@ -43,6 +43,7 @@ import (
 	"github.com/sentiae/runtime-service/internal/infrastructure/objectstore"
 	"github.com/sentiae/runtime-service/internal/infrastructure/oci"
 	"github.com/sentiae/runtime-service/internal/infrastructure/simulated"
+	"github.com/sentiae/runtime-service/internal/infrastructure/vaulttoken"
 	volumebackend "github.com/sentiae/runtime-service/internal/infrastructure/volume"
 	"github.com/sentiae/runtime-service/internal/repository"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
@@ -187,6 +188,17 @@ type Container struct {
 	// Closed by Close.
 	vaultClient *pkconfig.VaultClient
 
+	// runtime-fleet D-125 — in-memory store of handed per-deployment Vault
+	// tokens (never persisted); renews each for the deployment lifetime and
+	// revokes on Decommission. Non-nil only alongside the handed-token resolver.
+	fleetTokenStore *usecase.FleetSecretTokenStore
+
+	// runtime-fleet D-124 — in-memory store of handed per-deployment registry PULL
+	// tokens (never persisted); read at materialize (the image pull) and dropped on
+	// Decommission. Always constructed (registry pulls are always needed); nil-safe
+	// consumers fall back to the shared service key when a deploy handed no token.
+	fleetRegistryTokenStore *usecase.FleetRegistryTokenStore
+
 	// runtime-fleet CP4 §9#4 — host registry + this instance's self-host.
 	FleetHostRegistry   *usecase.FleetHostRegistry
 	fleetSelf           *domain.Host // non-nil only on the firecracker executor
@@ -290,6 +302,12 @@ func (c *Container) initFleet(cfg *config.Config) {
 		oci.NewMaterializer(client, cfg.ImageBoot.InitPath),
 	)
 
+	// D-124 — in-memory store of handed per-deployment registry PULL tokens. Always
+	// constructed (independent of Vault): ProvisionApp stashes each app's token,
+	// the replica runtime reads it at materialize, DecommissionApp drops it. Empty
+	// (pre-cutover) leaves the pull on the shared registry service key (back-compat).
+	c.fleetRegistryTokenStore = usecase.NewFleetRegistryTokenStore()
+
 	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
 		booter := firecracker.NewImageBooter(
 			c.FCProvider,
@@ -367,6 +385,9 @@ func (c *Container) initFleet(cfg *config.Config) {
 		)
 		// rt#9 — attach persistent data disks on resident boot.
 		c.FleetReplicaRuntimeUC.SetVolumeManager(c.FleetVolumeManager)
+		// D-124 — read each app's handed registry pull token at materialize.
+		// Unconditional (not gated on Vault): registry pulls always happen.
+		c.FleetReplicaRuntimeUC.SetRegistryTokenStore(c.fleetRegistryTokenStore)
 		if cfg.Fleet.SecretSelfTest {
 			c.FleetReplicaRuntimeUC.SetSecretSelfTest(true)
 			log.Println("Fleet secret vsock self-test ENABLED on resident replica runtime (APP_FLEET_SECRET_SELFTEST) — non-secret marker injected on resident boots")
@@ -379,7 +400,10 @@ func (c *Container) initFleet(cfg *config.Config) {
 		// resolve time (ErrSecretResolverUnavailable), never silently secret-less.
 		if resolver := c.buildSecretResolver(); resolver != nil {
 			c.FleetReplicaRuntimeUC.SetSecretResolver(resolver)
-			log.Println("Fleet per-tenant secret resolver wired on resident replica runtime (P14)")
+			// D-125 — hand the in-memory token store to the boot path so
+			// bootSecrets can stamp the deployment's handed token onto the resolver.
+			c.FleetReplicaRuntimeUC.SetTokenStore(c.fleetTokenStore)
+			log.Println("Fleet handed-token secret resolver wired on resident replica runtime (D-125)")
 		}
 	}
 
@@ -406,6 +430,14 @@ func (c *Container) initFleet(cfg *config.Config) {
 		)
 		// rt#9 — persistent-volume lifecycle (ensure/affinity/attach/degrade).
 		c.FleetOrchestratorUC.SetVolumeManager(c.FleetVolumeManager)
+
+		// D-124 — stash each app's handed registry pull token at ProvisionApp and
+		// drop it at DecommissionApp. Unconditional (not gated on Vault).
+		c.FleetOrchestratorUC.SetRegistryTokenStore(c.fleetRegistryTokenStore)
+
+		// D-125 — the orchestrator stashes each app's handed token at ProvisionApp
+		// and revokes it at DecommissionApp (nil-safe when no Vault path is wired).
+		c.FleetOrchestratorUC.SetTokenStore(c.fleetTokenStore)
 
 		// rt#8 — fleet-owned ingress (D-079). The syncer drives a co-located Caddy
 		// over its loopback admin API; construct it only on the firecracker host
@@ -476,12 +508,24 @@ func (c *Container) buildSecretResolver() secret.Resolver {
 		return nil
 	}
 	c.vaultClient = vc
-	// D-085 Phase-1: NO standing decrypt capability. The svc/runtime SVID token
-	// can only mint a per-org child token (via the `runtime-tenant` token role);
-	// each Resolve mints a child scoped to exactly one tenant's decrypt+KV
-	// policy, so a resolver bug cannot decrypt another tenant (403 at the Vault
-	// layer). The KEK is built per-resolution on the child client.
-	return secret.NewScopedEnvelopeVaultResolver(vc.Raw(), "runtime-tenant", "secret-tenant-", "secret", "transit-tenants")
+	// D-125 (executes D-089): the fleet host holds NO mint capability. It no
+	// longer mints a per-org child token (the D-085 ScopedEnvelopeVaultResolver
+	// path is dropped). Instead delivery mints the per-deployment secret-broker
+	// token and hands it down the descriptor; the HandedTokenEnvelopeResolver
+	// decrypts under that handed token (carried on secret.Principal.Token by
+	// bootSecrets from the in-memory token store). A stolen svc/runtime credential
+	// can no longer mint a child for any org.
+	//
+	// The token store renews each handed token via renew-self and revokes it on
+	// Decommission, over the fleet's own Vault client (used only for address+TLS
+	// to clone; the handed token governs the renew/revoke ACL). It is wired into
+	// the replica runtime + orchestrator by the caller.
+	c.fleetTokenStore = usecase.NewFleetSecretTokenStore(
+		context.Background(),
+		vaulttoken.New(vc.Raw()),
+		0, // default renewal cadence (30m; self-adjusts to the token's granted TTL)
+	)
+	return secret.NewHandedTokenEnvelopeResolver("secret", "transit-tenants")
 }
 
 // activeReplicas returns replicas currently holding a /30 index + host port

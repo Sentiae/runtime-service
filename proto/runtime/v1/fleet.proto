@@ -46,6 +46,21 @@ message DeploymentDescriptor {
     int32 idle_ttl_seconds = 14;         // resident class: seconds of inactivity before scale-to-zero (0 disables)
     int32 min_replicas = 15;             // resident class: floor replica count (default 0)
     int32 max_replicas = 16;             // resident class: ceiling replica count (0 → default 1)
+    // D-125 (executes D-089): the per-deployment Vault secret-broker token
+    // minted by delivery, scoped to owner_org's `secret-tenant-<org>` policy and
+    // handed to the fleet host. The fleet BEARS it (renews for the deployment
+    // lifetime, revokes on Decommission) and NEVER mints. Held memory/tmpfs-only
+    // on the fleet — NEVER persisted to a row, rootfs, or log. Resident class
+    // only; empty on the test leg.
+    string vault_token = 17;
+    // D-124: the per-deployment, org-scoped OCI registry PULL token minted by
+    // delivery for owner_org (scoped to this image's repository) and handed to the
+    // fleet host. The fleet presents it as the registry Basic password when
+    // pulling the image, replacing the shared read-any-org service key. Held
+    // memory-only on the fleet — NEVER persisted to a row, rootfs, or log. Resident
+    // (fleet) class only; empty on the test leg and pre-cutover (the fleet then
+    // falls back to the shared service key — back-compat).
+    string registry_pull_token = 18;
 }
 message ProvisionRequest {
     DeploymentDescriptor descriptor = 1;

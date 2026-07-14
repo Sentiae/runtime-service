@@ -36,6 +36,9 @@ func (a *MaterializerAdapter) Materialize(ctx context.Context, in usecase.ImageM
 		ExpectSecrets:  in.ExpectSecrets,
 		BootstrapNonce: in.BootstrapNonce,
 		DataMountPath:  in.DataMountPath,
+		// D-124: the per-deployment registry pull token, presented as the registry
+		// Basic password for this pull (empty → shared service key fallback).
+		PullToken: in.RegistryPullToken,
 	})
 	if err != nil {
 		return usecase.ImageMaterializeOutput{}, err

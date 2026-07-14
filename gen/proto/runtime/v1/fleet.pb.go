@@ -264,8 +264,23 @@ type DeploymentDescriptor struct {
 	IdleTtlSeconds int32 `protobuf:"varint,14,opt,name=idle_ttl_seconds,json=idleTtlSeconds,proto3" json:"idle_ttl_seconds,omitempty"` // resident class: seconds of inactivity before scale-to-zero (0 disables)
 	MinReplicas    int32 `protobuf:"varint,15,opt,name=min_replicas,json=minReplicas,proto3" json:"min_replicas,omitempty"`            // resident class: floor replica count (default 0)
 	MaxReplicas    int32 `protobuf:"varint,16,opt,name=max_replicas,json=maxReplicas,proto3" json:"max_replicas,omitempty"`            // resident class: ceiling replica count (0 → default 1)
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// D-125 (executes D-089): the per-deployment Vault secret-broker token
+	// minted by delivery, scoped to owner_org's `secret-tenant-<org>` policy and
+	// handed to the fleet host. The fleet BEARS it (renews for the deployment
+	// lifetime, revokes on Decommission) and NEVER mints. Held memory/tmpfs-only
+	// on the fleet — NEVER persisted to a row, rootfs, or log. Resident class
+	// only; empty on the test leg.
+	VaultToken string `protobuf:"bytes,17,opt,name=vault_token,json=vaultToken,proto3" json:"vault_token,omitempty"`
+	// D-124: the per-deployment, org-scoped OCI registry PULL token minted by
+	// delivery for owner_org (scoped to this image's repository) and handed to the
+	// fleet host. The fleet presents it as the registry Basic password when
+	// pulling the image, replacing the shared read-any-org service key. Held
+	// memory-only on the fleet — NEVER persisted to a row, rootfs, or log. Resident
+	// (fleet) class only; empty on the test leg and pre-cutover (the fleet then
+	// falls back to the shared service key — back-compat).
+	RegistryPullToken string `protobuf:"bytes,18,opt,name=registry_pull_token,json=registryPullToken,proto3" json:"registry_pull_token,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *DeploymentDescriptor) Reset() {
@@ -408,6 +423,20 @@ func (x *DeploymentDescriptor) GetMaxReplicas() int32 {
 		return x.MaxReplicas
 	}
 	return 0
+}
+
+func (x *DeploymentDescriptor) GetVaultToken() string {
+	if x != nil {
+		return x.VaultToken
+	}
+	return ""
+}
+
+func (x *DeploymentDescriptor) GetRegistryPullToken() string {
+	if x != nil {
+		return x.RegistryPullToken
+	}
+	return ""
 }
 
 type ProvisionRequest struct {
@@ -1359,7 +1388,7 @@ const file_proto_runtime_v1_fleet_proto_rawDesc = "" +
 	"\n" +
 	"VolumeSpec\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x17\n" +
-	"\asize_mb\x18\x02 \x01(\x05R\x06sizeMb\"\xd5\x05\n" +
+	"\asize_mb\x18\x02 \x01(\x05R\x06sizeMb\"\xa6\x06\n" +
 	"\x14DeploymentDescriptor\x12!\n" +
 	"\fcomponent_id\x18\x01 \x01(\tR\vcomponentId\x12\x10\n" +
 	"\x03env\x18\x02 \x01(\tR\x03env\x12-\n" +
@@ -1378,7 +1407,10 @@ const file_proto_runtime_v1_fleet_proto_rawDesc = "" +
 	"\rscale_to_zero\x18\r \x01(\bR\vscaleToZero\x12(\n" +
 	"\x10idle_ttl_seconds\x18\x0e \x01(\x05R\x0eidleTtlSeconds\x12!\n" +
 	"\fmin_replicas\x18\x0f \x01(\x05R\vminReplicas\x12!\n" +
-	"\fmax_replicas\x18\x10 \x01(\x05R\vmaxReplicas\x1a:\n" +
+	"\fmax_replicas\x18\x10 \x01(\x05R\vmaxReplicas\x12\x1f\n" +
+	"\vvault_token\x18\x11 \x01(\tR\n" +
+	"vaultToken\x12.\n" +
+	"\x13registry_pull_token\x18\x12 \x01(\tR\x11registryPullToken\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"q\n" +
