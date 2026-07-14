@@ -36,6 +36,26 @@ type FleetOrchestrator struct {
 	routes        repository.RouteRepository
 	ingressDomain string
 	ingress       IngressSyncer
+
+	// activityFeed reports per-host request activity observed at the ingress
+	// gateway (Caddy access log). SweepIdle consults it so an app served directly
+	// through Caddy — bypassing the activator that stamps LastActiveAt — is not
+	// wrongly scaled to zero (#fleet-scale-to-zero-activity-feed, D-122). Nil on
+	// builds with no feed wired → SweepIdle keeps its pre-D-122 behavior.
+	activityFeed ActivityFeed
+}
+
+// ActivityFeed reports per-host request activity observed at the ingress gateway
+// (the Caddy access log). SweepIdle uses it to avoid scaling a directly-served
+// app to zero (#fleet-scale-to-zero-activity-feed, D-122).
+type ActivityFeed interface {
+	// LastActivity returns the last time host was seen in the access log and
+	// whether it has been observed at all.
+	LastActivity(host string) (time.Time, bool)
+	// Warm reports whether the feed has ingested the access log and its answers
+	// can be trusted. A cold or errored feed makes SweepIdle fail safe (treat
+	// every app as active).
+	Warm() bool
 }
 
 // NewFleetOrchestrator constructs the reconciler.
@@ -62,6 +82,11 @@ func (uc *FleetOrchestrator) SetIngress(routes repository.RouteRepository, ingre
 	uc.ingressDomain = ingressDomain
 	uc.ingress = ingress
 }
+
+// SetActivityFeed wires the ingress access-log activity feed consulted by
+// SweepIdle (#fleet-scale-to-zero-activity-feed, D-122). Optional and nil-safe:
+// a nil feed leaves SweepIdle's pre-D-122 behavior intact.
+func (uc *FleetOrchestrator) SetActivityFeed(feed ActivityFeed) { uc.activityFeed = feed }
 
 // hostForApp derives the platform-issued hostname for an app:
 // <sanitize(componentID)>-<env>.<ingressDomain>.
@@ -513,11 +538,91 @@ func (uc *FleetOrchestrator) SweepIdle(ctx context.Context) error {
 		if !hasResident {
 			continue
 		}
+		// #fleet-scale-to-zero-activity-feed (D-122): an app served directly through
+		// Caddy (bypassing the activator) shows fresh access-log activity even though
+		// nothing re-stamped LastActiveAt. Consult the feed before draining; a
+		// cold/errored feed fails safe (skip the sweep, keep the app running).
+		if uc.sweepBlockedByActivity(ctx, app) {
+			continue
+		}
 		if _, serr := uc.ScaleApp(ctx, app.ID, 0); serr != nil {
 			logger.FromContext(ctx).Warn("fleet sweep: scale to zero", "app_id", app.ID, "err", serr)
 		}
 	}
 	return nil
+}
+
+// sweepBlockedByActivity reports whether SweepIdle must SKIP scaling app to zero.
+// It returns true (skip) when a feed is wired AND either: the feed is cold /
+// errored / the app's host cannot be resolved (fail-safe: never scale a
+// possibly-busy app to zero, D-122), OR the feed observed a request AFTER
+// app.LastActiveAt (the app is served directly through Caddy → re-stamp
+// LastActiveAt and keep it running). It returns false (allow the sweep) when no
+// feed is wired, or the feed is warm and saw no traffic since the last stamp.
+func (uc *FleetOrchestrator) sweepBlockedByActivity(ctx context.Context, app *domain.FleetApp) bool {
+	if uc.activityFeed == nil {
+		return false
+	}
+	if !uc.activityFeed.Warm() {
+		logger.FromContext(ctx).Warn("fleet sweep: activity feed cold, treating app as active", "app_id", app.ID)
+		return true
+	}
+	hosts, err := uc.appHosts(ctx, app)
+	if err != nil {
+		logger.FromContext(ctx).Warn("fleet sweep: resolve app hosts, treating app as active", "app_id", app.ID, "err", err)
+		return true
+	}
+	var latest time.Time
+	seen := false
+	for _, h := range hosts {
+		if t, ok := uc.activityFeed.LastActivity(h); ok {
+			seen = true
+			if t.After(latest) {
+				latest = t
+			}
+		}
+	}
+	if seen && latest.After(app.LastActiveAt) {
+		uc.stampActive(ctx, app)
+		return true
+	}
+	return false
+}
+
+// appHosts returns the ingress host(s) an app is served under (host_pattern +
+// custom_domain per route). Falls back to the platform-issued host when the
+// route repo is not wired.
+func (uc *FleetOrchestrator) appHosts(ctx context.Context, app *domain.FleetApp) ([]string, error) {
+	if uc.routes == nil {
+		return []string{uc.hostForApp(app)}, nil
+	}
+	routes, err := uc.routes.ListByApp(ctx, app.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list routes: %w", err)
+	}
+	hosts := make([]string, 0, len(routes)*2)
+	for i := range routes {
+		if routes[i].HostPattern != "" {
+			hosts = append(hosts, routes[i].HostPattern)
+		}
+		if routes[i].CustomDomain != "" {
+			hosts = append(hosts, routes[i].CustomDomain)
+		}
+	}
+	return hosts, nil
+}
+
+// stampActive refreshes app.LastActiveAt (and persists it) so a directly-served
+// app the feed just saw is not re-swept next tick. Mirrors the activator's stamp
+// on the wake path. Best-effort — a persist failure is logged, never aborting
+// the sweep.
+func (uc *FleetOrchestrator) stampActive(ctx context.Context, app *domain.FleetApp) {
+	now := time.Now().UTC()
+	app.LastActiveAt = now
+	app.UpdatedAt = now
+	if err := uc.apps.Update(ctx, app); err != nil {
+		logger.FromContext(ctx).Warn("fleet sweep: stamp last_active_at", "app_id", app.ID, "err", err)
+	}
 }
 
 // HealthApp reports the aggregate health of an app's replica set. The bool
@@ -632,6 +737,21 @@ func (uc *FleetOrchestrator) DecommissionApp(ctx context.Context, appID uuid.UUI
 		return true, fmt.Errorf("delete fleet app: %w", err)
 	}
 	return true, nil
+}
+
+// OwnerOrgForApp returns the owner org of the app identified by appID. The bool
+// reports whether appID is a known app (false → caller falls back to the
+// workload path). The by-handle caller-org check (#fleet-handle-ops-org-check,
+// D-083) uses this to authorize Health/Decommission/Scale on a leaked handle.
+func (uc *FleetOrchestrator) OwnerOrgForApp(ctx context.Context, appID uuid.UUID) (string, bool, error) {
+	app, err := uc.apps.FindByID(ctx, appID)
+	if err != nil {
+		if errors.Is(err, domain.ErrFleetAppNotFound) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("load app: %w", err)
+	}
+	return app.OwnerOrg, true, nil
 }
 
 // ScaleApp sets the app's desired replica count and reconciles. The bool

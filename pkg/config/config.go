@@ -67,6 +67,12 @@ type CaddyConfig struct {
 	// AdminEndpoint is the Caddy admin JSON API base URL (loopback-bound on the
 	// fleet host). The syncer POSTs the full config to <AdminEndpoint>/load.
 	AdminEndpoint string `mapstructure:"admin_endpoint"`
+	// AccessLogPath is the host file the fleet Caddy server writes JSON access
+	// logs to (#fleet-scale-to-zero-activity-feed, D-122). The activity feed
+	// tails it to detect apps served directly through Caddy (bypassing the
+	// activator) so SweepIdle does not scale a busy app to zero. Empty disables
+	// access logging (and the feed); the syncer then emits no logging block.
+	AccessLogPath string `mapstructure:"access_log_path"`
 }
 
 // RegistryConfig configures the OCI registry the image-boot path pulls compiled
@@ -451,16 +457,17 @@ func Load() (*Config, error) {
 			"imageboot.advertise_host": "10.0.10.244",
 
 			// Fleet self-registration + heartbeat (runtime-fleet CP4 §9#4).
-			"fleet.host_id":              "",
-			"fleet.region":               "homelab",
-			"fleet.host_disk_mb":         51200,
-			"fleet.heartbeat_interval":   "10s",
-			"fleet.secret_selftest":      false,
-			"fleet.volume_dir":           "",
-			"fleet.ingress_domain":       "fleet.sentiae.local",
-			"fleet.caddy.admin_endpoint": "http://127.0.0.1:2019",
-			"fleet.activate_timeout":     "30s",
-			"fleet.activator_endpoint":   "127.0.0.1:8090",
+			"fleet.host_id":               "",
+			"fleet.region":                "homelab",
+			"fleet.host_disk_mb":          51200,
+			"fleet.heartbeat_interval":    "10s",
+			"fleet.secret_selftest":       false,
+			"fleet.volume_dir":            "",
+			"fleet.ingress_domain":        "fleet.sentiae.local",
+			"fleet.caddy.admin_endpoint":  "http://127.0.0.1:2019",
+			"fleet.caddy.access_log_path": "/var/log/sentiae/caddy-access.log",
+			"fleet.activate_timeout":      "30s",
+			"fleet.activator_endpoint":    "127.0.0.1:8090",
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -600,6 +607,7 @@ func Load() (*Config, error) {
 			{"fleet.volume_dir", "APP_FLEET_VOLUME_DIR"},
 			{"fleet.ingress_domain", "APP_FLEET_INGRESS_DOMAIN"},
 			{"fleet.caddy.admin_endpoint", "APP_FLEET_CADDY_ADMIN_ENDPOINT"},
+			{"fleet.caddy.access_log_path", "APP_FLEET_CADDY_ACCESS_LOG_PATH"},
 			{"fleet.activate_timeout", "APP_FLEET_ACTIVATE_TIMEOUT"},
 			{"fleet.activator_endpoint", "APP_FLEET_ACTIVATOR_ENDPOINT"},
 		},

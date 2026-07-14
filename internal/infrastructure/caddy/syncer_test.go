@@ -72,7 +72,7 @@ func TestBuildConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := buildConfig(tt.routes, "127.0.0.1:8090")
+			cfg := buildConfig(tt.routes, "127.0.0.1:8090", "")
 			raw, err := json.Marshal(cfg)
 			if err != nil {
 				t.Fatalf("marshal: %v", err)
@@ -117,4 +117,53 @@ func TestBuildConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBuildConfigAccessLog covers the #fleet-scale-to-zero-activity-feed (D-122)
+// logging wiring: an empty path emits no logging block; a set path emits a
+// top-level JSON access log + routes the fleet server to it.
+func TestBuildConfigAccessLog(t *testing.T) {
+	routes := []usecase.IngressRoute{
+		{Host: "app-prod.fleet.sentiae.local", Upstreams: []string{"10.201.0.2:8080"}},
+	}
+
+	t.Run("no path yields no logging block", func(t *testing.T) {
+		cfg := buildConfig(routes, "127.0.0.1:8090", "")
+		if _, ok := cfg["logging"]; ok {
+			t.Fatalf("logging block present with empty access-log path")
+		}
+		fleet := cfg["apps"].(map[string]any)["http"].(map[string]any)["servers"].(map[string]any)["fleet"].(map[string]any)
+		if _, ok := fleet["logs"]; ok {
+			t.Fatalf("server logs present with empty access-log path")
+		}
+	})
+
+	t.Run("path yields json access log routed from the fleet server", func(t *testing.T) {
+		const path = "/var/log/sentiae/caddy-access.log"
+		cfg := buildConfig(routes, "127.0.0.1:8090", path)
+
+		fleet := cfg["apps"].(map[string]any)["http"].(map[string]any)["servers"].(map[string]any)["fleet"].(map[string]any)
+		logs, ok := fleet["logs"].(map[string]any)
+		if !ok || logs["default_logger_name"] != fleetAccessLogName {
+			t.Fatalf("fleet server not routed to %q log: %v", fleetAccessLogName, fleet["logs"])
+		}
+
+		raw, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		js := string(raw)
+		for _, frag := range []string{
+			`"logging"`,
+			`"fleet_access"`,
+			`"output":"file"`,
+			`"filename":"` + path + `"`,
+			`"format":"json"`,
+			`"http.log.access.fleet_access"`,
+		} {
+			if !strings.Contains(js, frag) {
+				t.Fatalf("fragment %q missing from config: %s", frag, js)
+			}
+		}
+	})
 }

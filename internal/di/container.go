@@ -204,6 +204,12 @@ type Container struct {
 	// orchestrator is wired (firecracker executor).
 	FleetActivatorUC *usecase.FleetActivator
 
+	// #fleet-scale-to-zero-activity-feed (D-122) — tails the fleet Caddy access
+	// log so SweepIdle does not scale a directly-served app to zero. Non-nil only
+	// on the firecracker executor with an access-log path configured; its Run
+	// goroutine is started in the lifecycle.
+	FleetActivityFeed *caddy.AccessLogFeed
+
 	// Use Cases
 	ExecutionUC  usecase.ExecutionUseCase
 	VMUC         usecase.VMUseCase
@@ -408,8 +414,24 @@ func (c *Container) initFleet(cfg *config.Config) {
 		// stable https URL.
 		var ingressSyncer usecase.IngressSyncer
 		if cfg.App.ExecutorType == "firecracker" {
-			ingressSyncer = caddy.NewSyncer(cfg.Fleet.Caddy.AdminEndpoint, cfg.Fleet.ActivatorEndpoint)
+			ingressSyncer = caddy.NewSyncer(cfg.Fleet.Caddy.AdminEndpoint, cfg.Fleet.ActivatorEndpoint, cfg.Fleet.Caddy.AccessLogPath)
 			log.Printf("Fleet ingress: Caddy syncer wired (admin=%s, domain=%s, activator=%s)", cfg.Fleet.Caddy.AdminEndpoint, cfg.Fleet.IngressDomain, cfg.Fleet.ActivatorEndpoint)
+
+			// #fleet-scale-to-zero-activity-feed (D-122) — tail the Caddy access log
+			// so SweepIdle skips draining an app served directly through Caddy. Only
+			// when an access-log path is configured; its Run goroutine starts in Start.
+			if cfg.Fleet.Caddy.AccessLogPath != "" {
+				// Caddy runs co-located in this process (root on the KVM host) and
+				// writes the access log here; ensure the parent dir exists so the
+				// first Sync/tail does not fail on a missing directory. Non-fatal —
+				// a missing dir only leaves the feed cold (SweepIdle fails safe).
+				if err := os.MkdirAll(filepath.Dir(cfg.Fleet.Caddy.AccessLogPath), 0o755); err != nil {
+					log.Printf("Warning: fleet activity feed: create access-log dir %q failed (%v) — feed will stay cold until Caddy can write it", filepath.Dir(cfg.Fleet.Caddy.AccessLogPath), err)
+				}
+				c.FleetActivityFeed = caddy.NewAccessLogFeed(cfg.Fleet.Caddy.AccessLogPath, 0)
+				c.FleetOrchestratorUC.SetActivityFeed(c.FleetActivityFeed)
+				log.Printf("Fleet activity feed: tailing Caddy access log (%s)", cfg.Fleet.Caddy.AccessLogPath)
+			}
 		}
 		c.FleetOrchestratorUC.SetIngress(c.RouteRepo, cfg.Fleet.IngressDomain, ingressSyncer)
 
@@ -1277,8 +1299,22 @@ func (c *Container) StartBackgroundControllers(ctx context.Context) {
 		log.Printf("[FC-POOL] %d warm pool(s) started", len(c.FCPools))
 	}
 	c.startFleetHeartbeat(ctx)
+	c.startFleetActivityFeed(ctx)
 	c.startFleetReconciler(ctx)
 	c.StartConsumers(ctx)
+}
+
+// startFleetActivityFeed starts the Caddy access-log tailer that backs the
+// SweepIdle direct-serve guard (#fleet-scale-to-zero-activity-feed, D-122). No-op
+// when the feed is not wired (non-firecracker executor or no access-log path).
+// The feed's Run is ctx-aware + panic-recovering and exits on ctx cancel; it is
+// started BEFORE the reconciler so it can warm before the first sweep.
+func (c *Container) startFleetActivityFeed(ctx context.Context) {
+	if c.FleetActivityFeed == nil {
+		return
+	}
+	go c.FleetActivityFeed.Run(ctx)
+	log.Println("[FLEET-ACTIVITY] access-log activity feed started")
 }
 
 // startFleetReconciler runs the CP4 §9#7 fleet reconcile loop, driving every

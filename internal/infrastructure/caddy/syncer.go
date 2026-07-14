@@ -21,6 +21,11 @@ import (
 // runtime-service scale-to-zero activator when a route has no live upstream.
 const defaultActivatorDial = "127.0.0.1:8090"
 
+// fleetAccessLogName is the Caddy named-log the fleet server routes its access
+// logs to (#fleet-scale-to-zero-activity-feed, D-122). The activity feed tails
+// the file this log writes to.
+const fleetAccessLogName = "fleet_access"
+
 // Syncer pushes the desired ingress route set to a local Caddy admin endpoint.
 type Syncer struct {
 	admin string
@@ -28,23 +33,29 @@ type Syncer struct {
 	// (rt#11): a route with zero live upstreams reverse-proxies to this loopback
 	// activator instead of serving a dead 503.
 	activator string
-	http      *http.Client
+	// accessLogPath is the host file the fleet server writes JSON access logs to
+	// (rt#11/D-122). Empty → no logging block is emitted (access logging off).
+	accessLogPath string
+	http          *http.Client
 }
 
 var _ usecase.IngressSyncer = (*Syncer)(nil)
 
 // NewSyncer constructs a Syncer targeting the Caddy admin base URL (e.g.
 // http://127.0.0.1:2019). activatorDial is the loopback "host:port" of the
-// runtime-service scale-to-zero activator (empty → 127.0.0.1:8090). The 5s
-// client timeout bounds a hung admin endpoint so the reconcile tick never blocks.
-func NewSyncer(admin, activatorDial string) *Syncer {
+// runtime-service scale-to-zero activator (empty → 127.0.0.1:8090).
+// accessLogPath is the host file the fleet server writes JSON access logs to
+// (empty → access logging disabled). The 5s client timeout bounds a hung admin
+// endpoint so the reconcile tick never blocks.
+func NewSyncer(admin, activatorDial, accessLogPath string) *Syncer {
 	if activatorDial == "" {
 		activatorDial = defaultActivatorDial
 	}
 	return &Syncer{
-		admin:     admin,
-		activator: activatorDial,
-		http:      &http.Client{Timeout: 5 * time.Second},
+		admin:         admin,
+		activator:     activatorDial,
+		accessLogPath: accessLogPath,
+		http:          &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
@@ -52,7 +63,7 @@ func NewSyncer(admin, activatorDial string) *Syncer {
 // failure (unreachable admin, non-2xx) is returned wrapped for the caller to
 // log-and-continue — the reconciler must never crash on an ingress hiccup.
 func (s *Syncer) Sync(ctx context.Context, routes []usecase.IngressRoute) error {
-	cfg := buildConfig(routes, s.activator)
+	cfg := buildConfig(routes, s.activator, s.accessLogPath)
 	body, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal caddy config: %w", err)
@@ -78,9 +89,11 @@ func (s *Syncer) Sync(ctx context.Context, routes []usecase.IngressRoute) error 
 // buildConfig assembles the full Caddy JSON: one HTTP server "fleet" on :443
 // (TLS) + :80 (auto HTTP→HTTPS redirect), one route per IngressRoute, and a TLS
 // automation policy issuing internal (local CA) certs for the platform
-// subdomains. Returned as a map because it is a wire document (JSON), not a
-// domain type.
-func buildConfig(routes []usecase.IngressRoute, activatorDial string) map[string]any {
+// subdomains. When accessLogPath is non-empty the fleet server also emits JSON
+// access logs to that file (each entry carries request.host) via a named log —
+// what the activity feed tails (#fleet-scale-to-zero-activity-feed, D-122).
+// Returned as a map because it is a wire document (JSON), not a domain type.
+func buildConfig(routes []usecase.IngressRoute, activatorDial, accessLogPath string) map[string]any {
 	httpRoutes := make([]any, 0, len(routes))
 	platformHosts := make([]any, 0, len(routes))
 	for _, r := range routes {
@@ -90,13 +103,21 @@ func buildConfig(routes []usecase.IngressRoute, activatorDial string) map[string
 		}
 	}
 
+	fleetServer := map[string]any{
+		"listen": []any{":443", ":80"},
+		"routes": httpRoutes,
+	}
+	// rt#11/D-122 — route this server's access logs to the named "fleet_access"
+	// log (defined under top-level "logging" below). The hot request path is
+	// untouched: this only mirrors each handled request to the log file.
+	if accessLogPath != "" {
+		fleetServer["logs"] = map[string]any{"default_logger_name": fleetAccessLogName}
+	}
+
 	apps := map[string]any{
 		"http": map[string]any{
 			"servers": map[string]any{
-				"fleet": map[string]any{
-					"listen": []any{":443", ":80"},
-					"routes": httpRoutes,
-				},
+				"fleet": fleetServer,
 			},
 		},
 	}
@@ -117,7 +138,27 @@ func buildConfig(routes []usecase.IngressRoute, activatorDial string) map[string
 		}
 	}
 
-	return map[string]any{"apps": apps}
+	cfg := map[string]any{"apps": apps}
+
+	// rt#11/D-122 — top-level logging: a JSON access log written to accessLogPath,
+	// scoped (via include) to only the fleet server's access records so the file
+	// stays parseable one-request-per-line for the activity feed's tailer.
+	if accessLogPath != "" {
+		cfg["logging"] = map[string]any{
+			"logs": map[string]any{
+				fleetAccessLogName: map[string]any{
+					"writer": map[string]any{
+						"output":   "file",
+						"filename": accessLogPath,
+					},
+					"encoder": map[string]any{"format": "json"},
+					"include": []any{"http.log.access." + fleetAccessLogName},
+				},
+			},
+		}
+	}
+
+	return cfg
 }
 
 // buildRoute builds one Caddy route: a host matcher over [Host, CustomDomain]

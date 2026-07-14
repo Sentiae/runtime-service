@@ -389,6 +389,51 @@ func (uc *FleetProvision) Provision(ctx context.Context, in FleetProvisionInput)
 	return FleetProvisionOutput{Handle: wl.ID.String(), URL: url}, nil
 }
 
+// OwnerOrgForHandle resolves the owning org of a fleet handle for the by-handle
+// caller-org check (#fleet-handle-ops-org-check, D-083): Health/Decommission/
+// Scale act on an unguessable handle, so a leaked one must not let a foreign
+// caller act on another org's app. It fails closed — an unparseable or unknown
+// handle returns ErrWorkloadNotFound (the same not-found shape the other methods
+// yield). A handle with no owning org (a test-class workload — which stores none
+// — or an app whose OwnerOrg is empty) returns uuid.Nil, mirroring Provision's
+// empty-owner_org pass-through so the caller skips the org gate.
+func (uc *FleetProvision) OwnerOrgForHandle(ctx context.Context, handle string) (uuid.UUID, error) {
+	id, err := uuid.Parse(handle)
+	if err != nil {
+		return uuid.Nil, domain.ErrWorkloadNotFound
+	}
+	if uc.orchestrator != nil {
+		org, isApp, oerr := uc.orchestrator.OwnerOrgForApp(ctx, id)
+		if oerr != nil {
+			return uuid.Nil, oerr
+		}
+		if isApp {
+			return parseOwnerOrg(org)
+		}
+	}
+	// Not a known app: the handle must be a test-class / fallback workload. Confirm
+	// it exists (fail closed on an unknown handle) — the row carries no owner org,
+	// so an existing one is org-less (uuid.Nil → gate skipped, as Provision does).
+	if _, err := uc.repo.FindByID(ctx, id); err != nil {
+		return uuid.Nil, err
+	}
+	return uuid.Nil, nil
+}
+
+// parseOwnerOrg maps a stored owner-org string to a uuid. Empty → uuid.Nil (no
+// org to gate on). A non-empty value is a uuid validated at provision time, so a
+// parse failure here is corrupt state and fails closed with an error.
+func parseOwnerOrg(org string) (uuid.UUID, error) {
+	if org == "" {
+		return uuid.Nil, nil
+	}
+	id, err := uuid.Parse(org)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("parse owner org: %w", err)
+	}
+	return id, nil
+}
+
 // Scale sets the desired replica count for a resident app (routed to the CP4
 // orchestrator). A handle that is not a known app returns ErrWorkloadNotFound.
 func (uc *FleetProvision) Scale(ctx context.Context, handle string, replicas int) error {

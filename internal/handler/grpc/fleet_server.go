@@ -103,10 +103,37 @@ func (s *FleetServer) Provision(ctx context.Context, req *runtimev1.ProvisionReq
 	return &runtimev1.ProvisionResponse{Handle: out.Handle, Url: out.URL}, nil
 }
 
+// authorizeHandleOrg is the by-handle counterpart of Provision's owner_org gate
+// (#fleet-handle-ops-org-check, D-083): Health/Decommission/Scale act on an
+// unguessable handle, so a leaked one must not let a foreign caller act on
+// another org's app. It resolves the handle's owning org and shadow-authorizes
+// the caller against it with the EXACT same enforce flag as Provision. An
+// org-less handle (a test-class workload, or an app with no owner org) skips the
+// gate exactly as Provision's empty owner_org does. On success it returns the
+// (possibly org-stamped) context so the caller can propagate the active org, and
+// preserves the existing not-found mapping for an unknown handle.
+func (s *FleetServer) authorizeHandleOrg(ctx context.Context, handle string) (context.Context, error) {
+	ownerOrg, err := s.provision.OwnerOrgForHandle(ctx, handle)
+	if err != nil {
+		return ctx, fleetError(err)
+	}
+	if ownerOrg == uuid.Nil {
+		return ctx, nil
+	}
+	if err := tenant.AuthorizeOrgShadow(ctx, ownerOrg, pkconfig.OrgEnforce()); err != nil {
+		return ctx, err
+	}
+	return tenant.WithActiveOrg(ctx, ownerOrg), nil
+}
+
 // Health reports the current state + health of a workload.
 func (s *FleetServer) Health(ctx context.Context, req *runtimev1.FleetHealthRequest) (*runtimev1.FleetHealthResponse, error) {
 	if s.provision == nil {
 		return nil, status.Error(codes.Unavailable, "fleet provision use case not configured")
+	}
+	ctx, err := s.authorizeHandleOrg(ctx, req.GetHandle())
+	if err != nil {
+		return nil, err
 	}
 	out, err := s.provision.Health(ctx, req.GetHandle())
 	if err != nil {
@@ -128,6 +155,10 @@ func (s *FleetServer) Decommission(ctx context.Context, req *runtimev1.FleetDeco
 	if s.provision == nil {
 		return nil, status.Error(codes.Unavailable, "fleet provision use case not configured")
 	}
+	ctx, err := s.authorizeHandleOrg(ctx, req.GetHandle())
+	if err != nil {
+		return nil, err
+	}
 	if err := s.provision.Decommission(ctx, req.GetHandle()); err != nil {
 		return nil, fleetError(err)
 	}
@@ -138,6 +169,10 @@ func (s *FleetServer) Decommission(ctx context.Context, req *runtimev1.FleetDeco
 func (s *FleetServer) Scale(ctx context.Context, req *runtimev1.FleetScaleRequest) (*runtimev1.FleetScaleResponse, error) {
 	if s.provision == nil {
 		return nil, status.Error(codes.Unavailable, "fleet provision use case not configured")
+	}
+	ctx, err := s.authorizeHandleOrg(ctx, req.GetHandle())
+	if err != nil {
+		return nil, err
 	}
 	if err := s.provision.Scale(ctx, req.GetHandle(), int(req.GetReplicas())); err != nil {
 		return nil, fleetError(err)
