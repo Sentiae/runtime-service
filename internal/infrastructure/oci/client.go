@@ -7,13 +7,64 @@ package oci
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/sentiae/runtime-service/pkg/logger"
 )
+
+// ErrDigestMismatch is returned when content fetched by a sha256 content address
+// does not hash to that address — a corrupt or MITM'd registry response over
+// plain HTTP. Fetching by digest is content-addressed, so a mismatch means the
+// bytes are NOT the bytes that were requested: the pull/boot MUST fail closed
+// and never assemble a rootfs from unverified content.
+var ErrDigestMismatch = errors.New("oci: fetched content digest mismatch")
+
+// verifyDigest checks that content hashes to the sha256 digest it was requested
+// by. A reference that is not a "sha256:" content address (e.g. a tag) has no
+// digest to verify against and returns nil — only digest-addressed fetches are
+// verified. Used for content that is already buffered whole (manifests, config).
+func verifyDigest(requested string, content []byte) error {
+	if !strings.HasPrefix(requested, "sha256:") {
+		return nil
+	}
+	sum := sha256.Sum256(content)
+	return checkDigest(requested, "sha256:"+hex.EncodeToString(sum[:]))
+}
+
+// verifyDigestSum finalizes a streaming hasher that was fed the ENTIRE fetched
+// content and checks it against the requested sha256 digest. Used for large
+// layer blobs hashed while streaming, so they are never buffered whole in memory.
+func verifyDigestSum(requested string, h hash.Hash) error {
+	if !strings.HasPrefix(requested, "sha256:") {
+		return nil
+	}
+	return checkDigest(requested, "sha256:"+hex.EncodeToString(h.Sum(nil)))
+}
+
+// checkDigest compares the computed digest against the requested one, logging
+// and returning a hard fail-closed error on mismatch. Digests are content
+// addresses, not secrets — both sides are safe to log.
+func checkDigest(requested, got string) error {
+	if got == requested {
+		return nil
+	}
+	// pkg/logger is initialized in the server bootstrap; guard the nil case so
+	// a verification failure surfaced from a unit test (no Init) still returns
+	// the error instead of panicking on a nil logger.
+	if logger.ErrorLogger != nil {
+		logger.Error(fmt.Sprintf("oci content-trust: digest mismatch: requested=%s got=%s", requested, got))
+	}
+	return fmt.Errorf("digest mismatch for %s: got %s: %w", requested, got, ErrDigestMismatch)
+}
 
 // Media types the client accepts / understands.
 const (
@@ -161,6 +212,10 @@ func (c *Client) FetchManifest(ctx context.Context, repo, digest string) (resolv
 }
 
 // FetchBlob streams a blob (layer or config) for repo@digest. The caller closes.
+// The returned stream is UNVERIFIED: because a blob is streamed (not buffered),
+// the caller MUST hash the bytes it reads and compare against digest
+// (verifyDigestSum for the streaming layer path, verifyDigest for buffered
+// callers) and fail closed on mismatch before trusting the content.
 func (c *Client) FetchBlob(ctx context.Context, repo, digest string) (io.ReadCloser, error) {
 	url := fmt.Sprintf("http://%s/v2/%s/blobs/%s", c.cfg.Host, repo, digest)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -201,6 +256,12 @@ func (c *Client) getManifest(ctx context.Context, repo, digest string) ([]byte, 
 	if resp.StatusCode >= 300 {
 		return nil, "", fmt.Errorf("fetch manifest %s@%s: registry returned %d: %s", repo, digest, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+	// Content-trust: when fetched BY DIGEST, the raw manifest bytes must hash to
+	// the requested address (a manifest fetched by tag has no digest and is
+	// skipped by verifyDigest). Fail closed before the caller parses it.
+	if err := verifyDigest(digest, body); err != nil {
+		return nil, "", fmt.Errorf("verify manifest %s@%s: %w", repo, digest, err)
+	}
 	return body, resp.Header.Get("Content-Type"), nil
 }
 
@@ -214,6 +275,11 @@ func (c *Client) fetchConfig(ctx context.Context, repo, digest string) (ImageCon
 	body, err := io.ReadAll(rc)
 	if err != nil {
 		return ImageConfig{}, fmt.Errorf("read config blob: %w", err)
+	}
+	// Content-trust: the config blob is fetched by digest and buffered whole, so
+	// hash the buffer and fail closed on mismatch before parsing it.
+	if err := verifyDigest(digest, body); err != nil {
+		return ImageConfig{}, fmt.Errorf("verify config blob: %w", err)
 	}
 	var cb configBlob
 	if err := json.Unmarshal(body, &cb); err != nil {

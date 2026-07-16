@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -140,7 +141,13 @@ func (m *Materializer) applyLayer(ctx context.Context, cl *Client, repo, digest,
 	}
 	defer rc.Close()
 
-	br := bufio.NewReader(rc)
+	// Content-trust: hash the raw blob bytes as they stream through (never buffer
+	// the whole layer). The TeeReader sits UNDER gzip/tar so it sees the exact
+	// on-wire bytes the digest addresses, whatever the declared compression.
+	hasher := sha256.New()
+	tee := io.TeeReader(rc, hasher)
+
+	br := bufio.NewReader(tee)
 	var src io.Reader = br
 	if magic, _ := br.Peek(2); len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
 		gz, err := gzip.NewReader(br)
@@ -151,7 +158,18 @@ func (m *Materializer) applyLayer(ctx context.Context, cl *Client, repo, digest,
 		src = gz
 	}
 
-	return unpackTar(src, stagingDir, budget)
+	if err := unpackTar(src, stagingDir, budget); err != nil {
+		return err
+	}
+
+	// The tar/gzip readers stop at the archive end and may leave the gzip trailer
+	// and tar padding unread; drain them through the tee so the hasher sees the
+	// ENTIRE blob before verifying. Fail closed: a mismatch aborts before the
+	// staged layer is trusted (Stage returns the error, the rootfs is not built).
+	if _, err := io.Copy(io.Discard, br); err != nil {
+		return fmt.Errorf("drain layer blob %s: %w", digest, err)
+	}
+	return verifyDigestSum(digest, hasher)
 }
 
 // maxUnpackedBytes caps the total DECOMPRESSED bytes written across all of an

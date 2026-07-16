@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,13 @@ import (
 	"strings"
 	"testing"
 )
+
+// digestOf returns the sha256 content address of b, matching the on-wire digest
+// the pull client re-verifies against.
+func digestOf(b []byte) string {
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
 
 // fakeRegistry serves an OCI image: index → linux/amd64 manifest → config +
 // two gzipped layers. The second layer whiteouts a file the first created.
@@ -127,11 +136,11 @@ func TestMaterializerStage(t *testing.T) {
 		},
 	})
 
-	configDigest := "sha256:cfg"
-	l1Digest := "sha256:layer1"
-	l2Digest := "sha256:layer2"
-	manDigest := "sha256:manifest"
-	idxDigest := "sha256:index"
+	// Real content addresses: the pull client re-hashes every by-digest fetch and
+	// fails closed on mismatch, so the fake registry must key on true digests.
+	configDigest := digestOf(configBody)
+	l1Digest := digestOf(layer1)
+	l2Digest := digestOf(layer2)
 
 	manifest, _ := json.Marshal(imageManifest{
 		MediaType: mediaTypeOCIManifest,
@@ -141,6 +150,7 @@ func TestMaterializerStage(t *testing.T) {
 			{MediaType: "application/vnd.oci.image.layer.v1.tar+gzip", Digest: l2Digest},
 		},
 	})
+	manDigest := digestOf(manifest)
 	index, _ := json.Marshal(imageIndex{
 		MediaType: mediaTypeOCIIndex,
 		Manifests: []descriptor{
@@ -148,6 +158,7 @@ func TestMaterializerStage(t *testing.T) {
 			{MediaType: mediaTypeOCIManifest, Digest: "sha256:arm", Platform: &platformSpec{OS: "linux", Architecture: "arm64"}},
 		},
 	})
+	idxDigest := digestOf(index)
 
 	reg := &fakeRegistry{
 		repo: "org/component",
