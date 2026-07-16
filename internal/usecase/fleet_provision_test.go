@@ -18,12 +18,41 @@ type fakeWorkloadRepo struct {
 func newFakeWorkloadRepo() *fakeWorkloadRepo {
 	return &fakeWorkloadRepo{store: map[uuid.UUID]*domain.ImageWorkload{}}
 }
+
+// errFakeDuplicateKey stands in for the Postgres unique violation on
+// (owner_org, idempotency_key). The fake enforces the constraint for real —
+// a fake that accepted duplicates would make the idempotency tests vacuous.
+var errFakeDuplicateKey = errors.New("fake: duplicate key")
+
 func (f *fakeWorkloadRepo) Create(_ context.Context, w *domain.ImageWorkload) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if w.IdempotencyKey != nil {
+		for _, existing := range f.store {
+			if existing.IdempotencyKey != nil &&
+				*existing.IdempotencyKey == *w.IdempotencyKey &&
+				existing.OwnerOrg == w.OwnerOrg {
+				return errFakeDuplicateKey
+			}
+		}
+	}
 	cp := *w
 	f.store[w.ID] = &cp
 	return nil
+}
+func (f *fakeWorkloadRepo) FindByIdempotencyKey(_ context.Context, ownerOrg, key string) (*domain.ImageWorkload, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, w := range f.store {
+		if w.IdempotencyKey != nil && *w.IdempotencyKey == key && w.OwnerOrg == ownerOrg {
+			cp := *w
+			return &cp, nil
+		}
+	}
+	return nil, domain.ErrWorkloadNotFound
+}
+func (f *fakeWorkloadRepo) IsDuplicateKey(err error) bool {
+	return errors.Is(err, errFakeDuplicateKey)
 }
 func (f *fakeWorkloadRepo) Update(_ context.Context, w *domain.ImageWorkload) error {
 	f.mu.Lock()

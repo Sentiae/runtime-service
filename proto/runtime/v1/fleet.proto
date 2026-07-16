@@ -34,13 +34,13 @@ message DeploymentDescriptor {
     OCIImageRef image = 3;
     ResourceSpec resources = 4;          // 0 values → defaults (1 vcpu, 512 MB)
     map<string, string> env_vars = 5;
-    repeated string secret_refs = 6;     // resident class: tenant-namespaced refs ("tenants/<org-uuid>/<subpath>#<field>") resolved per-tenant at boot (P14/I32); test class rejects them
+    repeated string secret_refs = 6;     // resident + job classes: tenant-namespaced refs ("tenants/<org-uuid>/<subpath>#<field>") resolved per-tenant at boot (P14/I32); test class rejects them
     repeated RouteSpec routes = 7;       // ignored in CP3
     repeated VolumeSpec volumes = 8;     // ignored in CP3
     int32 port = 9;                      // guest port the workload listens on (resident class)
-    string workload_class = 10;          // "test" | "resident"
-    string test_command = 11;            // test class only: overrides the image entrypoint when non-empty (run via /bin/sh -c)
-    int64 timeout_seconds = 12;          // test class: max run time (default 300)
+    string workload_class = 10;          // "test" | "resident" | "job" — STRING, never an enum (wire-compat)
+    string test_command = 11;            // test class only: overrides the image entrypoint when non-empty (run via /bin/sh -c); rejected on the job class (use job_command)
+    int64 timeout_seconds = 12;          // test + job classes: max run time (default 300); enforced as a real substrate deadline (the VM is killed)
     // Scale-to-zero (rt#11, D-082). 0-defaults preserve today's behavior.
     bool scale_to_zero = 13;             // resident class: allow the fleet to drain to zero replicas when idle
     int32 idle_ttl_seconds = 14;         // resident class: seconds of inactivity before scale-to-zero (0 disables)
@@ -61,6 +61,26 @@ message DeploymentDescriptor {
     // (fleet) class only; empty on the test leg and pre-cutover (the fleet then
     // falls back to the shared service key — back-compat).
     string registry_pull_token = 18;
+    // ── P7 RunJob seam: the one-shot "job" workload class ────────────────
+    // job_command is an ARGV-EXACT entrypoint override for the job class (e.g.
+    // ["/app/migrate","up"]). It is exec'd directly — NEVER shell-interpolated,
+    // never joined into a string, never run via `sh -c` (that is test_command's
+    // legacy behavior, and it is why test_command is rejected on the job class).
+    // Empty → the image's own entrypoint runs. Job class only.
+    repeated string job_command = 19;
+    // idempotency_key makes a job run at-most-once: a duplicate key returns the
+    // EXISTING handle instead of starting a second run. Load-bearing — a database
+    // migration that runs twice can destroy data. Uniqueness is scoped to
+    // (owner_org, idempotency_key) so one tenant's key can never resolve to
+    // another tenant's handle (I28). Empty → no idempotency (every call runs).
+    // Job class only.
+    string idempotency_key = 20;
+    // egress_allow is the job's network egress allowlist (IPs, CIDRs, or
+    // hostnames resolved once at boot). Non-empty installs a per-VM iptables
+    // chain that ACCEPTs only these destinations and DROPs the rest. Empty → no
+    // allowlist is installed (the class's default subnet rules apply). Job class
+    // only.
+    repeated string egress_allow = 21;
 }
 message ProvisionRequest {
     DeploymentDescriptor descriptor = 1;
@@ -71,14 +91,14 @@ message ProvisionRequest {
     // empty; a secret-bearing resident deploy without owner_org fails closed.
     string owner_org = 7;
 }
-message ProvisionResponse { string handle = 1; string url = 2; } // url set for resident class ("http://<advertise_host>:<host_port>"), empty for test
+message ProvisionResponse { string handle = 1; string url = 2; } // url set for resident class ("http://<advertise_host>:<host_port>"), empty for test + job
 message FleetHealthRequest { string handle = 1; }
 message FleetHealthResponse {
     string state = 1;        // "booting" | "running" | "exited" | "failed"
-    bool healthy = 2;        // resident: TCP dial guest port ok; test: state==exited && exit_code==0
-    int32 exit_code = 3;     // meaningful when state=="exited"
+    bool healthy = 2;        // resident: TCP dial guest port ok; test + job: state==exited && exit_code==0
+    int32 exit_code = 3;     // meaningful when state=="exited" (job: terminal == state=="exited", success == exit_code==0)
     string message = 4;
-    string stdout_tail = 5;  // last <=8KB, test class
+    string stdout_tail = 5;  // last <=8KB, test + job classes
     string stderr_tail = 6;
     string url = 7;
 }

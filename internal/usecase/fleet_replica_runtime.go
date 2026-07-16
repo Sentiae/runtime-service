@@ -96,38 +96,53 @@ func (uc *FleetReplicaRuntime) SetRegistryTokenStore(ts *FleetRegistryTokenStore
 // the caller pushes over vsock — never logged, never persisted.
 func (uc *FleetReplicaRuntime) bootSecrets(ctx context.Context, app *domain.FleetApp) ([]HostSecret, error) {
 	if len(app.SecretRefs) > 0 {
-		if uc.resolver == nil {
-			return nil, domain.ErrSecretResolverUnavailable
-		}
-		if app.OwnerOrg == "" {
-			return nil, domain.ErrSecretOwnerOrgMissing
-		}
-		p := secret.Principal{Service: "runtime-fleet", OrgID: app.OwnerOrg}
 		// D-125: stamp the app's handed per-deployment token (memory-only) so the
 		// HandedTokenEnvelopeResolver decrypts under it instead of the host minting.
 		// A missing token with a handed-token resolver fails closed at Resolve
 		// (no host-side mint fallback), preserving I32.
+		var token string
 		if uc.tokenStore != nil {
 			if tok, ok := uc.tokenStore.Get(app.ID); ok {
-				p.Token = tok
+				token = tok
 			}
 		}
-		secrets := make([]HostSecret, 0, len(app.SecretRefs))
-		for _, ref := range app.SecretRefs {
-			sv, err := uc.resolver.Resolve(ctx, ref, p)
-			if err != nil {
-				// ref is a reference (not the secret); safe to surface. The value
-				// is never touched here.
-				return nil, fmt.Errorf("resolve secret %q: %w", ref, err)
-			}
-			secrets = append(secrets, HostSecret{Name: fieldName(ref), Val: sv.Reveal()})
-		}
-		return secrets, nil
+		return resolveBootSecrets(ctx, uc.resolver, app.SecretRefs, app.OwnerOrg, token)
 	}
 	if uc.secretSelfTest {
 		return []HostSecret{{Name: selfTestSecretName, Val: selfTestSecretValue}}, nil
 	}
 	return nil, nil
+}
+
+// resolveBootSecrets resolves each secret_ref through the per-tenant resolver,
+// scoped to ownerOrg (I28) and decrypting under the handed per-deployment token
+// (D-125). It is THE boot-time P14 resolution path — shared by the resident
+// replica boot and the one-shot job boot so neither drifts from the other.
+//
+// It fails closed on ANY error (nil resolver, missing owner org, cross-tenant
+// denial, missing KEK, decrypt failure, not-found): the caller aborts the boot
+// rather than run a VM with missing or partial secrets (I32). A resolved value
+// is revealed only into the returned HostSecret the caller pushes over vsock —
+// never logged, never persisted.
+func resolveBootSecrets(ctx context.Context, resolver secret.Resolver, refs []string, ownerOrg, token string) ([]HostSecret, error) {
+	if resolver == nil {
+		return nil, domain.ErrSecretResolverUnavailable
+	}
+	if ownerOrg == "" {
+		return nil, domain.ErrSecretOwnerOrgMissing
+	}
+	p := secret.Principal{Service: "runtime-fleet", OrgID: ownerOrg, Token: token}
+	secrets := make([]HostSecret, 0, len(refs))
+	for _, ref := range refs {
+		sv, err := resolver.Resolve(ctx, ref, p)
+		if err != nil {
+			// ref is a reference (not the secret); safe to surface. The value is
+			// never touched here.
+			return nil, fmt.Errorf("resolve secret %q: %w", ref, err)
+		}
+		secrets = append(secrets, HostSecret{Name: fieldName(ref), Val: sv.Reveal()})
+	}
+	return secrets, nil
 }
 
 // fieldName extracts the "<field>" tail of a "<path>#<field>" secret_ref — the

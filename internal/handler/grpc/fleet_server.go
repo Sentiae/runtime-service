@@ -91,6 +91,11 @@ func (s *FleetServer) Provision(ctx context.Context, req *runtimev1.ProvisionReq
 		WorkloadClass:  d.GetWorkloadClass(),
 		TestCommand:    d.GetTestCommand(),
 		TimeoutSeconds: d.GetTimeoutSeconds(),
+		// P7 RunJob seam (job class). job_command stays a LIST all the way to the
+		// guest exec — it is never joined or shell-interpolated.
+		JobCommand:     d.GetJobCommand(),
+		IdempotencyKey: d.GetIdempotencyKey(),
+		EgressAllow:    d.GetEgressAllow(),
 		Volumes:        volumesFromProto(d.GetVolumes()),
 		ScaleToZero:    d.GetScaleToZero(),
 		IdleTTLSeconds: int(d.GetIdleTtlSeconds()),
@@ -309,9 +314,23 @@ func fleetError(err error) error {
 	case errors.Is(err, domain.ErrWorkloadNotFound):
 		return status.Error(codes.NotFound, "workload not found")
 	case errors.Is(err, domain.ErrUnsupportedClass):
-		return status.Error(codes.InvalidArgument, "unsupported workload class (want test|resident)")
+		return status.Error(codes.InvalidArgument, "unsupported workload class (want test|resident|job)")
 	case errors.Is(err, domain.ErrSecretsNotSupported):
-		return status.Error(codes.InvalidArgument, "secret_refs are only supported for resident workloads")
+		return status.Error(codes.InvalidArgument, "secret_refs are only supported for resident and job workloads")
+	case errors.Is(err, domain.ErrScaleNotSupported):
+		return status.Error(codes.FailedPrecondition, "scale is not supported for job workloads")
+	case errors.Is(err, domain.ErrTestCommandNotSupported):
+		return status.Error(codes.InvalidArgument, "test_command is not supported for job workloads (use job_command)")
+	case errors.Is(err, domain.ErrJobCommandNotSupported):
+		return status.Error(codes.InvalidArgument, "job_command is only supported for job workloads")
+	case errors.Is(err, domain.ErrIdempotencyKeyNotSupported):
+		return status.Error(codes.InvalidArgument, "idempotency_key is only supported for job workloads")
+	case errors.Is(err, domain.ErrIdempotencyOwnerOrgMissing):
+		return status.Error(codes.InvalidArgument, "idempotency_key requires an owner org")
+	case errors.Is(err, domain.ErrSecretResolverUnavailable):
+		return status.Error(codes.FailedPrecondition, "secret resolver unavailable on this host")
+	case errors.Is(err, domain.ErrSecretOwnerOrgMissing):
+		return status.Error(codes.InvalidArgument, "secret refs require an owner org")
 	case errors.Is(err, domain.ErrImageRefIncomplete):
 		return status.Error(codes.InvalidArgument, "image reference requires registry, repository, and digest")
 	case errors.Is(err, domain.ErrResidentPortRequired):

@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sentiae/platform-kit/logger"
+	"github.com/sentiae/platform-kit/secret"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/repository"
 )
@@ -56,9 +57,12 @@ type ImageMaterializeInput struct {
 	ChangeID    string
 	WorkDir     string
 	EnvVars     map[string]string
-	Mode        string // "test" | "resident"
+	Mode        string // "test" | "resident" | "job"
 	TestCommand string
-	Port        int
+	// JobCommand is the job class's argv-exact entrypoint override, carried as a
+	// list end-to-end (never a joined string) so the guest execs it directly.
+	JobCommand []string
+	Port       int
 	// ExpectSecrets tells the guest (via runtime.json) to open the vsock secret
 	// listener at boot and block on a host push before exec (invariant I32).
 	ExpectSecrets bool
@@ -125,6 +129,12 @@ type ImageBootInput struct {
 	// DataMountPath is the in-guest mount point for the data disk (informational at
 	// the boot layer; the guest reads it from runtime.json).
 	DataMountPath string
+	// EgressAllow is the job class's network egress allowlist (IPs/CIDRs/hostnames,
+	// resolved once at boot). Non-empty makes the booter install a per-VM iptables
+	// chain on the workload's TAP that ACCEPTs only these destinations and DROPs
+	// everything else, torn down with the TAP. Empty installs nothing (the class's
+	// default subnet rules apply) — so the test/resident paths are unaffected.
+	EgressAllow []string
 }
 
 // ImageTestResult is the outcome of a single-shot test boot.
@@ -211,6 +221,14 @@ type FleetProvisionInput struct {
 	TestCommand    string
 	TimeoutSeconds int64
 	Volumes        []VolumeSpecInput
+	// JobCommand is the job class's argv-exact entrypoint override (empty → the
+	// image's own entrypoint). Carried as a list end-to-end and never joined.
+	JobCommand []string
+	// IdempotencyKey makes a job at-most-once: a duplicate returns the existing
+	// handle instead of starting a second run. Scoped to OwnerOrg (I28).
+	IdempotencyKey string
+	// EgressAllow is the job's boot-time network egress allowlist.
+	EgressAllow []string
 	// Scale-to-zero desired state (rt#11, D-082). 0-defaults preserve today's
 	// behavior: ScaleToZero=false, MinReplicas=0, MaxReplicas defaults to 1.
 	ScaleToZero    bool
@@ -274,9 +292,28 @@ type FleetProvision struct {
 	// behavior-neutral (no /vsock, no push, guest skips the receive).
 	secretSelfTest bool
 
+	// resolver turns a job's secret_refs into concrete values at boot, scoped to
+	// the job's owner org (I28) and decrypting under the handed per-deployment
+	// Vault token (D-125). This is the SAME P14 resolver the resident class uses
+	// (see fleet_replica_runtime.go). Nil where Vault could not be reached at
+	// boot: a secret-less job still runs, a secret-bearing one fails closed.
+	resolver secret.Resolver
+
+	// jobCancels holds the cancel func of every in-flight job run, keyed by
+	// handle, so Decommission can cancel a RUNNING job (kill + remove). Entries
+	// are removed by the run goroutine when it finishes, so a completed job's
+	// Decommission is a plain no-op.
+	jobCancels sync.Map // uuid.UUID → context.CancelFunc
+
 	baseCtx context.Context
 	wg      sync.WaitGroup
 }
+
+// SetSecretResolver wires the per-tenant secret resolver (P14) into the job
+// path. Nil is valid — a host that could not reach Vault only runs secret-less
+// jobs; a secret-bearing one fails closed at resolve time, never silently
+// secret-less. Mirrors FleetReplicaRuntime.SetSecretResolver.
+func (uc *FleetProvision) SetSecretResolver(r secret.Resolver) { uc.resolver = r }
 
 // SetSecretSelfTest enables the gated vsock self-test marker injection (Phase
 // 3.3 verification only). Wired from APP_FLEET_SECRET_SELFTEST in the container.
@@ -332,16 +369,39 @@ func (uc *FleetProvision) Provision(ctx context.Context, in FleetProvisionInput)
 	if class == domain.ImageWorkloadClassTest && len(in.SecretRefs) > 0 {
 		return FleetProvisionOutput{}, domain.ErrSecretsNotSupported
 	}
-	// The test class is a single-shot ephemeral boot with no durable data path, so
-	// it rejects volumes rather than silently dropping them (mirrors secret_refs).
-	if class == domain.ImageWorkloadClassTest && len(in.Volumes) > 0 {
+	// Neither one-shot class has a durable data path, so both reject volumes
+	// rather than silently dropping them (mirrors secret_refs).
+	if class.IsOneShot() && len(in.Volumes) > 0 {
 		return FleetProvisionOutput{}, domain.ErrVolumesNotSupported
+	}
+	// Job-class field discipline. Each of these is REJECTED rather than ignored,
+	// matching how the test class treats secret_refs/volumes: silently dropping a
+	// caller's intent on a data-mutating one-shot is exactly the failure mode the
+	// job class exists to prevent.
+	if class == domain.ImageWorkloadClassJob && in.TestCommand != "" {
+		return FleetProvisionOutput{}, domain.ErrTestCommandNotSupported
+	}
+	if class != domain.ImageWorkloadClassJob && len(in.JobCommand) > 0 {
+		return FleetProvisionOutput{}, domain.ErrJobCommandNotSupported
+	}
+	if class != domain.ImageWorkloadClassJob && in.IdempotencyKey != "" {
+		return FleetProvisionOutput{}, domain.ErrIdempotencyKeyNotSupported
+	}
+	// A key with no attested org has no tenant scope to be unique within, and the
+	// index is (owner_org, idempotency_key) — fail closed rather than let a key
+	// collide or resolve across tenants (I28).
+	if class == domain.ImageWorkloadClassJob && in.IdempotencyKey != "" && in.OwnerOrg == "" {
+		return FleetProvisionOutput{}, domain.ErrIdempotencyOwnerOrgMissing
 	}
 	if in.Registry == "" || in.Repository == "" || in.Digest == "" {
 		return FleetProvisionOutput{}, domain.ErrImageRefIncomplete
 	}
 	if class == domain.ImageWorkloadClassResident && in.Port <= 0 {
 		return FleetProvisionOutput{}, domain.ErrResidentPortRequired
+	}
+
+	if class == domain.ImageWorkloadClassJob {
+		return uc.provisionJob(ctx, in)
 	}
 
 	now := time.Now().UTC()
@@ -417,6 +477,202 @@ func (uc *FleetProvision) Provision(ctx context.Context, in FleetProvisionInput)
 	return FleetProvisionOutput{Handle: wl.ID.String(), URL: url}, nil
 }
 
+// provisionJob starts a one-shot job: the test class's boot path plus resolved
+// secrets, an egress allowlist, and at-most-once idempotency. Provision returns
+// the handle immediately; the run itself is detached (like the test class), so a
+// long migration never blocks the RPC.
+//
+// Idempotency is enforced by the DB, not by a check-then-act: a pre-check races
+// (two callers both see "no run" and both boot), and a migration that runs twice
+// can destroy data. The (owner_org, idempotency_key) unique index is the actual
+// guarantee — the pre-check below is only a fast path, and the duplicate-key
+// branch is what makes a concurrent duplicate safe.
+func (uc *FleetProvision) provisionJob(ctx context.Context, in FleetProvisionInput) (FleetProvisionOutput, error) {
+	if in.IdempotencyKey != "" {
+		existing, err := uc.repo.FindByIdempotencyKey(ctx, in.OwnerOrg, in.IdempotencyKey)
+		if err == nil {
+			logger.FromContext(ctx).Info("fleet job: idempotency key already ran — returning existing handle",
+				"workload_id", existing.ID, "component_id", in.ComponentID)
+			return FleetProvisionOutput{Handle: existing.ID.String()}, nil
+		}
+		if !errors.Is(err, domain.ErrWorkloadNotFound) {
+			return FleetProvisionOutput{}, fmt.Errorf("lookup idempotency key: %w", err)
+		}
+	}
+
+	now := time.Now().UTC()
+	wl := &domain.ImageWorkload{
+		ID:              uuid.New(),
+		ComponentID:     in.ComponentID,
+		Env:             in.Env,
+		OwnerOrg:        in.OwnerOrg,
+		ImageRepository: in.Repository,
+		ImageDigest:     in.Digest,
+		Class:           domain.ImageWorkloadClassJob,
+		State:           domain.ImageWorkloadStateBooting,
+		JobCommand:      in.JobCommand,
+		EgressAllow:     in.EgressAllow,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if in.IdempotencyKey != "" {
+		key := in.IdempotencyKey
+		wl.IdempotencyKey = &key
+	}
+
+	if err := uc.repo.Create(ctx, wl); err != nil {
+		// Lost the race: a concurrent Provision inserted this exact
+		// (owner_org, idempotency_key) first. Return THEIR handle — never boot a
+		// second VM for a key that is already running.
+		if in.IdempotencyKey != "" && uc.repo.IsDuplicateKey(err) {
+			existing, ferr := uc.repo.FindByIdempotencyKey(ctx, in.OwnerOrg, in.IdempotencyKey)
+			if ferr != nil {
+				return FleetProvisionOutput{}, fmt.Errorf("resolve raced idempotency key: %w", ferr)
+			}
+			logger.FromContext(ctx).Info("fleet job: idempotency key raced — returning existing handle",
+				"workload_id", existing.ID, "component_id", in.ComponentID)
+			return FleetProvisionOutput{Handle: existing.ID.String()}, nil
+		}
+		return FleetProvisionOutput{}, fmt.Errorf("persist job workload: %w", err)
+	}
+
+	// Resolve secrets through the SAME P14 boot path the resident class uses. A
+	// job legitimately needs them (a migrator needs its DSN), unlike the test
+	// class. Fails closed: the job never runs with missing/partial secrets (I32).
+	// Values live only in this slice and the vsock push — never a row, log, or argv.
+	var secrets []HostSecret
+	if len(in.SecretRefs) > 0 {
+		resolved, err := resolveBootSecrets(ctx, uc.resolver, in.SecretRefs, in.OwnerOrg, in.VaultToken)
+		if err != nil {
+			uc.markFailed(ctx, wl, fmt.Errorf("resolve secrets: %w", err))
+			return FleetProvisionOutput{}, err
+		}
+		secrets = resolved
+	} else {
+		secrets = uc.selfTestSecrets(in)
+	}
+
+	var nonce string
+	if len(secrets) > 0 {
+		var nerr error
+		if nonce, nerr = newBootstrapNonce(); nerr != nil {
+			uc.markFailed(ctx, wl, nerr)
+			return FleetProvisionOutput{}, nerr
+		}
+	}
+
+	matIn := ImageMaterializeInput{
+		Registry:          in.Registry,
+		Repository:        in.Repository,
+		Digest:            in.Digest,
+		ChangeID:          in.ChangeID,
+		WorkDir:           filepath.Join(uc.workDir, wl.ID.String()),
+		EnvVars:           in.EnvVars,
+		Mode:              string(domain.ImageWorkloadClassJob),
+		JobCommand:        in.JobCommand,
+		ExpectSecrets:     len(secrets) > 0,
+		BootstrapNonce:    nonce,
+		RegistryPullToken: in.RegistryPullToken,
+	}
+	uc.startJobRun(wl, matIn, in.VCPU, in.MemoryMB, int(in.TimeoutSeconds), secrets, in.EgressAllow)
+	return FleetProvisionOutput{Handle: wl.ID.String()}, nil
+}
+
+// startJobRun launches the detached job boot and registers its cancel func so
+// Decommission can kill a running job. Provision has already returned the handle
+// by the time this runs.
+func (uc *FleetProvision) startJobRun(wl *domain.ImageWorkload, matIn ImageMaterializeInput, vcpu, memMB, timeoutSec int, secrets []HostSecret, egressAllow []string) {
+	if timeoutSec <= 0 {
+		timeoutSec = 300
+	}
+	// The run context outlives the Provision RPC. Its deadline covers materialize
+	// (image pull) + the run; the booter separately enforces timeoutSec as the
+	// real substrate deadline on the VM itself (it kills the VM at that mark), so
+	// this outer budget only bounds the surrounding host work.
+	ctx, cancel := context.WithTimeout(uc.baseCtx, time.Duration(timeoutSec)*time.Second+10*time.Minute)
+	uc.jobCancels.Store(wl.ID, cancel)
+
+	uc.wg.Add(1)
+	go func() {
+		defer uc.wg.Done()
+		defer cancel()
+		defer uc.jobCancels.Delete(wl.ID)
+		defer func() {
+			if r := recover(); r != nil {
+				logger.FromContext(uc.baseCtx).Error("fleet job run panicked", "workload_id", wl.ID, "panic", r)
+			}
+		}()
+
+		mat, err := uc.materializer.Materialize(ctx, matIn)
+		if err != nil {
+			uc.finishCancelledOrFailed(ctx, wl, fmt.Errorf("materialize: %w", err))
+			return
+		}
+		wl.RootfsPath = mat.RootfsPath
+		wl.State = domain.ImageWorkloadStateRunning
+		wl.UpdatedAt = time.Now().UTC()
+		_ = uc.repo.Update(ctx, wl)
+
+		res, err := uc.booter.BootTest(ctx, ImageBootInput{
+			WorkloadID:     wl.ID,
+			RootfsPath:     mat.RootfsPath,
+			VCPU:           vcpu,
+			MemoryMB:       memMB,
+			TimeoutSeconds: timeoutSec,
+			ExpectSecrets:  matIn.ExpectSecrets,
+			Secrets:        secrets,
+			BootstrapNonce: matIn.BootstrapNonce,
+			EgressAllow:    egressAllow,
+		})
+		if err != nil {
+			uc.finishCancelledOrFailed(ctx, wl, fmt.Errorf("boot job: %w", err))
+			return
+		}
+
+		code := res.ExitCode
+		wl.ExitCode = &code
+		wl.StdoutTail = tail(res.Stdout, stdoutTailBytes)
+		wl.StderrTail = tail(res.Stderr, stdoutTailBytes)
+		wl.State = domain.ImageWorkloadStateExited
+		if res.TimedOut {
+			wl.Message = "job timed out"
+		}
+		wl.UpdatedAt = time.Now().UTC()
+		// The run context is cancelled/expired at this point only in the cancel
+		// path (handled above), so persist the terminal result on the base context
+		// — a job whose result is lost is a job that "never ran" to the caller.
+		if err := uc.repo.Update(uc.baseCtx, wl); err != nil {
+			logger.FromContext(ctx).Error("fleet job: persist result failed", "workload_id", wl.ID, "err", err)
+		}
+	}()
+}
+
+// jobCancelledExitCode is the exit code recorded for a job cancelled via
+// Decommission. It is deliberately NON-ZERO (128+SIGKILL, the standard
+// convention): a cancelled migration must never report exit_code 0, which the
+// caller reads as "the job succeeded".
+const jobCancelledExitCode = 137
+
+// finishCancelledOrFailed records a job's terminal state. A run killed by
+// Decommission lands as exited/137 (terminal + unsuccessful) rather than
+// "failed", since cancellation is an operator action, not a fault. Everything
+// else is a genuine failure.
+func (uc *FleetProvision) finishCancelledOrFailed(ctx context.Context, wl *domain.ImageWorkload, cause error) {
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		uc.markFailed(ctx, wl, cause)
+		return
+	}
+	code := jobCancelledExitCode
+	wl.ExitCode = &code
+	wl.State = domain.ImageWorkloadStateExited
+	wl.Message = "job cancelled"
+	wl.UpdatedAt = time.Now().UTC()
+	// ctx is cancelled — persist on the base context or the write is dropped.
+	if err := uc.repo.Update(uc.baseCtx, wl); err != nil {
+		logger.FromContext(uc.baseCtx).Error("fleet job: persist cancelled-state failed", "workload_id", wl.ID, "err", err)
+	}
+}
+
 // OwnerOrgForHandle resolves the owning org of a fleet handle for the by-handle
 // caller-org check (#fleet-handle-ops-org-check, D-083): Health/Decommission/
 // Scale act on an unguessable handle, so a leaked one must not let a foreign
@@ -439,13 +695,17 @@ func (uc *FleetProvision) OwnerOrgForHandle(ctx context.Context, handle string) 
 			return parseOwnerOrg(org)
 		}
 	}
-	// Not a known app: the handle must be a test-class / fallback workload. Confirm
-	// it exists (fail closed on an unknown handle) — the row carries no owner org,
-	// so an existing one is org-less (uuid.Nil → gate skipped, as Provision does).
-	if _, err := uc.repo.FindByID(ctx, id); err != nil {
+	// Not a known app: the handle must be a job / test-class / fallback workload.
+	// Confirm it exists (fail closed on an unknown handle). A JOB stores its
+	// attested owner org, so the by-handle gate applies to it exactly as it does
+	// to an app — a leaked job handle must not let a foreign caller read another
+	// org's job output or cancel its migration. A test-class row carries no owner
+	// org and stays org-less (uuid.Nil → gate skipped, as Provision does).
+	wl, err := uc.repo.FindByID(ctx, id)
+	if err != nil {
 		return uuid.Nil, err
 	}
-	return uuid.Nil, nil
+	return parseOwnerOrg(wl.OwnerOrg)
 }
 
 // parseOwnerOrg maps a stored owner-org string to a uuid. Empty → uuid.Nil (no
@@ -468,6 +728,13 @@ func (uc *FleetProvision) Scale(ctx context.Context, handle string, replicas int
 	id, err := uuid.Parse(handle)
 	if err != nil {
 		return domain.ErrWorkloadNotFound
+	}
+	// A one-shot job has no replica count to set — reject rather than no-op, so a
+	// caller scaling a job learns it asked the wrong question. Checked before the
+	// orchestrator lookup: a job is never an app, and the orchestrator would
+	// otherwise report it simply not-found.
+	if wl, ferr := uc.repo.FindByID(ctx, id); ferr == nil && wl.Class == domain.ImageWorkloadClassJob {
+		return domain.ErrScaleNotSupported
 	}
 	if uc.orchestrator == nil {
 		return domain.ErrWorkloadNotFound
@@ -645,7 +912,9 @@ func (uc *FleetProvision) Health(ctx context.Context, handle string) (FleetHealt
 		if wl.State == domain.ImageWorkloadStateRunning && wl.GuestIP != "" && wl.Port > 0 {
 			out.Healthy = dialTCP(wl.GuestIP, wl.Port)
 		}
-	case domain.ImageWorkloadClassTest:
+	case domain.ImageWorkloadClassTest, domain.ImageWorkloadClassJob:
+		// One-shot observation contract (identical for both classes, per the
+		// frozen Health shape): terminal == exited, success == exit_code 0.
 		out.Healthy = wl.State == domain.ImageWorkloadStateExited && wl.ExitCode != nil && *wl.ExitCode == 0
 	}
 	return out, nil
@@ -669,6 +938,18 @@ func (uc *FleetProvision) Decommission(ctx context.Context, handle string) error
 	wl, err := uc.repo.FindByID(ctx, id)
 	if err != nil {
 		return err
+	}
+	// A job is cancelled, not torn down: cancelling its run context makes the
+	// booter kill the VM and reverse its own net/rootfs plumbing. The run
+	// goroutine owns the terminal state write (exited/137) — writing it here too
+	// would race it. An already-finished job has no cancel entry, so this is a
+	// no-op and Decommission stays idempotent.
+	if wl.Class == domain.ImageWorkloadClassJob {
+		if v, ok := uc.jobCancels.Load(id); ok {
+			logger.FromContext(ctx).Info("fleet job: cancelling running job", "workload_id", id)
+			v.(context.CancelFunc)()
+		}
+		return nil
 	}
 	if wl.Class == domain.ImageWorkloadClassResident && wl.State == domain.ImageWorkloadStateRunning {
 		if err := uc.booter.Decommission(ctx, decommissionInput(wl)); err != nil && !errors.Is(err, domain.ErrImageBootUnavailable) {

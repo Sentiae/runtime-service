@@ -32,6 +32,7 @@ func (a *MaterializerAdapter) Materialize(ctx context.Context, in usecase.ImageM
 		EnvVars:        in.EnvVars,
 		Mode:           in.Mode,
 		TestCmd:        in.TestCommand,
+		JobCmd:         in.JobCommand,
 		Port:           in.Port,
 		ExpectSecrets:  in.ExpectSecrets,
 		BootstrapNonce: in.BootstrapNonce,

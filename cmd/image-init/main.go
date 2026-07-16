@@ -5,8 +5,9 @@
 //
 // It reads /sentiae/runtime.json (written by the OCI materializer), mounts the
 // standard pseudo-filesystems, and then either:
-//   - mode "test": runs the workload once, captures stdout/stderr/exit_code to
-//     /sentiae/out/*, syncs, and powers the VM off; or
+//   - mode "test" / "job": runs the workload once, captures stdout/stderr/exit_code
+//     to /sentiae/out/*, syncs, and powers the VM off. The job class supplies its
+//     entrypoint as job_command — an argv list exec'd directly, never via a shell; or
 //   - mode "resident": starts the workload as a child, reaps zombies as PID 1,
 //     and powers off when the child exits.
 //
@@ -42,7 +43,11 @@ type runtimeSpec struct {
 	WorkDir     string   `json:"workdir"`
 	Mode        string   `json:"mode"`
 	TestCommand string   `json:"test_command"`
-	Port        int      `json:"port"`
+	// JobCommand is the job class's argv-exact entrypoint override. It arrives as
+	// a LIST and is exec'd as argv[0] + argv[1:] — never joined into a string and
+	// never handed to a shell, so its contents cannot be interpolated.
+	JobCommand []string `json:"job_command,omitempty"`
+	Port       int      `json:"port"`
 	// ExpectSecrets tells this init to open the vsock secret listener and block
 	// on the host push before exec (invariant I32). Boolean flag only — no
 	// secret plaintext is ever carried in runtime.json.
@@ -99,7 +104,7 @@ func main() {
 	switch spec.Mode {
 	case "resident":
 		runResident(spec)
-	default: // "test" and anything else default to single-shot
+	default: // "test", "job", and anything else default to single-shot
 		runTest(spec)
 	}
 }
@@ -176,15 +181,22 @@ func runTest(spec *runtimeSpec) {
 	}
 
 	var cmd *exec.Cmd
-	if spec.TestCommand != "" {
+	switch {
+	case len(spec.JobCommand) > 0:
+		// Job class: exec the argv EXACTLY as given. No /bin/sh, no joining, no
+		// quoting — a job_command element containing shell metacharacters is an
+		// argument, never a command. (This is the whole reason job_command is a
+		// list and test_command is not reused here.)
+		cmd = exec.Command(spec.JobCommand[0], spec.JobCommand[1:]...)
+	case spec.TestCommand != "":
 		if _, err := os.Stat("/bin/sh"); err != nil {
 			writeErr("image-init: /bin/sh not found in image; cannot run test_command", 127)
 			return
 		}
 		cmd = exec.Command("/bin/sh", "-c", spec.TestCommand)
-	} else {
+	default:
 		if len(spec.Entrypoint) == 0 {
-			writeErr("image-init: image has no entrypoint and no test_command", 127)
+			writeErr("image-init: image has no entrypoint, job_command, or test_command", 127)
 			return
 		}
 		cmd = exec.Command(spec.Entrypoint[0], spec.Entrypoint[1:]...)

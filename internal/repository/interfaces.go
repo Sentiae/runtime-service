@@ -150,6 +150,15 @@ type ImageWorkloadRepository interface {
 	FindByID(ctx context.Context, id uuid.UUID) (*domain.ImageWorkload, error)
 	FindActive(ctx context.Context) ([]domain.ImageWorkload, error)
 	Delete(ctx context.Context, id uuid.UUID) error
+	// FindByIdempotencyKey resolves an existing job by its (owner_org, key)
+	// scope — the pair the unique index enforces, so a key never resolves across
+	// tenants (I28). Returns ErrWorkloadNotFound when no run matches.
+	FindByIdempotencyKey(ctx context.Context, ownerOrg, key string) (*domain.ImageWorkload, error)
+	// IsDuplicateKey reports whether err is the unique-constraint violation
+	// raised by a racing Create on the same (owner_org, idempotency_key). It
+	// lives on the repository because the SQLSTATE is a persistence detail the
+	// use case must not know.
+	IsDuplicateKey(err error) bool
 }
 
 // HostRepository persists fleet hosts (runtime-fleet CP4 durable control plane).

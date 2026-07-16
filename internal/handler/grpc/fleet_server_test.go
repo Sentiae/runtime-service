@@ -167,6 +167,10 @@ func (fakeWorkloadRepo) FindByID(context.Context, uuid.UUID) (*domain.ImageWorkl
 }
 func (fakeWorkloadRepo) FindActive(context.Context) ([]domain.ImageWorkload, error) { return nil, nil }
 func (fakeWorkloadRepo) Delete(context.Context, uuid.UUID) error                    { return nil }
+func (fakeWorkloadRepo) FindByIdempotencyKey(context.Context, string, string) (*domain.ImageWorkload, error) {
+	return nil, domain.ErrWorkloadNotFound
+}
+func (fakeWorkloadRepo) IsDuplicateKey(error) bool { return false }
 
 var (
 	_ repository.FleetAppRepository      = (*fakeAppRepo)(nil)

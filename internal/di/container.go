@@ -404,6 +404,15 @@ func (c *Container) initFleet(cfg *config.Config) {
 			// bootSecrets can stamp the deployment's handed token onto the resolver.
 			c.FleetReplicaRuntimeUC.SetTokenStore(c.fleetTokenStore)
 			log.Println("Fleet handed-token secret resolver wired on resident replica runtime (D-125)")
+
+			// P7 RunJob seam — the one-shot job class resolves secret_refs through
+			// this SAME resolver (a migrator needs its DSN). The job's per-deployment
+			// Vault token arrives on each descriptor and is passed straight to the
+			// resolve call, so no token store is needed here: unlike a resident app
+			// (whose reconciler re-boots replicas later from a DB row that never
+			// carries the token), a job resolves exactly once, in-process, at provision.
+			c.FleetProvisionUC.SetSecretResolver(resolver)
+			log.Println("Fleet handed-token secret resolver wired on the job path (P7 RunJob)")
 		}
 	}
 

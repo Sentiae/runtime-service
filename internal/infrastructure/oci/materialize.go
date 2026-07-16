@@ -29,9 +29,13 @@ type MaterializeRequest struct {
 	Image   ImageRef
 	WorkDir string            // per-workload working directory (staging + rootfs live here)
 	EnvVars map[string]string // descriptor env vars, appended after image Env (later wins)
-	Mode    string            // "test" | "resident"
-	TestCmd string            // test class: overrides the image entrypoint when non-empty
-	Port    int               // resident class: guest port
+	Mode    string            // "test" | "resident" | "job"
+	TestCmd string            // test class: overrides the image entrypoint when non-empty (run via /bin/sh -c)
+	// JobCmd is the job class's ARGV-EXACT entrypoint override. The guest execs
+	// argv[0] with argv[1:] directly — it is never joined, quoted, or passed to a
+	// shell (that is TestCmd's legacy behavior). Empty → the image's entrypoint.
+	JobCmd []string
+	Port   int // resident class: guest port
 	// ExpectSecrets is a boolean FLAG (never a secret value) written to
 	// runtime.json so the guest opens its vsock secret listener at boot and
 	// blocks on the host push before exec (invariant I32). No plaintext at rest.
@@ -66,7 +70,10 @@ type runtimeSpec struct {
 	WorkDir     string   `json:"workdir"`
 	Mode        string   `json:"mode"`
 	TestCommand string   `json:"test_command"`
-	Port        int      `json:"port"`
+	// JobCommand is the job class's argv-exact entrypoint override, carried as a
+	// LIST so the guest can exec it without any shell or re-parsing.
+	JobCommand []string `json:"job_command,omitempty"`
+	Port       int      `json:"port"`
 	// ExpectSecrets is a boolean flag (NOT a secret value): it tells the guest
 	// image-init to open the vsock secret listener and block on the host push
 	// before exec. runtime.json carries no secret plaintext (invariant I32).
@@ -374,6 +381,7 @@ func writeRuntimeJSON(stagingDir string, req MaterializeRequest, cfg ImageConfig
 		WorkDir:        cfg.WorkingDir,
 		Mode:           req.Mode,
 		TestCommand:    req.TestCmd,
+		JobCommand:     req.JobCmd,
 		Port:           req.Port,
 		ExpectSecrets:  req.ExpectSecrets,
 		BootstrapNonce: req.BootstrapNonce,

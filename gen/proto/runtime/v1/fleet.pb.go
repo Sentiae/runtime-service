@@ -252,13 +252,13 @@ type DeploymentDescriptor struct {
 	Image          *OCIImageRef           `protobuf:"bytes,3,opt,name=image,proto3" json:"image,omitempty"`
 	Resources      *ResourceSpec          `protobuf:"bytes,4,opt,name=resources,proto3" json:"resources,omitempty"` // 0 values → defaults (1 vcpu, 512 MB)
 	EnvVars        map[string]string      `protobuf:"bytes,5,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	SecretRefs     []string               `protobuf:"bytes,6,rep,name=secret_refs,json=secretRefs,proto3" json:"secret_refs,omitempty"`               // resident class: tenant-namespaced refs ("tenants/<org-uuid>/<subpath>#<field>") resolved per-tenant at boot (P14/I32); test class rejects them
+	SecretRefs     []string               `protobuf:"bytes,6,rep,name=secret_refs,json=secretRefs,proto3" json:"secret_refs,omitempty"`               // resident + job classes: tenant-namespaced refs ("tenants/<org-uuid>/<subpath>#<field>") resolved per-tenant at boot (P14/I32); test class rejects them
 	Routes         []*RouteSpec           `protobuf:"bytes,7,rep,name=routes,proto3" json:"routes,omitempty"`                                         // ignored in CP3
 	Volumes        []*VolumeSpec          `protobuf:"bytes,8,rep,name=volumes,proto3" json:"volumes,omitempty"`                                       // ignored in CP3
 	Port           int32                  `protobuf:"varint,9,opt,name=port,proto3" json:"port,omitempty"`                                            // guest port the workload listens on (resident class)
-	WorkloadClass  string                 `protobuf:"bytes,10,opt,name=workload_class,json=workloadClass,proto3" json:"workload_class,omitempty"`     // "test" | "resident"
-	TestCommand    string                 `protobuf:"bytes,11,opt,name=test_command,json=testCommand,proto3" json:"test_command,omitempty"`           // test class only: overrides the image entrypoint when non-empty (run via /bin/sh -c)
-	TimeoutSeconds int64                  `protobuf:"varint,12,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"` // test class: max run time (default 300)
+	WorkloadClass  string                 `protobuf:"bytes,10,opt,name=workload_class,json=workloadClass,proto3" json:"workload_class,omitempty"`     // "test" | "resident" | "job" — STRING, never an enum (wire-compat)
+	TestCommand    string                 `protobuf:"bytes,11,opt,name=test_command,json=testCommand,proto3" json:"test_command,omitempty"`           // test class only: overrides the image entrypoint when non-empty (run via /bin/sh -c); rejected on the job class (use job_command)
+	TimeoutSeconds int64                  `protobuf:"varint,12,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"` // test + job classes: max run time (default 300); enforced as a real substrate deadline (the VM is killed)
 	// Scale-to-zero (rt#11, D-082). 0-defaults preserve today's behavior.
 	ScaleToZero    bool  `protobuf:"varint,13,opt,name=scale_to_zero,json=scaleToZero,proto3" json:"scale_to_zero,omitempty"`          // resident class: allow the fleet to drain to zero replicas when idle
 	IdleTtlSeconds int32 `protobuf:"varint,14,opt,name=idle_ttl_seconds,json=idleTtlSeconds,proto3" json:"idle_ttl_seconds,omitempty"` // resident class: seconds of inactivity before scale-to-zero (0 disables)
@@ -279,8 +279,28 @@ type DeploymentDescriptor struct {
 	// (fleet) class only; empty on the test leg and pre-cutover (the fleet then
 	// falls back to the shared service key — back-compat).
 	RegistryPullToken string `protobuf:"bytes,18,opt,name=registry_pull_token,json=registryPullToken,proto3" json:"registry_pull_token,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// ── P7 RunJob seam: the one-shot "job" workload class ────────────────
+	// job_command is an ARGV-EXACT entrypoint override for the job class (e.g.
+	// ["/app/migrate","up"]). It is exec'd directly — NEVER shell-interpolated,
+	// never joined into a string, never run via `sh -c` (that is test_command's
+	// legacy behavior, and it is why test_command is rejected on the job class).
+	// Empty → the image's own entrypoint runs. Job class only.
+	JobCommand []string `protobuf:"bytes,19,rep,name=job_command,json=jobCommand,proto3" json:"job_command,omitempty"`
+	// idempotency_key makes a job run at-most-once: a duplicate key returns the
+	// EXISTING handle instead of starting a second run. Load-bearing — a database
+	// migration that runs twice can destroy data. Uniqueness is scoped to
+	// (owner_org, idempotency_key) so one tenant's key can never resolve to
+	// another tenant's handle (I28). Empty → no idempotency (every call runs).
+	// Job class only.
+	IdempotencyKey string `protobuf:"bytes,20,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	// egress_allow is the job's network egress allowlist (IPs, CIDRs, or
+	// hostnames resolved once at boot). Non-empty installs a per-VM iptables
+	// chain that ACCEPTs only these destinations and DROPs the rest. Empty → no
+	// allowlist is installed (the class's default subnet rules apply). Job class
+	// only.
+	EgressAllow   []string `protobuf:"bytes,21,rep,name=egress_allow,json=egressAllow,proto3" json:"egress_allow,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DeploymentDescriptor) Reset() {
@@ -439,6 +459,27 @@ func (x *DeploymentDescriptor) GetRegistryPullToken() string {
 	return ""
 }
 
+func (x *DeploymentDescriptor) GetJobCommand() []string {
+	if x != nil {
+		return x.JobCommand
+	}
+	return nil
+}
+
+func (x *DeploymentDescriptor) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+func (x *DeploymentDescriptor) GetEgressAllow() []string {
+	if x != nil {
+		return x.EgressAllow
+	}
+	return nil
+}
+
 type ProvisionRequest struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
 	Descriptor_ *DeploymentDescriptor  `protobuf:"bytes,1,opt,name=descriptor,proto3" json:"descriptor,omitempty"`
@@ -595,10 +636,10 @@ func (x *FleetHealthRequest) GetHandle() string {
 type FleetHealthResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	State         string                 `protobuf:"bytes,1,opt,name=state,proto3" json:"state,omitempty"`                        // "booting" | "running" | "exited" | "failed"
-	Healthy       bool                   `protobuf:"varint,2,opt,name=healthy,proto3" json:"healthy,omitempty"`                   // resident: TCP dial guest port ok; test: state==exited && exit_code==0
-	ExitCode      int32                  `protobuf:"varint,3,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"` // meaningful when state=="exited"
+	Healthy       bool                   `protobuf:"varint,2,opt,name=healthy,proto3" json:"healthy,omitempty"`                   // resident: TCP dial guest port ok; test + job: state==exited && exit_code==0
+	ExitCode      int32                  `protobuf:"varint,3,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"` // meaningful when state=="exited" (job: terminal == state=="exited", success == exit_code==0)
 	Message       string                 `protobuf:"bytes,4,opt,name=message,proto3" json:"message,omitempty"`
-	StdoutTail    string                 `protobuf:"bytes,5,opt,name=stdout_tail,json=stdoutTail,proto3" json:"stdout_tail,omitempty"` // last <=8KB, test class
+	StdoutTail    string                 `protobuf:"bytes,5,opt,name=stdout_tail,json=stdoutTail,proto3" json:"stdout_tail,omitempty"` // last <=8KB, test + job classes
 	StderrTail    string                 `protobuf:"bytes,6,opt,name=stderr_tail,json=stderrTail,proto3" json:"stderr_tail,omitempty"`
 	Url           string                 `protobuf:"bytes,7,opt,name=url,proto3" json:"url,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -1388,7 +1429,7 @@ const file_proto_runtime_v1_fleet_proto_rawDesc = "" +
 	"\n" +
 	"VolumeSpec\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x17\n" +
-	"\asize_mb\x18\x02 \x01(\x05R\x06sizeMb\"\xa6\x06\n" +
+	"\asize_mb\x18\x02 \x01(\x05R\x06sizeMb\"\x93\a\n" +
 	"\x14DeploymentDescriptor\x12!\n" +
 	"\fcomponent_id\x18\x01 \x01(\tR\vcomponentId\x12\x10\n" +
 	"\x03env\x18\x02 \x01(\tR\x03env\x12-\n" +
@@ -1410,7 +1451,11 @@ const file_proto_runtime_v1_fleet_proto_rawDesc = "" +
 	"\fmax_replicas\x18\x10 \x01(\x05R\vmaxReplicas\x12\x1f\n" +
 	"\vvault_token\x18\x11 \x01(\tR\n" +
 	"vaultToken\x12.\n" +
-	"\x13registry_pull_token\x18\x12 \x01(\tR\x11registryPullToken\x1a:\n" +
+	"\x13registry_pull_token\x18\x12 \x01(\tR\x11registryPullToken\x12\x1f\n" +
+	"\vjob_command\x18\x13 \x03(\tR\n" +
+	"jobCommand\x12'\n" +
+	"\x0fidempotency_key\x18\x14 \x01(\tR\x0eidempotencyKey\x12!\n" +
+	"\fegress_allow\x18\x15 \x03(\tR\vegressAllow\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"q\n" +

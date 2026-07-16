@@ -310,6 +310,9 @@ func (b *ImageBooter) killVM(cmd *exec.Cmd, socketPath string) {
 
 // BootTest boots a single-shot VM, waits for it to power off (bounded by the
 // timeout), reads /sentiae/out/* from the rootfs, and tears everything down.
+// It serves both the test class and the one-shot job class; the job class is the
+// same path plus a secret push (already handled below via ExpectSecrets) and an
+// egress allowlist (in.EgressAllow).
 func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (usecase.ImageTestResult, error) {
 	nw, cleanupNet, err := b.setupNet()
 	if err != nil {
@@ -317,6 +320,19 @@ func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (
 	}
 	defer cleanupNet()
 	defer func() { _ = os.Remove(in.RootfsPath) }()
+
+	// Job class: lock egress down to the allowlist BEFORE the VM starts, so the
+	// workload never gets an unfiltered moment. The chain jump lands at the top of
+	// FORWARD (above ensureNAT's blanket subnet ACCEPTs), so the allowlist wins.
+	// Fail closed: if the chain cannot be installed the boot aborts rather than run
+	// a secret-bearing job with unrestricted egress.
+	if len(in.EgressAllow) > 0 {
+		if err := b.p.applyEgressList(nw.tapName, in.EgressAllow); err != nil {
+			b.p.flushEgressList(nw.tapName)
+			return usecase.ImageTestResult{}, fmt.Errorf("apply egress allowlist: %w", err)
+		}
+		defer b.p.flushEgressList(nw.tapName)
+	}
 
 	vcpu, memMB := normalizeResources(in.VCPU, in.MemoryMB)
 	cmd, socketPath, err := b.startVM(ctx, in.WorkloadID, in.RootfsPath, nw, vcpu, memMB, in.ExpectSecrets, "")
