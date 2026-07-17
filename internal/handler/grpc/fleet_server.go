@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pkconfig "github.com/sentiae/platform-kit/config"
+	pkerrors "github.com/sentiae/platform-kit/errors"
 	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/platform-kit/tenant"
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
@@ -377,6 +378,26 @@ func fleetError(err error) error {
 	case errors.Is(err, domain.ErrInvalidHostHealth):
 		return status.Error(codes.InvalidArgument, "invalid host health (want healthy|degraded|unhealthy|unknown)")
 	default:
-		return status.Error(codes.Internal, "internal server error")
+		return registryOrInternal(err)
 	}
+}
+
+// registryOrInternal is fleetError's last resort before Internal: it consults
+// the platform error registry (§16.3) for sentinels this handler does not
+// hand-map — notably platform-kit/secret's P14 sentinels, registered in
+// internal/app. Those are NOT runtime-local domain errors, so hand-mapping them
+// here would fork their meaning away from the registry that owns it; the
+// registry stays the single source of truth and this function is the seam that
+// makes it FIRE (a registration nothing consults is not a control).
+//
+// An error the registry does not know keeps this handler's long-standing
+// curated Internal. That matters: pkerrors.ToGRPC's own default echoes raw
+// err.Error() to the caller, and this handler has never leaked internal error
+// text (a DB or Vault error would go out verbatim). Codes registered AS
+// Internal land here too, which is the identical outcome either way.
+func registryOrInternal(err error) error {
+	if ge := pkerrors.ToGRPC(err); status.Code(ge) != codes.Internal {
+		return ge
+	}
+	return status.Error(codes.Internal, "internal server error")
 }

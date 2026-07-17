@@ -15,6 +15,7 @@ import (
 	pkdebug "github.com/sentiae/platform-kit/debug"
 	pkkafka "github.com/sentiae/platform-kit/kafka"
 	pklogger "github.com/sentiae/platform-kit/logger"
+	"github.com/sentiae/runtime-service/internal/app"
 	"github.com/sentiae/runtime-service/internal/di"
 	"github.com/sentiae/runtime-service/pkg/config"
 	"github.com/sentiae/runtime-service/pkg/logger"
@@ -75,6 +76,11 @@ func main() {
 
 	// Initialize logger
 	logger.Init()
+
+	// Bind the domain/library error sentinels to their HTTP/gRPC codes before
+	// anything can serve (§16.3). Must precede the gRPC server: an unregistered
+	// sentinel silently degrades to codes.Internal at the boundary.
+	app.RegisterErrors()
 
 	log.Printf("Starting Runtime Service v%s (built: %s)", Version, BuildTime)
 	log.Printf("Environment: %s", cfg.App.Environment)
