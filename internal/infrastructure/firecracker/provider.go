@@ -183,27 +183,41 @@ func (p *Provider) cleanupTap(tapName string, policy domain.NetworkPolicy) {
 		return
 	}
 	if policy.Mode == domain.NetworkPolicyEgressList {
-		p.flushEgressList(tapName)
+		// Warm path: parent stays FORWARD (see applyEgressList).
+		p.flushEgressList("FORWARD", tapName)
 	}
 	if err := p.destroyTapDevice(tapName); err != nil {
 		log.Printf("Warning: failed to destroy TAP %s: %v", tapName, err)
 	}
 }
 
-// applyEgressList installs an iptables FORWARD chain that drops every
-// packet leaving the VM's TAP except those destined to one of the
-// allowed hosts/CIDRs. It runs `iptables` as a child process — the same
-// pattern used by setupBridge — so we don't need cgo or netlink bindings.
+// applyEgressList installs an iptables chain that drops every packet leaving the
+// VM's TAP except those destined to one of the allowed hosts/CIDRs. It runs
+// `iptables` as a child process — the same pattern used by setupBridge — so we
+// don't need cgo or netlink bindings.
+//
+// parentChain is the chain the per-tap jump is installed INTO:
+//
+//   - The fleet image path passes netfabric.EgressParentChain ("SNT-EGRESS"), so
+//     the jump lands BELOW the inter-VM decision (SNT-XVM) and ABOVE the fleet's
+//     blanket egress ACCEPT. Below SNT-XVM, an allowlist entry can never re-open
+//     inter-VM reach; above the blanket ACCEPT, this chain's trailing DROP still
+//     governs. Both properties are ordering, and the netfabric enforcer owns that
+//     ordering as the single writer of the FORWARD program.
+//   - The warm path passes "FORWARD" — byte-for-byte the pre-#5 behavior. Its
+//     equivalent bypass is REPORTED, not fixed here: warm's topology differs (a
+//     bare 172.16.0.0/24 cross-tenant DROP, no blanket ACCEPTs), so fixing it needs
+//     its own anchor skeleton, which is not this slice's scope.
 //
 // Hostnames are resolved once at boot. Failed lookups are logged but do
 // not abort boot: the caller still gets a working (but more locked-down)
 // network rather than a dead VM.
-func (p *Provider) applyEgressList(tapName string, allowed []string) error {
+func (p *Provider) applyEgressList(parentChain, tapName string, allowed []string) error {
 	chain := egressChainName(tapName)
 	// Create a dedicated chain so we never collide with another VM.
 	cmds := [][]string{
 		{"iptables", "-N", chain},
-		{"iptables", "-I", "FORWARD", "-i", tapName, "-j", chain},
+		{"iptables", "-I", parentChain, "-i", tapName, "-j", chain},
 	}
 	for _, args := range cmds {
 		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
@@ -252,11 +266,12 @@ func (p *Provider) applyEgressList(tapName string, allowed []string) error {
 
 // flushEgressList removes the per-VM iptables chain installed by
 // applyEgressList. Called from cleanupTap on shutdown / boot failure.
-func (p *Provider) flushEgressList(tapName string) {
+// parentChain must match the one applyEgressList installed the jump into.
+func (p *Provider) flushEgressList(parentChain, tapName string) {
 	chain := egressChainName(tapName)
 	// Best-effort: each command is idempotent on the rule-not-found path.
 	cmds := [][]string{
-		{"iptables", "-D", "FORWARD", "-i", tapName, "-j", chain},
+		{"iptables", "-D", parentChain, "-i", tapName, "-j", chain},
 		{"iptables", "-F", chain},
 		{"iptables", "-X", chain},
 	}
@@ -361,7 +376,8 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 		// before starting Firecracker so the kernel never sees an
 		// unfiltered packet leaving the new TAP.
 		if policy.Mode == domain.NetworkPolicyEgressList {
-			if err := p.applyEgressList(tapName, policy.AllowedHosts); err != nil {
+			// Warm path: parent stays FORWARD — unchanged from pre-#5.
+			if err := p.applyEgressList("FORWARD", tapName, policy.AllowedHosts); err != nil {
 				_ = p.destroyTapDevice(tapName)
 				return nil, fmt.Errorf("failed to apply egress list: %w", err)
 			}

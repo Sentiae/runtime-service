@@ -49,6 +49,12 @@ type FleetOrchestrator struct {
 	// DecommissionApp revokes it. Nil where no handed-token path is wired.
 	tokenStore *FleetSecretTokenStore
 
+	// netFabric realizes P21 fleet network policy (CP4.5 §9 #5). Nil on builds with
+	// no fabric wired (non-firecracker, tests) — ProvisionApp then REFUSES any
+	// descriptor carrying a system_id rather than booting it unenforced, and an app
+	// with no system_id is unaffected (it reaches no peer either way).
+	netFabric *FleetNetworkFabric
+
 	// registryTokenStore holds each app's handed per-deployment registry PULL token
 	// in memory (D-124): ProvisionApp stashes it, the replica runtime reads it at
 	// materialize (the image pull), and DecommissionApp drops it. Nil leaves the
@@ -82,6 +88,11 @@ func NewFleetOrchestrator(
 // SetVolumeManager wires the persistent-volume manager (rt#9). Optional: a nil
 // manager leaves every app stateless.
 func (uc *FleetOrchestrator) SetVolumeManager(vm *FleetVolumeManager) { uc.volumes = vm }
+
+// SetNetworkFabric wires the P21 fleet network fabric (CP4.5 §9 #5). Leaving it
+// nil does NOT disable enforcement — it makes every system-scoped provision fail
+// closed (there is no "skip policies, boot anyway" branch).
+func (uc *FleetOrchestrator) SetNetworkFabric(f *FleetNetworkFabric) { uc.netFabric = f }
 
 // SetIngress wires the fleet-owned ingress (rt#8, D-079): the route repository
 // (durable host→app records), the base domain for platform-issued hostnames,
@@ -247,9 +258,24 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 		minReplicas = 0
 	}
 
+	// CP4.5 §9 #5 — P21 network membership gate, BEFORE any row is written or any
+	// replica placed. A descriptor claiming a system_id must have a host that can
+	// prove its enforcement posture AND an ACTIVE network for (system_id, env);
+	// otherwise nothing boots. An empty system_id claims no membership and is
+	// unaffected — it reaches no fleet peer either way (the pre-#5 behavior).
+	if in.SystemID != "" {
+		if uc.netFabric == nil {
+			return "", "", domain.ErrNetworkEnforcerUnavailable
+		}
+		if err := uc.netFabric.RequireNetwork(ctx, in.SystemID, in.Env); err != nil {
+			return "", "", err
+		}
+	}
+
 	app, err := uc.apps.FindByComponentEnv(ctx, in.ComponentID, in.Env)
 	switch {
 	case err == nil:
+		app.SystemID = in.SystemID
 		app.ImageRepository = in.Repository
 		app.ImageDigest = in.Digest
 		app.Port = in.Port
@@ -279,6 +305,7 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 			ComponentID:     in.ComponentID,
 			Env:             in.Env,
 			OwnerOrg:        in.OwnerOrg,
+			SystemID:        in.SystemID,
 			ImageRepository: in.Repository,
 			ImageDigest:     in.Digest,
 			SecretRefs:      refs,
@@ -519,6 +546,19 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 			if derr := uc.runtime.DecommissionReplica(ctx, surplus[i].ID); derr != nil {
 				logger.FromContext(ctx).Warn("fleet reconcile: decommission surplus replica", "replica_id", surplus[i].ID, "err", derr)
 			}
+		}
+	}
+
+	// CP4.5 §9 #5 — re-resolve this app's network against the LIVE replica set.
+	// Guest IPs are allocated per BOOT, so the chain must be recompiled whenever
+	// the set changes; driving that from the tick is what makes per-boot IPs safe
+	// and lets a reboot self-heal with no delivery call. Log-and-continue: a sync
+	// error must never stop reconcile, and it fails closed anyway — the enforcer
+	// leaves the system chain flushed rather than carrying stale addresses.
+	if uc.netFabric != nil && app.SystemID != "" {
+		if nerr := uc.netFabric.SyncForApp(ctx, app.SystemID, app.Env); nerr != nil {
+			logger.FromContext(ctx).Error("fleet reconcile: sync network policy",
+				"app_id", app.ID, "system_id", app.SystemID, "err", nerr)
 		}
 	}
 

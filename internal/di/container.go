@@ -40,6 +40,7 @@ import (
 	"github.com/sentiae/runtime-service/internal/infrastructure/foundry"
 	"github.com/sentiae/runtime-service/internal/infrastructure/gitservice"
 	"github.com/sentiae/runtime-service/internal/infrastructure/messaging"
+	"github.com/sentiae/runtime-service/internal/infrastructure/netfabric"
 	"github.com/sentiae/runtime-service/internal/infrastructure/objectstore"
 	"github.com/sentiae/runtime-service/internal/infrastructure/oci"
 	"github.com/sentiae/runtime-service/internal/infrastructure/simulated"
@@ -177,6 +178,15 @@ type Container struct {
 	// silently faked.
 	VolumeBackend      usecase.VolumeBackend
 	FleetVolumeManager *usecase.FleetVolumeManager
+
+	// CP4.5 §9#5 — P21 fleet network fabric (per-system×env policy scope compiled
+	// to iptables). The enforcer is fail-loud off the firecracker host, and also
+	// whenever the real one could not install or PROVE its FORWARD program at boot
+	// — a control that cannot prove itself must prevent the operation.
+	FleetNetworkRepo       repository.FleetNetworkRepository
+	FleetNetworkPolicyRepo repository.FleetNetworkPolicyRepository
+	NetworkEnforcer        usecase.NetworkEnforcer
+	FleetNetworkFabricUC   *usecase.FleetNetworkFabric
 
 	// runtime-fleet CP4 §9#6 — resident replica boot/teardown/health. Non-nil
 	// only on the firecracker executor (the fleet host); nil otherwise.
@@ -359,6 +369,17 @@ func (c *Container) initFleet(cfg *config.Config) {
 	}
 	c.FleetVolumeManager = usecase.NewFleetVolumeManager(c.VolumeRepo, c.VolumeBackend, volumeDir)
 
+	// CP4.5 §9#5 — P21 fleet network fabric. The enforcer is the SINGLE WRITER of
+	// the fleet's FORWARD program (see the netfabric package doc): it installs the
+	// complete ordered program, restores every active system's chain from the DB
+	// (the kernel does not remember our chains across a host reboot), and then
+	// PROVES the result. Any failure flips the host to the fail-loud enforcer, so
+	// every EnsureNetwork/ApplyPolicies and every Provision carrying a system_id is
+	// refused. There is deliberately NO config flag here: membership is data and
+	// enforcement is structure, so there is no name to typo into the permissive
+	// branch.
+	c.initNetworkFabric(cfg)
+
 	c.FleetProvisionUC = usecase.NewFleetProvision(
 		context.Background(),
 		c.ImageWorkloadRepo,
@@ -440,6 +461,10 @@ func (c *Container) initFleet(cfg *config.Config) {
 		// rt#9 — persistent-volume lifecycle (ensure/affinity/attach/degrade).
 		c.FleetOrchestratorUC.SetVolumeManager(c.FleetVolumeManager)
 
+		// CP4.5 §9#5 — P21 network membership gate on ProvisionApp + per-tick
+		// re-resolution of each app's chain from its LIVE replica set.
+		c.FleetOrchestratorUC.SetNetworkFabric(c.FleetNetworkFabricUC)
+
 		// D-124 — stash each app's handed registry pull token at ProvisionApp and
 		// drop it at DecommissionApp. Unconditional (not gated on Vault).
 		c.FleetOrchestratorUC.SetRegistryTokenStore(c.fleetRegistryTokenStore)
@@ -496,6 +521,57 @@ func (c *Container) initFleet(cfg *config.Config) {
 	} else {
 		log.Println("Fleet self-registration skipped (executor is not firecracker)")
 	}
+}
+
+// initNetworkFabric wires the P21 fleet network fabric (CP4.5 §9#5, D-164).
+//
+// The sequence is install → restore → PROVE, and every step is a gate: the host
+// only keeps the real enforcer if it can install the complete FORWARD program,
+// rebuild every active system chain from the DB, and then prove the resulting
+// layout matches the intended program exactly. Anything else flips it to
+// FailLoudNetworkEnforcer, which refuses every fabric call and every provision
+// carrying a system_id.
+//
+// Failing here is safe by construction: apps with no system_id are untouched
+// (they reach no peer either way), and system-scoped apps simply do not boot.
+// Replicas already resident keep running with no system chain — their peers are
+// unreachable. Broken-CLOSED. A restart degrades to isolation, never to reach.
+func (c *Container) initNetworkFabric(cfg *config.Config) {
+	failLoud := func(reason string, err error) {
+		log.Printf("Fleet network enforcer: FAIL-LOUD (%s: %v) — system-scoped workloads will be REFUSED on this host", reason, err)
+		c.NetworkEnforcer = usecase.FailLoudNetworkEnforcer{}
+		c.FleetNetworkFabricUC = usecase.NewFleetNetworkFabric(
+			c.FleetNetworkRepo, c.FleetNetworkPolicyRepo, c.FleetAppRepo, c.ReplicaRepo, c.NetworkEnforcer,
+		)
+	}
+
+	if cfg.App.ExecutorType != "firecracker" || c.FCProvider == nil {
+		failLoud("firecracker executor not selected", nil)
+		return
+	}
+
+	ctx := context.Background()
+	enforcer := netfabric.NewIPTablesEnforcer()
+	c.NetworkEnforcer = enforcer
+	c.FleetNetworkFabricUC = usecase.NewFleetNetworkFabric(
+		c.FleetNetworkRepo, c.FleetNetworkPolicyRepo, c.FleetAppRepo, c.ReplicaRepo, c.NetworkEnforcer,
+	)
+
+	if err := enforcer.InstallSkeleton(ctx); err != nil {
+		failLoud("install FORWARD program", err)
+		return
+	}
+	if err := c.FleetNetworkFabricUC.RestoreAll(ctx); err != nil {
+		failLoud("restore system chains from store", err)
+		return
+	}
+	// Prove it; do not assume it. This is the step that catches a FORWARD program
+	// some other writer reordered underneath us.
+	if err := enforcer.AssertPosture(ctx); err != nil {
+		failLoud("prove FORWARD program", err)
+		return
+	}
+	log.Println("Fleet network enforcer: iptables program installed, restored, and PROVEN")
 }
 
 // buildSecretResolver constructs the per-tenant envelope resolver used to
@@ -858,6 +934,11 @@ func (c *Container) initRepositories() {
 	c.PlacementRepo = postgres.NewPlacementRepository(c.DB)
 	c.RouteRepo = postgres.NewRouteRepository(c.DB)
 	c.VolumeRepo = postgres.NewVolumeRepository(c.DB)
+
+	// CP4.5 §9#5 — P21 fleet network fabric store (golang-migrate-owned; these
+	// models are deliberately NOT in the AutoMigrate set).
+	c.FleetNetworkRepo = postgres.NewFleetNetworkRepository(c.DB)
+	c.FleetNetworkPolicyRepo = postgres.NewFleetNetworkPolicyRepository(c.DB)
 
 	log.Println("Repositories initialized (PostgreSQL)")
 }
@@ -1302,6 +1383,12 @@ func (c *Container) initHandlers() {
 	if c.GRPCServer != nil {
 		c.GRPCServer.RegisterFleet(grpchandler.NewFleetServer(c.FleetProvisionUC, c.FleetHostRegistry))
 		log.Println("FleetOrchestration gRPC service registered")
+
+		// CP4.5 §9#5 — P21 FleetNetworkFabric. Registered on every host: off the
+		// firecracker host the fail-loud enforcer makes each RPC refuse, which is a
+		// truthful answer rather than an unimplemented one.
+		c.GRPCServer.RegisterNetworkFabric(grpchandler.NewNetworkFabricServer(c.FleetNetworkFabricUC))
+		log.Println("FleetNetworkFabric gRPC service registered")
 	}
 
 	// Register routes now that every Set*Handler has fired. NewServer

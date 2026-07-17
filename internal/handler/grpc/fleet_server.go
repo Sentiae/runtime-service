@@ -52,12 +52,8 @@ func (s *FleetServer) Provision(ctx context.Context, req *runtimev1.ProvisionReq
 	// APP_AUTH_ORG_ENFORCE unset this is a strict no-op (divergence logged only);
 	// once flipped, a foreign org is denied before the secret path runs.
 	ownerOrgRaw := req.GetOwnerOrg()
-	// Carriage cross-check (defense-in-depth for the delivery→runtime attested
-	// carriage, B3): a present, non-empty x-organization-id MUST match owner_org.
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if vals := md.Get("x-organization-id"); len(vals) > 0 && vals[0] != "" && vals[0] != ownerOrgRaw {
-			return nil, status.Error(codes.InvalidArgument, "owner_org / x-organization-id mismatch")
-		}
+	if err := requireCarriageMatch(ctx, ownerOrgRaw); err != nil {
+		return nil, err
 	}
 	if ownerOrgRaw == "" {
 		// Empty-org provisions exist today (CP3 test-class boots) — pass through
@@ -76,19 +72,22 @@ func (s *FleetServer) Provision(ctx context.Context, req *runtimev1.ProvisionReq
 
 	res := d.GetResources()
 	out, err := s.provision.Provision(ctx, usecase.FleetProvisionInput{
-		ComponentID:    d.GetComponentId(),
-		Env:            d.GetEnv(),
-		OwnerOrg:       req.GetOwnerOrg(),
-		Registry:       img.GetRegistry(),
-		Repository:     img.GetRepository(),
-		Digest:         img.GetDigest(),
-		ChangeID:       img.GetChangeId(),
-		VCPU:           int(res.GetVcpu()),
-		MemoryMB:       int(res.GetMemoryMb()),
-		EnvVars:        d.GetEnvVars(),
-		SecretRefs:     d.GetSecretRefs(),
-		Port:           int(d.GetPort()),
-		WorkloadClass:  d.GetWorkloadClass(),
+		ComponentID:   d.GetComponentId(),
+		Env:           d.GetEnv(),
+		OwnerOrg:      req.GetOwnerOrg(),
+		Registry:      img.GetRegistry(),
+		Repository:    img.GetRepository(),
+		Digest:        img.GetDigest(),
+		ChangeID:      img.GetChangeId(),
+		VCPU:          int(res.GetVcpu()),
+		MemoryMB:      int(res.GetMemoryMb()),
+		EnvVars:       d.GetEnvVars(),
+		SecretRefs:    d.GetSecretRefs(),
+		Port:          int(d.GetPort()),
+		WorkloadClass: d.GetWorkloadClass(),
+		// CP4.5 §9 #5 — P21 network membership. Empty (every pre-#5 caller) means no
+		// membership: the workload reaches no fleet peer, exactly as before.
+		SystemID:       d.GetSystemId(),
 		TestCommand:    d.GetTestCommand(),
 		TimeoutSeconds: d.GetTimeoutSeconds(),
 		// P7 RunJob seam (job class). job_command stays a LIST all the way to the
@@ -113,6 +112,22 @@ func (s *FleetServer) Provision(ctx context.Context, req *runtimev1.ProvisionReq
 		return nil, fleetError(err)
 	}
 	return &runtimev1.ProvisionResponse{Handle: out.Handle, Url: out.URL}, nil
+}
+
+// requireCarriageMatch is the delivery→runtime attested-carriage cross-check
+// (defense-in-depth, B3): a present, non-empty x-organization-id MUST match the
+// caller-supplied owner_org. Shared by Provision and the P21 network fabric so
+// the two seams can never drift on this check.
+func requireCarriageMatch(ctx context.Context, ownerOrgRaw string) error {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil
+	}
+	vals := md.Get("x-organization-id")
+	if len(vals) > 0 && vals[0] != "" && vals[0] != ownerOrgRaw {
+		return status.Error(codes.InvalidArgument, "owner_org / x-organization-id mismatch")
+	}
+	return nil
 }
 
 // authorizeHandleOrg is the by-handle counterpart of Provision's owner_org gate
@@ -343,6 +358,20 @@ func fleetError(err error) error {
 		return status.Error(codes.FailedPrecondition, "a volume-bearing app cannot scale beyond one replica")
 	case errors.Is(err, domain.ErrVolumeBackendUnavailable):
 		return status.Error(codes.FailedPrecondition, "volumes require the firecracker host")
+	case errors.Is(err, domain.ErrFleetNetworkNotFound):
+		return status.Error(codes.FailedPrecondition, "no active fleet network for this system and env — EnsureNetwork first")
+	case errors.Is(err, domain.ErrNetworkEnforcerUnavailable):
+		return status.Error(codes.FailedPrecondition, "fleet network enforcement requires the firecracker host")
+	case errors.Is(err, domain.ErrNetworkPostureUnproven):
+		return status.Error(codes.FailedPrecondition, "fleet network posture could not be proven on this host")
+	case errors.Is(err, domain.ErrNetworkOwnerOrgRequired):
+		return status.Error(codes.InvalidArgument, "fleet network requires an owner org")
+	case errors.Is(err, domain.ErrInvalidNetworkPolicy):
+		return status.Error(codes.InvalidArgument, "invalid network policy (component ids required; port must be 1..65535)")
+	case errors.Is(err, domain.ErrUnsupportedPolicyProtocol):
+		return status.Error(codes.InvalidArgument, "unsupported network policy protocol (want tcp)")
+	case errors.Is(err, domain.ErrNetworkPolicyEgressOverlap):
+		return status.Error(codes.InvalidArgument, "egress_allow may not name fleet-internal addresses")
 	case errors.Is(err, domain.ErrFleetHostNotFound):
 		return status.Error(codes.NotFound, "fleet host not found")
 	case errors.Is(err, domain.ErrInvalidHostHealth):

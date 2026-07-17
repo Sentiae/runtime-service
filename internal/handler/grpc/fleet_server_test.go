@@ -270,3 +270,9 @@ func TestFleetHandleOps_ShadowForeignOrg_DoesNotDeny(t *testing.T) {
 		t.Fatalf("shadow mode must not deny a foreign org, got %s (%v)", code, err)
 	}
 }
+
+// ListBySystemEnv satisfies FleetAppRepository. This fake predates P21 network
+// membership and models none, so it matches nothing.
+func (f *fakeAppRepo) ListBySystemEnv(context.Context, string, string) ([]domain.FleetApp, error) {
+	return nil, nil
+}

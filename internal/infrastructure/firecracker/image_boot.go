@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/runtime-service/internal/infrastructure/netfabric"
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
 
@@ -117,41 +118,29 @@ func deriveNet(n int) imgNet {
 
 // ensureNAT enables IP forwarding and installs an idempotent MASQUERADE for the
 // image-boot /16 so guests reach external destinations. Runs once.
+//
+// ⚠ It deliberately writes NOTHING to the FORWARD chain (CP4.5 §9#5, D-164).
+// The netfabric enforcer is the single writer of the fleet's FORWARD program —
+// including the cross-tenant DROP and the two blanket /16 ACCEPTs that used to
+// live here. That is not a refactor for tidiness; it is the fix for a real bug:
+//
+//	ensureNAT is a sync.Once fired from the FIRST VM boot, i.e. AFTER DI init, and
+//	it inserted each rule at FORWARD position 1. So on a fresh host it landed its
+//	DROP and ACCEPTs ABOVE the enforcer's anchors, which (a) made every network
+//	policy unreachable — the DROP swallowed inter-VM traffic before SNT-XVM could
+//	ACCEPT it — and (b) silently disabled every job's egress allowlist, because
+//	`-s 10.201.0.0/16 -j ACCEPT` terminated the packet before SNT-EGRESS was
+//	reached. It was ordering-by-boot-sequence, so it worked after a service
+//	restart and broke after a host reboot.
+//
+// Two uncoordinated writers to one ordered chain IS the bug. MASQUERADE stays
+// here: it is the nat table, a different resource with no ordering contention.
 func (b *ImageBooter) ensureNAT() error {
 	b.natOnce.Do(func() {
 		_ = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0o644)
 		if exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", imgSubnet16, "-j", "MASQUERADE").Run() != nil {
 			if out, err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", imgSubnet16, "-j", "MASQUERADE").CombinedOutput(); err != nil {
 				b.natErr = fmt.Errorf("install image-boot MASQUERADE: %s: %w", string(out), err)
-			}
-		}
-		// Docker sets the FORWARD policy to DROP — DNAT'd ingress to a workload
-		// and workload egress both traverse FORWARD, so accept the img subnet.
-		for _, rule := range [][]string{
-			{"-d", imgSubnet16, "-j", "ACCEPT"},
-			{"-s", imgSubnet16, "-j", "ACCEPT"},
-		} {
-			check := append([]string{"-C", "FORWARD"}, rule...)
-			if exec.Command("iptables", check...).Run() != nil {
-				insert := append([]string{"-I", "FORWARD", "1"}, rule...)
-				if out, err := exec.Command("iptables", insert...).CombinedOutput(); err != nil && b.natErr == nil {
-					b.natErr = fmt.Errorf("install image-boot FORWARD accept: %s: %w", string(out), err)
-				}
-			}
-		}
-		// Tenant isolation: the two accepts above would also permit guest→guest
-		// traffic (both endpoints in the flat /16, one host root netns). Deny any
-		// flow whose source AND destination are both in the img subnet so one
-		// resident tenant's microVM cannot reach another's. Inserted at the TOP
-		// (after the accepts, so -I 1 lands it above them) → evaluated first;
-		// ingress (src=host/external) and egress (dst=external) each have only
-		// one side in the subnet and are unaffected. (Mirrors the 172.16/24 rule.)
-		denyRule := []string{"-s", imgSubnet16, "-d", imgSubnet16, "-j", "DROP"}
-		check := append([]string{"-C", "FORWARD"}, denyRule...)
-		if exec.Command("iptables", check...).Run() != nil {
-			insert := append([]string{"-I", "FORWARD", "1"}, denyRule...)
-			if out, err := exec.Command("iptables", insert...).CombinedOutput(); err != nil && b.natErr == nil {
-				b.natErr = fmt.Errorf("install image-boot cross-tenant deny: %s: %w", string(out), err)
 			}
 		}
 	})
@@ -322,16 +311,20 @@ func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (
 	defer func() { _ = os.Remove(in.RootfsPath) }()
 
 	// Job class: lock egress down to the allowlist BEFORE the VM starts, so the
-	// workload never gets an unfiltered moment. The chain jump lands at the top of
-	// FORWARD (above ensureNAT's blanket subnet ACCEPTs), so the allowlist wins.
+	// workload never gets an unfiltered moment. The jump lands in SNT-EGRESS, which
+	// the netfabric enforcer anchors BELOW the inter-VM decision (SNT-XVM) and
+	// ABOVE the blanket subnet ACCEPT — so the allowlist still wins over the
+	// ACCEPT, but can no longer win over the cross-tenant DENY. Before #5 this jump
+	// went to FORWARD position 1, above everything, which is how an allowlist
+	// naming 10.201.0.0/16 bought lateral reach to every other tenant's microVM.
 	// Fail closed: if the chain cannot be installed the boot aborts rather than run
 	// a secret-bearing job with unrestricted egress.
 	if len(in.EgressAllow) > 0 {
-		if err := b.p.applyEgressList(nw.tapName, in.EgressAllow); err != nil {
-			b.p.flushEgressList(nw.tapName)
+		if err := b.p.applyEgressList(netfabric.EgressParentChain, nw.tapName, in.EgressAllow); err != nil {
+			b.p.flushEgressList(netfabric.EgressParentChain, nw.tapName)
 			return usecase.ImageTestResult{}, fmt.Errorf("apply egress allowlist: %w", err)
 		}
-		defer b.p.flushEgressList(nw.tapName)
+		defer b.p.flushEgressList(netfabric.EgressParentChain, nw.tapName)
 	}
 
 	vcpu, memMB := normalizeResources(in.VCPU, in.MemoryMB)

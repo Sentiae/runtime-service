@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option go_package = "github.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1";
+
+// FleetNetworkFabric is the P21 NetworkFabric provider seam for the
+// sentiae_fleet target class (system-deployment §4-A, ratified D-164).
+// Scope: ONE fleet, ONE org trust domain, iptables. Cross-cloud (Nebula,
+// lighthouses, join tokens) is §9 #18 and is NOT this service.
+//
+// It is deliberately a SEPARATE service from FleetOrchestration (P7): P21 and P7
+// are two distinct ports, delivery binds a distinct adapter to each, and folding
+// them together would fuse the two at the wire.
+service FleetNetworkFabric {
+    rpc EnsureNetwork(EnsureNetworkRequest) returns (EnsureNetworkResponse);
+    rpc ApplyPolicies(ApplyPoliciesRequest) returns (ApplyPoliciesResponse);
+    rpc DeprovisionNetwork(DeprovisionNetworkRequest) returns (DeprovisionNetworkResponse);
+}
+
+message EnsureNetworkRequest {
+    // system_id is an OPAQUE SCOPE KEY = the catalog Product ID (D-146/D-164).
+    // The fleet stores and compares it and NEVER dereferences it; no `systems`
+    // table exists anywhere.
+    string system_id = 1;
+    string env = 2;
+    // owner_org is the attested tenant uuid (D-069/I28). REQUIRED — an org-less
+    // network is rejected. Unlike Provision (which tolerates an empty org for
+    // legacy CP3 test boots) this is a net-new surface with no legacy caller, so
+    // it is strict from birth.
+    string owner_org = 3;
+}
+message EnsureNetworkResponse {
+    string handle = 1;   // the NetworkHandle (fleet_networks.id)
+}
+
+message NetworkPolicySpec {
+    string from_component_id = 1;
+    string to_component_id = 2;
+    // protocol: "tcp" only. Any other value — INCLUDING EMPTY — is REJECTED and
+    // never defaulted.
+    string protocol = 3;
+    // port MUST be 1..65535. 0 is an ERROR, never "any port": the proto zero
+    // value must not be readable as a wildcard allow.
+    int32 port = 4;
+    string derived_from_edge_id = 5;   // provenance (I13)
+}
+message ApplyPoliciesRequest {
+    string handle = 1;
+    // policies is the COMPLETE desired set; it replaces, never merges. An EMPTY
+    // list is VALID and means "revoke everything" — the empty set is the most
+    // restrictive set, not a no-op. One invalid policy rejects the whole batch;
+    // nothing is partially applied.
+    repeated NetworkPolicySpec policies = 2;
+}
+message PolicyEnforcement {
+    string from_component_id = 1;
+    string to_component_id = 2;
+    int32 port = 3;
+    // tier: "enforced" | "partial" | "advisory" (D-140). A rule the fleet did not
+    // install is NEVER reported as enforced.
+    string tier = 4;
+    string detail = 5;   // why, when not "enforced"
+}
+message ApplyPoliciesResponse {
+    string aggregate = 1;                      // the weakest tier across all policies
+    repeated PolicyEnforcement policies = 2;   // per-policy EnforcementReport
+}
+
+message DeprovisionNetworkRequest {
+    string handle = 1;
+}
+message DeprovisionNetworkResponse {}

@@ -457,3 +457,9 @@ func TestDecommissionReplica_MissingIsNoop(t *testing.T) {
 		t.Fatalf("Decommission should not be called for a missing replica")
 	}
 }
+
+// ListBySystemEnv satisfies FleetAppRepository. This fake predates P21 network
+// membership and models none, so it matches nothing.
+func (f *rtAppRepo) ListBySystemEnv(context.Context, string, string) ([]domain.FleetApp, error) {
+	return nil, nil
+}

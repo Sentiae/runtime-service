@@ -191,3 +191,65 @@ type CreateExecutionInput struct {
 	EnvVars        domain.JSONMap        `json:"env_vars,omitempty"`
 	Resources      *domain.ResourceLimit `json:"resources,omitempty"`
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// NetworkEnforcer port — the host-level realization seam for P21 on the
+// fleet (CP4.5 §9 #5). Implemented by internal/infrastructure/netfabric
+// (iptables); fail-loud off the firecracker host.
+// ─────────────────────────────────────────────────────────────────────
+
+// NetworkEnforcer realizes fleet network policy on the host. The real
+// implementation owns the whole FORWARD program (see the netfabric package doc);
+// FailLoudNetworkEnforcer rejects every call so a workload is NEVER booted into
+// an unenforced network on a host that cannot enforce.
+type NetworkEnforcer interface {
+	// InstallSkeleton writes the complete, ordered chain program. It must converge
+	// from any starting state — kernel rules survive a process restart, so a clean
+	// slate is never assumed.
+	InstallSkeleton(ctx context.Context) error
+	// AssertPosture PROVES the installed program matches the intended one exactly.
+	// Called at DI init before anything serves, and again before any provision that
+	// depends on it. An error must prevent this host from serving system-scoped
+	// workloads — never a warning, never a metric. A refusal.
+	AssertPosture(ctx context.Context) error
+	// SyncSystem atomically rebuilds ONE system's allow chain from the resolved
+	// rules. Whole-chain flush+refill, never incremental — idempotent + self-healing.
+	SyncSystem(ctx context.Context, networkID uuid.UUID, rules []ResolvedRule) error
+	// DropSystem removes a system's chain entirely (Deprovision / teardown).
+	DropSystem(ctx context.Context, networkID uuid.UUID) error
+}
+
+// ResolvedRule is one compiled policy with live guest IPs substituted in. Empty
+// SrcIP or DstIP is impossible by construction: the resolver EMITS NO RULE for a
+// policy whose endpoint has no live replica — there is no wildcard substitute.
+type ResolvedRule struct {
+	SrcIP    string // a live replica guest IP (rendered /32 by the enforcer)
+	DstIP    string // a live replica guest IP (rendered /32 by the enforcer)
+	Protocol string // "tcp" — never defaulted; an empty value is rejected
+	Port     int    // 1..65535 — 0 is an error, never "any"
+}
+
+// FailLoudNetworkEnforcer is wired when the executor is not firecracker, or when
+// the real enforcer could not install/prove its program at boot. Every call fails
+// with ErrNetworkEnforcerUnavailable so the fleet never silently serves an
+// unenforced network (mirrors FailLoudImageBooter / FailLoudVolumeBackend).
+//
+// The forbidden shape here is `if !firecracker { skip policies; boot anyway }` —
+// that is a control degrading to permissive because its dependency is absent,
+// which is the platform's default failure mode and the reason this type exists.
+type FailLoudNetworkEnforcer struct{}
+
+var _ NetworkEnforcer = FailLoudNetworkEnforcer{}
+
+func (FailLoudNetworkEnforcer) InstallSkeleton(context.Context) error {
+	return domain.ErrNetworkEnforcerUnavailable
+}
+func (FailLoudNetworkEnforcer) AssertPosture(context.Context) error {
+	return domain.ErrNetworkEnforcerUnavailable
+}
+func (FailLoudNetworkEnforcer) SyncSystem(context.Context, uuid.UUID, []ResolvedRule) error {
+	return domain.ErrNetworkEnforcerUnavailable
+}
+func (FailLoudNetworkEnforcer) DropSystem(context.Context, uuid.UUID) error {
+	return domain.ErrNetworkEnforcerUnavailable
+}

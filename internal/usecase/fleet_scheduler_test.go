@@ -101,13 +101,13 @@ func TestFleetScheduler_SelectHost(t *testing.T) {
 	appsWith2 := map[uuid.UUID]*domain.FleetApp{appID: app2}
 
 	tests := []struct {
-		name       string
-		hosts      []domain.Host
-		byHost     map[uuid.UUID][]domain.Replica
-		apps       map[uuid.UUID]*domain.FleetApp
-		req        PlacementRequest
-		wantHost   uuid.UUID
-		wantErrIs  error
+		name      string
+		hosts     []domain.Host
+		byHost    map[uuid.UUID][]domain.Replica
+		apps      map[uuid.UUID]*domain.FleetApp
+		req       PlacementRequest
+		wantHost  uuid.UUID
+		wantErrIs error
 	}{
 		{
 			name: "bin_pack picks densest fitting host",
@@ -264,4 +264,10 @@ func TestFleetScheduler_SelectHost(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ListBySystemEnv satisfies FleetAppRepository. This fake predates P21 network
+// membership and models none, so it matches nothing.
+func (f *fakeAppRepo) ListBySystemEnv(context.Context, string, string) ([]domain.FleetApp, error) {
+	return nil, nil
 }

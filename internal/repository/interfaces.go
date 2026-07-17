@@ -179,7 +179,33 @@ type FleetAppRepository interface {
 	FindByID(ctx context.Context, id uuid.UUID) (*domain.FleetApp, error)
 	FindByComponentEnv(ctx context.Context, componentID, env string) (*domain.FleetApp, error)
 	List(ctx context.Context) ([]domain.FleetApp, error)
+	// ListBySystemEnv returns the apps that are members of one P21 fleet network
+	// (CP4.5 §9 #5). An empty systemID matches NOTHING: '' means "no network
+	// membership", and returning every unscoped app for it would make the resolver
+	// compile rules between strangers.
+	ListBySystemEnv(ctx context.Context, systemID, env string) ([]domain.FleetApp, error)
 	Delete(ctx context.Context, id uuid.UUID) error
+}
+
+// FleetNetworkRepository persists P21 fleet networks (the per-system×env policy
+// scope). CP4.5 §9 #5.
+type FleetNetworkRepository interface {
+	Create(ctx context.Context, n *domain.FleetNetwork) error
+	FindByID(ctx context.Context, id uuid.UUID) (*domain.FleetNetwork, error)
+	// FindBySystemEnv returns the network for a (system_id, env) regardless of
+	// status; callers decide what a deprovisioned network means for them.
+	FindBySystemEnv(ctx context.Context, systemID, env string) (*domain.FleetNetwork, error)
+	ListActive(ctx context.Context) ([]domain.FleetNetwork, error)
+	MarkDeprovisioned(ctx context.Context, id uuid.UUID) error
+}
+
+// FleetNetworkPolicyRepository persists the compiled arch edges of a network.
+type FleetNetworkPolicyRepository interface {
+	// ReplaceForNetwork atomically swaps a network's COMPLETE policy set in one
+	// transaction. It replaces, never merges: the caller always supplies the whole
+	// desired set, and an empty set means "revoke everything".
+	ReplaceForNetwork(ctx context.Context, networkID uuid.UUID, ps []domain.FleetNetworkPolicy) error
+	ListForNetwork(ctx context.Context, networkID uuid.UUID) ([]domain.FleetNetworkPolicy, error)
 }
 
 // ReplicaRepository persists resident replicas (actual state per app).

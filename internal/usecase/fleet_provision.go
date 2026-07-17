@@ -205,19 +205,26 @@ const (
 
 // FleetProvisionInput is the wire-agnostic provision request.
 type FleetProvisionInput struct {
-	ComponentID    string
-	Env            string
-	OwnerOrg       string
-	Registry       string
-	Repository     string
-	Digest         string
-	ChangeID       string
-	VCPU           int
-	MemoryMB       int
-	EnvVars        map[string]string
-	SecretRefs     []string
-	Port           int
-	WorkloadClass  string
+	ComponentID   string
+	Env           string
+	OwnerOrg      string
+	Registry      string
+	Repository    string
+	Digest        string
+	ChangeID      string
+	VCPU          int
+	MemoryMB      int
+	EnvVars       map[string]string
+	SecretRefs    []string
+	Port          int
+	WorkloadClass string
+	// SystemID binds the workload to a P21 fleet network (CP4.5 §9 #5, D-164). It
+	// is the opaque scope key delivery resolves from catalog. Non-empty requires an
+	// ACTIVE network for (SystemID, Env) on a host that can prove its enforcement
+	// posture — otherwise the provision is REFUSED, never auto-networked. Empty
+	// means no membership: the workload reaches no fleet peer, which is exactly the
+	// pre-#5 behavior, so back-compat and fail-closed are the same path.
+	SystemID       string
 	TestCommand    string
 	TimeoutSeconds int64
 	Volumes        []VolumeSpecInput
@@ -392,6 +399,15 @@ func (uc *FleetProvision) Provision(ctx context.Context, in FleetProvisionInput)
 	// collide or resolve across tenants (I28).
 	if class == domain.ImageWorkloadClassJob && in.IdempotencyKey != "" && in.OwnerOrg == "" {
 		return FleetProvisionOutput{}, domain.ErrIdempotencyOwnerOrgMissing
+	}
+	// CP4.5 §9 #5 — egress_allow is for EXTERNAL destinations only. An entry naming
+	// the fleet's own subnet (or a supernet of it) is rejected at the seam: inter-VM
+	// reach is governed by network policies alone. This is the EXPLICIT half of a
+	// two-layer guard; the structural half is the chain topology (SNT-XVM is
+	// terminal for inter-VM flows and evaluated before SNT-EGRESS), which holds
+	// even if this check is bypassed.
+	if err := ValidateEgressAllow(in.EgressAllow); err != nil {
+		return FleetProvisionOutput{}, err
 	}
 	if in.Registry == "" || in.Repository == "" || in.Digest == "" {
 		return FleetProvisionOutput{}, domain.ErrImageRefIncomplete

@@ -298,7 +298,19 @@ type DeploymentDescriptor struct {
 	// chain that ACCEPTs only these destinations and DROPs the rest. Empty → no
 	// allowlist is installed (the class's default subnet rules apply). Job class
 	// only.
-	EgressAllow   []string `protobuf:"bytes,21,rep,name=egress_allow,json=egressAllow,proto3" json:"egress_allow,omitempty"`
+	EgressAllow []string `protobuf:"bytes,21,rep,name=egress_allow,json=egressAllow,proto3" json:"egress_allow,omitempty"`
+	// system_id binds this workload to a P21 fleet network (CP4.5 §9 #5, D-164).
+	// It is the OPAQUE SCOPE KEY delivery resolves from catalog (the Product ID);
+	// the fleet stores and compares it and never dereferences it.
+	//
+	// NON-EMPTY requires an ACTIVE fleet_networks row for (system_id, env): a
+	// provision naming an unknown network is REJECTED (FailedPrecondition), never
+	// auto-created — auto-create-on-first-provision is the permissive branch.
+	//
+	// EMPTY = no network membership = the workload can reach NO fleet peer (the
+	// SNT-XVM terminal DROP governs). That is exactly today's behavior, so every
+	// pre-#5 caller is unaffected: back-compat and fail-closed are the same path.
+	SystemId      string `protobuf:"bytes,22,opt,name=system_id,json=systemId,proto3" json:"system_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -478,6 +490,13 @@ func (x *DeploymentDescriptor) GetEgressAllow() []string {
 		return x.EgressAllow
 	}
 	return nil
+}
+
+func (x *DeploymentDescriptor) GetSystemId() string {
+	if x != nil {
+		return x.SystemId
+	}
+	return ""
 }
 
 type ProvisionRequest struct {
@@ -1429,7 +1448,7 @@ const file_proto_runtime_v1_fleet_proto_rawDesc = "" +
 	"\n" +
 	"VolumeSpec\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x17\n" +
-	"\asize_mb\x18\x02 \x01(\x05R\x06sizeMb\"\x93\a\n" +
+	"\asize_mb\x18\x02 \x01(\x05R\x06sizeMb\"\xb0\a\n" +
 	"\x14DeploymentDescriptor\x12!\n" +
 	"\fcomponent_id\x18\x01 \x01(\tR\vcomponentId\x12\x10\n" +
 	"\x03env\x18\x02 \x01(\tR\x03env\x12-\n" +
@@ -1455,7 +1474,8 @@ const file_proto_runtime_v1_fleet_proto_rawDesc = "" +
 	"\vjob_command\x18\x13 \x03(\tR\n" +
 	"jobCommand\x12'\n" +
 	"\x0fidempotency_key\x18\x14 \x01(\tR\x0eidempotencyKey\x12!\n" +
-	"\fegress_allow\x18\x15 \x03(\tR\vegressAllow\x1a:\n" +
+	"\fegress_allow\x18\x15 \x03(\tR\vegressAllow\x12\x1b\n" +
+	"\tsystem_id\x18\x16 \x01(\tR\bsystemId\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"q\n" +

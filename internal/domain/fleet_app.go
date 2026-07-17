@@ -28,17 +28,25 @@ func (p RestartPolicy) IsValid() bool {
 // the Sentiae fleet. It doubles as the GORM model (see ImageWorkload). DDL is
 // owned by golang-migrate (migrations/), not AutoMigrate.
 type FleetApp struct {
-	ID              uuid.UUID     `json:"id" gorm:"type:uuid;primary_key"`
-	ComponentID     string        `json:"component_id" gorm:"type:varchar(255);not null;index;uniqueIndex:uq_fleet_apps_component_env"`
-	Env             string        `json:"env" gorm:"type:varchar(64);not null;uniqueIndex:uq_fleet_apps_component_env"`
-	ImageRepository string        `json:"image_repository" gorm:"type:varchar(512);not null"`
-	ImageDigest     string        `json:"image_digest" gorm:"type:varchar(255);not null"`
+	ID              uuid.UUID `json:"id" gorm:"type:uuid;primary_key"`
+	ComponentID     string    `json:"component_id" gorm:"type:varchar(255);not null;index;uniqueIndex:uq_fleet_apps_component_env"`
+	Env             string    `json:"env" gorm:"type:varchar(64);not null;uniqueIndex:uq_fleet_apps_component_env"`
+	ImageRepository string    `json:"image_repository" gorm:"type:varchar(512);not null"`
+	ImageDigest     string    `json:"image_digest" gorm:"type:varchar(255);not null"`
 	// OwnerOrg is the attested tenant (org uuid) that owns this app's secrets
 	// (D-069). The resident replica runtime scopes every secret_ref resolution to
 	// it (I28): secrets resolve only under this org's per-tenant KEK. Empty is
 	// valid only when SecretRefs is empty — a secret-bearing app without an owner
 	// org fails closed at boot (no org to scope to).
-	OwnerOrg        string        `json:"owner_org" gorm:"type:text;not null;default:''"`
+	OwnerOrg string `json:"owner_org" gorm:"type:text;not null;default:''"`
+	// SystemID binds this app to a P21 fleet network (CP4.5 §9 #5, D-164). It is
+	// the opaque scope key delivery resolves from catalog — the fleet stores and
+	// compares it, never dereferences it. Non-empty requires an ACTIVE
+	// fleet_networks row for (SystemID, Env); a provision naming an unknown
+	// network is rejected, never auto-created. Empty = no network membership =
+	// this app reaches NO fleet peer (the SNT-XVM terminal DROP governs), which is
+	// exactly the pre-#5 behavior.
+	SystemID        string        `json:"system_id" gorm:"type:varchar(255);not null;default:'';index"`
 	DesiredReplicas int           `json:"desired_replicas" gorm:"not null;default:1"`
 	MinReplicas     int           `json:"min_replicas" gorm:"not null;default:0"`
 	MaxReplicas     int           `json:"max_replicas" gorm:"not null;default:1"`
@@ -52,7 +60,7 @@ type FleetApp struct {
 	// (invariant I32). Real refs are still gate-rejected at provision today
 	// (ErrSecretsNotSupported); this carries the desired state the resolver (P3.4)
 	// will resolve into pushed secrets. ExpectSecrets is derived from it at boot.
-	SecretRefs      []string      `json:"secret_refs,omitempty" gorm:"type:jsonb;serializer:json"`
+	SecretRefs []string `json:"secret_refs,omitempty" gorm:"type:jsonb;serializer:json"`
 	// IdleTTLSeconds is the inactivity window before a scale-to-zero app drains to
 	// zero replicas (rt#11, D-082). 0 disables idle scale-down.
 	IdleTTLSeconds int `json:"idle_ttl_seconds" gorm:"column:idle_ttl_seconds;not null;default:0"`

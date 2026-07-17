@@ -146,6 +146,16 @@ func (s *Server) RegisterFleet(fleet *FleetServer) {
 	}
 }
 
+// RegisterNetworkFabric registers the FleetNetworkFabric service (P21, CP4.5
+// §9 #5). Separate from RegisterFleet because P21 and P7 are separate ports.
+// Safe to call after NewServer but before Serve.
+func (s *Server) RegisterNetworkFabric(fabric *NetworkFabricServer) {
+	runtimev1.RegisterFleetNetworkFabricServer(s.builder.Registrar(), fabric)
+	if s.healthServer != nil {
+		s.healthServer.SetServingStatus("runtime.v1.FleetNetworkFabric", grpc_health_v1.HealthCheckResponse_SERVING)
+	}
+}
+
 // GetGRPCServer returns a primary underlying gRPC server for introspection.
 // Use Serve for the real listen path so every configured transport is served.
 func (s *Server) GetGRPCServer() *grpc.Server {

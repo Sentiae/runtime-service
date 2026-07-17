@@ -81,6 +81,18 @@ message DeploymentDescriptor {
     // allowlist is installed (the class's default subnet rules apply). Job class
     // only.
     repeated string egress_allow = 21;
+    // system_id binds this workload to a P21 fleet network (CP4.5 §9 #5, D-164).
+    // It is the OPAQUE SCOPE KEY delivery resolves from catalog (the Product ID);
+    // the fleet stores and compares it and never dereferences it.
+    //
+    // NON-EMPTY requires an ACTIVE fleet_networks row for (system_id, env): a
+    // provision naming an unknown network is REJECTED (FailedPrecondition), never
+    // auto-created — auto-create-on-first-provision is the permissive branch.
+    //
+    // EMPTY = no network membership = the workload can reach NO fleet peer (the
+    // SNT-XVM terminal DROP governs). That is exactly today's behavior, so every
+    // pre-#5 caller is unaffected: back-compat and fail-closed are the same path.
+    string system_id = 22;
 }
 message ProvisionRequest {
     DeploymentDescriptor descriptor = 1;

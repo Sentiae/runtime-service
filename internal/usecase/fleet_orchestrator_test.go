@@ -577,3 +577,9 @@ func TestOrchestrator_ProvisionThenScaleThenDecommission(t *testing.T) {
 		t.Fatalf("replicas after decommission = %d, want 0", got)
 	}
 }
+
+// ListBySystemEnv satisfies FleetAppRepository. This fake predates P21 network
+// membership and models none, so it matches nothing.
+func (f *orchAppRepo) ListBySystemEnv(context.Context, string, string) ([]domain.FleetApp, error) {
+	return nil, nil
+}
