@@ -6,18 +6,32 @@ RUN apk add --no-cache git ca-certificates tzdata
 
 # Configure private module access
 ARG GITHUB_TOKEN
-ENV GOPRIVATE=github.com/sentiae/*
 RUN git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
 
 WORKDIR /app
 
 # Copy local replace dependencies
-COPY platform-kit/ /platform-kit/
 COPY foundry-service/ /foundry-service/
 COPY canvas-service/ /canvas-service/
 
 # Copy go.mod and go.sum first for better caching
 COPY runtime-service/go.mod runtime-service/go.sum ./
+# Fetch platform-kit (and all other modules) through the Athens Go proxy.
+# GOPROXY has no ",direct" fallback on purpose: Athens is the single source of
+# truth, so a proxy miss must FAIL rather than silently fall back to direct git
+# (which would re-expose the drift the substrate design forbids). GOPRIVATE and
+# GONOPROXY are deliberately left UNSET so ALL modules — public and private
+# sentiae alike — route through Athens by construction. GONOSUMDB scopes the
+# public checksum-DB skip to the private module only (public modules still
+# verify against sumdb); platform-kit itself is verified against the committed
+# go.sum hashes, so no global GOSUMDB=off is needed.
+ARG GOPROXY
+ARG GOFLAGS
+ENV GOPROXY=${GOPROXY} \
+    GOFLAGS=${GOFLAGS} \
+    GONOSUMDB=github.com/sentiae/* \
+    GOTOOLCHAIN=auto
+
 RUN go mod download && go mod verify
 
 # Copy source code

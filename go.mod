@@ -12,7 +12,7 @@ require (
 	github.com/minio/minio-go/v7 v7.1.0
 	github.com/sentiae/canvas-service v0.0.0-00010101000000-000000000000
 	github.com/sentiae/foundry-service v0.1.0
-	github.com/sentiae/platform-kit v0.1.0
+	github.com/sentiae/platform-kit v0.2.0
 	github.com/spiffe/go-spiffe/v2 v2.6.0
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.53.0
@@ -23,10 +23,7 @@ require (
 	gorm.io/gorm v1.31.2
 )
 
-replace (
-	github.com/sentiae/foundry-service => ../foundry-service
-	github.com/sentiae/platform-kit => ../platform-kit
-)
+replace github.com/sentiae/foundry-service => ../foundry-service
 
 require (
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260209202127-80ab13bee0bf.1 // indirect
