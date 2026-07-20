@@ -206,9 +206,8 @@ type PoolConfig struct {
 
 // MigrationsConfig contains migration settings.
 type MigrationsConfig struct {
-	Enabled     bool   `mapstructure:"enabled"`
-	Path        string `mapstructure:"path"`
-	AutoMigrate bool   `mapstructure:"auto_migrate"`
+	Enabled bool   `mapstructure:"enabled"`
+	Path    string `mapstructure:"path"`
 }
 
 // ServicesConfig contains external service endpoints.
@@ -356,20 +355,19 @@ func Load() (*Config, error) {
 			"server.grpc.jwt_issuer":      "identity-service",
 
 			// Database defaults
-			"database.postgres.host":                    "localhost",
-			"database.postgres.port":                    "5432",
-			"database.postgres.user":                    "postgres",
-			"database.postgres.password":                "postgres",
-			"database.postgres.database":                "runtime_service",
-			"database.postgres.ssl_mode":                "disable",
-			"database.postgres.pool.max_open_conns":     25,
-			"database.postgres.pool.max_idle_conns":     10,
-			"database.postgres.pool.max_lifetime":       "5m",
-			"database.postgres.pool.max_idle_time":      "10m",
-			"database.postgres.migrations.enabled":      true,
-			"database.postgres.migrations.path":         "./migrations",
-			"database.postgres.migrations.auto_migrate": false,
-			"database.postgres.log_level":               "warn",
+			"database.postgres.host":                "localhost",
+			"database.postgres.port":                "5432",
+			"database.postgres.user":                "postgres",
+			"database.postgres.password":            "postgres",
+			"database.postgres.database":            "runtime_service",
+			"database.postgres.ssl_mode":            "disable",
+			"database.postgres.pool.max_open_conns": 25,
+			"database.postgres.pool.max_idle_conns": 10,
+			"database.postgres.pool.max_lifetime":   "5m",
+			"database.postgres.pool.max_idle_time":  "10m",
+			"database.postgres.migrations.enabled":  true,
+			"database.postgres.migrations.path":     "./migrations",
+			"database.postgres.log_level":           "warn",
 
 			// Services defaults
 			"services.identity.enabled":   true,
@@ -513,7 +511,6 @@ func Load() (*Config, error) {
 			{"database.postgres.pool.max_idle_time", "APP_DATABASE_MAX_IDLE_TIME"},
 			{"database.postgres.migrations.enabled", "APP_DATABASE_MIGRATIONS_ENABLED"},
 			{"database.postgres.migrations.path", "APP_DATABASE_MIGRATIONS_PATH"},
-			{"database.postgres.migrations.auto_migrate", "APP_DATABASE_AUTO_MIGRATE"},
 			{"database.postgres.log_level", "APP_DATABASE_LOG_LEVEL"},
 
 			// Services bindings

@@ -716,21 +716,14 @@ func (c *Container) initDatabase(cfg *config.Config) error {
 	c.DB = db
 	log.Println("Database connection initialized successfully")
 
-	// Run golang-migrate migrations (durable path, idempotent) — owns the
-	// fleet control-plane DDL. Runs unconditionally before AutoMigrate.
+	// Run golang-migrate migrations (durable path, idempotent) — the SOLE
+	// schema authority (D-178). Every runtime table, core + fleet control-plane,
+	// is owned by migrations/ now; GORM AutoMigrate was retired.
 	version, applied, err := postgres.RunMigrations(db)
 	if err != nil {
 		return fmt.Errorf("failed to run migrations: %w", err)
 	}
 	log.Printf("Migrations complete (version=%d applied=%t)", version, applied)
-
-	// Run auto-migrations if enabled
-	if cfg.Database.Postgres.Migrations.AutoMigrate {
-		if err := postgres.AutoMigrate(db); err != nil {
-			return fmt.Errorf("failed to run auto-migrations: %w", err)
-		}
-		log.Println("Auto-migrations completed successfully")
-	}
 
 	return nil
 }
@@ -935,8 +928,7 @@ func (c *Container) initRepositories() {
 	c.RouteRepo = postgres.NewRouteRepository(c.DB)
 	c.VolumeRepo = postgres.NewVolumeRepository(c.DB)
 
-	// CP4.5 §9#5 — P21 fleet network fabric store (golang-migrate-owned; these
-	// models are deliberately NOT in the AutoMigrate set).
+	// CP4.5 §9#5 — P21 fleet network fabric store.
 	c.FleetNetworkRepo = postgres.NewFleetNetworkRepository(c.DB)
 	c.FleetNetworkPolicyRepo = postgres.NewFleetNetworkPolicyRepository(c.DB)
 
