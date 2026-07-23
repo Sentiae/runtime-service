@@ -125,15 +125,27 @@ func (uc *FleetNetworkFabric) EnsureNetwork(ctx context.Context, in EnsureNetwor
 			return EnsureNetworkOutput{}, domain.ErrNetworkOwnerOrgRequired
 		}
 		if existing.Status != domain.FleetNetworkActive {
-			// A tombstoned scope is NOT silently revived. Reviving it would re-open a
-			// scope that was explicitly torn down, and the P21 repository contract has
-			// no revive operation to do it deliberately. Refuse.
-			// ⚠ KNOWN GAP (reported, not papered over): this makes re-ensure-after-
-			// Deprovision fail, which delivery's P21 consumer (§9 #7) will hit on a
-			// redeploy-after-teardown. Nothing calls Deprovision until #7 exists, so
-			// the gap is unreachable this slice — it needs a deliberate revive
-			// semantic, not a guess here.
-			return EnsureNetworkOutput{}, domain.ErrFleetNetworkNotFound
+			// REVIVE (D-179 §807, #fleet-network-revive-after-teardown): a re-Ensure of
+			// a tombstoned scope reuses the SAME row rather than tombstone-refusing (the
+			// old KNOWN GAP) or minting a second row (which uq_fleet_networks_system_env
+			// forbids). The org-anchor guard above already blocked cross-org adoption, so
+			// this is the original owner re-opening its own scope. The revived scope comes
+			// back with ZERO reach: flip status Active, then install the EMPTY chain
+			// (replace policies with the empty set, then re-sync) so nothing is reachable
+			// until ApplyPolicies says otherwise (default-deny I23). The pre-teardown
+			// policy rows are deliberately NOT re-animated — re-opening reach that was
+			// explicitly torn down would be the fail-open reading.
+			if merr := uc.networks.MarkActive(ctx, existing.ID); merr != nil {
+				return EnsureNetworkOutput{}, fmt.Errorf("revive fleet network: %w", merr)
+			}
+			existing.Status = domain.FleetNetworkActive
+			if rerr := uc.policies.ReplaceForNetwork(ctx, existing.ID, nil); rerr != nil {
+				return EnsureNetworkOutput{}, fmt.Errorf("clear policies on revive: %w", rerr)
+			}
+			if serr := uc.syncNetwork(ctx, existing); serr != nil {
+				return EnsureNetworkOutput{}, serr
+			}
+			return EnsureNetworkOutput{Handle: existing.ID}, nil
 		}
 		if serr := uc.syncNetwork(ctx, existing); serr != nil {
 			return EnsureNetworkOutput{}, serr

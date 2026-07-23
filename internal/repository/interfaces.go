@@ -197,6 +197,12 @@ type FleetNetworkRepository interface {
 	FindBySystemEnv(ctx context.Context, systemID, env string) (*domain.FleetNetwork, error)
 	ListActive(ctx context.Context) ([]domain.FleetNetwork, error)
 	MarkDeprovisioned(ctx context.Context, id uuid.UUID) error
+	// MarkActive revives a tombstoned scope by reusing its existing row: it flips
+	// status back to 'active' so a re-EnsureNetwork after Deprovision never has to
+	// violate uq_fleet_networks_system_env with a second row (D-179 §807,
+	// #fleet-network-revive-after-teardown). This is runtime-INTERNAL persistence,
+	// not a new P21 verb.
+	MarkActive(ctx context.Context, id uuid.UUID) error
 }
 
 // FleetNetworkPolicyRepository persists the compiled arch edges of a network.

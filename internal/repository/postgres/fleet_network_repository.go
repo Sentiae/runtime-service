@@ -86,3 +86,26 @@ func (r *fleetNetworkRepository) MarkDeprovisioned(ctx context.Context, id uuid.
 	}
 	return nil
 }
+
+// MarkActive revives a tombstoned scope by reusing its existing row: status flips
+// back to 'active' and updated_at is bumped. Reusing the row is the point of the
+// ruling — a second (system_id, env) row would violate uq_fleet_networks_system_env,
+// so a re-EnsureNetwork after Deprovision goes through here instead (D-179 §807,
+// #fleet-network-revive-after-teardown). There is no separate tombstone timestamp
+// column to clear — the status field IS the tombstone.
+func (r *fleetNetworkRepository) MarkActive(ctx context.Context, id uuid.UUID) error {
+	res := r.db.WithContext(ctx).
+		Model(&domain.FleetNetwork{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"status":     string(domain.FleetNetworkActive),
+			"updated_at": time.Now().UTC(),
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return domain.ErrFleetNetworkNotFound
+	}
+	return nil
+}

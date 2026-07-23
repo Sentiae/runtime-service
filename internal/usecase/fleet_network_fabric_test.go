@@ -81,6 +81,17 @@ func (r *fakeNetworkRepo) MarkDeprovisioned(_ context.Context, id uuid.UUID) err
 	return nil
 }
 
+func (r *fakeNetworkRepo) MarkActive(_ context.Context, id uuid.UUID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, ok := r.store[id]
+	if !ok {
+		return domain.ErrFleetNetworkNotFound
+	}
+	n.Status = domain.FleetNetworkActive
+	return nil
+}
+
 type fakePolicyRepo struct {
 	mu    sync.Mutex
 	store map[uuid.UUID][]domain.FleetNetworkPolicy
@@ -640,6 +651,109 @@ func TestDeprovision_DropsTheChainAndTombstonesTheRow(t *testing.T) {
 	}
 	if n.Status != domain.FleetNetworkDeprovisioned {
 		t.Fatalf("status = %q, want %q", n.Status, domain.FleetNetworkDeprovisioned)
+	}
+}
+
+// ── revive after teardown (O6, D-179 §807) ───────────────────────────
+
+// The keystone O6 path: Ensure → Deprovision → Ensure must reuse the SAME row,
+// come back Active, and come back with an EMPTY chain (default-deny I23) — never
+// re-animating the pre-teardown policy rows.
+func TestEnsureNetwork_RevivesATombstonedScopeOnTheSameHandleWithAnEmptyChain(t *testing.T) {
+	h := newFabricHarness()
+	ctx := context.Background()
+	handle := h.ensure(t, "s", "prod", testOrg)
+	h.addApp("api", "s", "prod", "10.201.0.6")
+	h.addApp("db", "s", "prod", "10.201.0.10")
+
+	// Give the live scope real reach so we can prove the revive does NOT restore it.
+	if _, err := h.fabric.ApplyPolicies(ctx, ApplyPoliciesInput{
+		Handle:   handle,
+		Policies: []PolicySpecInput{{FromComponentID: "api", ToComponentID: "db", Protocol: "tcp", Port: 5432}},
+	}); err != nil {
+		t.Fatalf("ApplyPolicies: %v", err)
+	}
+	if len(h.enforcer.synced[handle]) != 1 {
+		t.Fatalf("pre-teardown chain = %+v, want one rule", h.enforcer.synced[handle])
+	}
+
+	if err := h.fabric.Deprovision(ctx, handle); err != nil {
+		t.Fatalf("Deprovision: %v", err)
+	}
+
+	revived, err := h.fabric.EnsureNetwork(ctx, EnsureNetworkInput{SystemID: "s", Env: "prod", OwnerOrg: testOrg})
+	if err != nil {
+		t.Fatalf("EnsureNetwork after Deprovision = %v, want revive", err)
+	}
+	if revived.Handle != handle {
+		t.Fatalf("revive minted a new handle %s, want the reused row %s", revived.Handle, handle)
+	}
+	// One row only — uq_fleet_networks_system_env was never at risk.
+	if got := len(h.networks.store); got != 1 {
+		t.Fatalf("%d network rows after revive, want 1 (the row is reused)", got)
+	}
+	n, err := h.networks.FindByID(ctx, handle)
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if n.Status != domain.FleetNetworkActive {
+		t.Fatalf("status = %q, want %q", n.Status, domain.FleetNetworkActive)
+	}
+	// Empty chain: the pre-teardown policy rows are gone and zero rules are installed.
+	if ps := h.policies.store[handle]; len(ps) != 0 {
+		t.Fatalf("revived scope has %d policy rows, want 0 — pre-teardown reach was re-animated", len(ps))
+	}
+	if rules := h.enforcer.synced[handle]; len(rules) != 0 {
+		t.Fatalf("revived chain installed %d rules, want 0 (default-deny): %+v", len(rules), rules)
+	}
+}
+
+// A foreign org must not be able to adopt a tombstoned scope via the revive path —
+// the org-anchor guard runs BEFORE the revive.
+func TestEnsureNetwork_RevivePathStillRefusesForeignOrgAdoption(t *testing.T) {
+	h := newFabricHarness()
+	ctx := context.Background()
+	handle := h.ensure(t, "s", "prod", testOrg)
+	if err := h.fabric.Deprovision(ctx, handle); err != nil {
+		t.Fatalf("Deprovision: %v", err)
+	}
+	_, err := h.fabric.EnsureNetwork(ctx, EnsureNetworkInput{
+		SystemID: "s", Env: "prod", OwnerOrg: "22222222-2222-2222-2222-222222222222",
+	})
+	if !errors.Is(err, domain.ErrNetworkOwnerOrgRequired) {
+		t.Fatalf("EnsureNetwork = %v, want ErrNetworkOwnerOrgRequired — a foreign org revived another org's scope", err)
+	}
+	n, ferr := h.networks.FindByID(ctx, handle)
+	if ferr != nil {
+		t.Fatalf("FindByID: %v", ferr)
+	}
+	if n.Status != domain.FleetNetworkDeprovisioned {
+		t.Fatalf("status = %q, want the scope to stay tombstoned after a refused adoption", n.Status)
+	}
+}
+
+// The revived scope behaves like a fresh scope: a subsequent ApplyPolicies works.
+func TestEnsureNetwork_RevivedScopeAcceptsNewPolicies(t *testing.T) {
+	h := newFabricHarness()
+	ctx := context.Background()
+	handle := h.ensure(t, "s", "prod", testOrg)
+	if err := h.fabric.Deprovision(ctx, handle); err != nil {
+		t.Fatalf("Deprovision: %v", err)
+	}
+	if _, err := h.fabric.EnsureNetwork(ctx, EnsureNetworkInput{SystemID: "s", Env: "prod", OwnerOrg: testOrg}); err != nil {
+		t.Fatalf("revive: %v", err)
+	}
+	h.addApp("api", "s", "prod", "10.201.0.6")
+	h.addApp("db", "s", "prod", "10.201.0.10")
+	out, err := h.fabric.ApplyPolicies(ctx, ApplyPoliciesInput{
+		Handle:   handle,
+		Policies: []PolicySpecInput{{FromComponentID: "api", ToComponentID: "db", Protocol: "tcp", Port: 5432}},
+	})
+	if err != nil {
+		t.Fatalf("ApplyPolicies on revived scope = %v, want nil", err)
+	}
+	if out.Aggregate != EnforcementEnforced || len(h.enforcer.synced[handle]) != 1 {
+		t.Fatalf("revived scope did not accept a new policy: aggregate=%q rules=%+v", out.Aggregate, h.enforcer.synced[handle])
 	}
 }
 
