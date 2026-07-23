@@ -22,6 +22,15 @@ type Config struct {
 	Registry      RegistryConfig      `mapstructure:"registry"`
 	ImageBoot     ImageBootConfig     `mapstructure:"imageboot"`
 	Fleet         FleetConfig         `mapstructure:"fleet"`
+	Telemetry     TelemetryConfig     `mapstructure:"telemetry"`
+}
+
+// TelemetryConfig configures the OTLP export path (traces/metrics/logs → the
+// otel-collector). Both fields are defaulted (never validate:required) so the
+// service boots without telemetry env set; init is non-fatal (D-179 Wave-8).
+type TelemetryConfig struct {
+	ServiceName  string `mapstructure:"service_name"`
+	OTLPEndpoint string `mapstructure:"otlp_endpoint"`
 }
 
 // FleetConfig configures this runtime-service instance's self-registration as a
@@ -466,6 +475,11 @@ func Load() (*Config, error) {
 			"fleet.caddy.access_log_path": "/var/log/sentiae/caddy-access.log",
 			"fleet.activate_timeout":      "30s",
 			"fleet.activator_endpoint":    "127.0.0.1:8090",
+
+			// Telemetry (OTLP export → otel-collector, D-179 Wave-8). Defaulted,
+			// never required — telemetry init is non-fatal.
+			"telemetry.service_name":  "runtime-service",
+			"telemetry.otlp_endpoint": "otel-collector:4317",
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -607,6 +621,10 @@ func Load() (*Config, error) {
 			{"fleet.caddy.access_log_path", "APP_FLEET_CADDY_ACCESS_LOG_PATH"},
 			{"fleet.activate_timeout", "APP_FLEET_ACTIVATE_TIMEOUT"},
 			{"fleet.activator_endpoint", "APP_FLEET_ACTIVATOR_ENDPOINT"},
+
+			// Telemetry (OTLP export)
+			{"telemetry.service_name", "APP_TELEMETRY_SERVICE_NAME"},
+			{"telemetry.otlp_endpoint", "APP_TELEMETRY_OTLP_ENDPOINT"},
 		},
 	})
 	if err != nil {

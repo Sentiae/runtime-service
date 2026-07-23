@@ -15,6 +15,7 @@ import (
 	pkdebug "github.com/sentiae/platform-kit/debug"
 	pkkafka "github.com/sentiae/platform-kit/kafka"
 	pklogger "github.com/sentiae/platform-kit/logger"
+	otelkit "github.com/sentiae/platform-kit/otel"
 	"github.com/sentiae/runtime-service/internal/app"
 	"github.com/sentiae/runtime-service/internal/di"
 	"github.com/sentiae/runtime-service/pkg/config"
@@ -62,6 +63,27 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	// Initialize telemetry (traces, metrics & logs → OTLP collector) early so
+	// the promauto→OTLP metric bridge is active before any component records
+	// (D-179 Wave-8). Non-fatal: a collector outage must not block boot.
+	otelCtx, otelCancel := context.WithCancel(context.Background())
+	defer otelCancel()
+	shutdownTelemetry, err := otelkit.Init(otelCtx, otelkit.Config{
+		ServiceName:    cfg.Telemetry.ServiceName,
+		ServiceVersion: Version,
+		Environment:    cfg.App.Environment,
+		Endpoint:       cfg.Telemetry.OTLPEndpoint,
+		Insecure:       true,
+	})
+	if err != nil {
+		log.Printf("Failed to init telemetry (continuing without it): %v", err)
+	}
+	defer func() {
+		if shutdownTelemetry != nil {
+			_ = shutdownTelemetry(context.Background())
+		}
+	}()
 
 	// Wire the shared structured logger as the slog default so every
 	// logger.FromContext(ctx) call in the fleet warm-pool/provision paths
