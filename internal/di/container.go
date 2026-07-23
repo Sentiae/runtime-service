@@ -17,6 +17,7 @@ import (
 
 	pkconfig "github.com/sentiae/platform-kit/config"
 	kafka "github.com/sentiae/platform-kit/kafka"
+	"github.com/sentiae/platform-kit/posture"
 	"github.com/sentiae/platform-kit/secret"
 	"github.com/sentiae/platform-kit/spiffe"
 	timetravel "github.com/sentiae/platform-kit/timetravel"
@@ -108,6 +109,12 @@ type Container struct {
 	EventConsumer     *messaging.EventConsumer
 	VsockListener     *vmcomm.Listener
 	VsockRunner       *vmcomm.Runner
+
+	// Posture is runtime's declared security posture (D-179 Wave-8). It carries
+	// the service's one real fail-closed boot control — the gRPC mesh must not be
+	// configured with mTLS off — and backs the /posture ops endpoint. Declared and
+	// proven at boot (initPosture); a failed assertion refuses boot.
+	Posture *posture.Set
 
 	// §9.1 — warm Firecracker VM pools, one per language profile. Kept
 	// on the container so the background controller hook can Start()
@@ -292,10 +299,39 @@ func NewContainer(cfg *config.Config) (*Container, error) {
 	// relocated to the end of initHandlers to break the init cycle.
 	c.initFleet(cfg)
 
+	// Declare + prove the service's fail-closed security posture (D-179 Wave-8)
+	// before any handler serves. A failed assertion refuses boot.
+	if err := c.initPosture(); err != nil {
+		return nil, fmt.Errorf("boot posture assertion failed: %w", err)
+	}
+
 	// Initialize handlers
 	c.initHandlers()
 
 	return c, nil
+}
+
+// initPosture declares runtime's real fail-closed security controls in the
+// posture framework and proves them at boot (D-179 Wave-8). runtime runs a gRPC
+// mesh listener (grpcserver.New), so its one named control is that the mesh must
+// not be configured with mTLS off. The declared *posture.Set is retained for the
+// /posture ops surface. MustHold fails closed: a control that does not hold, or
+// an empty/invalid declaration, is itself a boot error.
+func (c *Container) initPosture() error {
+	set, err := posture.Declare(posture.Control{
+		Name: "mesh-mtls",
+		Assert: func(ctx context.Context) error {
+			if pkconfig.MTLSMode() == pkconfig.MTLSModeOff {
+				return fmt.Errorf("mesh service configured with mTLS off")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("declare mesh posture: %w", err)
+	}
+	c.Posture = set
+	return set.MustHold(context.Background())
 }
 
 // initFleet wires the OCI→ext4 image-boot path and the FleetOrchestration gRPC
@@ -1383,6 +1419,11 @@ func (c *Container) initHandlers() {
 		log.Println("FleetNetworkFabric gRPC service registered")
 	}
 
+	// Wave-8 uniform ops surface (D-179): /posture reports the declared boot
+	// posture; /healthz/consumers surfaces runtime's inbound Kafka consumer lag
+	// + DLQ. Wired before SetupRoutes so the mounts see the live handles.
+	c.HTTPServer.SetOpsSurface(c.Posture, c.kafkaConsumers()...)
+
 	// Register routes now that every Set*Handler has fired. NewServer
 	// deliberately skips this step so setupRoutes can see the full set
 	// of handlers. Mirrors foundry-service's SetupRoutes pattern.
@@ -1523,6 +1564,21 @@ func (c *Container) startFleetHeartbeat(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// kafkaConsumers returns runtime's underlying platform-kit Kafka consumers for
+// the /healthz/consumers ops surface (D-179 Wave-8). runtime runs a single
+// shared inbound consumer (EventConsumer) onto which the session-commit and
+// canvas-executed handlers register; the wrapper is skipped when Kafka is
+// disabled (nil consumer).
+func (c *Container) kafkaConsumers() []*kafka.KafkaConsumer {
+	var out []*kafka.KafkaConsumer
+	if c.EventConsumer != nil {
+		if kc := c.EventConsumer.KafkaConsumer(); kc != nil {
+			out = append(out, kc)
+		}
+	}
+	return out
 }
 
 // StartConsumers launches any inbound Kafka consumers in background

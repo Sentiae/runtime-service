@@ -56,6 +56,16 @@ func (c *EventConsumer) Handle(eventType string, handler EventHandler) {
 	log.Printf("[KAFKA] Handler registered for event type: %s", eventType)
 }
 
+// KafkaConsumer exposes the underlying platform-kit consumer so the ops
+// /healthz/consumers surface can read its per-topic lag + DLQ counters. Returns
+// nil when the wrapper carries no consumer (Kafka disabled in dev).
+func (c *EventConsumer) KafkaConsumer() *kafka.KafkaConsumer {
+	if c == nil {
+		return nil
+	}
+	return c.consumer
+}
+
 // Start begins consuming messages. It blocks until ctx is cancelled.
 func (c *EventConsumer) Start(ctx context.Context) error {
 	if c == nil || c.consumer == nil {

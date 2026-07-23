@@ -4,6 +4,9 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	kafka "github.com/sentiae/platform-kit/kafka"
+	"github.com/sentiae/platform-kit/opshttp"
+	"github.com/sentiae/platform-kit/posture"
 	"github.com/sentiae/runtime-service/internal/infrastructure/canvasservice"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
 	"github.com/sentiae/runtime-service/internal/usecase"
@@ -32,6 +35,16 @@ type Server struct {
 	fleetHandler         *FleetHandler             // warm-VM fleet visibility + control
 	activatorHandler     *ActivatorHandler         // rt#11 scale-to-zero wake endpoint
 	permissionChecker    PermissionChecker
+	postureSet           *posture.Set             // D-179 Wave-8 — backs /posture
+	consumers            []*kafka.KafkaConsumer    // D-179 Wave-8 — backs /healthz/consumers
+}
+
+// SetOpsSurface wires the Wave-8 uniform ops endpoints (/posture,
+// /healthz/consumers). Called by the DI container BEFORE SetupRoutes, alongside
+// the other Set*Handler setters.
+func (s *Server) SetOpsSurface(postureSet *posture.Set, consumers ...*kafka.KafkaConsumer) {
+	s.postureSet = postureSet
+	s.consumers = consumers
 }
 
 // NewServer creates a new HTTP server with all handlers
@@ -85,6 +98,13 @@ func (s *Server) setupRoutes() {
 	// Health check
 	s.router.Get("/health", s.healthCheck)
 	s.router.Get("/api/v1/health", s.healthCheck)
+
+	// Wave-8 uniform ops surface (D-179). /posture reports the declared
+	// security controls + their boot result; /healthz/consumers surfaces
+	// per-topic Kafka lag + DLQ activity for runtime's inbound consumer.
+	// /health above is runtime's own liveness and stays untouched.
+	s.router.Handle("/posture", opshttp.PostureHandler("runtime", s.postureSet))
+	s.router.Handle("/healthz/consumers", kafka.ConsumersHealthzHandler("runtime", s.consumers...))
 
 	// §9.4 — customer-agent enrolment endpoint. Lives OUTSIDE the
 	// /api/v1 auth-protected group because the customer-agent has
