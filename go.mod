@@ -12,7 +12,7 @@ require (
 	github.com/minio/minio-go/v7 v7.1.0
 	github.com/sentiae/canvas-service v0.0.0-00010101000000-000000000000
 	github.com/sentiae/foundry-service v0.1.0
-	github.com/sentiae/platform-kit v0.3.3
+	github.com/sentiae/platform-kit v0.3.4
 	github.com/spiffe/go-spiffe/v2 v2.6.0
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.53.0

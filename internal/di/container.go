@@ -16,10 +16,10 @@ import (
 	"gorm.io/gorm/logger"
 
 	pkconfig "github.com/sentiae/platform-kit/config"
+	"github.com/sentiae/platform-kit/grpcclient"
 	kafka "github.com/sentiae/platform-kit/kafka"
 	"github.com/sentiae/platform-kit/posture"
 	"github.com/sentiae/platform-kit/secret"
-	"github.com/sentiae/platform-kit/spiffe"
 	timetravel "github.com/sentiae/platform-kit/timetravel"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 
@@ -305,10 +305,36 @@ func NewContainer(cfg *config.Config) (*Container, error) {
 		return nil, fmt.Errorf("boot posture assertion failed: %w", err)
 	}
 
+	// Phase 2 mTLS mesh: build the shared client-side SPIFFE source for runtime's
+	// outbound gRPC dials (the canvas push) via the fail-closed platform-kit helper
+	// (v0.3.4). NewMeshSource applies posture centrally: off ⇒ nil source; strict +
+	// unreachable workload API ⇒ error (runtime REFUSES to boot rather than come up
+	// with a nil source that silently plaintext-dials — the
+	// #pulse-outbound-mtls-fail-open fix); permissive + SPIRE down ⇒ nil source +
+	// loud warn (the dial then degrades to insecure via grpcclient.Dial).
+	if err := c.initMTLSSource(); err != nil {
+		return nil, err
+	}
+
 	// Initialize handlers
 	c.initHandlers()
 
 	return c, nil
+}
+
+// initMTLSSource builds the one shared SPIFFE X509 source for runtime's outbound
+// gRPC dials via the fail-closed platform-kit helper (v0.3.4). Posture is applied
+// centrally in grpcclient.NewMeshSource: off ⇒ nil source; strict + unreachable
+// workload API ⇒ error (runtime REFUSES to boot rather than serve with a nil
+// source that silently plaintext-dials — the #pulse-outbound-mtls-fail-open fix);
+// permissive + SPIRE down ⇒ nil source + loud warn (dials degrade via Dial).
+func (c *Container) initMTLSSource() error {
+	src, err := grpcclient.NewMeshSource(context.Background(), pkconfig.MTLSMode())
+	if err != nil {
+		return fmt.Errorf("init mtls mesh source (strict mesh dialing): %w", err)
+	}
+	c.canvasClientSource = src
+	return nil
 }
 
 // initPosture declares runtime's real fail-closed security controls in the
@@ -1257,20 +1283,12 @@ func (c *Container) initHandlers() {
 	// alongside the Kafka emit so badges update at the latency floor.
 	// CANVAS_SERVICE_URL empty disables the push (Kafka still delivers).
 	if canvasURL := os.Getenv("CANVAS_SERVICE_URL"); canvasURL != "" {
-		// Phase 2 mTLS: build one shared client-side SPIFFE source for the
-		// outbound canvas dial. Mode off (default) skips it → insecure dial,
-		// behavior-identical to before. A source error degrades to nil (the
-		// dial then falls back to insecure) rather than disabling the push.
-		mtlsMode := pkconfig.MTLSMode()
-		if mtlsMode != pkconfig.MTLSModeOff && c.canvasClientSource == nil {
-			src, srcErr := spiffe.NewSource(context.Background())
-			if srcErr != nil {
-				log.Printf("Warning: canvas-service client SPIFFE source unavailable, dialing insecure: %v", srcErr)
-			} else {
-				c.canvasClientSource = src
-			}
-		}
-		canvasClient := canvasservice.NewClient(context.Background(), canvasURL, mtlsMode, c.canvasClientSource, 10*time.Second)
+		// Phase 2 mTLS: the shared client-side SPIFFE source is built in
+		// initMTLSSource via grpcclient.NewMeshSource (fail-closed under strict —
+		// the #pulse-outbound-mtls-fail-open fix). c.canvasClientSource is nil when
+		// mode is off, or under permissive with the workload API down — the dial
+		// then degrades to insecure via grpcclient.Dial.
+		canvasClient := canvasservice.NewClient(context.Background(), canvasURL, pkconfig.MTLSMode(), c.canvasClientSource, 10*time.Second)
 		// x-api-key value: prefer the shared service API key; fall back to the
 		// legacy CANVAS_SERVICE_TOKEN only when the API key is unset.
 		serviceToken := c.Config.Server.GRPC.ServiceAPIKey

@@ -303,8 +303,8 @@ github.com/sagikazarmark/locafero v0.11.0 h1:1iurJgmM9G3PA/I+wWYIOw/5SyBtxapeHDc
 github.com/sagikazarmark/locafero v0.11.0/go.mod h1:nVIGvgyzw595SUSUE6tvCp3YYTeHs15MvlmU87WwIik=
 github.com/segmentio/kafka-go v0.4.50 h1:mcyC3tT5WeyWzrFbd6O374t+hmcu1NKt2Pu1L3QaXmc=
 github.com/segmentio/kafka-go v0.4.50/go.mod h1:Y1gn60kzLEEaW28YshXyk2+VCUKbJ3Qr6DrnT3i4+9E=
-github.com/sentiae/platform-kit v0.3.3 h1:2NNlnPkSDF00N59sn++rXIDB7YPldmYoLsoIxPTvgVE=
-github.com/sentiae/platform-kit v0.3.3/go.mod h1:w4yXCShfBWtq7rujwVYKBsVOOxJyzFbCCEEyF4VFTsE=
+github.com/sentiae/platform-kit v0.3.4 h1:qp3pSQT8QM5HFHO2HuUgqwlKf/UDuWwo1JOvrh1B9IQ=
+github.com/sentiae/platform-kit v0.3.4/go.mod h1:w4yXCShfBWtq7rujwVYKBsVOOxJyzFbCCEEyF4VFTsE=
 github.com/shirou/gopsutil/v4 v4.26.3 h1:2ESdQt90yU3oXF/CdOlRCJxrP+Am1aBYubTMTfxJ1qc=
 github.com/shirou/gopsutil/v4 v4.26.3/go.mod h1:LZ6ewCSkBqUpvSOf+LsTGnRinC6iaNUNMGBtDkJBaLQ=
 github.com/sirupsen/logrus v1.4.2/go.mod h1:tLMulIdttU9McNUspp0xgXVQah82FyeX6MwdIuYE2rE=
