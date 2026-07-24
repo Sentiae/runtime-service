@@ -17,8 +17,10 @@ service ResourceProvisioning {
     rpc GetResourceStatus(GetResourceStatusRequest) returns (ResourceStatusResponse);
     rpc SnapshotResource(SnapshotResourceRequest) returns (SnapshotResourceResponse);
     rpc ListResourceRecoveryPoints(ListResourceRecoveryPointsRequest) returns (ListResourceRecoveryPointsResponse);
-    // RestoreResource returns Unimplemented in v1 — the recovery-point restore
-    // path lands with a later CP4.5 slice; the contract is frozen now.
+    // RestoreResource restores a resource IN PLACE from one of its recovery
+    // points. Async like Provision: it returns immediately with phase
+    // "restoring" and the caller polls GetResourceStatus. Restore-as-fork is
+    // Phase 1 and is deliberately absent — there is no mode field to set.
     rpc RestoreResource(RestoreResourceRequest) returns (RestoreResourceResponse);
     // RotateResourceCredentials returns Unimplemented in v1 — credential rotation
     // lands with a later CP4.5 slice; the contract is frozen now.

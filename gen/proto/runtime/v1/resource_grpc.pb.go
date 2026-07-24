@@ -44,8 +44,10 @@ type ResourceProvisioningClient interface {
 	GetResourceStatus(ctx context.Context, in *GetResourceStatusRequest, opts ...grpc.CallOption) (*ResourceStatusResponse, error)
 	SnapshotResource(ctx context.Context, in *SnapshotResourceRequest, opts ...grpc.CallOption) (*SnapshotResourceResponse, error)
 	ListResourceRecoveryPoints(ctx context.Context, in *ListResourceRecoveryPointsRequest, opts ...grpc.CallOption) (*ListResourceRecoveryPointsResponse, error)
-	// RestoreResource returns Unimplemented in v1 — the recovery-point restore
-	// path lands with a later CP4.5 slice; the contract is frozen now.
+	// RestoreResource restores a resource IN PLACE from one of its recovery
+	// points. Async like Provision: it returns immediately with phase
+	// "restoring" and the caller polls GetResourceStatus. Restore-as-fork is
+	// Phase 1 and is deliberately absent — there is no mode field to set.
 	RestoreResource(ctx context.Context, in *RestoreResourceRequest, opts ...grpc.CallOption) (*RestoreResourceResponse, error)
 	// RotateResourceCredentials returns Unimplemented in v1 — credential rotation
 	// lands with a later CP4.5 slice; the contract is frozen now.
@@ -156,8 +158,10 @@ type ResourceProvisioningServer interface {
 	GetResourceStatus(context.Context, *GetResourceStatusRequest) (*ResourceStatusResponse, error)
 	SnapshotResource(context.Context, *SnapshotResourceRequest) (*SnapshotResourceResponse, error)
 	ListResourceRecoveryPoints(context.Context, *ListResourceRecoveryPointsRequest) (*ListResourceRecoveryPointsResponse, error)
-	// RestoreResource returns Unimplemented in v1 — the recovery-point restore
-	// path lands with a later CP4.5 slice; the contract is frozen now.
+	// RestoreResource restores a resource IN PLACE from one of its recovery
+	// points. Async like Provision: it returns immediately with phase
+	// "restoring" and the caller polls GetResourceStatus. Restore-as-fork is
+	// Phase 1 and is deliberately absent — there is no mode field to set.
 	RestoreResource(context.Context, *RestoreResourceRequest) (*RestoreResourceResponse, error)
 	// RotateResourceCredentials returns Unimplemented in v1 — credential rotation
 	// lands with a later CP4.5 slice; the contract is frozen now.
