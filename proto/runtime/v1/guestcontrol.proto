@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option go_package = "github.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1";
+
+// guestcontrol.proto is an INTERNAL host<->guest wire, NOT a mesh/service
+// contract — the sibling of guestsecrets.proto. It frames the persistent
+// post-boot control channel a RESIDENT guest serves on vsock so the host can
+// quiesce it (D-185a: image-init grows into the ratified `pg-guest` agent).
+//
+// Why it exists: Firecracker's Pause freezes vCPUs but does NOT flush the
+// GUEST kernel's dirty page cache, so a host-side copy of a data volume taken
+// under Pause alone is torn. The host must ask the guest to flush (and hold
+// still) first. No service exposes these messages.
+
+// ControlRequest is one host->guest control command. One request, one response,
+// then the connection is closed.
+message ControlRequest {
+    // token is the per-VM control token delivered in the boot-time sealed
+    // secret push (SecretBundle.control_token). The guest refuses — without
+    // acting — any request whose token does not match, comparing in constant
+    // time.
+    string token = 1;
+    // op is one of "SYNCFS", "FREEZE", "THAW", "SHUTDOWN". An unknown op is
+    // refused; the guest never guesses.
+    string op = 2;
+    // deadman_seconds bounds how long the guest stays frozen without a THAW
+    // (FREEZE only). A frozen filesystem blocks every writer in the guest, so
+    // if the host dies mid-snapshot the guest MUST thaw itself. 0 means the
+    // guest's own default.
+    uint32 deadman_seconds = 3;
+    // shutdown_wait_seconds bounds how long the guest waits for the workload
+    // child to exit after the forwarded SIGINT (SHUTDOWN only). 0 means the
+    // guest's own default.
+    uint32 shutdown_wait_seconds = 4;
+}
+
+// ControlResponse is the guest's reply to exactly one ControlRequest.
+message ControlResponse {
+    bool ok = 1;
+    string error = 2;
+}

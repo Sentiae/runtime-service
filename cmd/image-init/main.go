@@ -22,12 +22,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -97,13 +100,17 @@ func main() {
 	// off without running the workload (receiveSecrets never returns on failure).
 	// Secrets are written to tmpfs-0600 files ONLY; they are never placed in the
 	// workload env (D-085 Layer 3).
+	//
+	// The same sealed push carries the post-boot control token (D-185a) — the
+	// credential the resident control channel below requires on every request.
+	var controlToken string
 	if spec.ExpectSecrets {
-		receiveSecrets(spec)
+		controlToken = receiveSecrets(spec)
 	}
 
 	switch spec.Mode {
 	case "resident":
-		runResident(spec)
+		runResident(spec, controlToken)
 	default: // "test", "job", and anything else default to single-shot
 		runTest(spec)
 	}
@@ -231,9 +238,17 @@ func runTest(spec *runtimeSpec) {
 	syncAndPowerOff()
 }
 
+// shutdownReplyGrace bounds how long the reaper holds the power-off so a
+// control SHUTDOWN's reply can reach the host. Without it the reaper wins the
+// race and the host sees an EOF instead of the ack it is waiting on.
+const shutdownReplyGrace = 10 * time.Second
+
 // runResident starts the workload as a child and stays PID 1, reaping zombies
-// until the child exits, then powers off.
-func runResident(spec *runtimeSpec) {
+// until the child exits, then powers off. In this mode — and only this mode — it
+// also serves the persistent post-boot control channel (D-185a), armed BEFORE
+// the workload starts so there is no window in which the host can connect and be
+// silently ignored.
+func runResident(spec *runtimeSpec, controlToken string) {
 	if len(spec.Entrypoint) == 0 {
 		fmt.Fprintln(os.Stderr, "image-init: resident image has no entrypoint")
 		syncAndPowerOff()
@@ -244,6 +259,24 @@ func runResident(spec *runtimeSpec) {
 	if err != nil {
 		console = os.Stdout
 	}
+	logf := func(format string, args ...any) { fmt.Fprintf(console, format+"\n", args...) }
+
+	// The control channel lives as long as the VM does; cancelling on the way to
+	// power-off is what stops its accept loop.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	childExited := make(chan struct{})
+	var exitOnce sync.Once
+	markExited := func() { exitOnce.Do(func() { close(childExited) }) }
+
+	shutdownReplied := make(chan struct{})
+	var replyOnce sync.Once
+
+	ops := &residentOps{dataMount: spec.DataMountPath, childExited: childExited}
+	startControlServer(ctx, controlToken, ops, logf, func() {
+		replyOnce.Do(func() { close(shutdownReplied) })
+	})
 
 	cmd := exec.Command(spec.Entrypoint[0], spec.Entrypoint[1:]...)
 	applyEnv(cmd, spec)
@@ -256,9 +289,14 @@ func runResident(spec *runtimeSpec) {
 		return
 	}
 	childPID := cmd.Process.Pid
+	// Publish the pid so SHUTDOWN has something to signal. A request that lands
+	// before this reads zero and is refused, rather than signalling pid 0 (which
+	// would hit the whole process group).
+	ops.childPID.Store(int64(childPID))
 
 	// PID 1 reaper loop: wait for ANY child so grandchildren zombies are reaped;
-	// power off once our direct child exits.
+	// power off once our direct child exits. This is also the ONLY waiter — the
+	// control channel observes the exit through childExited rather than reaping.
 	for {
 		var ws syscall.WaitStatus
 		wpid, werr := syscall.Wait4(-1, &ws, 0, nil)
@@ -267,15 +305,27 @@ func runResident(spec *runtimeSpec) {
 		}
 		if werr != nil {
 			fmt.Fprintf(console, "image-init: wait4: %v — powering off\n", werr)
+			markExited()
 			break
 		}
 		if wpid == childPID {
 			fmt.Fprintf(console, "image-init: workload pid %d exited (status=%d signaled=%v signal=%v) — powering off\n",
 				wpid, ws.ExitStatus(), ws.Signaled(), ws.Signal())
+			markExited()
 			break
 		}
 		fmt.Fprintf(console, "image-init: reaped orphan pid %d (status=%d)\n", wpid, ws.ExitStatus())
 	}
+
+	// A control-driven exit owes the host an answer before the VM disappears.
+	if ops.shutdownAsked.Load() {
+		select {
+		case <-shutdownReplied:
+		case <-time.After(shutdownReplyGrace):
+			fmt.Fprintf(console, "image-init: control shutdown reply did not flush within %s — powering off anyway\n", shutdownReplyGrace)
+		}
+	}
+	cancel()
 	syncAndPowerOff()
 }
 

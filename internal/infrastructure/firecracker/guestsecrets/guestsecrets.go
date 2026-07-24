@@ -11,6 +11,14 @@ const (
 	// agree; changing it requires rebuilding the image-init binary too.
 	SecretPort = 10015
 
+	// ControlPort is the AF_VSOCK port a RESIDENT guest serves the persistent
+	// post-boot control channel on (D-185a: SYNCFS/FREEZE/THAW/SHUTDOWN). It is
+	// deliberately a SECOND port rather than a reuse of SecretPort: the secret
+	// listener is one-shot by contract (accept exactly one push, then close), and
+	// the control channel must outlive it for the VM's whole lifetime. Both ends
+	// must agree; changing it requires rebuilding the image-init binary too.
+	ControlPort = 10016
+
 	// MountDir is the in-guest tmpfs (RAM-only, mode 0700) into which the guest
 	// writes each received secret as a 0600 file. Never backed by the rootfs.
 	MountDir = "/sentiae/secrets"

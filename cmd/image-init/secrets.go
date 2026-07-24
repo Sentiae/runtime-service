@@ -45,7 +45,14 @@ const (
 // powers the VM off (fail-closed). The expected per-boot bootstrap nonce is read
 // from the (host-authored) runtime spec; a push whose nonce does not match is
 // rejected fail-closed (D-085 Layer 2 attestation).
-func receiveSecrets(spec *runtimeSpec) {
+//
+// It returns the bundle's post-boot control token (D-185a) — empty for a boot
+// with no control channel. The token is deliberately NOT the bootstrap nonce:
+// this listener is one-shot by contract, and reusing its credential would have
+// silently promoted a one-shot nonce into a VM-lifetime one. The token is
+// returned to the caller only; like every secret here it is never written to the
+// rootfs, the workload env, or a log.
+func receiveSecrets(spec *runtimeSpec) string {
 	// A boot that expects secrets MUST carry a host-minted nonce; an empty
 	// expected nonce means a misconfigured/spoofed spec — fail closed rather
 	// than accept an unauthenticated push.
@@ -102,6 +109,7 @@ func receiveSecrets(spec *runtimeSpec) {
 	if err := writeFrameProto(cfd, &runtimev1.Ack{Ok: true}); err != nil {
 		failSecrets("send ack: " + err.Error())
 	}
+	return bundle.GetControlToken()
 }
 
 // hardenAgainstDumps is a defense-in-depth belt (D-085 Layer 3): it disables

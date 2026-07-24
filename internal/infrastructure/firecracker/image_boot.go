@@ -43,6 +43,12 @@ type ImageBooter struct {
 	p             *Provider
 	advertiseHost string
 
+	// controlTokens holds the per-VM post-boot control token this booter mints
+	// and delivers inside the sealed secret push (D-185a). The
+	// GuestControlClient reads from the SAME instance — that shared store is the
+	// whole handoff between "the VM booted" and "the host can talk to it".
+	controlTokens *GuestControlTokens
+
 	natOnce sync.Once
 	natErr  error
 
@@ -55,10 +61,14 @@ var _ usecase.ImageBooter = (*ImageBooter)(nil)
 // NewImageBooter constructs an ImageBooter over an existing Provider. rt#8
 // retired per-VM host-port DNAT (the fleet owns ingress via Caddy), so no host
 // port range is tracked — guests are reached directly on their routed /30.
-func NewImageBooter(p *Provider, advertiseHost string) *ImageBooter {
+func NewImageBooter(p *Provider, advertiseHost string, controlTokens *GuestControlTokens) *ImageBooter {
+	if controlTokens == nil {
+		controlTokens = NewGuestControlTokens()
+	}
 	return &ImageBooter{
 		p:             p,
 		advertiseHost: advertiseHost,
+		controlTokens: controlTokens,
 		usedIndex:     make(map[int]bool),
 	}
 }
@@ -436,8 +446,11 @@ func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (
 
 	// Push secrets over vsock before the guest execs its workload. Fail-closed:
 	// a push failure kills the VM and aborts the test (invariant I32).
+	// No control token: the test/job class is single-shot and its guest never arms
+	// the control listener, so minting one would only hand out a credential for a
+	// channel that does not exist.
 	if in.ExpectSecrets {
-		if err := pushSecrets(ctx, socketPath, in.Secrets, in.BootstrapNonce, secretPushTimeout); err != nil {
+		if err := pushSecrets(ctx, socketPath, in.Secrets, in.BootstrapNonce, "", secretPushTimeout); err != nil {
 			b.killVM(cmd, socketPath)
 			return usecase.ImageTestResult{}, fmt.Errorf("push secrets: %w", err)
 		}
@@ -522,12 +535,24 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 
 	// Push secrets over vsock before the guest execs its workload. Fail-closed:
 	// a push failure kills the VM and tears down the net plumbing (invariant I32).
+	//
+	// D-185a — the same push carries the post-boot control token. It is minted per
+	// VM here and recorded ONLY after the guest has acked the bundle: a token
+	// stored for a push that failed would leave the client believing in a channel
+	// that was never armed.
 	if in.ExpectSecrets {
-		if err := pushSecrets(ctx, socketPath, in.Secrets, in.BootstrapNonce, secretPushTimeout); err != nil {
+		controlToken, terr := newControlToken()
+		if terr != nil {
+			b.killVM(cmd, socketPath)
+			cleanupNet()
+			return usecase.ImageResidentResult{}, terr
+		}
+		if err := pushSecrets(ctx, socketPath, in.Secrets, in.BootstrapNonce, controlToken, secretPushTimeout); err != nil {
 			b.killVM(cmd, socketPath)
 			cleanupNet()
 			return usecase.ImageResidentResult{}, fmt.Errorf("push secrets: %w", err)
 		}
+		b.controlTokens.Put(socketPath, controlToken)
 	}
 
 	// Reap the process if it dies while we wait (defensive — a resident VM that
@@ -539,6 +564,7 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 
 	if err := waitForTCP(ctx, nw.guestIP, in.Port, 60*time.Second); err != nil {
 		_ = cmd.Process.Kill()
+		b.controlTokens.Delete(socketPath)
 		_ = os.Remove(socketPath)
 		if dir := jailDirFromSocketPath(b.p.cfg.ChrootBase, socketPath); dir != "" {
 			_ = os.RemoveAll(dir)
@@ -580,6 +606,8 @@ func (b *ImageBooter) Decommission(_ context.Context, in usecase.ImageDecommissi
 	b.destroyTap(in.TapName)
 	b.freeIndex(in.NetIndex)
 	if in.SocketPath != "" {
+		// The VM is gone; stop bearing its control token (D-185a).
+		b.controlTokens.Delete(in.SocketPath)
 		_ = os.Remove(in.SocketPath)
 		_ = os.Remove(in.SocketPath + ".vsock")
 		// "" for a pre-jail VM, whose socket lives outside any chroot.

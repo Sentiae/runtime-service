@@ -353,6 +353,8 @@ func fleetError(err error) error {
 		return status.Error(codes.InvalidArgument, "resident workload requires a guest port")
 	case errors.Is(err, domain.ErrImageBootUnavailable):
 		return status.Error(codes.FailedPrecondition, "image boot requires the firecracker host")
+	case errors.Is(err, domain.ErrGuestControlUnavailable):
+		return status.Error(codes.FailedPrecondition, "guest control channel unavailable for this workload")
 	case errors.Is(err, domain.ErrVolumesNotSupported):
 		return status.Error(codes.InvalidArgument, "volumes are only supported for resident workloads")
 	case errors.Is(err, domain.ErrVolumeAppNotScalable):

@@ -70,7 +70,7 @@ func TestNormalizeResources(t *testing.T) {
 
 func TestAllocIndex(t *testing.T) {
 	// rt#8 retired per-VM host-port DNAT: only the /30 network index is allocated.
-	b := NewImageBooter(nil, "10.0.0.1")
+	b := NewImageBooter(nil, "10.0.0.1", NewGuestControlTokens())
 	b.Seed([]int{1})
 
 	n, err := b.allocIndex()

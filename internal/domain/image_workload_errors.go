@@ -32,6 +32,14 @@ var (
 	// without the firecracker executor (no KVM). The fail-loud booter returns it
 	// so an unbootable request never silently succeeds.
 	ErrImageBootUnavailable = errors.New("image boot requires the firecracker host")
+	// ErrGuestControlUnavailable is returned when a post-boot guest control op
+	// (SYNCFS/FREEZE/THAW/SHUTDOWN, D-185a) is requested for a VM that has no
+	// control channel: a host without the firecracker executor, or a workload
+	// booted without one (every non-resident class, and any resident boot that
+	// carried no sealed secret push to deliver the control token in). Failing
+	// loud is the point — a silently skipped quiesce reports a consistent
+	// snapshot of a filesystem that was never flushed.
+	ErrGuestControlUnavailable = errors.New("guest control channel unavailable")
 	// ErrScaleNotSupported is returned when Scale is called on a one-shot job
 	// handle. A job runs to completion exactly once — there is no replica count
 	// to set, so the call is a caller error, not a silent no-op.

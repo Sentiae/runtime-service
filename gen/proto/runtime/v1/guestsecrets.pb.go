@@ -89,8 +89,17 @@ type SecretBundle struct {
 	// integrity of the pusher's identity, not confidentiality) but MUST be
 	// per-boot fresh and unpredictable. Empty when the boot expects no secrets.
 	BootstrapNonce string `protobuf:"bytes,2,opt,name=bootstrap_nonce,json=bootstrapNonce,proto3" json:"bootstrap_nonce,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// control_token authenticates the HOST to the guest on every post-boot
+	// control request (guestcontrol.proto). It is deliberately NOT the
+	// bootstrap_nonce: that nonce is one-shot by contract (D-085 Layer 2, the
+	// secret listener accepts exactly one push), and reusing it would silently
+	// promote a one-shot credential to a VM-lifetime one. This is a separate,
+	// per-VM crypto/rand token delivered inside this already-sealed push and
+	// retained by the host for the VM's lifetime. Empty when the boot has no
+	// control channel (every non-resident class).
+	ControlToken  string `protobuf:"bytes,3,opt,name=control_token,json=controlToken,proto3" json:"control_token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SecretBundle) Reset() {
@@ -133,6 +142,13 @@ func (x *SecretBundle) GetItems() []*SecretItem {
 func (x *SecretBundle) GetBootstrapNonce() string {
 	if x != nil {
 		return x.BootstrapNonce
+	}
+	return ""
+}
+
+func (x *SecretBundle) GetControlToken() string {
+	if x != nil {
+		return x.ControlToken
 	}
 	return ""
 }
@@ -199,10 +215,11 @@ const file_proto_runtime_v1_guestsecrets_proto_rawDesc = "" +
 	"\n" +
 	"SecretItem\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value\"e\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\"\x8a\x01\n" +
 	"\fSecretBundle\x12,\n" +
 	"\x05items\x18\x01 \x03(\v2\x16.runtime.v1.SecretItemR\x05items\x12'\n" +
-	"\x0fbootstrap_nonce\x18\x02 \x01(\tR\x0ebootstrapNonce\"+\n" +
+	"\x0fbootstrap_nonce\x18\x02 \x01(\tR\x0ebootstrapNonce\x12#\n" +
+	"\rcontrol_token\x18\x03 \x01(\tR\fcontrolToken\"+\n" +
 	"\x03Ack\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05errorBCZAgithub.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1b\x06proto3"

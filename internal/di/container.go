@@ -47,6 +47,7 @@ import (
 	"github.com/sentiae/runtime-service/internal/infrastructure/simulated"
 	"github.com/sentiae/runtime-service/internal/infrastructure/vaulttoken"
 	volumebackend "github.com/sentiae/runtime-service/internal/infrastructure/volume"
+	"github.com/sentiae/runtime-service/internal/port/gateway"
 	"github.com/sentiae/runtime-service/internal/repository"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
 	"github.com/sentiae/runtime-service/internal/usecase"
@@ -179,6 +180,13 @@ type Container struct {
 	ImageBooter       usecase.ImageBooter
 	ImageMaterializer usecase.ImageMaterializer
 	FleetProvisionUC  *usecase.FleetProvision
+
+	// D-185a — the post-boot host->guest control channel (SYNCFS/FREEZE/THAW/
+	// SHUTDOWN). Real off the firecracker host is impossible, so the fail-loud
+	// implementation is wired there: a silently skipped quiesce would report a
+	// consistent snapshot of a filesystem that was never flushed.
+	GuestControl       gateway.GuestControl
+	guestControlTokens *firecracker.GuestControlTokens
 
 	// runtime-fleet CP4 rt#9 — persistent-volume backing-file backend + manager.
 	// The backend is fail-loud off the firecracker host so a volume is never
@@ -397,10 +405,17 @@ func (c *Container) initFleet(cfg *config.Config) {
 	// (pre-cutover) leaves the pull on the shared registry service key (back-compat).
 	c.fleetRegistryTokenStore = usecase.NewFleetRegistryTokenStore()
 
+	// D-185a — one control-token store shared by the booter (which mints a token
+	// per resident VM and delivers it inside the sealed secret push) and the
+	// control client (which spends it). Two instances would mean a client that
+	// finds no token for any VM.
+	c.guestControlTokens = firecracker.NewGuestControlTokens()
+
 	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
 		booter := firecracker.NewImageBooter(
 			c.FCProvider,
 			cfg.ImageBoot.AdvertiseHost,
+			c.guestControlTokens,
 		)
 		// Seed the allocator from any workloads still active in the store so a
 		// restart never double-allocates a /30 index. rt#8 retired host-port DNAT.
@@ -426,9 +441,11 @@ func (c *Container) initFleet(cfg *config.Config) {
 			log.Printf("Warning: image-boot seed from live replicas failed: %v", err)
 		}
 		c.ImageBooter = booter
+		c.GuestControl = firecracker.NewGuestControlClient(c.guestControlTokens)
 		log.Println("Image-boot Firecracker booter initialized")
 	} else {
 		c.ImageBooter = usecase.FailLoudImageBooter{}
+		c.GuestControl = gateway.FailLoudGuestControl{}
 		log.Println("Image-boot booter: fail-loud (firecracker executor not selected)")
 	}
 

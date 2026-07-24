@@ -29,7 +29,10 @@ const secretPushTimeout = 30 * time.Second
 // secret lingers in host memory beyond the send. Any failure returns an error —
 // the caller kills the VM (fail-closed): a secret workload must never run
 // without its channel.
-func pushSecrets(ctx context.Context, socketPath string, items []usecase.HostSecret, nonce string, timeout time.Duration) error {
+// controlToken (D-185a) rides along inside this already-sealed push: it is the
+// credential the guest will require on every post-boot control request. Empty
+// for a boot with no control channel.
+func pushSecrets(ctx context.Context, socketPath string, items []usecase.HostSecret, nonce, controlToken string, timeout time.Duration) error {
 	udsPath := socketPath + ".vsock"
 	if timeout <= 0 {
 		timeout = secretPushTimeout
@@ -42,6 +45,7 @@ func pushSecrets(ctx context.Context, socketPath string, items []usecase.HostSec
 	bundle := &runtimev1.SecretBundle{
 		Items:          make([]*runtimev1.SecretItem, 0, len(items)),
 		BootstrapNonce: nonce,
+		ControlToken:   controlToken,
 	}
 	for i := range items {
 		bundle.Items = append(bundle.Items, &runtimev1.SecretItem{
