@@ -380,6 +380,15 @@ func (p *WarmPool) pullObject(key, localPath string) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close temp: %w", err)
 	}
+	// os.CreateTemp makes the file 0600 root-only, but a pulled template is read
+	// by the JAILED clones (as the unprivileged warm uid) through hard links into
+	// their chroots — without this a pulled template restores nothing. It matches
+	// the mode a locally-built template gets when it is moved out of the template
+	// VM's chroot; the containing directory stays 0750 root-owned.
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("chmod: %w", err)
+	}
 	if err := os.Rename(tmpPath, localPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename: %w", err)

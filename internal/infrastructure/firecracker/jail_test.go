@@ -247,6 +247,50 @@ func TestCheckSocketPathFits(t *testing.T) {
 	}
 }
 
+// TestWarmSocketPathsFit pins the AF_UNIX budget for the warm path's own jail
+// ids, which are non-numeric ("warm", "cloneN") and therefore longer than the
+// numeric ones the other paths use. It builds the exact host socket paths
+// BootWarm and CloneFromSnapshot build.
+func TestWarmSocketPathsFit(t *testing.T) {
+	uid := 100000 + ephUIDOffset
+
+	template := newVMJail(defaultChrootBaseForTest, warmJailID, uid).
+		hostPath("run/" + uuid.MustParse("11111111-2222-3333-4444-555555555555").String() + ".sock")
+	if err := checkSocketPathFits(template); err != nil {
+		t.Fatalf("warm template socket rejected (%d bytes): %v", len(template), err)
+	}
+
+	// maxCloneIndex is the longest clone jail id + namespace the pool can produce.
+	d := cloneNaming(maxCloneIndex)
+	clone := newVMJail(defaultChrootBaseForTest, cloneJailID(maxCloneIndex), uid).
+		hostPath("run/" + d.namespace + ".sock")
+	if err := checkSocketPathFits(clone); err != nil {
+		t.Fatalf("warm clone socket rejected (%d bytes): %v", len(clone), err)
+	}
+}
+
+// TestWarmUIDIsTheReservedSlot pins the shared warm identity: template and
+// clones all run as the slot reserved at the bottom of the ephemeral range, so
+// the allocator can never hand that uid to an unrelated VM.
+func TestWarmUIDIsTheReservedSlot(t *testing.T) {
+	p := ephTestProvider(8192)
+	m := NewWarmManager(p)
+
+	want := 100000 + ephUIDOffset
+	if got := m.warmUID(); got != want {
+		t.Fatalf("warmUID = %d, want %d", got, want)
+	}
+	for i := 0; i < 16; i++ {
+		slot, err := p.allocEphSlot()
+		if err != nil {
+			t.Fatalf("allocEphSlot: %v", err)
+		}
+		if vmUID(p.cfg.VMUIDBase, slot) == m.warmUID() {
+			t.Fatalf("ephemeral slot %d collides with the warm uid", slot)
+		}
+	}
+}
+
 func TestJailDirFromSocketPath(t *testing.T) {
 	vmID := "11111111-2222-3333-4444-555555555555"
 	base := defaultChrootBaseForTest

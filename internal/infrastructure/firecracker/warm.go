@@ -7,7 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,6 +32,40 @@ const (
 	warmReadyTTL = 10 * time.Second
 )
 
+// Jail identities for the warm path. They are deliberately NON-numeric: the
+// numeric jail-id space belongs to the image-boot network index and the
+// ephemeral uid slot, and no two live VMs may share a chroot.
+const (
+	warmJailID = "warm"
+	// warmRootfsRel is where the warm rootfs sits inside EVERY warm chroot. It
+	// must be identical for the template and its clones: a Full snapshot records
+	// the block device's path, and /snapshot/load re-opens it at exactly that
+	// path — inside the restoring VMM's chroot.
+	warmRootfsRel = "rootfs.ext4"
+)
+
+// cloneJailID names one clone's chroot. n is already unique across live clones
+// (the warm pool's index allocator).
+func cloneJailID(n int) string { return fmt.Sprintf("clone%d", n) }
+
+// warmUID is the uid AND gid the warm template and every warm clone run as —
+// ONE shared identity for the whole warm path (D-185d, owner-ruled), drawn from
+// the slot reserved at the bottom of the ephemeral range.
+//
+// Why shared rather than per-VM: the clones' rootfs is a single shared ext4 file
+// opened READ-WRITE by every concurrent clone (the CoW in this path is on memory
+// only — mem_backend File is an mmap; the drive is not copied). A per-clone uid
+// would therefore have to chown that one shared inode per clone, which is a
+// fight no clone wins. It would also be buying clone-to-clone isolation that the
+// shared read-write filesystem defeats anyway. The gap between clones is that
+// shared rootfs, NOT the uid — and closing it is a separate change to the warm
+// path. What the shared uid DOES buy is the point of the ruling: an escaping
+// warm VMM lands as an unprivileged user, not as host root next to every
+// tenant's data volume.
+func (m *WarmManager) warmUID() int {
+	return vmUID(m.p.cfg.VMUIDBase, ephUIDOffset)
+}
+
 // WarmVM is a resident template VM running the guest-agent. The host POSTs code
 // to it (no per-execution boot) and snapshots it to seed the CoW-clone template.
 type WarmVM struct {
@@ -42,6 +76,11 @@ type WarmVM struct {
 	GuestIP    string
 	TapName    string
 	Language   domain.Language
+
+	// jail is the template's chroot. Teardown removes it, and the snapshot is
+	// written inside it (the jailed VMM resolves the snapshot paths after its
+	// chroot), so it has to travel with the VM.
+	jail *vmJail
 }
 
 // Endpoint returns the "host:port" the guest-agent listens on.
@@ -67,6 +106,10 @@ type Clone struct {
 	PID        int
 	Endpoint   string
 	VethHost   string
+
+	// jail is the clone's chroot, removed on teardown. A leaked one also pins the
+	// hard-linked snapshot inodes.
+	jail *vmJail
 }
 
 // WarmManager owns the warm-VM / snapshot / clone lifecycle. It reuses the
@@ -90,9 +133,11 @@ func NewWarmManager(p *Provider) *WarmManager {
 // the agent until it is serving. The returned WarmVM is the snapshot template.
 func (m *WarmManager) BootWarm(ctx context.Context, language domain.Language) (*WarmVM, error) {
 	vmID := uuid.New()
-	socketPath := m.p.socketPath(vmID)
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0750); err != nil {
-		return nil, fmt.Errorf("create socket dir: %w", err)
+	uid := m.warmUID()
+
+	rootfsPath := m.warmRootfsForLanguage(language)
+	if _, err := os.Stat(rootfsPath); err != nil {
+		return nil, fmt.Errorf("warm rootfs not found: %s: %w", rootfsPath, err)
 	}
 
 	// The template's TAP MUST share the clone's in-netns tap name: a Full
@@ -105,21 +150,52 @@ func (m *WarmManager) BootWarm(ctx context.Context, language domain.Language) (*
 
 	// Standalone /30 TAP: ip tuntap add / ip addr add <host>/30 / ip link set up.
 	_ = exec.Command("ip", "link", "del", tapName).Run() // clear a stale tap from a prior template
-	if err := runWarmTapSetup(tapName, warmHostIP); err != nil {
+	if err := runWarmTapSetup(tapName, warmHostIP, uid, uid); err != nil {
 		return nil, err
 	}
+	dropTap := func() { _ = exec.Command("ip", "link", "del", tapName).Run() }
 
-	rootfsPath := m.warmRootfsForLanguage(language)
-	if _, err := os.Stat(rootfsPath); err != nil {
-		_ = exec.Command("ip", "link", "del", tapName).Run()
-		return nil, fmt.Errorf("warm rootfs not found: %s: %w", rootfsPath, err)
+	j := newVMJail(m.p.cfg.ChrootBase, warmJailID, uid)
+	if err := j.prepare(); err != nil {
+		dropTap()
+		return nil, fmt.Errorf("prepare warm jail: %w", err)
+	}
+	for _, dir := range []string{"run", "kernel"} {
+		if err := j.mkdir(dir); err != nil {
+			j.remove()
+			dropTap()
+			return nil, fmt.Errorf("prepare warm jail: %w", err)
+		}
+	}
+	socketRel := "run/" + vmID.String() + ".sock"
+	socketPath := j.hostPath(socketRel)
+	if err := checkSocketPathFits(socketPath); err != nil {
+		j.remove()
+		dropTap()
+		return nil, err
+	}
+	kernelChroot, err := j.link(m.p.cfg.KernelPath, "kernel/vmlinux", false)
+	if err != nil {
+		j.remove()
+		dropTap()
+		return nil, fmt.Errorf("place kernel in warm jail: %w", err)
+	}
+	// The chown is a ONE-TIME owner set on a file that is shared by construction
+	// (the template and every clone of it run as the same warm uid), not a
+	// per-VM claim — see warmUID.
+	rootfsChroot, err := j.link(rootfsPath, warmRootfsRel, true)
+	if err != nil {
+		j.remove()
+		dropTap()
+		return nil, fmt.Errorf("place warm rootfs in jail: %w", err)
 	}
 
-	// Start firecracker: exec.CommandContext(BinaryPath, "--api-sock", socketPath).
-	cmd := exec.CommandContext(ctx, m.p.cfg.BinaryPath, "--api-sock", socketPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Always through the jailer: an unjailed VMM escape lands as host root, and
+	// this path runs customer code beside every tenant's data volume.
+	cmd := m.p.jailerCmd(ctx, j, j.chrootPath(socketRel), "")
 	if err := cmd.Start(); err != nil {
-		_ = exec.Command("ip", "link", "del", tapName).Run()
+		j.remove()
+		dropTap()
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
 	pid := cmd.Process.Pid
@@ -128,7 +204,8 @@ func (m *WarmManager) BootWarm(ctx context.Context, language domain.Language) (*
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		_ = os.Remove(socketPath)
-		_ = exec.Command("ip", "link", "del", tapName).Run()
+		j.remove()
+		dropTap()
 	}
 
 	if err := m.p.waitForSocket(ctx, socketPath); err != nil {
@@ -137,7 +214,9 @@ func (m *WarmManager) BootWarm(ctx context.Context, language domain.Language) (*
 	}
 
 	// Configure machine / boot-source (warm boot args) / rootfs / net via the API.
-	if err := m.configureWarmVM(ctx, socketPath, rootfsPath, tapName); err != nil {
+	// Every path handed to the API is the chroot view — the VMM opens it after
+	// the jailer has chroot'ed.
+	if err := m.configureWarmVM(ctx, socketPath, kernelChroot, rootfsChroot, tapName); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("configure warm VM: %w", err)
 	}
@@ -163,19 +242,21 @@ func (m *WarmManager) BootWarm(ctx context.Context, language domain.Language) (*
 		GuestIP:    warmGuestIP,
 		TapName:    tapName,
 		Language:   language,
+		jail:       j,
 	}, nil
 }
 
 // configureWarmVM drives the FC API to set machine config, the warm boot source
 // (init=/sbin/warm-init + kernel ip= arg), the warm rootfs drive (rw, root), and
-// the eth0 interface bound to the standalone TAP.
-func (m *WarmManager) configureWarmVM(ctx context.Context, socketPath, rootfsPath, tapName string) error {
+// the eth0 interface bound to the standalone TAP. kernelPath and rootfsPath are
+// chroot views.
+func (m *WarmManager) configureWarmVM(ctx context.Context, socketPath, kernelPath, rootfsPath, tapName string) error {
 	client := m.p.unixHTTPClient(socketPath)
 
 	if err := m.p.apiPut(ctx, client, "/machine-config", warmMachineConfigBody()); err != nil {
 		return fmt.Errorf("configure machine: %w", err)
 	}
-	if err := m.p.apiPut(ctx, client, "/boot-source", warmBootSourceBody(m.p.cfg.KernelPath)); err != nil {
+	if err := m.p.apiPut(ctx, client, "/boot-source", warmBootSourceBody(kernelPath)); err != nil {
 		return fmt.Errorf("configure boot source: %w", err)
 	}
 	if err := m.p.apiPut(ctx, client, "/drives/rootfs", warmRootfsDriveBody(rootfsPath)); err != nil {
@@ -220,6 +301,11 @@ func (m *WarmManager) DestroyWarm(warm *WarmVM) error {
 	if warm.SocketPath != "" {
 		_ = os.Remove(warm.SocketPath)
 	}
+	// The chroot outlives the process unless it is removed here; a leaked one
+	// also pins the hard-linked warm rootfs inode.
+	if warm.jail != nil {
+		warm.jail.remove()
+	}
 	log.Printf("Warm VM %s destroyed (tap=%s)", warm.ID, warm.TapName)
 	return nil
 }
@@ -230,12 +316,26 @@ func (m *WarmManager) DestroyWarm(warm *WarmVM) error {
 // (state + mem) under the Provider's SnapshotPath. The warm VM is left paused;
 // the caller may Resume, snapshot again, or kill it.
 func (m *WarmManager) CreateTemplateSnapshot(ctx context.Context, warm *WarmVM) (*TemplateSnapshot, error) {
+	if warm == nil || warm.jail == nil {
+		return nil, fmt.Errorf("create template snapshot: warm VM has no jail")
+	}
 	snapshotDir := m.p.cfg.SnapshotPath
 	if err := os.MkdirAll(snapshotDir, 0750); err != nil {
 		return nil, fmt.Errorf("create snapshot dir: %w", err)
 	}
 	statePath := filepath.Join(snapshotDir, warm.ID.String()+".state")
 	memPath := filepath.Join(snapshotDir, warm.ID.String()+".mem")
+
+	// The VMM writes the pair itself, resolving the paths AFTER its chroot and
+	// with no rights outside it — so it is asked for jail-local paths it owns and
+	// the results are moved out to SnapshotPath afterwards, where the template
+	// cache and the durable object-store persistence expect host paths.
+	j := warm.jail
+	if err := j.mkdir("snap"); err != nil {
+		return nil, fmt.Errorf("prepare jail snapshot dir: %w", err)
+	}
+	stateRel := "snap/" + warm.ID.String() + ".state"
+	memRel := "snap/" + warm.ID.String() + ".mem"
 
 	client := m.p.unixHTTPClient(warm.SocketPath)
 
@@ -244,8 +344,14 @@ func (m *WarmManager) CreateTemplateSnapshot(ctx context.Context, warm *WarmVM) 
 		return nil, fmt.Errorf("pause warm VM: %w", err)
 	}
 	// PUT /snapshot/create {Full, state, mem}.
-	if err := m.p.apiPut(ctx, client, "/snapshot/create", snapshotCreateBody(statePath, memPath)); err != nil {
+	if err := m.p.apiPut(ctx, client, "/snapshot/create", snapshotCreateBody(j.chrootPath(stateRel), j.chrootPath(memRel))); err != nil {
 		return nil, fmt.Errorf("create snapshot: %w", err)
+	}
+	if err := adoptJailedFile(j.hostPath(stateRel), statePath); err != nil {
+		return nil, fmt.Errorf("collect template state file: %w", err)
+	}
+	if err := adoptJailedFile(j.hostPath(memRel), memPath); err != nil {
+		return nil, fmt.Errorf("collect template memory file: %w", err)
 	}
 
 	log.Printf("Template snapshot created: lang=%s state=%s mem=%s", warm.Language, statePath, memPath)
@@ -263,24 +369,65 @@ func (m *WarmManager) CloneFromSnapshot(ctx context.Context, snap *TemplateSnaps
 		return nil, fmt.Errorf("clone index out of range (want 1..254): %d", n)
 	}
 	d := cloneNaming(n)
-	cloneSock := filepath.Join(m.p.cfg.SocketDir, d.namespace+".sock")
-	if err := os.MkdirAll(filepath.Dir(cloneSock), 0750); err != nil {
-		return nil, fmt.Errorf("create clone socket dir: %w", err)
-	}
+	uid := m.warmUID()
 
 	// Namespace + veth + in-ns tap + in-ns NAT, in the proven order.
-	if err := runCloneNetworkSetup(d); err != nil {
+	if err := runCloneNetworkSetup(d, uid, uid); err != nil {
 		_ = teardownCloneNetwork(d)
 		return nil, err
 	}
 
-	// Boot FC INSIDE the netns: ip netns exec <ns> firecracker --api-sock <sock>.
-	cmd := exec.CommandContext(ctx, "ip", "netns", "exec", d.namespace,
-		m.p.cfg.BinaryPath, "--api-sock", cloneSock)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
+	j := newVMJail(m.p.cfg.ChrootBase, cloneJailID(n), uid)
+	failClone := func(err error) (*Clone, error) {
+		j.remove()
 		_ = teardownCloneNetwork(d)
-		return nil, fmt.Errorf("start firecracker in netns %s: %w", d.namespace, err)
+		return nil, err
+	}
+	if err := j.prepare(); err != nil {
+		return failClone(fmt.Errorf("prepare clone jail: %w", err))
+	}
+	for _, dir := range []string{"run", "snap"} {
+		if err := j.mkdir(dir); err != nil {
+			return failClone(fmt.Errorf("prepare clone jail: %w", err))
+		}
+	}
+	socketRel := "run/" + d.namespace + ".sock"
+	cloneSock := j.hostPath(socketRel)
+	if err := checkSocketPathFits(cloneSock); err != nil {
+		return failClone(err)
+	}
+
+	// The restored VM re-opens its block device at the path the snapshot recorded
+	// — the template's chroot view — so the same shared inode has to be reachable
+	// at that exact path inside THIS chroot.
+	//
+	// The chown is safe here precisely BECAUSE the warm uid is shared: it asserts
+	// a constant owner, so it is idempotent rather than a per-clone claim other
+	// clones would have to fight. It is also load-bearing on a host whose
+	// template was PULLED from the object store — BootWarm never ran there, so
+	// nothing else would ever set the rootfs owner and every restore would fail
+	// to open its root device.
+	if _, err := j.link(m.warmRootfsForLanguage(snap.Language), warmRootfsRel, true); err != nil {
+		return failClone(fmt.Errorf("place warm rootfs in clone jail: %w", err))
+	}
+	// The template snapshot pair is read-only to the VMM (mem_backend File is an
+	// mmap) and shared by every clone, so it is linked in root-owned and NOT
+	// chowned — a per-clone chown would rewrite the owner of the one canonical
+	// template out from under every other live clone.
+	stateChroot, err := j.link(snap.StatePath, "snap/state", false)
+	if err != nil {
+		return failClone(fmt.Errorf("place template state in clone jail: %w", err))
+	}
+	memChroot, err := j.link(snap.MemPath, "snap/mem", false)
+	if err != nil {
+		return failClone(fmt.Errorf("place template memory in clone jail: %w", err))
+	}
+
+	// Boot FC inside the clone's netns via the JAILER's own --netns, not
+	// `ip netns exec` (which would leave a process between us and the pid).
+	cmd := m.p.jailerCmd(ctx, j, j.chrootPath(socketRel), netnsPath(d.namespace))
+	if err := cmd.Start(); err != nil {
+		return failClone(fmt.Errorf("start firecracker in netns %s: %w", d.namespace, err))
 	}
 	pid := cmd.Process.Pid
 
@@ -288,6 +435,7 @@ func (m *WarmManager) CloneFromSnapshot(ctx context.Context, snap *TemplateSnaps
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		_ = os.Remove(cloneSock)
+		j.remove()
 		_ = teardownCloneNetwork(d)
 	}
 
@@ -298,7 +446,7 @@ func (m *WarmManager) CloneFromSnapshot(ctx context.Context, snap *TemplateSnaps
 
 	// PUT /snapshot/load — mem_backend File (mmap = CoW; NOT mem_file_path), resume.
 	client := m.p.unixHTTPClient(cloneSock)
-	if err := m.p.apiPut(ctx, client, "/snapshot/load", snapshotLoadBody(snap.StatePath, snap.MemPath)); err != nil {
+	if err := m.p.apiPut(ctx, client, "/snapshot/load", snapshotLoadBody(stateChroot, memChroot)); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("load snapshot into clone: %w", err)
 	}
@@ -319,6 +467,7 @@ func (m *WarmManager) CloneFromSnapshot(ctx context.Context, snap *TemplateSnaps
 		PID:        pid,
 		Endpoint:   endpoint,
 		VethHost:   d.vethHost,
+		jail:       j,
 	}, nil
 }
 
@@ -338,6 +487,11 @@ func (m *WarmManager) DestroyClone(clone *Clone) error {
 	}
 	if clone.SocketPath != "" {
 		_ = os.Remove(clone.SocketPath)
+	}
+	// Removing the chroot is also what unlinks this clone's references to the
+	// shared template snapshot and rootfs inodes.
+	if clone.jail != nil {
+		clone.jail.remove()
 	}
 	if clone.Namespace != "" {
 		if out, err := exec.Command("ip", "netns", "del", clone.Namespace).CombinedOutput(); err != nil {
@@ -477,10 +631,16 @@ func runCmd(args ...string) error {
 	return nil
 }
 
-// runWarmTapSetup creates the standalone /30 TAP for a warm VM.
-func runWarmTapSetup(tapName, hostIP string) error {
+// netnsPath is the filesystem handle `ip netns add <ns>` creates, and what the
+// jailer's --netns flag expects.
+func netnsPath(ns string) string { return "/var/run/netns/" + ns }
+
+// runWarmTapSetup creates the standalone /30 TAP for a warm VM, owned by the
+// warm uid/gid: a jailed VMM has no CAP_NET_ADMIN and can only TUNSETIFF-attach
+// to a tap it owns.
+func runWarmTapSetup(tapName, hostIP string, uid, gid int) error {
 	cmds := [][]string{
-		{"ip", "tuntap", "add", tapName, "mode", "tap"},
+		{"ip", "tuntap", "add", tapName, "mode", "tap", "user", strconv.Itoa(uid), "group", strconv.Itoa(gid)},
 		{"ip", "addr", "add", hostIP + "/30", "dev", tapName},
 		{"ip", "link", "set", tapName, "up"},
 	}
@@ -495,7 +655,7 @@ func runWarmTapSetup(tapName, hostIP string) error {
 
 // runCloneNetworkSetup builds the clone's isolated network in the proven order:
 // netns, veth pair (guest end moved into ns), addresses, in-ns tap, in-ns NAT.
-func runCloneNetworkSetup(d cloneDerived) error {
+func runCloneNetworkSetup(d cloneDerived, uid, gid int) error {
 	ns := d.namespace
 	cmds := [][]string{
 		// Namespace + loopback.
@@ -510,8 +670,10 @@ func runCloneNetworkSetup(d cloneDerived) error {
 		// In-ns side address + up.
 		{"ip", "netns", "exec", ns, "ip", "addr", "add", d.nsVethIP + "/24", "dev", d.vethGuest},
 		{"ip", "netns", "exec", ns, "ip", "link", "set", d.vethGuest, "up"},
-		// In-ns tap for the VM's eth0.
-		{"ip", "netns", "exec", ns, "ip", "tuntap", "add", warmTapInNS, "mode", "tap"},
+		// In-ns tap for the VM's eth0, owned by the warm uid: the jailed VMM
+		// attaches to it with no CAP_NET_ADMIN.
+		{"ip", "netns", "exec", ns, "ip", "tuntap", "add", warmTapInNS, "mode", "tap",
+			"user", strconv.Itoa(uid), "group", strconv.Itoa(gid)},
 		{"ip", "netns", "exec", ns, "ip", "addr", "add", warmHostIP + "/30", "dev", warmTapInNS},
 		{"ip", "netns", "exec", ns, "ip", "link", "set", warmTapInNS, "up"},
 		// In-ns NAT: forward + DNAT 10.200.N.2:8000 -> 172.30.0.2:8000 + MASQUERADE.

@@ -436,16 +436,29 @@ func (p *Provider) releaseJailedVM(jv *jailedVM) {
 // no --new-pid-ns (jailer execve's firecracker in place, so cmd.Process.Pid stays
 // the firecracker pid that teardown signals).
 func (p *Provider) jailerCommand(ctx context.Context, jv *jailedVM) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, p.cfg.JailerPath,
-		"--id", jv.jail.id,
+	return p.jailerCmd(ctx, jv.jail, jv.chrootSock, "")
+}
+
+// jailerCmd is the shared jailer invocation for every boot path. netns, when
+// non-empty, is the path of the network namespace the jailer enters before it
+// execs (the warm clone's isolation) — the jailer's own flag rather than nesting
+// it inside `ip netns exec`, which would put a shell-level process between us
+// and the pid teardown signals.
+func (p *Provider) jailerCmd(ctx context.Context, j *vmJail, chrootSock, netns string) *exec.Cmd {
+	args := []string{
+		"--id", j.id,
 		"--exec-file", p.cfg.BinaryPath,
-		"--uid", strconv.Itoa(jv.jail.uid),
-		"--gid", strconv.Itoa(jv.jail.gid),
+		"--uid", strconv.Itoa(j.uid),
+		"--gid", strconv.Itoa(j.gid),
 		"--chroot-base-dir", p.cfg.ChrootBase,
 		"--cgroup-version", "2",
-		"--",
-		"--api-sock", jv.chrootSock,
-	)
+	}
+	if netns != "" {
+		args = append(args, "--netns", netns)
+	}
+	args = append(args, "--", "--api-sock", chrootSock)
+
+	cmd := exec.CommandContext(ctx, p.cfg.JailerPath, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	return cmd
 }
@@ -1125,11 +1138,6 @@ func (p *Provider) languageCommands(lang domain.Language) (ext, compileCmd, runC
 	default:
 		return ".txt", "", "cat /tmp/code.txt"
 	}
-}
-
-// socketPath returns the Unix socket path for a VM
-func (p *Provider) socketPath(vmID uuid.UUID) string {
-	return filepath.Join(p.cfg.SocketDir, vmID.String()+".sock")
 }
 
 // rootfsForLanguage returns the rootfs image path for a given language
