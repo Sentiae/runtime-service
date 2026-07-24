@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/runtime-service/internal/infrastructure/netfabric"
+	"github.com/sentiae/runtime-service/internal/port/gateway"
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
 
@@ -49,6 +51,22 @@ type ImageBooter struct {
 	// whole handoff between "the VM booted" and "the host can talk to it".
 	controlTokens *GuestControlTokens
 
+	// guestControl is the post-boot control channel into a resident guest — the
+	// sibling adapter in this package over the SAME token store. The stop path
+	// uses it to ask the guest to shut itself down before any signal reaches the
+	// VMM.
+	guestControl gateway.GuestControl
+
+	// stop bounds each stage of the resident stop path. Fields rather than
+	// constants only so a unit test can compress them; the defaults are what the
+	// fleet runs.
+	stop stopTimings
+
+	// findProcess resolves a recorded VMM pid to a host process handle. A field
+	// so the stop path's signal ORDER is assertable without a real microVM;
+	// production always runs the os.FindProcess default.
+	findProcess func(pid int) (vmProcess, error)
+
 	natOnce sync.Once
 	natErr  error
 
@@ -69,9 +87,55 @@ func NewImageBooter(p *Provider, advertiseHost string, controlTokens *GuestContr
 		p:             p,
 		advertiseHost: advertiseHost,
 		controlTokens: controlTokens,
-		usedIndex:     make(map[int]bool),
+		// Same store as the booter's, which is what makes the token minted at boot
+		// spendable at stop time.
+		guestControl: NewGuestControlClient(controlTokens),
+		stop:         defaultStopTimings(),
+		findProcess:  osFindProcess,
+		usedIndex:    make(map[int]bool),
 	}
 }
+
+// stopTimings bounds each stage of the resident stop path.
+type stopTimings struct {
+	// guestShutdown bounds the in-guest graceful stop: the vsock round-trip, the
+	// SIGINT forwarded to the workload, and the guest's own bounded wait for that
+	// child to exit. Postgres fast shutdown has to finish a checkpoint — seconds
+	// on a small database, but never instant — so this matches the control
+	// client's own SHUTDOWN budget (the guest's wait plus transport slack). A
+	// tighter value here would abandon a guest that is still shutting down
+	// correctly, which is exactly the crash-stop this path exists to avoid.
+	guestShutdown time.Duration
+	// powerOff bounds the wait for the VMM to exit after the guest acked. By then
+	// the guest only has to sync and issue its power-off reboot(2), so it is
+	// short.
+	powerOff time.Duration
+	// exitPoll is the interval between VMM liveness polls in that wait.
+	exitPoll time.Duration
+	// sigtermGrace is the fallback path's wait between SIGTERM and SIGKILL —
+	// unchanged from the pre-control-channel behaviour.
+	sigtermGrace time.Duration
+}
+
+func defaultStopTimings() stopTimings {
+	return stopTimings{
+		guestShutdown: controlShutdownTimeout,
+		powerOff:      15 * time.Second,
+		exitPoll:      100 * time.Millisecond,
+		sigtermGrace:  5 * time.Second,
+	}
+}
+
+// vmProcess is the host handle to a running VMM process.
+type vmProcess interface {
+	Signal(sig os.Signal) error
+	Kill() error
+	Wait() (*os.ProcessState, error)
+}
+
+var _ vmProcess = (*os.Process)(nil)
+
+func osFindProcess(pid int) (vmProcess, error) { return os.FindProcess(pid) }
 
 // Seed marks network indices already in use by active workloads so the allocator
 // (re)started from a persisted set never double-allocates a /30.
@@ -583,30 +647,26 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 	}, nil
 }
 
-// Decommission tears down a resident workload: kill process, remove the TAP,
+// Decommission tears down a resident workload: stop the guest, remove the TAP,
 // free the index, delete the rootfs. rt#8 retired the per-VM DNAT so there is no
 // host-port rule or port to reclaim.
-func (b *ImageBooter) Decommission(_ context.Context, in usecase.ImageDecommissionInput) error {
-	if in.PID > 0 {
-		if proc, err := os.FindProcess(in.PID); err == nil {
-			_ = proc.Signal(syscall.SIGTERM)
-			done := make(chan struct{})
-			go func() {
-				defer func() { _ = recover() }()
-				_, _ = proc.Wait()
-				close(done)
-			}()
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				_ = proc.Kill()
-			}
-		}
-	}
+//
+// ⚠ Teardown is NEVER blockable. stopVM returns nothing to fail on and every
+// step below runs unconditionally — including when the guest refuses to die and
+// when the caller's context is already cancelled. That is the deliberate
+// opposite of the snapshot path's fail-closed posture, and the asymmetry is the
+// point: refusing to snapshot protects data, whereas refusing to tear down
+// protects nothing and strands the customer's resource (a running VM, its /30,
+// its rootfs) with no way to release it.
+func (b *ImageBooter) Decommission(ctx context.Context, in usecase.ImageDecommissionInput) error {
+	b.stopVM(ctx, in)
 	b.destroyTap(in.TapName)
 	b.freeIndex(in.NetIndex)
 	if in.SocketPath != "" {
-		// The VM is gone; stop bearing its control token (D-185a).
+		// The VM is gone; stop bearing its control token (D-185a). This MUST stay
+		// after stopVM: that token is what authenticates the guest SHUTDOWN, so
+		// dropping it first would make every graceful stop fail and fall back to
+		// killing the VMM — the exact defect this path fixes.
 		b.controlTokens.Delete(in.SocketPath)
 		_ = os.Remove(in.SocketPath)
 		_ = os.Remove(in.SocketPath + ".vsock")
@@ -619,6 +679,123 @@ func (b *ImageBooter) Decommission(_ context.Context, in usecase.ImageDecommissi
 		_ = os.Remove(in.RootfsPath)
 	}
 	return nil
+}
+
+// stopVM stops the microVM, preferring a clean in-guest shutdown over killing
+// the VMM.
+//
+// Signalling the Firecracker process stops the guest the way pulling the power
+// cord does: the workload never gets its SIGINT, so Postgres never runs its fast
+// shutdown, and image-init never runs its own sync-and-power-off. Doing that on
+// every scale-to-zero and every decommission meant every customer database was
+// crash-stopped, and left a detached volume's snapshot only as consistent as
+// that crash. So the guest is asked to stop ITSELF first; the signals below are
+// the fallback for a guest that cannot.
+func (b *ImageBooter) stopVM(ctx context.Context, in usecase.ImageDecommissionInput) {
+	if in.PID <= 0 {
+		return
+	}
+	find := b.findProcess
+	if find == nil {
+		find = osFindProcess
+	}
+	proc, err := find(in.PID)
+	if err != nil {
+		// No handle means nothing to signal AND no way to observe the power-off,
+		// so there is no graceful attempt to make either.
+		logger.FromContext(ctx).Warn("image-boot: no handle for vmm process", "pid", in.PID, "err", err)
+		return
+	}
+	if b.shutdownGuest(ctx, in.SocketPath, proc) {
+		return
+	}
+	b.signalStop(proc)
+}
+
+// shutdownGuest asks the guest to stop itself over the post-boot control channel
+// and waits for the VMM to exit on its own. It reports whether that fully
+// succeeded.
+//
+// Every failure mode — a VM booted before the control channel existed, a guest
+// too old to know the verb, an unreachable or wedged guest, a timeout, a
+// cancelled caller — returns false so the caller falls back to signalling, and
+// is logged at WARN: a fleet that has silently stopped shutting down cleanly has
+// to be visible rather than invisible.
+func (b *ImageBooter) shutdownGuest(ctx context.Context, socketPath string, proc vmProcess) bool {
+	if b.guestControl == nil || socketPath == "" {
+		logger.FromContext(ctx).Warn("image-boot: resident stop has no guest control channel, signalling the vmm instead",
+			"socket_path", socketPath)
+		return false
+	}
+
+	// The caller's context is threaded, not replaced: a cancelled caller cuts the
+	// graceful attempt short and drops straight to the bounded fallback below,
+	// which is what keeps teardown finishing rather than being abandoned.
+	shutdownCtx, cancel := context.WithTimeout(ctx, b.stop.guestShutdown)
+	defer cancel()
+	if err := b.guestControl.Shutdown(shutdownCtx, socketPath); err != nil {
+		logger.FromContext(ctx).Warn("image-boot: guest shutdown failed, falling back to signalling the vmm",
+			"socket_path", socketPath, "err", err)
+		return false
+	}
+
+	// The guest powers itself off once it has acked, so the VMM exits on its own.
+	if err := waitForProcessExit(ctx, proc, b.stop.powerOff, b.stop.exitPoll); err != nil {
+		logger.FromContext(ctx).Warn("image-boot: vmm still alive after guest shutdown, falling back to signalling",
+			"socket_path", socketPath, "err", err)
+		return false
+	}
+	return true
+}
+
+// signalStop is the pre-control-channel stop: SIGTERM the VMM, grace window,
+// SIGKILL. It is the fallback, not the norm — it stops the guest without letting
+// it flush anything.
+//
+// Deliberately NOT bounded by the caller's context: this is the last chance to
+// stop the process, and a cancelled caller must never leave a live VM behind a
+// destroyed TAP and a deleted rootfs.
+func (b *ImageBooter) signalStop(proc vmProcess) {
+	_ = proc.Signal(syscall.SIGTERM)
+	done := make(chan struct{})
+	// No ctx by design (see above): the wait is bounded by the select's grace
+	// window, and the goroutine only reaps a process we are already killing.
+	go func() {
+		defer func() { _ = recover() }()
+		_, _ = proc.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(b.stop.sigtermGrace):
+		_ = proc.Kill()
+	}
+}
+
+// waitForProcessExit polls until the process is gone, bounded by both timeout
+// and the caller's context.
+//
+// It polls signal 0 instead of calling Wait(): the boot path already started a
+// reaper goroutine on the VMM's exec.Cmd, and after a service restart the VMM is
+// not this process's child at all — in both cases a Wait() here returns an error
+// immediately, which would read as "exited" for a process that is still running.
+func waitForProcessExit(ctx context.Context, proc vmProcess, timeout, poll time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		// ESRCH (or Go's ErrProcessDone) is the only report of "gone" that does not
+		// depend on being the parent.
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("vmm still running %s after guest shutdown", timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for vmm exit: %w", ctx.Err())
+		case <-time.After(poll):
+		}
+	}
 }
 
 // setupNet allocates an index and creates the routed /30 TAP. It returns the
