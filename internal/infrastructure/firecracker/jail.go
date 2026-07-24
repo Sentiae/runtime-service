@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -133,6 +134,83 @@ func (j *vmJail) remove() {
 // which is already unique by construction and reclaimed across restarts.
 func vmUID(base, index int) int {
 	return base + index
+}
+
+// ephUIDOffset opens the uid (and jail-id) sub-range the EPHEMERAL boot paths
+// draw from. The image-boot path derives uid = VMUIDBase + network index from a
+// persisted, restart-reclaimed index in [1,imgMaxIndex]; the cold-exec / single-
+// shot paths have no such durable index and allocate in memory instead. Starting
+// their range above imgMaxIndex makes the two schemes disjoint by construction,
+// so an in-memory allocator that forgets everything on restart can never hand a
+// VM the uid — or the chroot — a live image-boot VM already holds.
+//
+// The offset itself is NOT allocatable: it is the fixed slot reserved for the
+// single warm template VM (only one runs at a time, like its fixed tap name).
+const ephUIDOffset = 4096
+
+// allocEphSlot reserves an ephemeral uid slot. The slot doubles as the jail id,
+// so it must be unique across live VMs; it is returned to the range by
+// freeEphSlot on teardown. Exhaustion refuses the boot rather than wrapping —
+// wrapping would hand a running VM's uid to a second tenant, which is exactly
+// the isolation the jail exists to provide.
+func (p *Provider) allocEphSlot() (int, error) {
+	p.ephMu.Lock()
+	defer p.ephMu.Unlock()
+	if p.ephSlots == nil {
+		p.ephSlots = make(map[int]bool)
+	}
+	for slot := ephUIDOffset + 1; slot < p.cfg.VMUIDSpan; slot++ {
+		if !p.ephSlots[slot] {
+			p.ephSlots[slot] = true
+			return slot, nil
+		}
+	}
+	return 0, fmt.Errorf("ephemeral vm uid slots exhausted (range [%d,%d))", ephUIDOffset+1, p.cfg.VMUIDSpan)
+}
+
+// freeEphSlot returns a slot to the range. Slots at or below the offset are not
+// allocator-owned (the reserved warm-template slot, or a non-ephemeral id).
+func (p *Provider) freeEphSlot(slot int) {
+	if slot <= ephUIDOffset {
+		return
+	}
+	p.ephMu.Lock()
+	delete(p.ephSlots, slot)
+	p.ephMu.Unlock()
+}
+
+// ephSlotFromSocketPath recovers the ephemeral slot from a jailed VM's host
+// socket path. Teardown (Terminate) receives only (socketPath, pid), so the slot
+// has to be read back out of the path it was written into — otherwise every VM
+// leaks a slot and the range drains over the process lifetime.
+func ephSlotFromSocketPath(chrootBase, socketPath string) (int, bool) {
+	dir := jailDirFromSocketPath(chrootBase, socketPath)
+	if dir == "" {
+		return 0, false
+	}
+	slot, err := strconv.Atoi(filepath.Base(dir))
+	if err != nil || slot <= ephUIDOffset {
+		return 0, false
+	}
+	return slot, true
+}
+
+// vmJailFromSocketPath rebuilds a running VM's jail handle from its host socket
+// path, or nil when the socket is not inside chrootBase. The post-boot API calls
+// (snapshot create/restore) are handed nothing but the socket, and both the jail
+// id and the uid are derivable from it, so the handle is reconstructed instead of
+// tracked in a second source of truth that could drift from the filesystem.
+func vmJailFromSocketPath(chrootBase string, uidBase int, socketPath string) *vmJail {
+	dir := jailDirFromSocketPath(chrootBase, socketPath)
+	if dir == "" {
+		return nil
+	}
+	id := filepath.Base(dir)
+	index, err := strconv.Atoi(id)
+	if err != nil {
+		return nil
+	}
+	return newVMJail(chrootBase, id, vmUID(uidBase, index))
 }
 
 // jailDirFromSocketPath maps a persisted host-view API socket path back to the

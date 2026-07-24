@@ -277,7 +277,6 @@ type FirecrackerConfig struct {
 	DefaultTimeout time.Duration `mapstructure:"default_timeout"`
 	MaxTimeout     time.Duration `mapstructure:"max_timeout"`
 	PoolSize       int           `mapstructure:"pool_size"`
-	UseJailer      bool          `mapstructure:"use_jailer"`
 
 	// ChrootBase is the jailer chroot base for image-boot microVMs: each VM is
 	// confined to <chroot_base>/firecracker/<vm-id>/root.
@@ -452,7 +451,6 @@ func Load() (*Config, error) {
 			"firecracker.default_timeout":  "30s",
 			"firecracker.max_timeout":      "300s",
 			"firecracker.pool_size":        5,
-			"firecracker.use_jailer":       false,
 			// Short on purpose: the jail dir and the VM's socket basename both
 			// land in the host socket path, which must stay under the AF_UNIX
 			// sun_path limit of 107 bytes.
@@ -614,7 +612,6 @@ func Load() (*Config, error) {
 			{"firecracker.default_timeout", "APP_FC_DEFAULT_TIMEOUT"},
 			{"firecracker.max_timeout", "APP_FC_MAX_TIMEOUT"},
 			{"firecracker.pool_size", "APP_FC_POOL_SIZE"},
-			{"firecracker.use_jailer", "APP_FC_USE_JAILER"},
 			{"firecracker.chroot_base", "APP_FC_CHROOT_BASE"},
 			{"firecracker.vm_uid_base", "APP_FC_VM_UID_BASE"},
 			{"firecracker.vm_uid_span", "APP_FC_VM_UID_SPAN"},

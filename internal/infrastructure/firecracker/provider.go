@@ -50,6 +50,13 @@ type Provider struct {
 	// deregisters it. Nil is safe — Boot/Terminate stay on the legacy
 	// no-snapshot path.
 	checkpointScheduler *CheckpointScheduler
+
+	// ephMu/ephSlots is the in-memory allocator for the ephemeral per-VM uid
+	// (and jail id) sub-range — see ephUIDOffset. In-memory is correct here:
+	// these VMs never survive a service restart, so a forgotten slot is a slot
+	// whose VM is gone too.
+	ephMu    sync.Mutex
+	ephSlots map[int]bool
 }
 
 // SetCheckpointScheduler attaches a running CheckpointScheduler so
@@ -126,7 +133,10 @@ func (p *Provider) doSetupBridge() error {
 
 // createTapDevice creates a TAP device for a VM and attaches it to the bridge.
 // It returns the tap device name and the guest IP address to configure inside the VM.
-func (p *Provider) createTapDevice(vmID uuid.UUID) (tapName string, hostIP string, guestIP string, err error) {
+//
+// The device is owned by the VM's unprivileged uid/gid: a jailed VMM has no
+// CAP_NET_ADMIN, so it can only TUNSETIFF-attach to a tap it owns.
+func (p *Provider) createTapDevice(vmID uuid.UUID, uid, gid int) (tapName string, hostIP string, guestIP string, err error) {
 	if err = p.setupBridge(); err != nil {
 		return "", "", "", fmt.Errorf("setup bridge: %w", err)
 	}
@@ -150,7 +160,7 @@ func (p *Provider) createTapDevice(vmID uuid.UUID) (tapName string, hostIP strin
 	hostCIDR := fmt.Sprintf("%s/30", hostIP)
 
 	cmds := [][]string{
-		{"ip", "tuntap", "add", "dev", tapName, "mode", "tap"},
+		{"ip", "tuntap", "add", "dev", tapName, "mode", "tap", "user", strconv.Itoa(uid), "group", strconv.Itoa(gid)},
 		{"ip", "addr", "add", hostCIDR, "dev", tapName},
 		{"ip", "link", "set", tapName, "up"},
 		{"ip", "link", "set", tapName, "master", bridgeName},
@@ -338,18 +348,139 @@ func (p *Provider) Boot(ctx context.Context, bootCfg usecase.VMBootConfig) (*use
 	return p.bootCold(ctx, bootCfg)
 }
 
+// jailedVM is one prepared jailer chroot plus the two views of its paths: the
+// host view runtime-service dials/removes, and the chroot view the jailed VMM
+// resolves after it chroots and drops to its unprivileged uid.
+type jailedVM struct {
+	jail       *vmJail
+	slot       int
+	socketPath string // host view — waitForSocket + the API client use this
+	chrootSock string // chroot view — the VMM creates the socket here
+	kernelPath string // chroot view
+	rootfsPath string // chroot view
+}
+
+// prepareJailedVM allocates an ephemeral uid slot, builds the VM's chroot, and
+// places the kernel (shared, so never chowned — the hard link shares the inode)
+// and the VM's rootfs (exclusively owned, so chowned) inside it.
+//
+// rootfsHost MUST be a rootfs this VM alone owns: every path here opens the root
+// device read-write, so a shared per-language image linked into N chroots would
+// have N tenants writing through one inode and N chowns fighting over its owner.
+func (p *Provider) prepareJailedVM(vmID uuid.UUID, rootfsHost string) (*jailedVM, error) {
+	slot, err := p.allocEphSlot()
+	if err != nil {
+		return nil, err
+	}
+	j := newVMJail(p.cfg.ChrootBase, strconv.Itoa(slot), vmUID(p.cfg.VMUIDBase, slot))
+
+	fail := func(err error) (*jailedVM, error) {
+		j.remove()
+		p.freeEphSlot(slot)
+		return nil, err
+	}
+
+	if err := j.prepare(); err != nil {
+		return fail(fmt.Errorf("prepare vm jail: %w", err))
+	}
+	for _, dir := range []string{"run", "kernel"} {
+		if err := j.mkdir(dir); err != nil {
+			return fail(fmt.Errorf("prepare vm jail: %w", err))
+		}
+	}
+
+	// The socket keeps its <vm-id>.sock basename: vmIDFromSocketPath parses it
+	// and Terminate depends on it to find the VM's TAP. Only the directory moves
+	// into the chroot.
+	socketRel := "run/" + vmID.String() + ".sock"
+	socketPath := j.hostPath(socketRel)
+	if err := checkSocketPathFits(socketPath); err != nil {
+		return fail(err)
+	}
+
+	kernelChroot, err := j.link(p.cfg.KernelPath, "kernel/vmlinux", false)
+	if err != nil {
+		return fail(fmt.Errorf("place kernel in jail: %w", err))
+	}
+	rootfsChroot, err := j.link(rootfsHost, "rootfs.ext4", true)
+	if err != nil {
+		return fail(fmt.Errorf("place rootfs in jail: %w", err))
+	}
+
+	return &jailedVM{
+		jail:       j,
+		slot:       slot,
+		socketPath: socketPath,
+		chrootSock: j.chrootPath(socketRel),
+		kernelPath: kernelChroot,
+		rootfsPath: rootfsChroot,
+	}, nil
+}
+
+// releaseJailedVM removes the chroot and returns the uid slot. A leaked jail dir
+// also pins the hard-linked rootfs inode, so the disk is only freed here.
+func (p *Provider) releaseJailedVM(jv *jailedVM) {
+	if jv == nil {
+		return
+	}
+	jv.jail.remove()
+	p.freeEphSlot(jv.slot)
+}
+
+// jailerCommand builds the jailer invocation for a prepared chroot. Every boot
+// path goes through the jailer (chroot + seccomp + cgroup at an unprivileged
+// per-VM uid) — no flag, no fallback: an unjailed VMM escape lands as host root,
+// cross-tenant, on the same host that holds every tenant's data volume.
+//
+// No --daemonize (it redirects stdio to /dev/null and kills console capture) and
+// no --new-pid-ns (jailer execve's firecracker in place, so cmd.Process.Pid stays
+// the firecracker pid that teardown signals).
+func (p *Provider) jailerCommand(ctx context.Context, jv *jailedVM) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, p.cfg.JailerPath,
+		"--id", jv.jail.id,
+		"--exec-file", p.cfg.BinaryPath,
+		"--uid", strconv.Itoa(jv.jail.uid),
+		"--gid", strconv.Itoa(jv.jail.gid),
+		"--chroot-base-dir", p.cfg.ChrootBase,
+		"--cgroup-version", "2",
+		"--",
+		"--api-sock", jv.chrootSock,
+	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return cmd
+}
+
+// coldRootfsPath is the per-VM private copy of the language rootfs a cold-booted
+// VM runs on. Derived from the VM id so Terminate can unlink it with nothing but
+// the socket path.
+func (p *Provider) coldRootfsPath(vmID uuid.UUID) string {
+	return filepath.Join(p.cfg.RootfsBasePath, "cold-"+vmID.String()+".ext4")
+}
+
 // bootCold starts a fresh Firecracker microVM, bypassing any pool.
 // This is the original Boot implementation.
 func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (*usecase.VMBootResult, error) {
 	start := time.Now()
 
-	socketPath := p.socketPath(bootCfg.VMID)
-	kernelPath := p.cfg.KernelPath
-	rootfsPath := p.rootfsForLanguage(bootCfg.Language)
+	// Private rootfs copy per VM (see prepareJailedVM): the language image is
+	// mounted read-write by the guest, so it cannot be shared between jails.
+	rootfsHost := p.coldRootfsPath(bootCfg.VMID)
+	if err := copyFile(p.rootfsForLanguage(bootCfg.Language), rootfsHost); err != nil {
+		_ = os.Remove(rootfsHost)
+		return nil, fmt.Errorf("copy rootfs for VM: %w", err)
+	}
 
-	// Ensure socket directory exists
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0750); err != nil {
-		return nil, fmt.Errorf("failed to create socket dir: %w", err)
+	jv, err := p.prepareJailedVM(bootCfg.VMID, rootfsHost)
+	if err != nil {
+		_ = os.Remove(rootfsHost)
+		return nil, err
+	}
+	socketPath := jv.socketPath
+	// releaseVM tears down everything this boot created, for every failure path
+	// after the jail exists.
+	releaseVM := func() {
+		p.releaseJailedVM(jv)
+		_ = os.Remove(rootfsHost)
 	}
 
 	// Apply network policy. In "isolated" mode we skip TAP creation
@@ -368,8 +499,9 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 	attachNetwork := policy.Mode != domain.NetworkPolicyIsolated
 	if attachNetwork {
 		var err error
-		tapName, _, guestIP, err = p.createTapDevice(bootCfg.VMID)
+		tapName, _, guestIP, err = p.createTapDevice(bootCfg.VMID, jv.jail.uid, jv.jail.gid)
 		if err != nil {
+			releaseVM()
 			return nil, fmt.Errorf("failed to create TAP device: %w", err)
 		}
 		// Apply per-VM iptables rules for egress restriction. We do it
@@ -379,6 +511,7 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 			// Warm path: parent stays FORWARD — unchanged from pre-#5.
 			if err := p.applyEgressList("FORWARD", tapName, policy.AllowedHosts); err != nil {
 				_ = p.destroyTapDevice(tapName)
+				releaseVM()
 				return nil, fmt.Errorf("failed to apply egress list: %w", err)
 			}
 		}
@@ -386,33 +519,11 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 		log.Printf("VM %s booting in isolated mode (no network)", bootCfg.VMID)
 	}
 
-	// Build Firecracker command
-	args := []string{
-		"--api-sock", socketPath,
-	}
-
-	var cmd *exec.Cmd
-	if p.cfg.UseJailer {
-		// Use jailer for production: chroot + seccomp + cgroup isolation
-		cmd = exec.CommandContext(ctx, p.cfg.JailerPath,
-			"--id", bootCfg.VMID.String(),
-			"--exec-file", p.cfg.BinaryPath,
-			"--uid", "0",
-			"--gid", "0",
-			"--",
-		)
-		cmd.Args = append(cmd.Args, args...)
-	} else {
-		// Direct Firecracker for development
-		cmd = exec.CommandContext(ctx, p.cfg.BinaryPath, args...)
-	}
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
+	cmd := p.jailerCommand(ctx, jv)
 
 	if err := cmd.Start(); err != nil {
 		p.cleanupTap(tapName, policy)
+		releaseVM()
 		return nil, fmt.Errorf("failed to start firecracker: %w", err)
 	}
 
@@ -422,13 +533,15 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 	if err := p.waitForSocket(ctx, socketPath); err != nil {
 		_ = cmd.Process.Kill()
 		p.cleanupTap(tapName, policy)
+		releaseVM()
 		return nil, fmt.Errorf("firecracker socket not ready: %w", err)
 	}
 
 	// Configure the VM via Firecracker API
-	if err := p.configureVMWithPolicy(ctx, socketPath, kernelPath, rootfsPath, bootCfg, attachNetwork, tapName); err != nil {
+	if err := p.configureVMWithPolicy(ctx, socketPath, jv.chrootSock, jv.kernelPath, jv.rootfsPath, bootCfg, attachNetwork, tapName); err != nil {
 		_ = cmd.Process.Kill()
 		p.cleanupTap(tapName, policy)
+		releaseVM()
 		return nil, fmt.Errorf("failed to configure VM: %w", err)
 	}
 
@@ -436,6 +549,7 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 	if err := p.startInstance(ctx, socketPath); err != nil {
 		_ = cmd.Process.Kill()
 		p.cleanupTap(tapName, policy)
+		releaseVM()
 		return nil, fmt.Errorf("failed to start VM instance: %w", err)
 	}
 
@@ -499,19 +613,29 @@ func (p *Provider) Terminate(ctx context.Context, socketPath string, pid int) er
 		}
 	}
 
-	// Clean up the TAP device associated with this VM
+	// Clean up the TAP device and the VM's private rootfs copy
 	if socketPath != "" {
 		if vmID, err := vmIDFromSocketPath(socketPath); err == nil {
 			tapName := "tap-" + vmID.String()[:8]
 			if err := p.destroyTapDevice(tapName); err != nil {
 				log.Printf("Warning: failed to destroy TAP %s: %v", tapName, err)
 			}
+			// Nothing else references the copy; a leaked one is a whole rootfs
+			// image of dead disk per terminated VM.
+			_ = os.Remove(p.coldRootfsPath(vmID))
 		}
 	}
 
-	// Clean up the socket file
+	// Clean up the socket file, the chroot, and the uid slot
 	if socketPath != "" {
 		_ = os.Remove(socketPath)
+		_ = os.Remove(socketPath + ".vsock")
+		if dir := jailDirFromSocketPath(p.cfg.ChrootBase, socketPath); dir != "" {
+			_ = os.RemoveAll(dir)
+		}
+		if slot, ok := ephSlotFromSocketPath(p.cfg.ChrootBase, socketPath); ok {
+			p.freeEphSlot(slot)
+		}
 	}
 
 	return nil
@@ -574,24 +698,25 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 		return nil, fmt.Errorf("inject code: %w", err)
 	}
 
-	// 3. Boot a temporary VM with the modified rootfs
+	// 3. Boot a temporary VM with the modified rootfs. execRootfs is already this
+	// VM's private copy, so the jail hard-links and chowns it directly.
 	execVMID := uuid.New()
-	socketPath := p.socketPath(execVMID)
-
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0750); err != nil {
-		return nil, fmt.Errorf("create socket dir: %w", err)
+	jv, err := p.prepareJailedVM(execVMID, execRootfs)
+	if err != nil {
+		return nil, err
 	}
+	defer p.releaseJailedVM(jv)
+	socketPath := jv.socketPath
 
 	// Create TAP device (networking is set up even though we don't use SSH;
 	// Firecracker requires a network config or explicit opt-out per API)
-	tapName, _, guestIP, err := p.createTapDevice(execVMID)
+	tapName, _, guestIP, err := p.createTapDevice(execVMID, jv.jail.uid, jv.jail.gid)
 	if err != nil {
 		return nil, fmt.Errorf("create TAP for exec VM: %w", err)
 	}
 	defer func() { _ = p.destroyTapDevice(tapName) }()
 
-	cmd := exec.CommandContext(ctx, p.cfg.BinaryPath, "--api-sock", socketPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd := p.jailerCommand(ctx, jv)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start firecracker: %w", err)
@@ -602,6 +727,7 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		_ = os.Remove(socketPath)
+		_ = os.Remove(socketPath + ".vsock")
 	}()
 
 	if err := p.waitForSocket(ctx, socketPath); err != nil {
@@ -634,9 +760,10 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 		return nil, fmt.Errorf("configure machine: %w", err)
 	}
 
-	// Boot source with init=/init
+	// Boot source with init=/init. Every path handed to the API is the chroot
+	// view: the VMM opens it after the jailer has chroot'ed.
 	bootSource := map[string]any{
-		"kernel_image_path": p.cfg.KernelPath,
+		"kernel_image_path": jv.kernelPath,
 		"boot_args":         bootArgs,
 	}
 	if err := p.apiPut(ctx, client, "/boot-source", bootSource); err != nil {
@@ -647,7 +774,7 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 	// when caller specified DiskBandwidthMBps / DiskIOPS (§9.1.5).
 	rootfsDrive := map[string]any{
 		"drive_id":       "rootfs",
-		"path_on_host":   execRootfs,
+		"path_on_host":   jv.rootfsPath,
 		"is_root_device": true,
 		"is_read_only":   false,
 	}
@@ -678,7 +805,9 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 	guestCID := 3 + (p.tapCounter.Load() % 250) // unique CID per VM
 	vsockCfg := map[string]any{
 		"guest_cid": guestCID,
-		"uds_path":  socketPath + ".vsock",
+		// Chroot view: the VMM creates the UDS at the host path
+		// socketPath+".vsock", which is what the host-side agent dials.
+		"uds_path": jv.chrootSock + ".vsock",
 	}
 	if err := p.apiPut(ctx, client, "/vsock", vsockCfg); err != nil {
 		log.Printf("Warning: failed to configure vsock (agent communication disabled): %v", err)
@@ -870,6 +999,41 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
+// moveFile renames src to dst, falling back to copy+remove. The fallback is not
+// belt-and-braces: the jailer chroot base and the snapshot path are configured
+// independently and can sit on different mounts, where rename fails with EXDEV.
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	if err := copyFile(src, dst); err != nil {
+		return fmt.Errorf("copy %s to %s: %w", src, dst, err)
+	}
+	if err := os.Remove(src); err != nil {
+		return fmt.Errorf("remove %s: %w", src, err)
+	}
+	return nil
+}
+
+// adoptJailedFile moves a file the jailed VMM wrote inside its chroot out to a
+// host path and takes ownership back from the VM's uid. Ownership is the point:
+// a snapshot left owned by a VM uid stays writable by whichever VM that uid slot
+// is recycled to. Mode 0644 is what lets a DIFFERENT jailed VM read the pair
+// back on restore — the containing directory is 0750 root-owned, so the bits are
+// not host-wide exposure of guest memory.
+func adoptJailedFile(src, dst string) error {
+	if err := moveFile(src, dst); err != nil {
+		return err
+	}
+	if err := os.Chown(dst, 0, 0); err != nil {
+		return fmt.Errorf("chown %s: %w", dst, err)
+	}
+	if err := os.Chmod(dst, 0o644); err != nil {
+		return fmt.Errorf("chmod %s: %w", dst, err)
+	}
+	return nil
+}
+
 // sshResult holds the output of an SSH command execution.
 type sshResult struct {
 	ExitCode int
@@ -998,7 +1162,11 @@ func (p *Provider) waitForSocket(ctx context.Context, socketPath string) error {
 // skipped entirely; otherwise it falls through to the standard
 // configureVM. Splitting the helper keeps configureVM's signature stable
 // for the existing call sites and tests.
-func (p *Provider) configureVMWithPolicy(ctx context.Context, socketPath, kernelPath, rootfsPath string, cfg usecase.VMBootConfig, attachNetwork bool, tapName string) error {
+//
+// socketPath is the host view (the API client dials it); chrootSocketPath is the
+// same socket as the jailed VMM sees it, and is what the vsock UDS must be
+// derived from — the VMM creates that file after it has chroot'ed.
+func (p *Provider) configureVMWithPolicy(ctx context.Context, socketPath, chrootSocketPath, kernelPath, rootfsPath string, cfg usecase.VMBootConfig, attachNetwork bool, tapName string) error {
 	client := p.unixHTTPClient(socketPath)
 
 	machineConfig := map[string]any{
@@ -1051,7 +1219,7 @@ func (p *Provider) configureVMWithPolicy(ctx context.Context, socketPath, kernel
 	guestCID := 3 + (p.tapCounter.Load() % 250)
 	vsockCfg := map[string]any{
 		"guest_cid": guestCID,
-		"uds_path":  socketPath + ".vsock",
+		"uds_path":  chrootSocketPath + ".vsock",
 	}
 	if err := p.apiPut(ctx, client, "/vsock", vsockCfg); err != nil {
 		log.Printf("Warning: vsock config failed (agent communication disabled): %v", err)
@@ -1256,16 +1424,41 @@ func (p *Provider) CreateSnapshot(ctx context.Context, socketPath string, snapsh
 	memPath := filepath.Join(snapshotDir, snapshotID.String()+".mem")
 	statePath := filepath.Join(snapshotDir, snapshotID.String()+".state")
 
+	// The VMM writes these files itself, resolving the paths AFTER its chroot and
+	// with no rights outside it — so a jailed VM is asked for jail-local paths it
+	// owns, and the results are moved out afterwards. Callers only ever see the
+	// host paths under SnapshotPath.
+	reqStatePath, reqMemPath := statePath, memPath
+	var jailedState, jailedMem string
+	if j := vmJailFromSocketPath(p.cfg.ChrootBase, p.cfg.VMUIDBase, socketPath); j != nil {
+		if err := j.mkdir("snap"); err != nil {
+			return nil, fmt.Errorf("prepare jail snapshot dir: %w", err)
+		}
+		stateRel := "snap/" + snapshotID.String() + ".state"
+		memRel := "snap/" + snapshotID.String() + ".mem"
+		reqStatePath, reqMemPath = j.chrootPath(stateRel), j.chrootPath(memRel)
+		jailedState, jailedMem = j.hostPath(stateRel), j.hostPath(memRel)
+	}
+
 	client := p.unixHTTPClient(socketPath)
 
 	// Call Firecracker PUT /snapshot/create
 	snapshotReq := map[string]any{
 		"snapshot_type": "Full",
-		"snapshot_path": statePath,
-		"mem_file_path": memPath,
+		"snapshot_path": reqStatePath,
+		"mem_file_path": reqMemPath,
 	}
 	if err := p.apiPut(ctx, client, "/snapshot/create", snapshotReq); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot create: %w", err)
+	}
+
+	if jailedState != "" {
+		if err := adoptJailedFile(jailedState, statePath); err != nil {
+			return nil, fmt.Errorf("collect snapshot state file: %w", err)
+		}
+		if err := adoptJailedFile(jailedMem, memPath); err != nil {
+			return nil, fmt.Errorf("collect snapshot memory file: %w", err)
+		}
 	}
 
 	// Determine snapshot file sizes
@@ -1297,6 +1490,25 @@ func (p *Provider) RestoreSnapshot(ctx context.Context, socketPath, memPath, sta
 	}
 	if _, err := os.Stat(statePath); err != nil {
 		return fmt.Errorf("state file not found: %w", err)
+	}
+
+	// A jailed VMM opens these after its chroot, so hard-link the pair inside and
+	// hand it the chroot view. Deliberately NOT chowned: the link shares the
+	// canonical snapshot's inode, so a per-VM chown would rewrite the original's
+	// owner and race any concurrent restore of the same pair. The VMM only reads
+	// them (the mem backend is mmap'd copy-on-write), and adoptJailedFile already
+	// left them readable inside a 0750 root-owned directory.
+	if j := vmJailFromSocketPath(p.cfg.ChrootBase, p.cfg.VMUIDBase, socketPath); j != nil {
+		if err := j.mkdir("snap"); err != nil {
+			return fmt.Errorf("prepare jail snapshot dir: %w", err)
+		}
+		var err error
+		if statePath, err = j.link(statePath, "snap/restore.state", false); err != nil {
+			return fmt.Errorf("place snapshot state in jail: %w", err)
+		}
+		if memPath, err = j.link(memPath, "snap/restore.mem", false); err != nil {
+			return fmt.Errorf("place snapshot memory in jail: %w", err)
+		}
 	}
 
 	// Call Firecracker PUT /snapshot/load
