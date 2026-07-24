@@ -20,8 +20,9 @@ var _ usecase.LogicalProvisioner = (*Provisioner)(nil)
 // ProvisionLogical creates a dedicated LOGIN role and a logical database cloned
 // from an allowlisted seed template, owned by that role, with PUBLIC connect
 // revoked. It reuses the admin pool. It is idempotent per database name: an
-// already-present database is a no-op success. The plaintext password lives only
-// in this call frame — it is never returned, logged, or persisted.
+// already-present database re-applies the pushed role password and returns the
+// lease. The plaintext password lives only in this call frame — it is never
+// returned, logged, or persisted.
 func (p *Provisioner) ProvisionLogical(ctx context.Context, in usecase.LogicalProvisionRequest) (usecase.LogicalLease, error) {
 	if in.DBName == "" || in.RoleName == "" {
 		return usecase.LogicalLease{}, fmt.Errorf("testdb: db name and role name required")
@@ -33,8 +34,38 @@ func (p *Provisioner) ProvisionLogical(ctx context.Context, in usecase.LogicalPr
 		return usecase.LogicalLease{}, fmt.Errorf("%w: %q", ErrSeedTemplateNotAllowed, in.SeedTemplate)
 	}
 
+	// Ensure the owning role. CREATE ROLE has no IF NOT EXISTS, so guard on
+	// pg_roles. A role created here without a password cannot authenticate at
+	// all (a NULL password fails scram), so the gap until the ALTER below is
+	// fail-closed.
+	var roleExists bool
+	if err := p.adminDB.QueryRowContext(ctx,
+		"SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)", in.RoleName).Scan(&roleExists); err != nil {
+		return usecase.LogicalLease{}, fmt.Errorf("testdb: lookup role: %w", err)
+	}
+	if !roleExists {
+		createRole := fmt.Sprintf(`CREATE ROLE %s LOGIN`, quoteIdent(in.RoleName))
+		if _, err := p.adminDB.ExecContext(ctx, createRole); err != nil {
+			return usecase.LogicalLease{}, fmt.Errorf("testdb: create role %s: %w", in.RoleName, err)
+		}
+	}
+
+	// The pushed password is authoritative on EVERY provision, so this runs
+	// before the already-exists short-circuit below and regardless of whether the
+	// role is new. The caller mints a fresh password per provision and seals it to
+	// a ref with no generation; applying it only on first create would leave the
+	// sealed credential and the live role silently divergent, with no re-apply
+	// path for rotation. One statement, server already up, no restart.
+	// The password is a DDL string literal (Postgres forbids bind parameters in
+	// ALTER ROLE) — quote it safely; NEVER echo it in an error.
+	alterRole := fmt.Sprintf(`ALTER ROLE %s LOGIN PASSWORD %s`, quoteIdent(in.RoleName), quoteLiteral(in.Password))
+	if _, err := p.adminDB.ExecContext(ctx, alterRole); err != nil {
+		return usecase.LogicalLease{}, fmt.Errorf("testdb: set password for role %s: %w", in.RoleName, redactPassword(err, in.Password))
+	}
+
 	// Idempotent per db name: if the database already exists, the logical DB was
-	// provisioned — return the lease unchanged.
+	// provisioned — return the lease unchanged (the credential above has already
+	// been converged).
 	var dbExists bool
 	if err := p.adminDB.QueryRowContext(ctx,
 		"SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", in.DBName).Scan(&dbExists); err != nil {
@@ -42,21 +73,6 @@ func (p *Provisioner) ProvisionLogical(ctx context.Context, in usecase.LogicalPr
 	}
 	if dbExists {
 		return usecase.LogicalLease{DBName: in.DBName, RoleName: in.RoleName}, nil
-	}
-
-	// Ensure the owning role. CREATE ROLE has no IF NOT EXISTS, so guard on
-	// pg_roles. The password is a DDL string literal (Postgres forbids bind
-	// parameters in CREATE ROLE) — quote it safely; NEVER echo it in an error.
-	var roleExists bool
-	if err := p.adminDB.QueryRowContext(ctx,
-		"SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)", in.RoleName).Scan(&roleExists); err != nil {
-		return usecase.LogicalLease{}, fmt.Errorf("testdb: lookup role: %w", err)
-	}
-	if !roleExists {
-		createRole := fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD %s`, quoteIdent(in.RoleName), quoteLiteral(in.Password))
-		if _, err := p.adminDB.ExecContext(ctx, createRole); err != nil {
-			return usecase.LogicalLease{}, fmt.Errorf("testdb: create role %s: %w", in.RoleName, redactPassword(err, in.Password))
-		}
 	}
 
 	// Clone the seed template into the new database, owned by the role.
@@ -121,8 +137,8 @@ func seedAllowed(seed string, allowed []string) bool {
 }
 
 // quoteLiteral renders s as a safe Postgres string literal (single quotes
-// doubled; backslashes force the E'' escape form). Mirrors lib/pq's own
-// quoteLiteral — used for the CREATE ROLE password, which cannot be a bind
+// doubled; backslashes force the E-prefixed escape form). Mirrors lib/pq's own
+// quoteLiteral — used for the ALTER ROLE password, which cannot be a bind
 // parameter.
 func quoteLiteral(s string) string {
 	if strings.Contains(s, `\`) {
