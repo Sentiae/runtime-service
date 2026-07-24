@@ -816,6 +816,18 @@ func (uc *FleetVolumeRestorer) finish(ctx context.Context, resourceID uuid.UUID,
 // When `pre` already exists an EARLIER restore was interrupted: that file is the
 // only surviving original, so it is never clobbered — the current `live` is then
 // a half-restored artifact and is dropped instead.
+//
+// When NEITHER file exists there is nothing to park, and the swap proceeds. This
+// is the case where the backing file was LOST — a dead disk, a stray delete, an
+// unfinished teardown — and it is precisely the case a restore exists to fix: a
+// good recovery point is on hand and the resource is otherwise unrecoverable.
+// Proceeding is provably LOSSLESS, not a judgement call: both paths have just
+// been established ABSENT, so the install can overwrite no surviving copy of the
+// customer's data. Refusing, as this did, cost the single most valuable recovery
+// path to save nothing. The `pre`-exists branch above already tolerates a missing
+// live file on exactly this reasoning. Rollback is unaffected and still fails
+// honestly: with no anchor there is genuinely nowhere to go back to
+// (domain.ErrRestoreNoPrerestoreAnchor).
 func swapIn(staged, live, pre string) error {
 	_, err := os.Stat(pre)
 	switch {
@@ -824,8 +836,16 @@ func swapIn(staged, live, pre string) error {
 			return fmt.Errorf("drop half-restored volume %s: %w", live, rerr)
 		}
 	case os.IsNotExist(err):
-		if rerr := os.Rename(live, pre); rerr != nil {
-			return fmt.Errorf("park pre-restore volume %s: %w", live, rerr)
+		// Stat before rename so "the live file is gone" is a distinguishable state
+		// rather than a rename error that has to be reverse-engineered.
+		_, lerr := os.Stat(live)
+		switch {
+		case lerr == nil:
+			if rerr := os.Rename(live, pre); rerr != nil {
+				return fmt.Errorf("park pre-restore volume %s: %w", live, rerr)
+			}
+		case !os.IsNotExist(lerr):
+			return fmt.Errorf("stat %s: %w", live, lerr)
 		}
 	default:
 		return fmt.Errorf("stat %s: %w", pre, err)
@@ -838,8 +858,16 @@ func swapIn(staged, live, pre string) error {
 
 // swapBack rolls the live path back to the pre-restore original, keeping the
 // failed restore aside for forensics.
+//
+// A missing anchor is TERMINAL here, unlike in swapIn: the rollback's whole job
+// is to reinstate data that only the anchor holds, so without it there is
+// nothing to reinstate and no retry can produce one. The caller records the
+// resource degraded on this — the honest resting place.
 func swapBack(live, pre, failed string) error {
 	if _, err := os.Stat(pre); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: %s", domain.ErrRestoreNoPrerestoreAnchor, pre)
+		}
 		return fmt.Errorf("pre-restore volume %s unavailable: %w", pre, err)
 	}
 	if err := os.Rename(live, failed); err != nil && !os.IsNotExist(err) {
@@ -854,11 +882,19 @@ func swapBack(live, pre, failed string) error {
 // restorePrerestore puts the parked original back when the swap failed halfway
 // (live already renamed to pre, staged not yet installed). A live file that is
 // already in place is left alone.
+//
+// It reports the same terminal anchor error as swapBack: reaching here with
+// neither a live file nor an anchor means the swap failed on a volume whose
+// backing file was already lost, so there is nothing to put back and the caller
+// must degrade rather than pretend a recovery happened.
 func restorePrerestore(live, pre string) error {
 	if _, err := os.Stat(live); err == nil {
 		return nil
 	}
 	if _, err := os.Stat(pre); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: %s", domain.ErrRestoreNoPrerestoreAnchor, pre)
+		}
 		return fmt.Errorf("pre-restore volume %s unavailable: %w", pre, err)
 	}
 	if err := os.Rename(pre, live); err != nil {

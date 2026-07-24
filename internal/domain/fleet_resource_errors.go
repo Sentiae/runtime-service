@@ -70,6 +70,13 @@ var (
 	// cannot be checked at all (no addressable resident replica), because a
 	// restore that cannot be proven usable must not be declared successful.
 	ErrRestoreEngineNotAdmitting = errors.New("fleet resource restore: engine is listening but not admitting clients")
+	// ErrRestoreNoPrerestoreAnchor is returned when a ROLLBACK has no
+	// `.prerestore` original to put back. It is terminal by construction: the
+	// anchor is the only surviving copy of the pre-restore data, so without it
+	// there is nothing to return the live path to and no retry can invent one.
+	// The forward swap does NOT use this — with neither a live file nor an anchor
+	// there is nothing to park and the restore proceeds (see swapIn).
+	ErrRestoreNoPrerestoreAnchor = errors.New("fleet resource restore: no pre-restore volume to roll back to")
 	// ErrSnapshotNotQuiescible is returned when a volume's guest could not be
 	// quiesced (syncfs + fsfreeze over the D-185a control channel) before the
 	// backing file was copied. The snapshot is REFUSED rather than recorded:

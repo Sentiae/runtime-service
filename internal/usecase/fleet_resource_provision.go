@@ -117,7 +117,8 @@ type RecoveryPointInfo struct {
 	CreatedAt time.Time
 }
 
-// ResourceStatus is the live status of a resource claim.
+// ResourceStatus is the live status of a resource claim. Conditions carries the
+// stable reason tokens below when the resource is not simply healthy.
 type ResourceStatus struct {
 	Handle            string
 	Phase             string
@@ -125,7 +126,31 @@ type ResourceStatus struct {
 	Endpoint          string
 	SecretRefs        []string
 	ConnBudget        int
+	Conditions        []string
 	LastRecoveryPoint *RecoveryPointInfo
+}
+
+// Condition tokens reported on ResourceStatus.Conditions. They are STABLE,
+// machine-readable strings — never the raw error text, which is operator-facing
+// detail that belongs in the log, not on a tenant-visible API.
+const (
+	// conditionBackingAppMissing — the resource row points at an app the fleet no
+	// longer knows. Its recovery points survive, so this is a restore/rebuild
+	// decision, not a dead end; it just cannot be read as health.
+	conditionBackingAppMissing = "backing-app-missing"
+	// conditionHealthUnavailable — the health of the backing app could not be
+	// read at all (a store or transport fault). It says nothing about the data.
+	conditionHealthUnavailable = "health-unavailable"
+)
+
+// healthCondition classifies a failed health probe into a condition token. The
+// distinction is load-bearing for an operator: a MISSING app needs a rebuild or
+// a restore, while an unreadable one needs nothing but a retry.
+func healthCondition(err error) string {
+	if errors.Is(err, domain.ErrWorkloadNotFound) || errors.Is(err, domain.ErrFleetAppNotFound) {
+		return conditionBackingAppMissing
+	}
+	return conditionHealthUnavailable
 }
 
 // ProvisionDedicated declaratively ensures a dedicated Postgres data-VM for a
@@ -296,6 +321,10 @@ func (uc *FleetResourceProvisioner) recoverExisting(ctx context.Context, res *do
 // StatusOf returns the live status of a dedicated resource: the backing app's
 // health (healthy → ready), its private endpoint, its connection budget, and its
 // newest recovery point.
+//
+// A health probe that FAILS is reported as a condition, never as an error: this
+// call is how an operator (and the portal) sees a resource at all, so a resource
+// that is stuck must come back legible rather than as a broken RPC.
 func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uuid.UUID) (ResourceStatus, error) {
 	res, err := uc.resources.GetResourceByHandle(ctx, resourceID)
 	if err != nil {
@@ -314,13 +343,21 @@ func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uui
 		res.Phase != domain.FleetResourcePhaseDecommissioned {
 		h, herr := uc.provisioner.Health(ctx, res.AppID.String())
 		if herr != nil {
-			return ResourceStatus{}, fmt.Errorf("resource health: %w", herr)
+			// A resource whose health cannot be read is a STATE, not an API error.
+			// Hard-erroring here made the one case an operator most needs to see —
+			// a resource stuck because its backing app is gone — read as a broken
+			// endpoint: no phase, no endpoint, no recovery catalog, nothing to act
+			// on. The durable phase stands, the condition says why, and the recovery
+			// points below still list (they are what a recovery is built from).
+			status.Conditions = append(status.Conditions, healthCondition(herr))
+			logger.FromContext(ctx).Warn("fleet resource: health probe failed, reporting it as a condition",
+				"resource_id", res.ID, "app_id", res.AppID, "err", herr)
 		}
 		// D-184 — a restore owns the phase while it runs. Auto-advancing to ready
 		// here would race the restore's own verification window: the OLD engine can
 		// still be healthy the instant before the restore drains it, and the
 		// restored one is not proven until the restore says so.
-		if h.Healthy && res.Phase != domain.FleetResourcePhaseRestoring {
+		if herr == nil && h.Healthy && res.Phase != domain.FleetResourcePhaseRestoring {
 			status.Phase = string(domain.FleetResourcePhaseReady)
 			// Keep the durable row honest: advance provisioning → ready once observed.
 			if res.Phase != domain.FleetResourcePhaseReady {
@@ -368,36 +405,62 @@ func (uc *FleetResourceProvisioner) residentEndpoint(ctx context.Context, appID 
 }
 
 // DecommissionDedicated tears down a dedicated resource. A durable tier is torn
-// down snapshot-first: the final snapshot MUST succeed or the decommission
-// fails. The row becomes a tombstone (recovery points retained).
-func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, resourceID uuid.UUID, finalSnapshot bool) error {
+// down snapshot-first: the final snapshot MUST succeed AND MUST have produced a
+// recovery point, or the decommission fails. The row becomes a tombstone
+// (recovery points retained).
+//
+// It RETURNS the final recovery point so the caller can verify the guarantee
+// instead of inferring it from a status code. Without that, `final_snapshot=true`
+// proved only that a snapshot CALL succeeded — and a call over an app with zero
+// volumes succeeds while creating nothing, which is exactly the shape in which a
+// resource is destroyed with nothing to restore from. The return is nil only
+// when no final snapshot was asked for (an ephemeral tier) or when the resource
+// was already a tombstone.
+func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, resourceID uuid.UUID, finalSnapshot bool) (*domain.FleetResourceRecoveryPoint, error) {
 	res, err := uc.resources.GetResourceByHandle(ctx, resourceID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if res.Phase == domain.FleetResourcePhaseDecommissioned {
-		return nil // idempotent
+		return nil, nil // idempotent
 	}
 	// A durable tier must not be torn down without a recovery point. Only an
 	// ephemeral tier/lifecycle may skip the final snapshot — dedicated is durable.
 	if !finalSnapshot && res.Tier == resourceTierDedicated {
-		return domain.ErrResourceFinalSnapshotRequired
+		return nil, domain.ErrResourceFinalSnapshotRequired
 	}
+	var final *domain.FleetResourceRecoveryPoint
 	if finalSnapshot {
 		if uc.snapshotter == nil {
-			return domain.ErrResourceFinalSnapshotRequired
+			return nil, domain.ErrResourceFinalSnapshotRequired
 		}
 		if res.AppID == nil {
-			return fmt.Errorf("dedicated resource %s has no backing app to snapshot", res.ID)
+			return nil, fmt.Errorf("dedicated resource %s has no backing app to snapshot", res.ID)
 		}
 		// Snapshot-first: fail the decommission if the snapshot fails.
-		if _, serr := uc.snapshotter.SnapshotAppVolumes(ctx, res.ID, *res.AppID); serr != nil {
-			return fmt.Errorf("final snapshot: %w", serr)
+		points, serr := uc.snapshotter.SnapshotAppVolumes(ctx, res.ID, *res.AppID)
+		if serr != nil {
+			return nil, fmt.Errorf("final snapshot: %w", serr)
 		}
+		// ZERO recovery points is a REFUSAL, not a success. The snapshotter walks
+		// the app's volumes, so an app carrying none returns ([], nil) — the call
+		// worked and captured nothing. Tearing the resource down on that answer is
+		// the irreversible move: the customer's engine is destroyed and the
+		// "snapshot-first" guarantee it was destroyed under is vacuous. Refusing
+		// costs an operator a question; proceeding costs the data.
+		if len(points) == 0 {
+			return nil, fmt.Errorf("%w: resource %s produced NO recovery point (its backing app has no volume to snapshot), so tearing it down would leave nothing to restore from",
+				domain.ErrResourceFinalSnapshotRequired, res.ID)
+		}
+		// The dedicated tier is single-volume by construction (dedicatedDescriptor
+		// requests exactly one, and in-place restore refuses anything else), so the
+		// first point IS the resource's final recovery point — the same choice the
+		// SnapshotResource RPC makes.
+		final = &points[0]
 	}
 	if res.AppID != nil {
 		if derr := uc.provisioner.Decommission(ctx, res.AppID.String()); derr != nil {
-			return fmt.Errorf("decommission app: %w", derr)
+			return nil, fmt.Errorf("decommission app: %w", derr)
 		}
 	}
 	now := time.Now().UTC()
@@ -405,7 +468,7 @@ func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, r
 	res.DecommissionedAt = &now
 	res.UpdatedAt = now
 	if err := uc.resources.SaveResource(ctx, res); err != nil {
-		return fmt.Errorf("tombstone resource: %w", err)
+		return nil, fmt.Errorf("tombstone resource: %w", err)
 	}
-	return nil
+	return final, nil
 }

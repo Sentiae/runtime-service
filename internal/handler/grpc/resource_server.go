@@ -27,7 +27,7 @@ const resourceClassPostgres = "postgres"
 type dedicatedResourceProvisioner interface {
 	ProvisionDedicated(ctx context.Context, in usecase.ProvisionDedicatedInput) (usecase.ProvisionDedicatedOutput, error)
 	StatusOf(ctx context.Context, resourceID uuid.UUID) (usecase.ResourceStatus, error)
-	DecommissionDedicated(ctx context.Context, resourceID uuid.UUID, finalSnapshot bool) error
+	DecommissionDedicated(ctx context.Context, resourceID uuid.UUID, finalSnapshot bool) (*domain.FleetResourceRecoveryPoint, error)
 }
 
 // sharedResourceProvisioner is the subset of *usecase.FleetResourceSharedProvisioner
@@ -208,6 +208,7 @@ func (s *ResourceServer) GetResourceStatus(ctx context.Context, req *runtimev1.G
 		Endpoint:   st.Endpoint,
 		SecretRefs: st.SecretRefs,
 		ConnBudget: int32(st.ConnBudget),
+		Conditions: st.Conditions,
 	}
 	if st.LastRecoveryPoint != nil {
 		resp.LastRecoveryPoint = &runtimev1.RecoveryPointProto{
@@ -277,6 +278,10 @@ func (s *ResourceServer) ListResourceRecoveryPoints(ctx context.Context, req *ru
 
 // DecommissionResource tears down a resource. The by-handle org gate runs first;
 // a durable tier is torn down snapshot-first inside the use case.
+//
+// The response carries the FINAL RECOVERY POINT whenever one was taken. That is
+// what makes a snapshot-first teardown verifiable by the caller: a bare OK told
+// it only that the call returned, never that a recovery point exists.
 func (s *ResourceServer) DecommissionResource(ctx context.Context, req *runtimev1.DecommissionResourceRequest) (*runtimev1.DecommissionResourceResponse, error) {
 	if s.dedicated == nil {
 		return nil, status.Error(codes.Unavailable, "resource provisioner not configured")
@@ -285,10 +290,20 @@ func (s *ResourceServer) DecommissionResource(ctx context.Context, req *runtimev
 	if err != nil {
 		return nil, err
 	}
-	if err := s.dedicated.DecommissionDedicated(ctx, res.ID, req.GetFinalSnapshot()); err != nil {
+	rp, err := s.dedicated.DecommissionDedicated(ctx, res.ID, req.GetFinalSnapshot())
+	if err != nil {
 		return nil, resourceError(err)
 	}
-	return &runtimev1.DecommissionResourceResponse{}, nil
+	resp := &runtimev1.DecommissionResourceResponse{}
+	if rp != nil {
+		resp.FinalRecoveryPoint = &runtimev1.RecoveryPointProto{
+			Ref:      rp.ObjectKey,
+			Kind:     rp.Kind,
+			At:       timestamppb.New(rp.CreatedAt),
+			Verified: rp.Verified,
+		}
+	}
+	return resp, nil
 }
 
 // RestoreResource restores a resource IN PLACE from one of its recovery points

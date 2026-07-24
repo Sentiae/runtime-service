@@ -26,6 +26,7 @@ type fakeDedicatedProvisioner struct {
 	provisionCalled bool
 	out             usecase.ProvisionDedicatedOutput
 	status          usecase.ResourceStatus
+	finalRP         *domain.FleetResourceRecoveryPoint
 	err             error
 }
 
@@ -36,8 +37,8 @@ func (f *fakeDedicatedProvisioner) ProvisionDedicated(context.Context, usecase.P
 func (f *fakeDedicatedProvisioner) StatusOf(context.Context, uuid.UUID) (usecase.ResourceStatus, error) {
 	return f.status, f.err
 }
-func (f *fakeDedicatedProvisioner) DecommissionDedicated(context.Context, uuid.UUID, bool) error {
-	return f.err
+func (f *fakeDedicatedProvisioner) DecommissionDedicated(context.Context, uuid.UUID, bool) (*domain.FleetResourceRecoveryPoint, error) {
+	return f.finalRP, f.err
 }
 
 type fakeSharedProvisioner struct {
@@ -295,6 +296,89 @@ func TestResourceUnimplementedVerbs(t *testing.T) {
 
 	if _, err := s.RotateResourceCredentials(context.Background(), &runtimev1.RotateResourceCredentialsRequest{Handle: uuid.New().String()}); status.Code(err) != codes.Unimplemented {
 		t.Fatalf("RotateResourceCredentials: want Unimplemented, got %s (%v)", status.Code(err), err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// The snapshot-first guarantee is only verifiable if the teardown REPORTS the
+// recovery point it took. A bare OK proved a call happened, not that anything
+// exists to restore from.
+// ─────────────────────────────────────────────────────────────────────
+
+func TestDecommissionResource_ReportsFinalRecoveryPoint(t *testing.T) {
+	resID := uuid.New()
+	takenAt := time.Now().UTC().Truncate(time.Second)
+
+	tests := []struct {
+		name    string
+		finalRP *domain.FleetResourceRecoveryPoint
+		wantRef string
+	}{
+		{
+			name: "final snapshot is reported back to the caller",
+			finalRP: &domain.FleetResourceRecoveryPoint{
+				ID: uuid.New(), ResourceID: resID, ObjectKey: "volumes/v1/final.ext4",
+				Kind: "snapshot", CreatedAt: takenAt,
+			},
+			wantRef: "volumes/v1/final.ext4",
+		},
+		{
+			// No final snapshot asked for / already a tombstone: nothing to report,
+			// and the field stays unset rather than carrying an empty stand-in.
+			name:    "no recovery point leaves the field unset",
+			finalRP: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &fakeResourceRepo{res: &domain.FleetResource{ID: resID, Tier: resourceTierDedicated}}
+			s := NewResourceServer(&fakeDedicatedProvisioner{finalRP: tt.finalRP}, &fakeSharedProvisioner{}, nil, nil, repo)
+
+			resp, err := s.DecommissionResource(context.Background(), &runtimev1.DecommissionResourceRequest{
+				Handle: resID.String(), FinalSnapshot: true,
+			})
+			if err != nil {
+				t.Fatalf("decommission: %v", err)
+			}
+			if tt.wantRef == "" {
+				if resp.GetFinalRecoveryPoint() != nil {
+					t.Fatalf("want no final recovery point, got %+v", resp.GetFinalRecoveryPoint())
+				}
+				return
+			}
+			got := resp.GetFinalRecoveryPoint()
+			if got == nil {
+				t.Fatal("a teardown that took a final snapshot must report it")
+			}
+			if got.GetRef() != tt.wantRef || got.GetKind() != "snapshot" {
+				t.Fatalf("final recovery point = %+v", got)
+			}
+			if !got.GetAt().AsTime().Equal(takenAt) {
+				t.Fatalf("taken at = %v, want %v", got.GetAt().AsTime(), takenAt)
+			}
+		})
+	}
+}
+
+// A resource whose health cannot be read reports a CONDITION, not an error: the
+// status RPC is how an operator sees a stuck resource at all.
+func TestGetResourceStatus_SurfacesConditions(t *testing.T) {
+	resID := uuid.New()
+	repo := &fakeResourceRepo{res: &domain.FleetResource{ID: resID, Tier: resourceTierDedicated}}
+	dedicated := &fakeDedicatedProvisioner{status: usecase.ResourceStatus{
+		Handle:     resID.String(),
+		Phase:      string(domain.FleetResourcePhaseDegraded),
+		Conditions: []string{"backing-app-missing"},
+	}}
+	s := NewResourceServer(dedicated, &fakeSharedProvisioner{}, nil, nil, repo)
+
+	resp, err := s.GetResourceStatus(context.Background(), &runtimev1.GetResourceStatusRequest{Handle: resID.String()})
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if len(resp.GetConditions()) != 1 || resp.GetConditions()[0] != "backing-app-missing" {
+		t.Fatalf("conditions = %v, want [backing-app-missing]", resp.GetConditions())
 	}
 }
 

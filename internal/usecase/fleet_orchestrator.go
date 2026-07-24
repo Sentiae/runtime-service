@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -475,6 +477,24 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 
 	switch {
 	case len(occupying) < app.DesiredReplicas:
+		// A volume-bearing app whose backing FILE is gone cannot be booted by any
+		// number of attempts. Without this gate every tick minted a fresh replica
+		// row, materialized the image and resolved the boot secrets, watched the VM
+		// die on the missing disk, and did it again ~10s later — forever. Bounded
+		// (it replaces rather than accumulates) but permanent noise, and it buried
+		// the actual cause of a live incident.
+		//
+		// ⚠ THIS IS A PER-TICK PRECONDITION, NOT A LATCH — do not "improve" it into
+		// one. Recording it as VolumeStatusDegraded is the obvious move and it is
+		// wrong: NOTHING in this service ever clears that status, so it would trade
+		// a churning resource for a permanently stuck one, which is strictly worse.
+		// Evaluated fresh on every tick, the resource is one returned file away from
+		// self-healing: the moment the backing file is back the next tick places
+		// normally, with no operator verb and no state to unwind. Same shape as the
+		// ErrNoSchedulableHost defer below.
+		if !uc.placeableOnBackingFile(ctx, app.ID) {
+			return nil
+		}
 		shortfall := app.DesiredReplicas - len(occupying)
 		// rt#9 — a volume-bearing app is pinned to the host that holds its data:
 		// every replica placement targets the affinity host so the same backing
@@ -569,6 +589,71 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 	}
 
 	return nil
+}
+
+// Condition tokens recorded when a volume-bearing app cannot be placed on this
+// tick. They are logged, never latched — see placeableOnBackingFile.
+const (
+	// conditionBackingFileMissing — the volume's backing file is absent while its
+	// DIRECTORY is present. The volume store is mounted and the file is not in
+	// it: the data-loss shape, and the one an operator must be told about.
+	conditionBackingFileMissing = "backing-file-missing"
+	// conditionVolumeStoreUnavailable — the backing file's own directory is
+	// absent. An unmounted volume store looks exactly like this and it comes back
+	// on its own, so this is a DEFER, never a data-loss claim.
+	conditionVolumeStoreUnavailable = "volume-store-unavailable"
+)
+
+// placeableOnBackingFile reports whether a shortfall replica may be placed for
+// this app on THIS tick, by checking that the data it would attach still exists.
+//
+// It answers true for everything it cannot disprove: a stateless app, a volume
+// with no materialized backing path yet, a repository lookup that failed, a stat
+// that failed for any reason other than absence. Blocking a boot on an
+// inconclusive answer would be the far more damaging mistake, so only a file
+// PROVEN absent stops a placement — and even then only for this tick.
+//
+// The check is against the local filesystem, which is the same assumption every
+// other volume path in this service already makes (Ensure materializes, boot
+// attaches and the snapshotter copies the backing file locally on the host that
+// holds the app's affinity).
+func (uc *FleetOrchestrator) placeableOnBackingFile(ctx context.Context, appID uuid.UUID) bool {
+	if uc.volumes == nil {
+		return true // no volume support wired: every app is stateless here
+	}
+	// The volume-bearing apps this guards are single-volume by construction (a
+	// dedicated resource's descriptor requests exactly one, and in-place restore
+	// refuses anything else), so the primary volume IS the app's data.
+	vol, has, err := uc.volumes.PrimaryVolume(ctx, appID)
+	if err != nil {
+		logger.FromContext(ctx).Warn("fleet reconcile: primary volume lookup", "app_id", appID, "err", err)
+		return true
+	}
+	if !has || vol.BackingPath == "" {
+		return true
+	}
+	if _, serr := os.Stat(vol.BackingPath); serr == nil {
+		return true
+	} else if !os.IsNotExist(serr) {
+		logger.FromContext(ctx).Warn("fleet reconcile: stat backing file",
+			"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath, "err", serr)
+		return true // an unreadable stat is not evidence of absence
+	}
+
+	// The file is absent. WHY it is absent decides what this means, and getting it
+	// wrong in the loud direction is its own damage: an unmounted volume store
+	// makes every file under it vanish at once, and reporting that as customer
+	// data loss sends an operator hunting a restore for data that is intact.
+	if _, derr := os.Stat(filepath.Dir(vol.BackingPath)); derr != nil {
+		logger.FromContext(ctx).Warn("fleet reconcile: volume store unavailable, deferring placement (this is NOT data loss — the store is not mounted)",
+			"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath,
+			"condition", conditionVolumeStoreUnavailable, "err", derr)
+		return false
+	}
+	logger.FromContext(ctx).Error("fleet reconcile: backing file is missing from a mounted volume store — skipping placement (no replica, no image materialize, no secret resolve) until the file returns or the resource is restored from a recovery point",
+		"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath,
+		"condition", conditionBackingFileMissing)
+	return false
 }
 
 // ReconcileAll reconciles every known app. A per-app error is logged, never

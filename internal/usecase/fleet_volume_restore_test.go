@@ -576,6 +576,62 @@ func TestRestore_HappyPath(t *testing.T) {
 	}
 }
 
+// The recovery path that matters most: the backing file is GONE (dead disk,
+// stray delete, half-finished teardown) and a good recovery point exists. This
+// used to fail at the park-the-original rename — a resource was unrecoverable
+// with its own restore sitting right there.
+func TestRestore_RecoversAVolumeWhoseBackingFileIsGone(t *testing.T) {
+	t.Run("restores onto the missing file", func(t *testing.T) {
+		h := newRestoreHarness(t)
+		if err := os.Remove(h.live); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := h.run(t); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		if got := readFile(t, h.live); got != restoreBytes {
+			t.Fatalf("live volume = %q, want the RESTORED %q", got, restoreBytes)
+		}
+		if _, err := os.Stat(h.live + prerestoreSuffix); !os.IsNotExist(err) {
+			t.Fatal("no anchor may be created: there was no original to park")
+		}
+		res := h.resource(t)
+		if res.Phase != domain.FleetResourcePhaseReady {
+			t.Fatalf("phase = %q, want ready", res.Phase)
+		}
+		if res.LastError != "" {
+			t.Fatalf("last_error = %q, want empty on a clean restore", res.LastError)
+		}
+	})
+
+	// The other half of the same state: with no original there is no rollback, so
+	// a restore that will not boot must END degraded and SAY why — never silently
+	// ready, never pretending an original was put back.
+	t.Run("cannot roll back what never existed, and says so", func(t *testing.T) {
+		h := newRestoreHarness(t)
+		if err := os.Remove(h.live); err != nil {
+			t.Fatal(err)
+		}
+		h.health.healthy = false
+
+		if _, err := h.run(t); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		res := h.resource(t)
+		if res.Phase != domain.FleetResourcePhaseDegraded {
+			t.Fatalf("phase = %q, want degraded", res.Phase)
+		}
+		if !strings.Contains(res.LastError, domain.ErrRestoreNoPrerestoreAnchor.Error()) {
+			t.Fatalf("last_error = %q, want it to name the missing pre-restore anchor", res.LastError)
+		}
+		// The restored bytes stay in place: they are the only data there is.
+		if got := readFile(t, h.live); got != restoreBytes {
+			t.Fatalf("live volume = %q, want the restored bytes left in place", got)
+		}
+	})
+}
+
 func TestRestore_RollsBackWhenRestoredVolumeWillNotBoot(t *testing.T) {
 	h := newRestoreHarness(t)
 	// The engine only comes up on the ORIGINAL bytes: the recovery point is
@@ -744,7 +800,6 @@ func TestSwapIn_FileStates(t *testing.T) {
 		live, pre string
 		wantLive  string
 		wantPre   string
-		wantErr   bool
 	}{
 		{
 			name:     "first restore parks the original",
@@ -768,10 +823,15 @@ func TestSwapIn_FileStates(t *testing.T) {
 			wantPre:  "ORIGINAL",
 		},
 		{
-			name:    "no live and no anchor is an error, not a silent create",
-			live:    "",
-			pre:     "",
-			wantErr: true,
+			// The lost-backing-file case, and the reason Restore is worth having: a
+			// volume whose file is gone, a good recovery point in hand. Nothing to
+			// park means nothing to lose — both paths are established absent, so the
+			// install cannot overwrite any surviving copy of the data.
+			name:     "no live and no anchor installs the recovery point",
+			live:     "",
+			pre:      "",
+			wantLive: "STAGED",
+			wantPre:  "", // no anchor was created: there was no original to park
 		},
 	}
 
@@ -796,12 +856,6 @@ func TestSwapIn_FileStates(t *testing.T) {
 			}
 
 			err := swapIn(staged, live, pre)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("want error")
-				}
-				return
-			}
 			if err != nil {
 				t.Fatalf("swapIn: %v", err)
 			}
@@ -850,14 +904,21 @@ func TestSwapBack_FileStates(t *testing.T) {
 		}
 	})
 
+	// A ROLLBACK with no anchor is terminal, unlike the forward swap: the anchor
+	// holds the only copy of the pre-restore data, so there is nothing to
+	// reinstate and no retry can produce one. It must say so unambiguously.
 	t.Run("refuses without an anchor", func(t *testing.T) {
 		dir := t.TempDir()
 		live := filepath.Join(dir, "vol.ext4")
 		if err := os.WriteFile(live, []byte("RESTORED"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := swapBack(live, live+prerestoreSuffix, live+".failed-x"); err == nil {
-			t.Fatal("want error when the pre-restore anchor is missing")
+		err := swapBack(live, live+prerestoreSuffix, live+".failed-x")
+		if !errors.Is(err, domain.ErrRestoreNoPrerestoreAnchor) {
+			t.Fatalf("err = %v, want ErrRestoreNoPrerestoreAnchor", err)
+		}
+		if got := readFile(t, live); got != "RESTORED" {
+			t.Fatalf("live = %q, want it untouched when the rollback cannot proceed", got)
 		}
 	})
 }
@@ -875,6 +936,18 @@ func TestRestorePrerestore(t *testing.T) {
 		}
 		if got := readFile(t, live); got != "ORIGINAL" {
 			t.Fatalf("live = %q, want ORIGINAL", got)
+		}
+	})
+
+	// Reaching here with neither file means the swap failed on a volume whose
+	// backing file was already lost: there is nothing to put back, and the caller
+	// must degrade rather than report a recovery that did not happen.
+	t.Run("reports the terminal anchor error when there is nothing to put back", func(t *testing.T) {
+		dir := t.TempDir()
+		live := filepath.Join(dir, "vol.ext4")
+		err := restorePrerestore(live, live+prerestoreSuffix)
+		if !errors.Is(err, domain.ErrRestoreNoPrerestoreAnchor) {
+			t.Fatalf("err = %v, want ErrRestoreNoPrerestoreAnchor", err)
 		}
 	})
 

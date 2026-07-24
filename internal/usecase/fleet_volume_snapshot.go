@@ -132,6 +132,12 @@ func NewFleetVolumeSnapshotter(
 // resource and returns the recovery points it created. It aborts on the first
 // volume that fails (a partial snapshot of a data resource is not a recovery
 // point the caller can trust).
+//
+// ⚠ An app with NO volumes returns ([], nil) — success, zero recovery points.
+// That is honest (there was nothing to snapshot) but it means a successful CALL
+// is not evidence a recovery point EXISTS. Every caller whose guarantee depends
+// on one existing must check the length itself: the SnapshotResource RPC does,
+// and so does the snapshot-first DecommissionDedicated.
 func (s *FleetVolumeSnapshotter) SnapshotAppVolumes(ctx context.Context, resourceID, appID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error) {
 	vols, err := s.volumes.ListByApp(ctx, appID)
 	if err != nil {

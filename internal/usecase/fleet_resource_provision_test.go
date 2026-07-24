@@ -233,6 +233,12 @@ type fakeSnapshotter struct {
 	resourceID uuid.UUID
 	appID      uuid.UUID
 	err        error
+	// noVolumes reproduces the real snapshotter's zero-volume answer: the call
+	// SUCCEEDS and creates nothing.
+	noVolumes bool
+	// produced records the recovery points handed back, so a test can assert the
+	// caller reports the SAME one it was given.
+	produced []domain.FleetResourceRecoveryPoint
 }
 
 func (f *fakeSnapshotter) SnapshotAppVolumes(_ context.Context, resourceID, appID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error) {
@@ -242,7 +248,14 @@ func (f *fakeSnapshotter) SnapshotAppVolumes(_ context.Context, resourceID, appI
 	if f.err != nil {
 		return nil, f.err
 	}
-	return []domain.FleetResourceRecoveryPoint{{ID: uuid.New(), ResourceID: resourceID}}, nil
+	if f.noVolumes {
+		return []domain.FleetResourceRecoveryPoint{}, nil
+	}
+	f.produced = []domain.FleetResourceRecoveryPoint{{
+		ID: uuid.New(), ResourceID: resourceID, ObjectKey: "volumes/v1/final.ext4",
+		Kind: "snapshot", CreatedAt: time.Now().UTC(),
+	}}
+	return f.produced, nil
 }
 
 // fakeResourceReplicaRepo serves FindByID + ListByApp from in-memory maps
@@ -627,6 +640,70 @@ func TestStatusOf_DoesNotAdvanceWhileRestoring(t *testing.T) {
 	}
 }
 
+// A resource whose health cannot be read is a STATE, not an API error: the
+// status call is the only way an operator sees a stuck resource, and hard-
+// erroring turned "your database is stuck" into "the API is broken".
+func TestStatusOf_UnreadableHealthIsAConditionNotAnError(t *testing.T) {
+	tests := []struct {
+		name          string
+		healthErr     error
+		wantCondition string
+	}{
+		{
+			name:          "backing app is gone",
+			healthErr:     domain.ErrWorkloadNotFound,
+			wantCondition: conditionBackingAppMissing,
+		},
+		{
+			name:          "app row lookup says not found",
+			healthErr:     fmt.Errorf("load app: %w", domain.ErrFleetAppNotFound),
+			wantCondition: conditionBackingAppMissing,
+		},
+		{
+			name:          "anything else is unreadable, not missing",
+			healthErr:     errors.New("connection refused"),
+			wantCondition: conditionHealthUnavailable,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newFakeResourceRepo()
+			prov := &fakeFleetProvisioner{healthErr: tt.healthErr}
+			appID := uuid.New()
+			replicas := newFakeResourceReplicaRepo()
+			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine())
+
+			rid := uuid.New()
+			repo.seed(&domain.FleetResource{
+				ID: rid, OwnerOrg: uuid.New(), ClaimKey: "c", Env: "prod",
+				Tier: "dedicated", Phase: domain.FleetResourcePhaseProvisioning, AppID: &appID,
+			})
+			repo.recovery[rid] = []domain.FleetResourceRecoveryPoint{{ID: uuid.New(), ResourceID: rid, ObjectKey: "volumes/x/y.ext4"}}
+
+			st, err := uc.StatusOf(context.Background(), rid)
+			if err != nil {
+				t.Fatalf("a failed health probe must not fail the status call: %v", err)
+			}
+			if len(st.Conditions) != 1 || st.Conditions[0] != tt.wantCondition {
+				t.Fatalf("conditions = %v, want [%s]", st.Conditions, tt.wantCondition)
+			}
+			if st.Phase != string(domain.FleetResourcePhaseProvisioning) {
+				t.Errorf("phase = %q, want the durable phase unchanged", st.Phase)
+			}
+			// The recovery catalog is exactly what a recovery is built from, so it
+			// must still be reported when health cannot be read.
+			if st.LastRecoveryPoint == nil {
+				t.Error("recovery points must still be reported for an unhealthy resource")
+			}
+			stored, _ := repo.GetResourceByHandle(context.Background(), rid)
+			if stored.Phase != domain.FleetResourcePhaseProvisioning {
+				t.Errorf("stored phase = %q, want it untouched", stored.Phase)
+			}
+		})
+	}
+}
+
 func TestDecommissionDedicated_RejectsNoFinalSnapshot(t *testing.T) {
 	repo := newFakeResourceRepo()
 	snap := &fakeSnapshotter{}
@@ -637,7 +714,7 @@ func TestDecommissionDedicated_RejectsNoFinalSnapshot(t *testing.T) {
 	appID := uuid.New()
 	repo.seed(&domain.FleetResource{ID: rid, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady, AppID: &appID})
 
-	err := uc.DecommissionDedicated(context.Background(), rid, false)
+	_, err := uc.DecommissionDedicated(context.Background(), rid, false)
 	if !errors.Is(err, domain.ErrResourceFinalSnapshotRequired) {
 		t.Fatalf("got %v, want ErrResourceFinalSnapshotRequired", err)
 	}
@@ -656,11 +733,20 @@ func TestDecommissionDedicated_SnapshotFirstThenTombstone(t *testing.T) {
 	appID := uuid.New()
 	repo.seed(&domain.FleetResource{ID: rid, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady, AppID: &appID})
 
-	if err := uc.DecommissionDedicated(context.Background(), rid, true); err != nil {
+	final, err := uc.DecommissionDedicated(context.Background(), rid, true)
+	if err != nil {
 		t.Fatalf("decommission: %v", err)
 	}
 	if snap.calls != 1 || snap.appID != appID || snap.resourceID != rid {
 		t.Errorf("snapshot not taken snapshot-first: calls=%d", snap.calls)
+	}
+	// The teardown must hand back the recovery point it took: that is the only
+	// thing that makes `final_snapshot=true` verifiable by the caller.
+	if final == nil {
+		t.Fatal("decommission must return the final recovery point")
+	}
+	if len(snap.produced) != 1 || final.ID != snap.produced[0].ID || final.ObjectKey != snap.produced[0].ObjectKey {
+		t.Errorf("final recovery point = %+v, want the one the snapshotter created %+v", final, snap.produced)
 	}
 	if len(prov.decommissioned) != 1 || prov.decommissioned[0] != appID.String() {
 		t.Errorf("app not decommissioned: %v", prov.decommissioned)
@@ -681,7 +767,7 @@ func TestDecommissionDedicated_SnapshotFailureAborts(t *testing.T) {
 	appID := uuid.New()
 	repo.seed(&domain.FleetResource{ID: rid, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady, AppID: &appID})
 
-	if err := uc.DecommissionDedicated(context.Background(), rid, true); err == nil {
+	if _, err := uc.DecommissionDedicated(context.Background(), rid, true); err == nil {
 		t.Fatalf("expected decommission to fail when snapshot fails")
 	}
 	if len(prov.decommissioned) != 0 {
@@ -690,6 +776,59 @@ func TestDecommissionDedicated_SnapshotFailureAborts(t *testing.T) {
 	row, _ := repo.GetResourceByHandle(context.Background(), rid)
 	if row.Phase == domain.FleetResourcePhaseDecommissioned {
 		t.Errorf("row must not be tombstoned when snapshot fails")
+	}
+}
+
+// A snapshot CALL that succeeds is not a recovery point. An app with no volumes
+// returns ([], nil) — success, nothing created — and tearing the resource down
+// on that answer destroys it under a guarantee that never held.
+func TestDecommissionDedicated_RefusesWhenNoRecoveryPointWasCreated(t *testing.T) {
+	tests := []struct {
+		name      string
+		noVolumes bool
+		wantErr   error
+		wantTorn  bool
+	}{
+		{
+			name:      "zero volumes yields zero recovery points and is refused",
+			noVolumes: true,
+			wantErr:   domain.ErrResourceFinalSnapshotRequired,
+		},
+		{
+			name:     "one recovery point tears down",
+			wantTorn: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newFakeResourceRepo()
+			snap := &fakeSnapshotter{noVolumes: tt.noVolumes}
+			prov := &fakeFleetProvisioner{}
+			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine())
+
+			rid := uuid.New()
+			appID := uuid.New()
+			repo.seed(&domain.FleetResource{ID: rid, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady, AppID: &appID})
+
+			final, err := uc.DecommissionDedicated(context.Background(), rid, true)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
+			}
+			if torn := len(prov.decommissioned) == 1; torn != tt.wantTorn {
+				t.Fatalf("app torn down = %v, want %v", torn, tt.wantTorn)
+			}
+			row, _ := repo.GetResourceByHandle(context.Background(), rid)
+			if tombstoned := row.Phase == domain.FleetResourcePhaseDecommissioned; tombstoned != tt.wantTorn {
+				t.Fatalf("tombstoned = %v, want %v", tombstoned, tt.wantTorn)
+			}
+			if tt.wantTorn && final == nil {
+				t.Fatal("a successful snapshot-first teardown must report its recovery point")
+			}
+			if !tt.wantTorn && final != nil {
+				t.Fatalf("a refused teardown must report no recovery point, got %+v", final)
+			}
+		})
 	}
 }
 

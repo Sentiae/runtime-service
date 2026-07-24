@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -397,6 +399,135 @@ func TestReconcileApp(t *testing.T) {
 				t.Fatalf("resident replicas = %d, want %d", got, tt.wantResident)
 			}
 		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// The backing-file placement precondition. A volume-bearing app whose data file
+// is gone cannot boot, and re-placing it every tick burned a replica row, an
+// image materialize and a secret resolve each time, forever.
+// ─────────────────────────────────────────────────────────────────────
+
+// newStatefulOrchHarness wires a volume-bearing app whose single volume points
+// at `backing` (which the caller creates or removes at will), through the REAL
+// FleetVolumeManager the reconciler consults in production.
+func newStatefulOrchHarness(t *testing.T, backing string) (orchHarness, *domain.FleetApp) {
+	t.Helper()
+	app := testFleetApp(1)
+	h := newOrchHarness(oneLiveHost(), app)
+	vol := volWithBacking(app.ID, backing)
+	h.orch.SetVolumeManager(NewFleetVolumeManager(newVolRepoFake(vol), &recordingBackend{}, filepath.Dir(backing)))
+	return h, app
+}
+
+func TestReconcileApp_BackingFilePrecondition(t *testing.T) {
+	origAlive := processAlive
+	processAlive = func(int) bool { return true }
+	defer func() { processAlive = origAlive }()
+
+	tests := []struct {
+		name string
+		// setup prepares the on-disk state and returns the volume's backing path.
+		setup     func(t *testing.T) string
+		wantPlace bool
+	}{
+		{
+			name: "backing file present places normally",
+			setup: func(t *testing.T) string {
+				p := filepath.Join(t.TempDir(), "vol.ext4")
+				if err := os.WriteFile(p, []byte("DATA"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return p
+			},
+			wantPlace: true,
+		},
+		{
+			// File gone, store mounted: the data-loss shape. No replica, and — the
+			// point of the gate — no image materialize and no secret resolve either.
+			name: "backing file missing from a mounted store places nothing",
+			setup: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "vol.ext4")
+			},
+			wantPlace: false,
+		},
+		{
+			// The whole directory is gone: an UNMOUNTED volume store looks exactly
+			// like this and the data is intact. Deferring is the only honest move —
+			// concluding data loss would send an operator chasing a restore for data
+			// that never left.
+			name: "missing volume store defers, it does not conclude data loss",
+			setup: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "not-mounted", "vol.ext4")
+			},
+			wantPlace: false,
+		},
+		{
+			// An app with no volume at all is untouched by any of this.
+			name:      "stateless app is unaffected",
+			setup:     func(*testing.T) string { return "" },
+			wantPlace: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backing := tt.setup(t)
+			var h orchHarness
+			var app *domain.FleetApp
+			if backing == "" {
+				app = testFleetApp(1)
+				h = newOrchHarness(oneLiveHost(), app)
+			} else {
+				h, app = newStatefulOrchHarness(t, backing)
+			}
+
+			if err := h.orch.ReconcileApp(context.Background(), app.ID); err != nil {
+				t.Fatalf("ReconcileApp: %v", err)
+			}
+			if placed := h.replicas.count() > 0; placed != tt.wantPlace {
+				t.Fatalf("replica placed = %v, want %v", placed, tt.wantPlace)
+			}
+		})
+	}
+}
+
+// ⚠ THE ASSERTION THAT MATTERS: the gate is a per-tick PRECONDITION, not a
+// latch. Nothing in this service clears a degraded volume status, so latching
+// would trade a churning resource for a permanently stuck one. The moment the
+// backing file returns — an operator remounts, a restore lands it — the very
+// next tick must place normally, with no operator verb and no state to unwind.
+func TestReconcileApp_BackingFilePreconditionIsNotALatch(t *testing.T) {
+	origAlive := processAlive
+	processAlive = func(int) bool { return true }
+	defer func() { processAlive = origAlive }()
+
+	backing := filepath.Join(t.TempDir(), "vol.ext4")
+	h, app := newStatefulOrchHarness(t, backing)
+
+	// Tick 1 + 2, file absent: nothing placed, and repeated ticks do not
+	// accumulate anything either.
+	for i := 1; i <= 2; i++ {
+		if err := h.orch.ReconcileApp(context.Background(), app.ID); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+		if got := h.replicas.count(); got != 0 {
+			t.Fatalf("tick %d placed %d replicas, want 0", i, got)
+		}
+	}
+
+	// The file comes back. The NEXT tick must recover on its own.
+	if err := os.WriteFile(backing, []byte("DATA"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.orch.ReconcileApp(context.Background(), app.ID); err != nil {
+		t.Fatalf("recovery tick: %v", err)
+	}
+	if got := h.replicas.count(); got != 1 {
+		t.Fatalf("replicas after the file returned = %d, want 1 (the gate must not latch)", got)
+	}
+	if got := h.replicas.countState(domain.ReplicaStateResident); got != 1 {
+		t.Fatalf("resident replicas = %d, want 1", got)
 	}
 }
 
