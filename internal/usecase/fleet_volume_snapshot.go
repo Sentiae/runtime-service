@@ -195,17 +195,19 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 	}
 	defer func() { _ = os.Remove(tmpPath) }()
 
-	size, err := fileSize(tmpPath)
-	if err != nil {
-		return zero, fmt.Errorf("stat snapshot copy: %w", err)
-	}
-
 	objectKey := fmt.Sprintf("volumes/%s/%s.ext4", vol.ID, snapshotID)
-	checksum, err := uploadSnapshotFileHashed(s.store, objectKey, tmpPath)
+	up, err := uploadSnapshotFileHashed(ctx, s.store, objectKey, tmpPath)
 	if err != nil {
 		// A local-only copy is not a recovery point: abort with no catalog row.
 		return zero, fmt.Errorf("upload snapshot: %w", err)
 	}
+	// Both sizes, because they diverge: the recovery point records the LOGICAL
+	// size (what a restore materializes) while the transfer only pays for the
+	// compressed bytes. The gap is the volume's holes, and it is the number to
+	// look at when a snapshot is slower than the data it holds.
+	logger.FromContext(ctx).Info("fleet snapshot: uploaded",
+		"volume_id", vol.ID, "object_key", objectKey,
+		"logical_bytes", up.LogicalBytes, "stored_bytes", up.StoredBytes)
 
 	now := time.Now().UTC()
 	volID := vol.ID
@@ -215,8 +217,8 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 		VolumeID:   &volID,
 		ObjectKey:  objectKey,
 		Kind:       "snapshot",
-		SizeBytes:  size,
-		Checksum:   checksum,
+		SizeBytes:  up.LogicalBytes,
+		Checksum:   up.Checksum,
 		Verified:   false,
 		CreatedAt:  now,
 	}
@@ -455,13 +457,4 @@ func realSparseCopy(ctx context.Context, src, dst string) error {
 		return fmt.Errorf("cp --sparse=always %s %s: %s: %w", src, dst, strings.TrimSpace(string(out)), err)
 	}
 	return nil
-}
-
-// fileSize returns the on-disk size of a file in bytes.
-func fileSize(path string) (int64, error) {
-	st, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	return st.Size(), nil
 }

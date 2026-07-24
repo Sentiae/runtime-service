@@ -1,6 +1,8 @@
 package usecase
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -135,6 +138,9 @@ type fakeArtifactStore struct {
 	puts      []string
 	putErr    error
 	shortRead bool
+	// bodies keeps the bytes AS STORED, so tests can assert the transfer size,
+	// the checksum, and feed a stored blob straight back into the restore path.
+	bodies map[string][]byte
 }
 
 func (f *fakeArtifactStore) Put(digest string, r io.Reader) error {
@@ -144,15 +150,30 @@ func (f *fakeArtifactStore) Put(digest string, r io.Reader) error {
 	if f.putErr != nil {
 		return f.putErr
 	}
+	var body []byte
 	if f.shortRead {
 		// Consume only the first byte — models a store that did not take the whole
 		// blob, which must NOT yield a checksum of the full file.
 		_, _ = io.CopyN(io.Discard, r, 1)
 	} else {
-		_, _ = io.Copy(io.Discard, r)
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, r); err != nil {
+			return err
+		}
+		body = buf.Bytes()
 	}
+	if f.bodies == nil {
+		f.bodies = map[string][]byte{}
+	}
+	f.bodies[digest] = body
 	f.puts = append(f.puts, digest)
 	return nil
+}
+
+func (f *fakeArtifactStore) stored(digest string) []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.bodies[digest]
 }
 func (f *fakeArtifactStore) Get(string) (io.ReadCloser, error) { return nil, ErrArtifactNotFound }
 func (f *fakeArtifactStore) Exists(string) (bool, error)       { return false, nil }
@@ -657,18 +678,85 @@ func sameOrder(got, want []string) bool {
 // D-184 — the recovery point records the sha256 of the uploaded bytes, computed
 // on the SAME single pass as the upload. Until this landed a recovery point
 // carried only its size, so a corrupt blob was indistinguishable from a good one.
+//
+// The checksum covers the bytes AS STORED (the compressed stream): that is what
+// "did the blob arrive intact" means, and it is what a restore can verify before
+// materializing anything. size_bytes stays the LOGICAL volume size.
 func TestSnapshot_RecordsChecksumOfUploadedBytes(t *testing.T) {
 	h := newSnapshotHarness(t)
 	appID, resID, _, _, _ := h.attachedVolume(t)
 
-	if _, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID); err != nil {
+	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
+	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
-	sum := sha256.Sum256([]byte("ext4-bytes")) // what the harness copyFile writes
+	body := h.store.stored(points[0].ObjectKey)
+	sum := sha256.Sum256(body)
 	if want := hex.EncodeToString(sum[:]); rps[0].Checksum != want {
-		t.Fatalf("checksum = %q, want %q", rps[0].Checksum, want)
+		t.Fatalf("checksum = %q, want the sha256 of the STORED bytes %q", rps[0].Checksum, want)
 	}
+	if got := gunzip(t, body); got != "ext4-bytes" { // what the harness copyFile writes
+		t.Fatalf("stored blob decompresses to %q, want the volume bytes", got)
+	}
+	if rps[0].SizeBytes != int64(len("ext4-bytes")) {
+		t.Fatalf("size_bytes = %d, want the LOGICAL volume size %d", rps[0].SizeBytes, len("ext4-bytes"))
+	}
+}
+
+// The product-blocking defect: an upload reads a volume's HOLES back as zeros,
+// so a 20GB-nominal volume holding a few GB transferred all 20GB and could not
+// be snapshotted inside any sane deadline — and, because a durable resource
+// refuses decommission without a final snapshot, could then never be deleted.
+// Compression is what collapses those zero runs, so the transfer costs about
+// what the real data costs.
+func TestSnapshot_SparseVolumeStoresFarLessThanItsNominalSize(t *testing.T) {
+	const (
+		nominal  = 32 << 20 // logical volume size
+		realData = 4 << 10  // the only bytes that are not a hole
+	)
+	h := newSnapshotHarness(t)
+	appID, resID, _, _, _ := h.attachedVolume(t)
+	// A REAL sparse copy: a small write, then Truncate out to the nominal size.
+	// Everything past the write is a hole that reads back as zeros.
+	h.s.copyFile = func(_ context.Context, _, dst string) error {
+		h.rec.add("copy")
+		payload := bytes.Repeat([]byte{0xAB}, realData)
+		if err := os.WriteFile(dst, payload, 0o600); err != nil {
+			return err
+		}
+		return os.Truncate(dst, nominal)
+	}
+
+	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	stored := int64(len(h.store.stored(points[0].ObjectKey)))
+	if points[0].SizeBytes != nominal {
+		t.Fatalf("size_bytes = %d, want the LOGICAL %d", points[0].SizeBytes, nominal)
+	}
+	// The bar is deliberately loose (a 100:1 floor against deflate's ~1000:1 on
+	// zeros): the assertion is "holes cost nothing", not a compression ratio.
+	if stored >= nominal/100 {
+		t.Fatalf("stored %d bytes for a %d-byte volume holding %d bytes of data — holes are still being transferred",
+			stored, int64(nominal), int64(realData))
+	}
+}
+
+// gunzip decompresses a stored snapshot blob for assertions.
+func gunzip(t *testing.T, body []byte) string {
+	t.Helper()
+	zr, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	defer zr.Close()
+	out, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("gunzip: %v", err)
+	}
+	return string(out)
 }
 
 // A store that consumes only part of the blob must NOT produce a recovery point:
@@ -686,4 +774,172 @@ func TestSnapshot_RefusesWhenStoreDidNotConsumeWholeBlob(t *testing.T) {
 	if len(rps) != 0 {
 		t.Fatalf("no recovery point may be recorded, got %d", len(rps))
 	}
+}
+
+// limitStore models an artifact store that stops reading early: `limit` bytes
+// then a SUCCESSFUL return. That is the dangerous shape — a failure the caller
+// would otherwise record a checksum over.
+type limitStore struct {
+	limit int64 // <0 consumes everything
+	err   error
+	body  bytes.Buffer
+}
+
+func (s *limitStore) Put(_ string, r io.Reader) error {
+	if s.err != nil {
+		return s.err
+	}
+	if s.limit < 0 {
+		_, _ = io.Copy(&s.body, r)
+		return nil
+	}
+	_, _ = io.CopyN(&s.body, r, s.limit)
+	return nil
+}
+func (s *limitStore) Get(string) (io.ReadCloser, error) { return nil, ErrArtifactNotFound }
+func (s *limitStore) Exists(string) (bool, error)       { return false, nil }
+func (s *limitStore) VerifyHash(string) error           { return nil }
+
+// The upload's honesty gate. Compression means "bytes stored" and "bytes of the
+// volume" are different numbers, so the guard compares two pairs: the whole
+// source must have been read (else the stream is a valid gzip of a PREFIX of
+// the volume — a truncation no size check on the stored blob can see any more),
+// and every compressed byte produced must have been consumed by the store (else
+// the digest describes bytes nobody stored).
+func TestUploadSnapshotFileHashed_TruncationGuard(t *testing.T) {
+	payload := bytes.Repeat([]byte("volume-bytes"), 512)
+
+	tests := []struct {
+		name    string
+		store   *limitStore
+		wantErr bool
+	}{
+		{"store consumes the whole compressed stream", &limitStore{limit: -1}, false},
+		{"store consumes a prefix and reports success", &limitStore{limit: 4}, true},
+		{"store reads nothing and reports success", &limitStore{limit: 0}, true},
+		{"store fails outright", &limitStore{limit: -1, err: errors.New("s3 down")}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "snap.tmp")
+			if err := os.WriteFile(path, payload, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			up, err := uploadSnapshotFileHashed(context.Background(), tt.store, "k", path)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("want an error, got upload %+v", up)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("upload: %v", err)
+			}
+			if up.LogicalBytes != int64(len(payload)) {
+				t.Errorf("logical = %d, want %d", up.LogicalBytes, len(payload))
+			}
+			if up.StoredBytes != int64(tt.store.body.Len()) {
+				t.Errorf("stored = %d, store took %d", up.StoredBytes, tt.store.body.Len())
+			}
+			sum := sha256.Sum256(tt.store.body.Bytes())
+			if want := hex.EncodeToString(sum[:]); up.Checksum != want {
+				t.Errorf("checksum = %q, want the sha256 of the stored bytes %q", up.Checksum, want)
+			}
+		})
+	}
+}
+
+// A cancelled or failed snapshot unlinks its temp copy, so any descriptor still
+// open on it pins the disk until the process dies — measured live as ~28GB of
+// held-open deleted files after repeated cancels. Every abort path must leave
+// zero descriptors behind.
+//
+// The proxy is the fd NUMBER a fresh open gets: on Unix the kernel hands out the
+// lowest free descriptor, so leaked descriptors push it up. It proves "no
+// descriptor outlived these snapshots"; it does not attribute a leak to a
+// particular file, and it cannot see a descriptor another test leaked.
+func TestSnapshot_AbortedSnapshotLeavesNoOpenDescriptor(t *testing.T) {
+	aborts := []struct {
+		name  string
+		setup func(h *snapHarness) context.Context
+	}{
+		{
+			name: "context cancelled mid-copy",
+			setup: func(h *snapHarness) context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				h.s.copyFile = func(_ context.Context, _, dst string) error {
+					// A killed `cp` leaves a partial file behind, like the real one does.
+					_ = os.WriteFile(dst, []byte("half-a-vol"), 0o600)
+					cancel()
+					return context.Canceled
+				}
+				return ctx
+			},
+		},
+		{
+			name: "upload fails",
+			setup: func(h *snapHarness) context.Context {
+				h.store.putErr = errors.New("s3 down")
+				return context.Background()
+			},
+		},
+		{
+			name: "store stops reading mid-upload",
+			setup: func(h *snapHarness) context.Context {
+				h.store.shortRead = true
+				return context.Background()
+			},
+		},
+	}
+
+	const rounds = 4
+	baseFD := probeFD(t)
+	baseGoroutines := runtime.NumGoroutine()
+
+	for i := 0; i < rounds; i++ {
+		for _, ab := range aborts {
+			h := newSnapshotHarness(t)
+			appID, resID, _, _, dir := h.attachedVolume(t)
+			ctx := ab.setup(h)
+			if _, err := h.s.SnapshotAppVolumes(ctx, resID, appID); err == nil {
+				t.Fatalf("%s: expected the snapshot to abort", ab.name)
+			}
+			// The temp copy is unlinked on every abort — that is exactly why a
+			// surviving descriptor would hold the disk hostage.
+			entries, _ := os.ReadDir(dir)
+			if len(entries) != 1 {
+				t.Fatalf("%s: temp copy not cleaned up: %d entries", ab.name, len(entries))
+			}
+		}
+	}
+
+	if got := probeFD(t); got > baseFD+2 {
+		t.Fatalf("a fresh open landed on fd %d, was %d before %d aborted snapshots — descriptors outlived them",
+			got, baseFD, rounds*len(aborts))
+	}
+	// A compressor goroutine parked on the upload pipe would hold the file it is
+	// reading, so it is joined on every exit. Settle briefly: unrelated tests in
+	// this package run background goroutines.
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > baseGoroutines+4 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > baseGoroutines+4 {
+		t.Fatalf("goroutines = %d, was %d before the aborted snapshots — an upload goroutine outlived its snapshot", got, baseGoroutines)
+	}
+}
+
+// probeFD reports the descriptor number a fresh open receives.
+func probeFD(t *testing.T) uintptr {
+	t.Helper()
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open probe: %v", err)
+	}
+	fd := f.Fd()
+	if err := f.Close(); err != nil {
+		t.Fatalf("close probe: %v", err)
+	}
+	return fd
 }

@@ -1973,22 +1973,28 @@ func (c *Container) buildSnapshotStore(cfg *config.Config) usecase.ArtifactStore
 		log.Printf("[snapshot-store] disabled: failed to init S3 backend: %v", err)
 		return nil
 	}
-	cacheDir := sc.CacheDir
-	if cacheDir == "" {
-		cacheDir = filepath.Join(cfg.Firecracker.SnapshotPath, "cache")
-	}
-	local, err := usecase.NewFilesystemStore(cacheDir)
-	if err != nil {
-		log.Printf("[snapshot-store] disabled: failed to init local cache at %s: %v", cacheDir, err)
-		return nil
-	}
-	caching, err := objectstore.NewCachingStore(local, remote)
-	if err != nil {
-		log.Printf("[snapshot-store] disabled: failed to wire caching store: %v", err)
-		return nil
-	}
-	log.Printf("[snapshot-store] enabled (bucket=%s, endpoint=%s, cache=%s)", sc.Bucket, sc.Endpoint, cacheDir)
-	return caching
+	// NO local cache in front of this store, deliberately.
+	//
+	// The only local implementation is FilesystemStore, which is CONTENT-ADDRESSED:
+	// its Put streams the body to a temp file, hashes it, and refuses the write
+	// unless sha256(content) == key (see its ErrArtifactIntegrity path). That is
+	// correct for its real user, the hermetic-build artifact store, whose keys ARE
+	// digests.
+	//
+	// Every key on THIS store is a path, not a digest -- "snapshots/<id>/mem",
+	// "volumes/<vol>/<snap>.ext4", warm templates. So the check could never pass:
+	// each Put wrote a full-size temp file, hashed it, mismatched, deleted it, and
+	// returned an error CachingStore records but never surfaces. The cache
+	// therefore never held a single object and never served a read, while costing
+	// a second full-size write of every snapshot -- on the fleet host's own disk,
+	// where free space is what keeps customer VMs alive.
+	//
+	// Caching multi-GB volume images locally would be the wrong goal anyway: they
+	// are written once and read only on restore, so the cache would trade the disk
+	// live volumes need for a hit that almost never comes. If a warm-path cache is
+	// ever wanted, it needs a path-keyed local store, not this one.
+	log.Printf("[snapshot-store] enabled (bucket=%s, endpoint=%s, no local cache)", sc.Bucket, sc.Endpoint)
+	return remote
 }
 
 // dockerAvailable returns true if the Docker CLI is installed and the daemon

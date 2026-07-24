@@ -1,9 +1,13 @@
 package usecase
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -458,6 +462,17 @@ func (uc *FleetVolumeRestorer) rollback(ctx context.Context, resourceID, appID u
 
 // stage streams the recovery point into the staging file, fsyncs it and its
 // directory, and verifies it against the catalog.
+//
+// Two things happen on the way in. The object is DECOMPRESSED when it is a gzip
+// stream (see uploadSnapshotFileHashed for why snapshots are compressed), and
+// the staging file is written SPARSELY — a 20GB-nominal volume holding 4.6GB
+// must not materialize 20GB of zeros on the way back, or the restore reproduces
+// the disk cost the snapshot side just eliminated.
+//
+// The hash is taken over the bytes AS DOWNLOADED (== as stored), which is what
+// the recovery point's checksum covers, while the SIZE check compares the
+// decompressed length against the logical volume size. Both are verified before
+// anything live is touched.
 func (uc *FleetVolumeRestorer) stage(ctx context.Context, rp *domain.FleetResourceRecoveryPoint, dst string) error {
 	rc, err := uc.store.Get(rp.ObjectKey)
 	if err != nil {
@@ -469,30 +484,122 @@ func (uc *FleetVolumeRestorer) stage(ctx context.Context, rp *domain.FleetResour
 	if err != nil {
 		return fmt.Errorf("create staging file %s: %w", dst, err)
 	}
+	// Close exactly once on every exit — error, panic, or the explicit close
+	// below whose error must be checked (it is the last chance to see a
+	// write-back failure before the swap).
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+	}()
+
 	h := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(f, h), rc)
+	body, err := decompressedBody(io.TeeReader(rc, h))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", rp.ObjectKey, err)
+	}
+	restored, copyErr := copySparse(f, body)
 	if copyErr != nil {
-		_ = f.Close()
 		return fmt.Errorf("write staging file %s: %w", dst, copyErr)
 	}
 	// fsync before the rename: the whole point of the restore is durability, so
 	// the bytes must be on the platter, not in page cache, when we swap.
 	if err := f.Sync(); err != nil {
-		_ = f.Close()
 		return fmt.Errorf("fsync staging file %s: %w", dst, err)
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close staging file %s: %w", dst, err)
 	}
+	closed = true
 	if err := syncDir(filepath.Dir(dst)); err != nil {
 		return err
 	}
-	return verifyRecoveryPoint(ctx, rp, n, hex.EncodeToString(h.Sum(nil)))
+	return verifyRecoveryPoint(ctx, rp, restored, hex.EncodeToString(h.Sum(nil)))
 }
 
-// verifyRecoveryPoint checks the staged bytes against the catalog. A recovery
-// point written before D-184 carries no checksum: it is size-verified only, and
-// that limitation is LOGGED rather than passed off as integrity.
+// decompressedBody returns the volume image behind a stored object, unwrapping
+// gzip when the object is compressed.
+//
+// The format is DETECTED from the two-byte gzip magic rather than recorded,
+// because objects written before compression landed are raw images and they are
+// still a customer's only recovery points — a restore that failed on them would
+// fail with no visible reason. This is format detection on a durable artifact,
+// not a compatibility shim: it is three lines and it never grows a second codec
+// (Phase 2's CoW block plane replaces this path wholesale).
+func decompressedBody(r io.Reader) (io.Reader, error) {
+	br := bufio.NewReaderSize(r, 64<<10)
+	magic, err := br.Peek(2)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if len(magic) < 2 || magic[0] != 0x1f || magic[1] != 0x8b {
+		return br, nil
+	}
+	zr, err := gzip.NewReader(br)
+	if err != nil {
+		return nil, fmt.Errorf("decompress: %w", err)
+	}
+	return zr, nil
+}
+
+// sparseChunk is the granularity at which the decompressed stream is scanned
+// for holes. Reads are filled completely, so chunks stay aligned to multiples
+// of this size and a skipped chunk always covers whole filesystem blocks.
+const sparseChunk = 256 << 10
+
+// zeroChunk is the comparison operand for "this chunk is a hole". Package-level
+// so the copy loop allocates nothing per chunk.
+var zeroChunk = make([]byte, sparseChunk)
+
+// copySparse writes r into f, SKIPPING runs of zeros instead of writing them,
+// and returns the logical length written.
+//
+// A hole in the source volume decompresses back into zeros, and writing them
+// would allocate real blocks — the staged file would cost the volume's NOMINAL
+// size on a host that only ever had room for its real data. Seeking past them
+// (WriteAt at the advanced offset) keeps the staged file as sparse as the volume
+// it came from. The residual cost is that the zeros are still decompressed into
+// memory and scanned; only the writes are avoided.
+func copySparse(f *os.File, r io.Reader) (int64, error) {
+	buf := make([]byte, sparseChunk)
+	var off int64
+	for {
+		n, err := io.ReadFull(r, buf)
+		if n > 0 {
+			if chunk := buf[:n]; !bytes.Equal(chunk, zeroChunk[:n]) {
+				if _, werr := f.WriteAt(chunk, off); werr != nil {
+					return off, fmt.Errorf("write at offset %d: %w", off, werr)
+				}
+			}
+			off += int64(n)
+		}
+		switch {
+		case err == nil:
+			continue
+		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+			// A short final chunk and a TRUNCATED source are indistinguishable
+			// here; that is safe because the caller verifies the decompressed
+			// length and the downloaded checksum before anything live is touched.
+			// The file's LENGTH comes from Truncate, not from the last write: a
+			// volume ending in a hole has nothing written anywhere near its end.
+			if terr := f.Truncate(off); terr != nil {
+				return off, fmt.Errorf("set staging file length to %d: %w", off, terr)
+			}
+			return off, nil
+		default:
+			return off, err
+		}
+	}
+}
+
+// verifyRecoveryPoint checks the staged image against the catalog. `staged` is
+// the DECOMPRESSED length (what the volume will be) and `sum` is the sha256 of
+// the bytes as DOWNLOADED (what the checksum column has always covered) — for a
+// raw, uncompressed object the two are the same bytes, which is why legacy
+// recovery points verify unchanged. A recovery point written before D-184
+// carries no checksum: it is size-verified only, and that limitation is LOGGED
+// rather than passed off as integrity.
 func verifyRecoveryPoint(ctx context.Context, rp *domain.FleetResourceRecoveryPoint, staged int64, sum string) error {
 	if rp.SizeBytes <= 0 && rp.Checksum == "" {
 		return fmt.Errorf("%w: recovery point %s records neither size nor checksum", domain.ErrRestoreIntegrity, rp.ID)

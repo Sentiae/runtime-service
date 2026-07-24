@@ -1,9 +1,11 @@
 package usecase
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -75,33 +77,141 @@ func uploadSnapshotFile(store ArtifactStore, key, path string) error {
 	return nil
 }
 
-// uploadSnapshotFileHashed streams a local file into the artifact store and
-// returns the lowercase hex sha256 of exactly the bytes the store consumed.
-// Hashing rides the SAME single pass as the upload (io.TeeReader) — a second
-// read of a multi-GB backing file would double the snapshot's IO cost.
+// snapshotUpload reports what an upload actually stored. Compression makes
+// "bytes stored" and "bytes of the volume" two different numbers, and the two
+// have different jobs, so both are returned rather than conflated.
+type snapshotUpload struct {
+	// Checksum is the lowercase hex sha256 of the bytes AS STORED (i.e. of the
+	// compressed stream). "Did the blob arrive intact" is a question about the
+	// stored bytes, and hashing those is what lets a restore verify what it
+	// downloaded BEFORE it materializes anything.
+	Checksum string
+	// StoredBytes is the compressed transfer size — observability only.
+	StoredBytes int64
+	// LogicalBytes is the uncompressed source size: what a restore produces.
+	// This is what `size_bytes` on a recovery point means.
+	LogicalBytes int64
+}
+
+// errStoreStoppedEarly unparks a compressor still blocked writing into the
+// upload pipe because the artifact store stopped reading. It is what the
+// compressor reports back, so a truncated upload names its own cause instead of
+// surfacing as a bare "read/write on closed pipe".
+var errStoreStoppedEarly = errors.New("artifact store stopped reading before the whole snapshot was consumed")
+
+// uploadSnapshotFileHashed streams a local file into the artifact store,
+// GZIP-COMPRESSED, and returns the sha256 of exactly the bytes the store
+// consumed together with both sizes. Hashing rides the SAME single pass as the
+// upload (io.TeeReader) — a second read of a multi-GB backing file would double
+// the snapshot's IO cost.
 //
-// The byte-count cross-check is the honesty gate: if the store did not consume
-// the whole file, the digest would describe a prefix, and a restore would
-// "verify" against a checksum of bytes nobody stored. Refuse instead.
-func uploadSnapshotFileHashed(store ArtifactStore, key, path string) (string, error) {
+// ⚠ WHY COMPRESS AT ALL, AND WHY AT BestSpeed. A volume backing file is SPARSE:
+// a 20GB-nominal volume holding 4.6GB of data costs 4.6GB on disk and copies
+// cheaply (`cp --sparse=always`). But a hole READS BACK AS ZEROS, so an
+// uncompressed upload transfers the full nominal size — measured live, a 20GB
+// volume could not be snapshotted inside a 300s deadline, and because a durable
+// resource refuses decommission without a final snapshot, a large database
+// could then never be deleted either. gzip collapses those zero runs to almost
+// nothing, so the transfer costs about what the real data costs. The win is
+// ELIMINATING HOLES, not squeezing real data — a stronger level would burn CPU
+// over the real 4.6GB for a few percent. Do not "optimize" the level.
+//
+// The byte-count cross-checks are the honesty gate: if the compressor did not
+// read the whole file, or the store did not consume the whole compressed
+// stream, the digest would describe something other than a complete snapshot,
+// and a restore would "verify" against it. Refuse instead.
+func uploadSnapshotFileHashed(ctx context.Context, store ArtifactStore, key, path string) (snapshotUpload, error) {
+	var zero snapshotUpload
 	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("open %s: %w", path, err)
+		return zero, fmt.Errorf("open %s: %w", path, err)
 	}
+	// This function is the SOLE owner of f. The compressor goroutine below only
+	// borrows it and is always joined before this returns, so exactly one Close
+	// runs on every exit — success, error, context cancellation and panic. A
+	// descriptor left open here is not just a leak: the temp file it points at is
+	// unlinked on the way out, so its disk is not reclaimed until the process
+	// dies (measured live: ~28GB of held-open deleted files after repeated
+	// cancels).
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return "", fmt.Errorf("stat %s: %w", path, err)
+		return zero, fmt.Errorf("stat %s: %w", path, err)
 	}
+
+	pr, pw := io.Pipe()
+	// source counts UNCOMPRESSED bytes read off the file; emitted counts the
+	// COMPRESSED bytes handed to the store. ctxReader is what makes a cancelled
+	// snapshot an actual exit path: the artifact store's Put takes no context, so
+	// without it a caller that gave up still pays for the whole transfer while
+	// this descriptor stays open.
+	source := &countingReader{r: &ctxReader{ctx: ctx, r: f}}
+	emitted := &countingWriter{w: pw}
+
+	var compressErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				compressErr = fmt.Errorf("snapshot compressor panicked: %v", r)
+			}
+			// Closing the write end unblocks the store's read with the same error,
+			// so a failed compressor can never leave Put waiting forever.
+			_ = pw.CloseWithError(compressErr)
+		}()
+		compressErr = gzipStream(emitted, source)
+	}()
+	// Unpark and JOIN the compressor on EVERY exit — including a panic inside the
+	// store's Put. It borrows f, so the deferred Close above (registered first,
+	// therefore running last) must not fire while it is still reading. Closing
+	// the read end is what unparks a compressor blocked writing into the pipe.
+	// Both operations are idempotent, so the explicit join below is free.
+	defer func() {
+		_ = pr.CloseWithError(errStoreStoppedEarly)
+		<-done
+	}()
+
 	h := sha256.New()
-	counted := &countingReader{r: io.TeeReader(f, h)}
-	if err := store.Put(key, counted); err != nil {
-		return "", fmt.Errorf("put %s: %w", key, err)
+	stored := &countingReader{r: io.TeeReader(pr, h)}
+	putErr := store.Put(key, stored)
+	_ = pr.CloseWithError(errStoreStoppedEarly)
+	<-done
+
+	if putErr != nil {
+		return zero, fmt.Errorf("put %s: %w", key, putErr)
 	}
-	if counted.n != st.Size() {
-		return "", fmt.Errorf("artifact store consumed %d of %d bytes for %s", counted.n, st.Size(), key)
+	if compressErr != nil {
+		return zero, fmt.Errorf("compress %s for %s: %w", path, key, compressErr)
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	if source.n != st.Size() {
+		return zero, fmt.Errorf("compressed %d of %d bytes of %s", source.n, st.Size(), path)
+	}
+	if stored.n != emitted.n {
+		return zero, fmt.Errorf("artifact store consumed %d of %d compressed bytes for %s", stored.n, emitted.n, key)
+	}
+	return snapshotUpload{
+		Checksum:     hex.EncodeToString(h.Sum(nil)),
+		StoredBytes:  stored.n,
+		LogicalBytes: st.Size(),
+	}, nil
+}
+
+// gzipStream compresses r into w and flushes the trailer. Close is what writes
+// the trailer, so its error is a write error and must not be swallowed.
+func gzipStream(w io.Writer, r io.Reader) error {
+	gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+	if err != nil {
+		return fmt.Errorf("gzip writer: %w", err)
+	}
+	if _, err := io.Copy(gz, r); err != nil {
+		_ = gz.Close()
+		return fmt.Errorf("compress: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return fmt.Errorf("flush compressed stream: %w", err)
+	}
+	return nil
 }
 
 // countingReader counts the bytes a consumer actually read.
@@ -114,6 +224,33 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += int64(n)
 	return n, err
+}
+
+// countingWriter counts the bytes actually written through it.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// ctxReader aborts a long read loop as soon as its context ends. Wrapping the
+// SOURCE (rather than plumbing a context into the store) is what stops a
+// cancelled snapshot from streaming multi-GB nobody is waiting for.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // ensureLocalFile guarantees a snapshot file is present at localPath,

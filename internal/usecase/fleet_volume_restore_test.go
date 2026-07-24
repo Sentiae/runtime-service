@@ -1,6 +1,8 @@
 package usecase
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -892,4 +895,176 @@ func TestSweepInterruptedRestores_ReleasedResourceIsRestorableAgain(t *testing.T
 	if h.resource(t).Phase != domain.FleetResourcePhaseReady {
 		t.Fatalf("phase = %q, want ready", h.resource(t).Phase)
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Staging: compressed transfer, sparse materialization
+// ─────────────────────────────────────────────────────────────────────
+
+// Snapshots are stored gzipped (holes transfer for nothing), but objects
+// written before that landed are RAW images and are still a customer's only
+// recovery points — so the format is sniffed from the gzip magic and both
+// restore identically. The checksum is verified over the bytes AS DOWNLOADED
+// and the size over the DECOMPRESSED image; either failing refuses the object.
+func TestRestore_StageAcceptsRawAndGzippedObjects(t *testing.T) {
+	image := []byte(restoreBytes)
+	gz := gzipBytes(t, image)
+
+	tests := []struct {
+		name string
+		// object is what the store holds; summed is what the recovery point's
+		// checksum is computed over (a mismatch models a corrupt transfer).
+		object   []byte
+		summed   []byte
+		size     int64
+		wantErr  bool
+		wantFile string
+	}{
+		{"gzipped object", gz, gz, int64(len(image)), false, string(image)},
+		{"raw pre-compression object still restores", image, image, int64(len(image)), false, string(image)},
+		{"corrupt gzipped object refused", gz, image, int64(len(image)), true, ""},
+		{"size mismatch refused", gz, gz, int64(len(image)) + 1, true, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dst := filepath.Join(t.TempDir(), "staged.tmp")
+			sum := sha256.Sum256(tt.summed)
+			rp := &domain.FleetResourceRecoveryPoint{
+				ID: uuid.New(), ObjectKey: "k", SizeBytes: tt.size,
+				Checksum: hex.EncodeToString(sum[:]),
+			}
+			uc := &FleetVolumeRestorer{store: &restoreStore{objects: map[string][]byte{"k": tt.object}}}
+
+			err := uc.stage(context.Background(), rp, dst)
+			if tt.wantErr {
+				if !errors.Is(err, domain.ErrRestoreIntegrity) {
+					t.Fatalf("err = %v, want ErrRestoreIntegrity", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("stage: %v", err)
+			}
+			if got := readFile(t, dst); got != tt.wantFile {
+				t.Fatalf("staged = %q, want %q", got, tt.wantFile)
+			}
+		})
+	}
+}
+
+// The full loop the product depends on: a SPARSE volume is snapshotted, stored,
+// and staged back. The bytes must come back exactly — including the holes — and
+// neither the transfer nor the staged file may cost the volume's nominal size.
+// Before compression a 20GB-nominal volume transferred all 20GB and could not be
+// snapshotted (nor, therefore, deleted) at all.
+func TestRestore_RoundTripFromSnapshotPreservesHolesAndBytes(t *testing.T) {
+	const (
+		nominal = 8 << 20
+		head    = 1 << 20
+		tail    = 1 << 10
+	)
+	// The volume: data, a big hole, then data again at the very end.
+	image := make([]byte, nominal)
+	copy(image, bytes.Repeat([]byte{0x5A}, head))
+	copy(image[nominal-tail:], bytes.Repeat([]byte{0x7E}, tail))
+
+	h := newSnapshotHarness(t)
+	appID, resID, _, _, _ := h.attachedVolume(t)
+	h.s.copyFile = func(_ context.Context, _, dst string) error {
+		f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if _, err := f.WriteAt(image[:head], 0); err != nil {
+			return err
+		}
+		if _, err := f.WriteAt(image[nominal-tail:], nominal-tail); err != nil {
+			return err
+		}
+		return f.Truncate(nominal)
+	}
+
+	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	rp := points[0]
+	body := h.store.stored(rp.ObjectKey)
+	if int64(len(body)) >= nominal/10 {
+		t.Fatalf("stored %d bytes for a %d-byte volume: the holes are still being transferred", len(body), nominal)
+	}
+
+	dst := filepath.Join(t.TempDir(), "staged.tmp")
+	uc := &FleetVolumeRestorer{store: &restoreStore{objects: map[string][]byte{rp.ObjectKey: body}}}
+	if err := uc.stage(context.Background(), &rp, dst); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read staged: %v", err)
+	}
+	if !bytes.Equal(got, image) {
+		t.Fatalf("staged image differs from the volume (len %d, want %d)", len(got), len(image))
+	}
+	// Sparseness is the other half: materializing the holes would reproduce on
+	// restore exactly the disk cost the snapshot side eliminates. Self-calibrating
+	// — a filesystem that does not do sparse files cannot be asked to prove it.
+	if !sparseSupported(t) {
+		t.Log("filesystem does not keep files sparse; skipping the allocation check")
+		return
+	}
+	if alloc := allocatedBytes(t, dst); alloc >= nominal/2 {
+		t.Fatalf("staged file allocates %d bytes of a %d-byte image — the holes were materialized", alloc, int64(nominal))
+	}
+}
+
+// gzipBytes compresses b the way the snapshot uploader does.
+func gzipBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	if err != nil {
+		t.Fatalf("gzip writer: %v", err)
+	}
+	if _, err := zw.Write(b); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// allocatedBytes reports the disk actually charged to a file (st_blocks × 512),
+// which is what distinguishes a hole from a run of written zeros.
+func allocatedBytes(t *testing.T, path string) int64 {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("stat %s: no syscall.Stat_t", path)
+	}
+	return sys.Blocks * 512
+}
+
+// sparseSupported reports whether the test filesystem leaves a hole unallocated.
+func sparseSupported(t *testing.T) bool {
+	t.Helper()
+	probe := filepath.Join(t.TempDir(), "sparse.probe")
+	f, err := os.OpenFile(probe, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("create probe: %v", err)
+	}
+	if _, err := f.WriteAt([]byte{1}, 8<<20); err != nil {
+		t.Fatalf("write probe: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close probe: %v", err)
+	}
+	return allocatedBytes(t, probe) < 4<<20
 }
