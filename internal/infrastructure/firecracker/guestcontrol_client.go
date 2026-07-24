@@ -63,6 +63,21 @@ func (c *GuestControlClient) Freeze(ctx context.Context, socketPath string) erro
 	}, controlCallTimeout)
 }
 
+// Renew extends the dead-man window of a freeze this host already holds. It
+// carries the same window as Freeze (the guest clamps it either way) and does
+// not touch the guest filesystem, which is what lets it run against a filesystem
+// that is already frozen — a repeat Freeze there would fail with EBUSY and, worse,
+// would not re-arm anything.
+//
+// A guest with no dead-man armed refuses it (guestcontrol.ErrDeadManNotArmed):
+// the freeze is gone, and the caller's in-flight work under it is void.
+func (c *GuestControlClient) Renew(ctx context.Context, socketPath string) error {
+	return c.call(ctx, socketPath, &runtimev1.ControlRequest{
+		Op:             guestcontrol.OpRenew,
+		DeadmanSeconds: uint32(c.deadMan / time.Second),
+	}, controlCallTimeout)
+}
+
 // Thaw releases a Freeze. Safe to call unconditionally: an unfrozen guest
 // answers ok.
 func (c *GuestControlClient) Thaw(ctx context.Context, socketPath string) error {
@@ -89,24 +104,28 @@ func (c *GuestControlClient) call(ctx context.Context, socketPath string, req *r
 	}
 	req.Token = token
 
-	conn, err := c.dial(ctx, socketPath, timeout)
+	// The CALLER's deadline wins when it is the tighter one. Without this the dial
+	// loop below runs to its own fixed deadline no matter what the caller asked
+	// for, which is why a caller that budgets 10s for several retried attempts got
+	// exactly one 30s attempt (fleet_volume_snapshot.thawWithRetries).
+	deadline, _ := ctxOrDeadline(ctx, time.Now().Add(timeout))
+
+	conn, err := c.dial(ctx, socketPath, deadline)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	deadline := time.Now().Add(timeout)
-	if d, ok := ctxOrDeadline(ctx, deadline); ok {
-		_ = conn.SetDeadline(d)
-	}
+	_ = conn.SetDeadline(deadline)
 	return exchange(conn, req)
 }
 
 // dial reuses the secret pusher's vsock dial + Firecracker CONNECT handshake —
 // same UDS convention (socketPath + ".vsock"), same retry-until-deadline shape,
-// different port.
-func (c *GuestControlClient) dial(ctx context.Context, socketPath string, timeout time.Duration) (net.Conn, error) {
-	conn, err := connectGuestVsock(ctx, socketPath+".vsock", guestsecrets.ControlPort, time.Now().Add(timeout))
+// different port. The deadline bounds the whole retry loop (a per-attempt dial
+// or handshake can still overshoot it by its own fixed timeout).
+func (c *GuestControlClient) dial(ctx context.Context, socketPath string, deadline time.Time) (net.Conn, error) {
+	conn, err := connectGuestVsock(ctx, socketPath+".vsock", guestsecrets.ControlPort, deadline)
 	if err != nil {
 		return nil, fmt.Errorf("connect guest control channel: %w", err)
 	}

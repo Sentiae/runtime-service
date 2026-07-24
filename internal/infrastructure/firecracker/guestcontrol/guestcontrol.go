@@ -27,7 +27,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// The four control ops. This set is closed: an op outside it is refused, never
+// The five control ops. This set is closed: an op outside it is refused, never
 // guessed at.
 const (
 	// OpSyncFS asks the guest kernel to flush the data filesystem (syncfs(2)).
@@ -35,6 +35,24 @@ const (
 	// OpFreeze asks the guest to syncfs and then FIFREEZE the data filesystem,
 	// arming the dead-man auto-thaw.
 	OpFreeze = "FREEZE"
+	// OpRenew extends the dead-man window of a freeze the host already holds. It
+	// touches the filesystem NOT AT ALL — no syncfs, no ioctl — because it means
+	// something different from FREEZE: FREEZE says "make this filesystem immutable
+	// and protect me for N seconds", RENEW says "I am still alive, extend my
+	// protection".
+	//
+	// It exists because a host-side copy runs with the guest's vCPUs RUNNING (the
+	// VMM must not be paused: Firecracker v1.16.0's vsock device does not survive
+	// Pause/Resume), so the dead-man keeps counting during a copy that may outlast
+	// the window. Re-sending FREEZE cannot do this job: FIFREEZE on an
+	// already-frozen superblock returns EBUSY, and the guest arms the dead-man only
+	// on a freeze that succeeded — the re-arm would fail exactly when it matters.
+	//
+	// Overloading FREEZE to tolerate EBUSY was rejected: "FREEZE succeeded" would
+	// stop meaning "I froze it" and start meaning "it is frozen, possibly by
+	// someone else", which lets a host piggyback on a stale freeze it does not own
+	// and get thawed mid-copy when that other holder's dead-man fires.
+	OpRenew = "RENEW"
 	// OpThaw asks the guest to FITHAW the data filesystem and disarm the dead-man.
 	OpThaw = "THAW"
 	// OpShutdown asks the guest to stop the workload child gracefully (SIGINT —
@@ -61,6 +79,14 @@ var ErrNoDataMount = errors.New("guest control: no data mount configured")
 // ErrWorkloadNotRunning is returned when SHUTDOWN arrives before the workload
 // child has been started (or after it has already gone).
 var ErrWorkloadNotRunning = errors.New("guest control: workload child not running")
+
+// ErrDeadManNotArmed is the guest's refusal of a RENEW when no dead-man is
+// armed. It is its own sentinel because it carries information no transport
+// error does: the freeze this host thought it held is GONE (it fired, or was
+// thawed, or never happened), so any copy in flight on the host is now taken
+// across a live filesystem and must be thrown away. Silently re-arming here
+// would hand the host a protection it does not have.
+var ErrDeadManNotArmed = errors.New("guest control: no dead-man armed — the freeze is gone")
 
 // Ops is the guest-side seam the server drives. Its implementation issues real
 // syscalls/ioctls and therefore only exists on linux; every branching decision

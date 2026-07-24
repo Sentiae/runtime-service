@@ -30,6 +30,17 @@ type GuestControl interface {
 	// guest arms a dead-man auto-thaw, so a host that dies before Thaw cannot
 	// wedge the guest permanently — but the caller still owns thawing.
 	Freeze(ctx context.Context, socketPath string) error
+	// Renew extends the dead-man window of a freeze this host already holds,
+	// without touching the filesystem. A caller whose work outlives the window
+	// (a long backing-file copy) must call it on an interval well inside the
+	// window; a caller that does not is asking to be thawed mid-flight.
+	//
+	// It fails when the guest has no dead-man armed, which means the freeze is
+	// GONE — that failure invalidates whatever the caller was doing under the
+	// freeze and must never be treated as advisory. Re-sending Freeze is NOT an
+	// alternative: FIFREEZE on an already-frozen filesystem returns EBUSY and the
+	// guest re-arms only on a freeze that succeeded.
+	Renew(ctx context.Context, socketPath string) error
 	// Thaw releases a Freeze. Thawing a filesystem that is not frozen is a
 	// benign success, so a crash-recovery path may call it unconditionally.
 	Thaw(ctx context.Context, socketPath string) error
@@ -52,6 +63,10 @@ func (FailLoudGuestControl) SyncFS(context.Context, string) error {
 }
 
 func (FailLoudGuestControl) Freeze(context.Context, string) error {
+	return domain.ErrGuestControlUnavailable
+}
+
+func (FailLoudGuestControl) Renew(context.Context, string) error {
 	return domain.ErrGuestControlUnavailable
 }
 

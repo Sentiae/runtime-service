@@ -22,38 +22,25 @@ import (
 // provisioner's endpoint; kept here so the snapshot + provision paths agree.
 const residentPGPort = 5432
 
-// ─────────────────────────────────────────────────────────────────────
-// VMPauser port — pauses/resumes a running microVM around a crash-consistent
-// backing-file copy. The firecracker Provider satisfies it (Pause/Resume).
-// ─────────────────────────────────────────────────────────────────────
-
-// VMPauser pauses and resumes a running microVM by its API socket. Pausing
-// suspends the guest's vCPUs; Resume releases them. The firecracker Provider
-// implements this. It is NOT sufficient for a consistent data-disk copy on its
-// own — see snapshotVolume, which pairs it with the guest freeze.
-type VMPauser interface {
-	Pause(ctx context.Context, socketPath string) error
-	Resume(ctx context.Context, socketPath string) error
-}
-
-// ReplicaRecycler kills a replica's microVM. It is the snapshotter's escalation
-// path for a guest that will not thaw: the replica row goes away with the VM and
-// the reconciler's shortfall step boots a replacement on the SAME host and the
-// SAME backing file within a tick (fleet_orchestrator.ReconcileApp), which is
-// how "kill" becomes "reboot" without this use case owning any boot mechanics.
-// *FleetReplicaRuntime satisfies it.
-type ReplicaRecycler interface {
-	DecommissionReplica(ctx context.Context, replicaID uuid.UUID) error
-}
-
-var _ ReplicaRecycler = (*FleetReplicaRuntime)(nil)
-
 const (
 	// defaultThawDeadline bounds the post-copy thaw retries. The copy is already
 	// consistent by then, so this is only about not leaving guest writers blocked.
 	defaultThawDeadline = 10 * time.Second
 	// defaultThawRetry is the pause between thaw attempts inside that deadline.
 	defaultThawRetry = 500 * time.Millisecond
+	// defaultThawAttempt bounds ONE thaw attempt. It must sit comfortably under
+	// defaultThawDeadline or there are no retries at all: the control client's own
+	// timeout is 30s (firecracker.controlCallTimeout, sized for a syncfs over a
+	// large dirty page cache), so without a per-attempt deadline the first attempt
+	// alone outlives the whole budget and the loop below runs exactly once.
+	defaultThawAttempt = 2 * time.Second
+	// defaultFreezeHeartbeat is how often the copy RENEWs the guest's dead-man
+	// auto-thaw. The guest clamps the window to 60s and lets the host only SHORTEN
+	// it (guestcontrol.DefaultDeadMan / deadManFor), and with the vCPUs running
+	// that timer advances during the copy — so a copy longer than the window would
+	// auto-thaw mid-flight and produce a torn snapshot. A third of the window
+	// leaves room for two missed beats before the guest gives up on us.
+	defaultFreezeHeartbeat = 20 * time.Second
 )
 
 // ─────────────────────────────────────────────────────────────────────
@@ -63,20 +50,42 @@ const (
 // FleetVolumeSnapshotter takes GUEST-CONSISTENT snapshots of a resource's
 // persistent volumes and records them as durable recovery points (D-080, CP4.5
 // §9 #3). For an attached volume it quiesces the guest filesystem (syncfs +
-// fsfreeze over the D-185a control channel), pauses the resident engine ONLY for
-// the local sparse copy — the frozen/paused window never covers the (slower)
-// upload — then resumes, thaws, and streams the copy to the artifact store.
+// fsfreeze over the D-185a control channel), copies the backing file while the
+// freeze holds — the frozen window never covers the (slower) upload — then
+// thaws and streams the copy to the artifact store.
 //
-// Consistency comes from the GUEST freeze, not from the pause: Firecracker's
-// Pause stops vCPUs without flushing the guest kernel's dirty page cache
-// (#p19-snapshot-not-guest-consistent). A guest that cannot be quiesced is
-// REFUSED (ErrSnapshotNotQuiescible) — no recovery point, no SnapshotRef —
-// because everything downstream treats a recovery point as trustworthy and the
-// checksum gate proves only transport integrity, never source consistency.
+// Consistency comes from the GUEST freeze and from NOTHING else. A frozen
+// filesystem cannot change, which is exactly what makes the backing file stable
+// under a copy taken with the vCPUs still running. A guest that cannot be
+// quiesced is REFUSED (ErrSnapshotNotQuiescible) — no recovery point, no
+// SnapshotRef — because everything downstream treats a recovery point as
+// trustworthy and the checksum gate proves only transport integrity, never
+// source consistency.
+//
+// ⚠ DO NOT REINTRODUCE A VMM Pause AROUND THE COPY. It looks like an obvious
+// extra safety measure and it is not one:
+//
+//   - It adds no consistency the freeze does not already give (Firecracker's
+//     Pause stops vCPUs without flushing the guest kernel's dirty page cache —
+//     #p19-snapshot-not-guest-consistent — so it was never the thing making the
+//     copy safe).
+//   - Firecracker v1.16.0's VSOCK DEVICE DOES NOT SURVIVE Pause/Resume. After
+//     the first pause the guest control channel is dead for the rest of the VM's
+//     life: the host-side CONNECT handshake gets no reply at all (the guest is
+//     provably still alive — Postgres keeps answering TCP, the console keeps
+//     logging — and a second pause/resume does not recover it). Firecracker's
+//     own resume log shows net and block being kicked back to life
+//     ("[Net:eth0] notifying queues", "[Block:data] notifying queues") while
+//     vsock only "signals its event queue" and stays dead.
+//   - The consequence shipped for one release: every snapshot failed to Thaw,
+//     the host escalated by killing and rebooting the customer's Postgres (~45s
+//     down, ~32s of it with /data frozen), and any VM paused once was
+//     permanently unsnapshottable.
+//
+// The pause's only real job was suspending the in-guest dead-man auto-thaw for
+// the length of the copy. That job now belongs to the freeze heartbeat below.
 type FleetVolumeSnapshotter struct {
-	pauser   VMPauser
 	guest    gateway.GuestControl
-	recycler ReplicaRecycler
 	store    ArtifactStore
 	volumes  repository.VolumeRepository
 	replicas repository.ReplicaRepository
@@ -84,39 +93,38 @@ type FleetVolumeSnapshotter struct {
 
 	// copyFile makes the local backing-file copy. It defaults to a sparse `cp`
 	// and is overridable in tests (the real sparse cp is a coreutils call that a
-	// non-Linux test host cannot run).
-	copyFile func(src, dst string) error
+	// non-Linux test host cannot run). It takes a ctx because the copy must be
+	// killable: a failed dead-man heartbeat has to abort a copy already in flight.
+	copyFile func(ctx context.Context, src, dst string) error
 
-	// Thaw budget. Fields (not constants) so tests drive the escalation path
-	// without waiting on the real deadline.
-	thawDeadline time.Duration
-	thawRetry    time.Duration
+	// Thaw + heartbeat budget. Fields (not constants) so tests drive the retry and
+	// heartbeat paths without waiting on the real timers.
+	thawDeadline    time.Duration
+	thawRetry       time.Duration
+	thawAttempt     time.Duration
+	freezeHeartbeat time.Duration
 }
 
 // NewFleetVolumeSnapshotter constructs the use case. guest is the post-boot
-// control channel every attached-volume snapshot quiesces through; recycler is
-// the escalation path for a guest that will not thaw (nil leaves the guest's own
-// dead-man auto-thaw as the only backstop).
+// control channel every attached-volume snapshot quiesces through.
 func NewFleetVolumeSnapshotter(
-	pauser VMPauser,
 	guest gateway.GuestControl,
-	recycler ReplicaRecycler,
 	store ArtifactStore,
 	volumes repository.VolumeRepository,
 	replicas repository.ReplicaRepository,
 	recovery repository.FleetResourceRepository,
 ) *FleetVolumeSnapshotter {
 	return &FleetVolumeSnapshotter{
-		pauser:       pauser,
-		guest:        guest,
-		recycler:     recycler,
-		store:        store,
-		volumes:      volumes,
-		replicas:     replicas,
-		recovery:     recovery,
-		copyFile:     realSparseCopy,
-		thawDeadline: defaultThawDeadline,
-		thawRetry:    defaultThawRetry,
+		guest:           guest,
+		store:           store,
+		volumes:         volumes,
+		replicas:        replicas,
+		recovery:        recovery,
+		copyFile:        realSparseCopy,
+		thawDeadline:    defaultThawDeadline,
+		thawRetry:       defaultThawRetry,
+		thawAttempt:     defaultThawAttempt,
+		freezeHeartbeat: defaultFreezeHeartbeat,
 	}
 }
 
@@ -141,9 +149,10 @@ func (s *FleetVolumeSnapshotter) SnapshotAppVolumes(ctx context.Context, resourc
 }
 
 // snapshotVolume snapshots one volume. Attached: quiesce the guest (syncfs +
-// freeze) → pause the VMM → flush the host fd → local sparse copy → resume →
-// thaw → upload → recovery-point row → SnapshotRef. A guest that cannot be
-// quiesced, and an upload that fails, both abort with NO recovery-point row.
+// freeze) → flush the host fd → local sparse copy (with the dead-man heartbeat
+// holding the freeze) → thaw → upload → recovery-point row → SnapshotRef. A
+// guest that cannot be quiesced, a dead-man re-arm that fails, and an upload
+// that fails all abort with NO recovery-point row.
 func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID uuid.UUID, vol *domain.Volume) (domain.FleetResourceRecoveryPoint, error) {
 	var zero domain.FleetResourceRecoveryPoint
 	if vol.BackingPath == "" {
@@ -164,35 +173,11 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 			return zero, err
 		}
 		// From here the guest filesystem is FROZEN — every exit path must thaw it.
-		if err := s.pauser.Pause(ctx, replica.SocketPath); err != nil {
-			s.thawOrEscalate(ctx, replica)
-			return zero, fmt.Errorf("pause vm for snapshot: %w", err)
-		}
-		// The pause is NOT redundant with the freeze, and must not be deleted as
-		// such: a frozen filesystem cannot change, but the auto-thaw dead-man the
-		// guest armed at Freeze is a timer INSIDE the guest, and pausing the vCPUs
-		// suspends it. That is what makes a copy of an arbitrarily large volume
-		// unable to race the guest thawing itself mid-copy.
-		//
-		// The pause window covers ONLY the local copy. Resume runs in a defer so a
-		// copy failure never leaves the engine paused (mirrors resumeQuietly).
-		copyErr := func() error {
-			defer s.resumeQuietly(ctx, replica.SocketPath, replica.ID)
-			// Flush the HOST's own dirty pages for the backing file before copying
-			// it — the design's mandated park-capture ordering
-			// (docs/designs/sentiae-database-platform.md §4.2). It is close to a
-			// no-op today because `cp` reads back through that same page cache, but
-			// it becomes load-bearing the moment the snapshot is taken BELOW the
-			// cache (a ZFS dataset snapshot in Phase 2 captures the block layer
-			// only, and "memory believes a write the snapshot lacks" is the
-			// silent-corruption direction).
-			if err := syncHostFile(vol.BackingPath); err != nil {
-				return err
-			}
-			return s.copyFile(vol.BackingPath, tmpPath)
-		}()
-		// Thaw AFTER the resume: a paused guest cannot answer the control channel.
-		s.thawOrEscalate(ctx, replica)
+		// The vCPUs keep running throughout (see the type comment on why pausing
+		// them is forbidden), so the copy runs against a filesystem that cannot
+		// change while the guest's other work is undisturbed.
+		copyErr := s.copyUnderFreeze(ctx, replica, vol.BackingPath, tmpPath)
+		s.thawAfterCopy(ctx, replica)
 		if copyErr != nil {
 			_ = os.Remove(tmpPath)
 			return zero, fmt.Errorf("snapshot copy: %w", copyErr)
@@ -203,7 +188,7 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 		// it was clean — which today it never is, because a resident stop is a VMM
 		// kill (#resident-stop-is-vmm-kill). Making the detached branch trustworthy
 		// depends on that fix, not on this one.
-		if err := s.copyFile(vol.BackingPath, tmpPath); err != nil {
+		if err := s.copyFile(ctx, vol.BackingPath, tmpPath); err != nil {
 			_ = os.Remove(tmpPath)
 			return zero, fmt.Errorf("snapshot copy: %w", err)
 		}
@@ -274,46 +259,141 @@ func (s *FleetVolumeSnapshotter) quiesce(ctx context.Context, replica *domain.Re
 }
 
 // quiesceRefusal wraps a control-channel failure in the refusal sentinel. The
-// unavailable-channel case gets its own text because it has one likely cause an
-// operator can act on immediately: the VM predates the control channel (D-185a)
-// and has never had one, so no retry will ever succeed — only a reboot will.
+// two causes get different text because they send an operator to DIFFERENT
+// fixes, and telling them the wrong one costs a wasted reboot or a wasted hunt:
+//
+//   - ErrGuestControlUnavailable — the host holds no control token for this VM,
+//     i.e. it was booted BEFORE the channel existed (D-185a) or with no sealed
+//     push. It has never had a channel, so no retry can ever succeed; only a
+//     reboot gives it one.
+//   - anything else — the channel IS armed for this VM and the call still
+//     failed: it was reachable at boot and is not answering (or the guest
+//     refused) NOW. A reboot is not the first move; read the guest console and
+//     the runtime logs.
 func quiesceRefusal(replica *domain.Replica, op string, cause error) error {
 	if errors.Is(cause, domain.ErrGuestControlUnavailable) {
 		return fmt.Errorf("%w: replica %s has NO guest control channel — this VM was booted BEFORE the channel existed (D-185a), so it can never be quiesced as it stands and no retry will help; reboot the replica (it comes back with a channel) and snapshot again: %w",
 			domain.ErrSnapshotNotQuiescible, replica.ID, cause)
 	}
-	return fmt.Errorf("%w: could not %s the guest filesystem of replica %s: %w",
-		domain.ErrSnapshotNotQuiescible, op, replica.ID, cause)
+	return fmt.Errorf("%w: replica %s HAS a guest control channel but the %s call failed — the channel was armed at boot and is unreachable or refusing now; check the guest console and the runtime-service logs before rebooting anything: %w",
+		domain.ErrSnapshotNotQuiescible, replica.ID, op, cause)
 }
 
-// thawOrEscalate releases the freeze, retrying inside a bounded deadline.
+// copyUnderFreeze flushes the host's view of the backing file and copies it
+// while the guest filesystem stays frozen.
+//
+// It is the freeze — not any host-side or VMM-side trick — that makes the copy
+// safe, so the ONE thing that can invalidate the copy is the guest thawing
+// itself mid-flight. With the vCPUs running (they must be: see the type
+// comment), the dead-man auto-thaw the guest armed at Freeze keeps counting, and
+// the guest clamps that window to 60s and lets the host only SHORTEN it. So the
+// copy RENEWS it on an interval — the op that extends the window while touching
+// the filesystem not at all. Re-sending FREEZE cannot do this job: FIFREEZE on an
+// already-frozen filesystem returns EBUSY, and the guest re-arms only on a freeze
+// that succeeded, so the re-arm would fail precisely when it is needed.
+//
+// A renew that FAILS invalidates the copy — either the dead-man can now fire at
+// any moment, or (ErrDeadManNotArmed) the freeze is already gone — so the copy is
+// aborted and the snapshot fails. Continuing would produce exactly the torn
+// recovery point this whole path exists to prevent, and a torn recovery point is
+// indistinguishable from a good one forever after.
+func (s *FleetVolumeSnapshotter) copyUnderFreeze(ctx context.Context, replica *domain.Replica, src, dst string) error {
+	copyCtx, abort := context.WithCancel(ctx)
+	defer abort()
+
+	heartbeatErr := make(chan error, 1)
+	heartbeatDone := make(chan struct{})
+	go s.holdFreeze(copyCtx, abort, replica, heartbeatErr, heartbeatDone)
+
+	err := func() error {
+		// Flush the HOST's own dirty pages for the backing file before copying it —
+		// the design's mandated park-capture ordering
+		// (docs/designs/sentiae-database-platform.md §4.2). It is close to a no-op
+		// today because `cp` reads back through that same page cache, but it becomes
+		// load-bearing the moment the snapshot is taken BELOW the cache (a ZFS
+		// dataset snapshot in Phase 2 captures the block layer only, and "memory
+		// believes a write the snapshot lacks" is the silent-corruption direction).
+		if err := syncHostFile(src); err != nil {
+			return err
+		}
+		return s.copyFile(copyCtx, src, dst)
+	}()
+
+	abort()
+	<-heartbeatDone
+	// A heartbeat failure outranks the copy's own error: when it aborts the copy,
+	// the copy's error is just "killed", and the real, actionable cause is the
+	// re-arm that did not land.
+	select {
+	case hbErr := <-heartbeatErr:
+		return hbErr
+	default:
+	}
+	return err
+}
+
+// holdFreeze renews the guest's dead-man until ctx ends, reporting the first
+// failed renew on failed and aborting the copy through abort. It closes done on
+// exit so the caller can join it deterministically instead of racing the copy.
+func (s *FleetVolumeSnapshotter) holdFreeze(ctx context.Context, abort context.CancelFunc, replica *domain.Replica, failed chan<- error, done chan<- struct{}) {
+	defer close(done)
+	defer func() {
+		if r := recover(); r != nil {
+			// A panicked heartbeat is a stopped heartbeat, so it invalidates the copy
+			// exactly like a failed re-arm does.
+			select {
+			case failed <- fmt.Errorf("guest dead-man heartbeat panicked: %v", r):
+			default:
+			}
+			abort()
+			logger.FromContext(ctx).Error("fleet snapshot: dead-man heartbeat panicked",
+				"replica_id", replica.ID, "panic", r)
+		}
+	}()
+
+	ticker := time.NewTicker(s.freezeHeartbeat)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.guest.Renew(ctx, replica.SocketPath); err != nil {
+				select {
+				case failed <- fmt.Errorf("re-arm guest dead-man mid-copy for replica %s: %w", replica.ID, err):
+				default:
+				}
+				abort()
+				return
+			}
+		}
+	}
+}
+
+// thawAfterCopy releases the freeze, retrying inside a bounded deadline.
 //
 // A thaw failure never fails the snapshot — the copy is already consistent by
-// the time this runs — but it must not leave guest writers blocked either. When
-// the retries are exhausted the replica is KILLED, and the reconciler boots a
-// replacement on the same host and backing file within a tick. The guest's own
-// dead-man auto-thaw is the backstop; this escalation is for the guest that is
-// not honouring it.
-func (s *FleetVolumeSnapshotter) thawOrEscalate(ctx context.Context, replica *domain.Replica) {
+// the time this runs — and it deliberately does NOT kill the replica either. The
+// guest's own dead-man auto-thaw is the designed backstop and releases the
+// filesystem within its window; killing the VM would trade that bounded stall
+// for a full database restart, which is strictly worse for the customer. It stays
+// loud so the condition is still investigated.
+func (s *FleetVolumeSnapshotter) thawAfterCopy(ctx context.Context, replica *domain.Replica) {
 	lastErr := s.thawWithRetries(ctx, replica)
 	if lastErr == nil {
 		return
 	}
-	log := logger.FromContext(ctx)
-	log.Error("fleet snapshot: guest filesystem NOT thawed after retries — killing the replica so its writers are not left blocked",
+	logger.FromContext(ctx).Error("fleet snapshot: guest filesystem NOT thawed after retries — leaving the replica RUNNING and relying on the guest's dead-man auto-thaw to release it within its window; the guest control channel is not answering and needs investigation",
 		"replica_id", replica.ID, "thaw_deadline", s.thawDeadline.String(), "err", lastErr)
-	if s.recycler == nil {
-		log.Error("fleet snapshot: no replica recycler wired — the guest stays frozen until its own dead-man auto-thaw fires",
-			"replica_id", replica.ID)
-		return
-	}
-	if err := s.recycler.DecommissionReplica(ctx, replica.ID); err != nil {
-		log.Error("fleet snapshot: kill wedged replica", "replica_id", replica.ID, "err", err)
-	}
 }
 
 // thawWithRetries thaws until it succeeds, the deadline passes, or ctx ends,
 // returning the last failure (nil on success).
+//
+// Each attempt carries its OWN deadline: the control client's timeout is 30s,
+// three times the whole budget here, so without one the first attempt would
+// consume the entire deadline and the "retries" would never run (they did not,
+// before this).
 func (s *FleetVolumeSnapshotter) thawWithRetries(ctx context.Context, replica *domain.Replica) error {
 	if s.guest == nil {
 		// Unreachable: quiesce already refused a snapshot with no control channel.
@@ -321,7 +401,7 @@ func (s *FleetVolumeSnapshotter) thawWithRetries(ctx context.Context, replica *d
 	}
 	deadline := time.Now().Add(s.thawDeadline)
 	for {
-		err := s.guest.Thaw(ctx, replica.SocketPath)
+		err := s.thawOnce(ctx, replica)
 		if err == nil {
 			return nil
 		}
@@ -333,6 +413,16 @@ func (s *FleetVolumeSnapshotter) thawWithRetries(ctx context.Context, replica *d
 		case <-time.After(s.thawRetry):
 		}
 	}
+}
+
+// thawOnce bounds one thaw attempt with its own context deadline, which is the
+// only way to shorten the call without changing the control client's timeout for
+// every other caller (a syncfs over a large dirty page cache legitimately needs
+// the long one).
+func (s *FleetVolumeSnapshotter) thawOnce(ctx context.Context, replica *domain.Replica) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, s.thawAttempt)
+	defer cancel()
+	return s.guest.Thaw(attemptCtx, replica.SocketPath)
 }
 
 // syncHostFile fsyncs the host's view of a file. Opening read-only is enough:
@@ -353,20 +443,14 @@ func syncHostFile(path string) error {
 	return nil
 }
 
-// resumeQuietly resumes a paused VM after the local copy, logging (but not
-// propagating) a resume error — the copy is already done, and a failed resume is
-// surfaced by the resident's own health, not by aborting the snapshot.
-func (s *FleetVolumeSnapshotter) resumeQuietly(ctx context.Context, socketPath string, replicaID uuid.UUID) {
-	if err := s.pauser.Resume(ctx, socketPath); err != nil {
-		logger.FromContext(ctx).Warn("fleet snapshot: resume after copy", "replica_id", replicaID, "err", err)
-	}
-}
-
 // realSparseCopy makes a sparse copy of a backing file (holes preserved so a
 // large-but-empty volume copies cheaply). Linux/coreutils only — overridden in
 // tests on hosts without GNU cp.
-func realSparseCopy(src, dst string) error {
-	out, err := exec.Command("cp", "--sparse=always", src, dst).CombinedOutput()
+//
+// CommandContext, not Command: a failed dead-man re-arm has to kill a copy that
+// is already running, because from that moment its output cannot be trusted.
+func realSparseCopy(ctx context.Context, src, dst string) error {
+	out, err := exec.CommandContext(ctx, "cp", "--sparse=always", src, dst).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("cp --sparse=always %s %s: %s: %w", src, dst, strings.TrimSpace(string(out)), err)
 	}

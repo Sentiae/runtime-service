@@ -430,6 +430,94 @@ func TestDeadManRearmReplacesPreviousTimer(t *testing.T) {
 	}
 }
 
+// RENEW is the op a host-side copy uses to hold a freeze open past the dead-man
+// window. It must extend the window WITHOUT touching the filesystem: a repeat
+// FREEZE would hit FIFREEZE's EBUSY on an already-frozen filesystem and re-arm
+// nothing, which is why this op exists at all.
+func TestRenewExtendsTheDeadManWithoutTouchingTheFilesystem(t *testing.T) {
+	ops := &fakeOps{}
+	sched := &fakeScheduler{}
+	s := newTestServer(t, ops, sched, nil)
+
+	s.Handle(context.Background(), &runtimev1.ControlRequest{Token: testToken, Op: OpFreeze})
+	first := sched.last()
+
+	resp := s.Handle(context.Background(), &runtimev1.ControlRequest{Token: testToken, Op: OpRenew})
+	if !resp.GetOk() {
+		t.Fatalf("renew failed: %s", resp.GetError())
+	}
+	second := sched.last()
+	if first == second {
+		t.Fatal("renew reused the freeze's timer instead of replacing the window")
+	}
+	if got := second.d; got != DefaultDeadMan {
+		t.Fatalf("renewed window = %s, want %s", got, DefaultDeadMan)
+	}
+	// The filesystem was touched exactly once, by the freeze.
+	if got := ops.got(); len(got) != 1 || got[0] != OpFreeze {
+		t.Fatalf("ops calls = %v, want just [FREEZE] — RENEW must issue no syscall", got)
+	}
+	first.fire() // superseded by the renew — must be inert
+	if got := ops.got(); len(got) != 1 {
+		t.Fatalf("ops calls = %v, want the replaced timer to be inert", got)
+	}
+	second.fire()
+	if got := ops.got(); len(got) != 2 || got[1] != OpThaw {
+		t.Fatalf("ops calls = %v, want the renewed timer to still auto-thaw", got)
+	}
+}
+
+// A renew that finds no armed dead-man means the freeze this host thought it
+// held is GONE — it fired, or was thawed, or never happened. Whatever the host
+// is copying under that freeze is void, so this fails loudly with its own
+// sentinel instead of handing back a protection that does not exist.
+func TestRenewRefusedWhenNoDeadManIsArmed(t *testing.T) {
+	tests := []struct {
+		name string
+		arm  func(*Server, *fakeScheduler)
+	}{
+		{
+			name: "never frozen",
+			arm:  func(*Server, *fakeScheduler) {},
+		},
+		{
+			name: "already thawed",
+			arm: func(s *Server, _ *fakeScheduler) {
+				s.Handle(context.Background(), &runtimev1.ControlRequest{Token: testToken, Op: OpFreeze})
+				s.Handle(context.Background(), &runtimev1.ControlRequest{Token: testToken, Op: OpThaw})
+			},
+		},
+		{
+			name: "the dead-man already fired",
+			arm: func(s *Server, sched *fakeScheduler) {
+				s.Handle(context.Background(), &runtimev1.ControlRequest{Token: testToken, Op: OpFreeze})
+				sched.last().fire()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ops := &fakeOps{}
+			sched := &fakeScheduler{}
+			s := newTestServer(t, ops, sched, nil)
+			tt.arm(s, sched)
+			before := sched.count()
+
+			resp := s.Handle(context.Background(), &runtimev1.ControlRequest{Token: testToken, Op: OpRenew})
+			if resp.GetOk() {
+				t.Fatal("renew reported ok with no dead-man armed")
+			}
+			if resp.GetError() != ErrDeadManNotArmed.Error() {
+				t.Fatalf("error = %q, want the distinct %q sentinel so the host can tell it from a transport failure", resp.GetError(), ErrDeadManNotArmed)
+			}
+			if sched.count() != before {
+				t.Fatalf("timers armed = %d, want %d — a refused renew must arm nothing", sched.count(), before)
+			}
+		})
+	}
+}
+
 func TestDeadManWindowCanOnlyBeShortened(t *testing.T) {
 	tests := []struct {
 		name    string

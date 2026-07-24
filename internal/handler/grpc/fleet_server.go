@@ -353,13 +353,18 @@ func fleetError(err error) error {
 		return status.Error(codes.InvalidArgument, "resident workload requires a guest port")
 	case errors.Is(err, domain.ErrImageBootUnavailable):
 		return status.Error(codes.FailedPrecondition, "image boot requires the firecracker host")
+	// ⚠ Order matters, and it was wrong before: a quiesce refusal wraps BOTH
+	// sentinels, so with ErrGuestControlUnavailable tested first every
+	// "no channel" refusal answered with the generic channel message and only the
+	// OTHER causes reached the "booted before the channel existed" text — i.e. the
+	// reboot advice was given to exactly the operators it could not help. The
+	// refusal is therefore matched first and split by its cause.
+	case errors.Is(err, domain.ErrSnapshotNotQuiescible) && errors.Is(err, domain.ErrGuestControlUnavailable):
+		return status.Error(codes.FailedPrecondition, "snapshot refused: this VM has no guest control channel — it was booted before the channel existed, so no retry can succeed; reboot the replica and snapshot again")
+	case errors.Is(err, domain.ErrSnapshotNotQuiescible):
+		return status.Error(codes.FailedPrecondition, "snapshot refused: the guest control channel is armed for this VM but the quiesce call failed — the guest is unreachable or refusing now; check the guest console and the runtime-service logs (a reboot is not the first move)")
 	case errors.Is(err, domain.ErrGuestControlUnavailable):
 		return status.Error(codes.FailedPrecondition, "guest control channel unavailable for this workload")
-	case errors.Is(err, domain.ErrSnapshotNotQuiescible):
-		// The curated message carries the actionable half of the refusal: the usual
-		// cause is a VM booted before the control channel existed, and the only
-		// thing that fixes that is a reboot, not a retry.
-		return status.Error(codes.FailedPrecondition, "snapshot refused: the guest filesystem could not be quiesced (a VM booted before the guest control channel existed must be rebooted before it can be snapshotted)")
 	case errors.Is(err, domain.ErrVolumesNotSupported):
 		return status.Error(codes.InvalidArgument, "volumes are only supported for resident workloads")
 	case errors.Is(err, domain.ErrVolumeAppNotScalable):

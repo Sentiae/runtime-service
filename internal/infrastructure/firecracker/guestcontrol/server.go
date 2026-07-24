@@ -157,6 +157,8 @@ func (s *Server) Handle(ctx context.Context, req *runtimev1.ControlRequest) *run
 		return resultResp(s.ops.SyncFS(ctx))
 	case OpFreeze:
 		return resultResp(s.freeze(ctx, deadManFor(req.GetDeadmanSeconds())))
+	case OpRenew:
+		return resultResp(s.renew(ctx, deadManFor(req.GetDeadmanSeconds())))
 	case OpThaw:
 		return resultResp(s.thaw(ctx))
 	case OpShutdown:
@@ -175,6 +177,30 @@ func (s *Server) freeze(ctx context.Context, deadMan time.Duration) error {
 		return fmt.Errorf("freeze data filesystem: %w", err)
 	}
 	s.armDeadMan(ctx, deadMan)
+	return nil
+}
+
+// renew extends the dead-man window WITHOUT touching the filesystem, and only
+// while a dead-man is actually armed.
+//
+// s.deadMan != nil is the guest's own record of "the host holds a freeze I am
+// protecting": disarmDeadMan nils it on THAW, and the auto-thaw closure nils it
+// before thawing. So a nil timer means the freeze is gone, and the host — which
+// may be halfway through copying the backing file — has to learn that
+// immediately rather than be handed a fresh window over an unfrozen filesystem.
+// It is refused with ErrDeadManNotArmed so the host can tell that apart from a
+// transport failure.
+//
+// Ops is untouched on purpose: this op is pure dead-man bookkeeping, which is
+// why it works on an already-frozen filesystem where a repeat FIFREEZE (EBUSY)
+// cannot.
+func (s *Server) renew(ctx context.Context, d time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deadMan == nil {
+		return ErrDeadManNotArmed
+	}
+	s.armDeadManLocked(ctx, d)
 	return nil
 }
 
@@ -197,8 +223,22 @@ func (s *Server) thaw(ctx context.Context) error {
 func (s *Server) armDeadMan(ctx context.Context, d time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.armDeadManLocked(ctx, d)
+}
+
+// armDeadManLocked is armDeadMan's body, callable from a path that already holds
+// the mutex (renew, which must decide and re-arm without a gap another op could
+// slip through).
+//
+// If the previous timer had ALREADY fired, Stop returns false and its closure
+// still runs: it nils s.deadMan and thaws. The next renew then finds no dead-man
+// and fails, so the copy is aborted and discarded — a snapshot taken across that
+// thaw is never kept. That is the correct outcome anyway: a timer that fired
+// means the freeze window genuinely elapsed, i.e. the host was already too late.
+func (s *Server) armDeadManLocked(ctx context.Context, d time.Duration) {
 	if s.deadMan != nil {
-		// A second FREEZE replaces the previous window rather than stacking one.
+		// A second FREEZE (or a RENEW) replaces the previous window rather than
+		// stacking one.
 		s.deadMan.Stop()
 	}
 	s.deadMan = s.afterFunc(d, func() {

@@ -638,29 +638,20 @@ func (c *Container) initFleet(cfg *config.Config) {
 // fail-loud posture as the P7 workload seam: off the firecracker host
 // FleetProvision boots through FailLoudImageBooter and every ProvisionDedicated
 // is refused (ErrImageBootUnavailable) rather than silently faking a data-VM.
-// The snapshotter needs a live VMPauser (the firecracker Provider) and so is
+// The snapshotter needs a live guest control channel and so is
 // firecracker-host-only; off-host it stays nil and the snapshot-first
 // decommission of a durable resource fails closed (ErrResourceFinalSnapshotRequired).
 func (c *Container) initResourceControlPlane(cfg *config.Config) {
-	// Volume snapshotter — firecracker host only (needs the FC Provider as the
-	// VMPauser and the real GuestControl client to quiesce the guest; off-host
-	// GuestControl is fail-loud, so every attached-volume snapshot would be
-	// refused anyway) AND only with a configured artifact store: the snapshotter calls
-	// store.Put unconditionally, so a nil store here would panic on the first
-	// snapshot instead of failing closed. A nil pointer is deliberate off-host; it
-	// is never wrapped in a non-nil interface (see the explicit branches below).
+	// Volume snapshotter — firecracker host only (it quiesces the guest over the
+	// real GuestControl client; off-host GuestControl is fail-loud, so every
+	// attached-volume snapshot would be refused anyway) AND only with a configured
+	// artifact store: the snapshotter calls store.Put unconditionally, so a nil
+	// store here would panic on the first snapshot instead of failing closed. A nil
+	// pointer is deliberate off-host; it is never wrapped in a non-nil interface
+	// (see the explicit branches below).
 	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil && c.snapshotArtifactStore != nil {
-		// The replica runtime is the escalation path for a guest that will not thaw
-		// (kill the replica; the reconciler boots a replacement). Passed only when
-		// non-nil so the snapshotter's nil-check stays honest against a typed nil.
-		var recycler usecase.ReplicaRecycler
-		if c.FleetReplicaRuntimeUC != nil {
-			recycler = c.FleetReplicaRuntimeUC
-		}
 		c.ResourceSnapshotter = usecase.NewFleetVolumeSnapshotter(
-			c.FCProvider,
 			c.GuestControl,
-			recycler,
 			c.snapshotArtifactStore,
 			c.VolumeRepo,
 			c.ReplicaRepo,

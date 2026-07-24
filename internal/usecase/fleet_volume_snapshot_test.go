@@ -22,76 +22,125 @@ import (
 // Fakes for the snapshotter
 // ─────────────────────────────────────────────────────────────────────
 
-type fakePauser struct {
-	events    *[]string
-	pauseErr  error
-	resumeErr error
-	paused    int
-	resumed   int
+// recorder collects the snapshotter's externally visible steps in order. It is
+// mutex-guarded because the dead-man heartbeat records from its own goroutine
+// while the copy records from the caller's.
+type recorder struct {
+	mu     sync.Mutex
+	events []string
 }
 
-func (f *fakePauser) Pause(_ context.Context, _ string) error {
-	*f.events = append(*f.events, "pause")
-	f.paused++
-	return f.pauseErr
+func (r *recorder) add(event string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, event)
 }
-func (f *fakePauser) Resume(_ context.Context, _ string) error {
-	*f.events = append(*f.events, "resume")
-	f.resumed++
-	return f.resumeErr
+
+func (r *recorder) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.events...)
+}
+
+func (r *recorder) count(event string) int {
+	n := 0
+	for _, e := range r.all() {
+		if e == event {
+			n++
+		}
+	}
+	return n
 }
 
 // fakeGuestControl records every control op in order and can fail any of them.
 // Ordering is the point: a snapshot whose freeze lands AFTER the copy is exactly
 // the torn-snapshot defect this slice closes.
 type fakeGuestControl struct {
-	events    *[]string
+	rec *recorder
+
+	mu        sync.Mutex
 	syncErr   error
 	freezeErr error
-	thawErr   error
-	thaws     int
+	// renewErr fails the dead-man heartbeat that holds the freeze open while the
+	// copy runs, never the initial quiesce.
+	renewErr error
+	thawErr  error
+	// thawBlocks makes Thaw hang until its context ends, modelling the real
+	// client's long call timeout. It is how the retry loop is proven to retry.
+	thawBlocks bool
+	freezes    int
+	renews     int
+	thaws      int
 }
 
 func (f *fakeGuestControl) SyncFS(_ context.Context, _ string) error {
-	*f.events = append(*f.events, "syncfs")
+	f.rec.add("syncfs")
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.syncErr
 }
+
 func (f *fakeGuestControl) Freeze(_ context.Context, _ string) error {
-	*f.events = append(*f.events, "freeze")
+	f.rec.add("freeze")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.freezes++
 	return f.freezeErr
 }
-func (f *fakeGuestControl) Thaw(_ context.Context, _ string) error {
-	*f.events = append(*f.events, "thaw")
-	f.thaws++
-	return f.thawErr
+
+func (f *fakeGuestControl) Renew(_ context.Context, _ string) error {
+	f.rec.add("renew")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renews++
+	return f.renewErr
 }
+
+func (f *fakeGuestControl) Thaw(ctx context.Context, _ string) error {
+	f.rec.add("thaw")
+	f.mu.Lock()
+	f.thaws++
+	block, err := f.thawBlocks, f.thawErr
+	f.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return fmt.Errorf("guest control THAW: %w", ctx.Err())
+	}
+	return err
+}
+
 func (f *fakeGuestControl) Shutdown(_ context.Context, _ string) error { return nil }
 
-// fakeReplicaRecycler records the escalation kill.
-type fakeReplicaRecycler struct {
-	events *[]string
-	killed []uuid.UUID
-	err    error
+func (f *fakeGuestControl) freezeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.freezes
 }
 
-func (f *fakeReplicaRecycler) DecommissionReplica(_ context.Context, id uuid.UUID) error {
-	*f.events = append(*f.events, "kill-replica")
-	f.killed = append(f.killed, id)
-	return f.err
+func (f *fakeGuestControl) renewCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.renews
+}
+
+func (f *fakeGuestControl) thawCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.thaws
 }
 
 type fakeArtifactStore struct {
 	mu        sync.Mutex
-	events    *[]string
+	rec       *recorder
 	puts      []string
 	putErr    error
 	shortRead bool
 }
 
 func (f *fakeArtifactStore) Put(digest string, r io.Reader) error {
+	f.rec.add("upload")
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	*f.events = append(*f.events, "upload")
 	if f.putErr != nil {
 		return f.putErr
 	}
@@ -140,9 +189,8 @@ func (f *fakeVolumeRepo) ListByHost(context.Context, uuid.UUID) ([]domain.Volume
 // snapHarness bundles the snapshotter and every fake behind it.
 type snapHarness struct {
 	s        *FleetVolumeSnapshotter
-	pauser   *fakePauser
+	rec      *recorder
 	guest    *fakeGuestControl
-	recycler *fakeReplicaRecycler
 	store    *fakeArtifactStore
 	vols     *fakeVolumeRepo
 	recovery *fakeResourceRepo
@@ -150,25 +198,28 @@ type snapHarness struct {
 }
 
 // newSnapshotHarness builds a snapshotter with fakes and a recording copyFile.
-func newSnapshotHarness(t *testing.T, events *[]string) *snapHarness {
+func newSnapshotHarness(t *testing.T) *snapHarness {
 	t.Helper()
+	rec := &recorder{}
 	h := &snapHarness{
-		pauser:   &fakePauser{events: events},
-		guest:    &fakeGuestControl{events: events},
-		recycler: &fakeReplicaRecycler{events: events},
-		store:    &fakeArtifactStore{events: events},
+		rec:      rec,
+		guest:    &fakeGuestControl{rec: rec},
+		store:    &fakeArtifactStore{rec: rec},
 		vols:     newFakeVolumeRepo(),
 		recovery: newFakeResourceRepo(),
 		replicas: newFakeResourceReplicaRepo(),
 	}
-	h.s = NewFleetVolumeSnapshotter(h.pauser, h.guest, h.recycler, h.store, h.vols, h.replicas, h.recovery)
-	h.s.copyFile = func(_, dst string) error {
-		*events = append(*events, "copy")
+	h.s = NewFleetVolumeSnapshotter(h.guest, h.store, h.vols, h.replicas, h.recovery)
+	h.s.copyFile = func(_ context.Context, _, dst string) error {
+		rec.add("copy")
 		return os.WriteFile(dst, []byte("ext4-bytes"), 0o600)
 	}
-	// Keep the thaw escalation reachable without burning the real 10s deadline.
-	h.s.thawDeadline = 20 * time.Millisecond
+	// Keep the thaw retry loop reachable without burning the real 10s deadline,
+	// and park the heartbeat far out so only the tests that exercise it see one.
+	h.s.thawDeadline = 60 * time.Millisecond
 	h.s.thawRetry = 5 * time.Millisecond
+	h.s.thawAttempt = 10 * time.Millisecond
+	h.s.freezeHeartbeat = time.Hour
 	return h
 }
 
@@ -192,27 +243,35 @@ func (h *snapHarness) attachedVolume(t *testing.T) (appID, resID, volID, replica
 // ─────────────────────────────────────────────────────────────────────
 
 // The ORDER is the contract, not the presence of the calls: the guest has to be
-// flushed and frozen BEFORE the VMM pause, the host fd flushed and the copy taken
-// while both hold, and the thaw issued only after the resume. A test that merely
-// counted the calls would still pass on the torn-snapshot behaviour this closes.
-func TestSnapshot_AttachedQuiescePauseCopyResumeThawOrder(t *testing.T) {
-	var events []string
-	h := newSnapshotHarness(t, &events)
+// flushed and frozen BEFORE the copy, and the thaw issued only after it. A test
+// that merely counted the calls would still pass on the torn-snapshot behaviour
+// this closes.
+//
+// It also pins the ABSENCE of a VMM pause/resume. Firecracker v1.16.0's vsock
+// device does not survive Pause/Resume — the guest control channel is dead for
+// the rest of the VM's life after the first pause — so reintroducing the pause
+// (which looks like an obvious safety measure) breaks every subsequent snapshot
+// of that VM. This is the assertion that catches it.
+func TestSnapshot_AttachedQuiesceCopyThawOrder(t *testing.T) {
+	h := newSnapshotHarness(t)
 	appID, resID, volID, _, dir := h.attachedVolume(t)
 
 	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
-	want := []string{"syncfs", "freeze", "pause", "copy", "resume", "thaw", "upload"}
+	events := h.rec.all()
+	want := []string{"syncfs", "freeze", "copy", "thaw", "upload"}
 	if !sameOrder(events, want) {
 		t.Fatalf("order = %v, want %v", events, want)
 	}
-	if h.pauser.paused != 1 || h.pauser.resumed != 1 {
-		t.Errorf("pause=%d resume=%d, want 1/1", h.pauser.paused, h.pauser.resumed)
+	for _, forbidden := range []string{"pause", "resume"} {
+		if h.rec.count(forbidden) != 0 {
+			t.Errorf("the attached path must never %s the VMM (fc v1.16.0 vsock does not survive it): %v", forbidden, events)
+		}
 	}
-	if h.guest.thaws != 1 {
-		t.Errorf("thaws = %d, want 1", h.guest.thaws)
+	if h.guest.thawCount() != 1 {
+		t.Errorf("thaws = %d, want 1", h.guest.thawCount())
 	}
 	if len(h.store.puts) != 1 {
 		t.Fatalf("uploads = %d, want 1", len(h.store.puts))
@@ -240,6 +299,98 @@ func TestSnapshot_AttachedQuiescePauseCopyResumeThawOrder(t *testing.T) {
 	}
 }
 
+// With the vCPUs running, the dead-man the guest armed at Freeze keeps counting
+// and would auto-thaw mid-copy on any volume big enough to take longer than the
+// window. The copy therefore RENEWs it on an interval; a copy that outlives the
+// interval must show those renews — and they must be renews, not repeat freezes:
+// FIFREEZE on an already-frozen filesystem returns EBUSY and re-arms nothing, so
+// a heartbeat built on Freeze fails exactly when it is load-bearing.
+func TestSnapshot_HeartbeatHoldsTheFreezeForALongCopy(t *testing.T) {
+	h := newSnapshotHarness(t)
+	appID, resID, _, _, _ := h.attachedVolume(t)
+	h.s.freezeHeartbeat = 10 * time.Millisecond
+	h.s.copyFile = func(ctx context.Context, _, dst string) error {
+		h.rec.add("copy")
+		select {
+		case <-time.After(80 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return os.WriteFile(dst, []byte("ext4-bytes"), 0o600)
+	}
+
+	if _, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if got := h.guest.renewCount(); got < 2 {
+		t.Fatalf("renews = %d, want at least 2 heartbeats across the copy", got)
+	}
+	if got := h.guest.freezeCount(); got != 1 {
+		t.Fatalf("freezes = %d, want exactly the initial quiesce — a heartbeat must never re-FREEZE (EBUSY)", got)
+	}
+	events := h.rec.all()
+	if !sameOrder(events[:3], []string{"syncfs", "freeze", "copy"}) {
+		t.Fatalf("events = %v, want it to start syncfs,freeze,copy", events)
+	}
+	if !sameOrder(events[len(events)-2:], []string{"thaw", "upload"}) {
+		t.Fatalf("events = %v, want it to end thaw,upload", events)
+	}
+	// Everything between the copy and the thaw is a heartbeat renew.
+	for _, e := range events[3 : len(events)-2] {
+		if e != "renew" {
+			t.Fatalf("events = %v, want only renew heartbeats between copy and thaw", events)
+		}
+	}
+}
+
+// A renew that fails means either the dead-man may fire at any moment or the
+// freeze is already gone, so the copy cannot be trusted: it is aborted and the
+// snapshot fails with no recovery point. "Continue and hope" would mint exactly
+// the torn recovery point this path exists to prevent. The guest's refusal when
+// no dead-man is armed (the freeze was lost) is the sharpest instance of it.
+func TestSnapshot_FailedHeartbeatAbortsTheSnapshot(t *testing.T) {
+	h := newSnapshotHarness(t)
+	appID, resID, volID, _, _ := h.attachedVolume(t)
+	h.s.freezeHeartbeat = 5 * time.Millisecond
+	h.guest.renewErr = errors.New("guest refused RENEW: guest control: no dead-man armed — the freeze is gone")
+	copyAborted := make(chan struct{})
+	h.s.copyFile = func(ctx context.Context, _, _ string) error {
+		h.rec.add("copy")
+		// Never completes on its own: the only way out is the heartbeat aborting it,
+		// which is the behaviour under test.
+		<-ctx.Done()
+		close(copyAborted)
+		return ctx.Err()
+	}
+
+	_, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
+	if err == nil {
+		t.Fatal("want the failed re-arm to fail the snapshot")
+	}
+	if !strings.Contains(err.Error(), "re-arm guest dead-man") {
+		t.Errorf("err = %v, want it to name the failed dead-man re-arm", err)
+	}
+	select {
+	case <-copyAborted:
+	default:
+		t.Error("the in-flight copy must be aborted, not left to finish")
+	}
+	if len(h.store.puts) != 0 {
+		t.Errorf("uploads = %d, want 0", len(h.store.puts))
+	}
+	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
+	if len(rps) != 0 {
+		t.Errorf("recovery points = %d, want 0 — a copy that may have raced the dead-man is not a recovery point", len(rps))
+	}
+	if _, ok := h.vols.updated[volID]; ok {
+		t.Error("SnapshotRef must not be written when the heartbeat failed")
+	}
+	// The guest is still released: the freeze must not outlive the failed copy.
+	if h.guest.thawCount() == 0 {
+		t.Error("the guest must still be thawed after a heartbeat failure")
+	}
+}
+
 // A guest that cannot be quiesced means a possibly-torn copy, and a torn copy
 // recorded as a recovery point is trusted forever after — so the snapshot is
 // refused outright, with nothing written anywhere.
@@ -255,15 +406,19 @@ func TestSnapshot_RefusesWhenTheGuestCannotBeQuiesced(t *testing.T) {
 		wantThawedGE int // thaws expected (freeze-lost-response window)
 	}{
 		{
-			name:      "syncfs fails",
-			arm:       func(h *snapHarness) { h.guest.syncErr = controlDown },
-			wantIs:    []error{domain.ErrSnapshotNotQuiescible, controlDown},
-			wantOrder: []string{"syncfs"},
+			name:   "syncfs fails",
+			arm:    func(h *snapHarness) { h.guest.syncErr = controlDown },
+			wantIs: []error{domain.ErrSnapshotNotQuiescible, controlDown},
+			// The channel IS armed for this VM, so the refusal must NOT send the
+			// operator off to reboot it.
+			wantMsgPart: "HAS a guest control channel",
+			wantOrder:   []string{"syncfs"},
 		},
 		{
 			name:         "freeze fails",
 			arm:          func(h *snapHarness) { h.guest.freezeErr = controlDown },
 			wantIs:       []error{domain.ErrSnapshotNotQuiescible, controlDown},
+			wantMsgPart:  "HAS a guest control channel",
 			wantOrder:    []string{"syncfs", "freeze", "thaw"},
 			wantThawedGE: 1,
 		},
@@ -287,8 +442,7 @@ func TestSnapshot_RefusesWhenTheGuestCannotBeQuiesced(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var events []string
-			h := newSnapshotHarness(t, &events)
+			h := newSnapshotHarness(t)
 			appID, resID, volID, _, _ := h.attachedVolume(t)
 			tt.arm(h)
 
@@ -304,15 +458,15 @@ func TestSnapshot_RefusesWhenTheGuestCannotBeQuiesced(t *testing.T) {
 			if tt.wantMsgPart != "" && !strings.Contains(err.Error(), tt.wantMsgPart) {
 				t.Errorf("err = %q, want it to mention %q", err.Error(), tt.wantMsgPart)
 			}
-			if !sameOrder(events, tt.wantOrder) {
+			if events := h.rec.all(); !sameOrder(events, tt.wantOrder) {
 				t.Errorf("events = %v, want %v", events, tt.wantOrder)
 			}
-			if h.guest.thaws < tt.wantThawedGE {
-				t.Errorf("thaws = %d, want >= %d", h.guest.thaws, tt.wantThawedGE)
+			if h.guest.thawCount() < tt.wantThawedGE {
+				t.Errorf("thaws = %d, want >= %d", h.guest.thawCount(), tt.wantThawedGE)
 			}
-			// The VM is never paused and nothing is copied, uploaded or recorded.
-			if h.pauser.paused != 0 {
-				t.Errorf("pauses = %d, want 0", h.pauser.paused)
+			// Nothing is copied, uploaded or recorded.
+			if h.rec.count("copy") != 0 {
+				t.Errorf("copies = %d, want 0", h.rec.count("copy"))
 			}
 			if len(h.store.puts) != 0 {
 				t.Errorf("uploads = %d, want 0", len(h.store.puts))
@@ -329,11 +483,11 @@ func TestSnapshot_RefusesWhenTheGuestCannotBeQuiesced(t *testing.T) {
 }
 
 // The copy is already consistent once the freeze held, so a thaw that will not
-// take must not fail the snapshot — but it must not leave writers blocked
-// either: the replica is killed and the reconciler boots a replacement.
-func TestSnapshot_ThawFailureKeepsTheSnapshotAndEscalates(t *testing.T) {
-	var events []string
-	h := newSnapshotHarness(t, &events)
+// take must not fail the snapshot — and must NOT kill the replica either: the
+// guest's own dead-man auto-thaw releases the filesystem within its window,
+// while a kill would trade that bounded stall for a full database restart.
+func TestSnapshot_ThawFailureKeepsTheSnapshotAndDoesNotKillTheReplica(t *testing.T) {
+	h := newSnapshotHarness(t)
 	appID, resID, volID, replicaID, _ := h.attachedVolume(t)
 	h.guest.thawErr = errors.New("guest refused THAW: device busy")
 
@@ -351,49 +505,74 @@ func TestSnapshot_ThawFailureKeepsTheSnapshotAndEscalates(t *testing.T) {
 	if h.vols.updated[volID].SnapshotRef == "" {
 		t.Error("SnapshotRef must still be written")
 	}
-	if h.guest.thaws < 2 {
-		t.Errorf("thaw attempts = %d, want the retries to have run (>=2)", h.guest.thaws)
+	if h.guest.thawCount() < 2 {
+		t.Errorf("thaw attempts = %d, want the retries to have run (>=2)", h.guest.thawCount())
 	}
-	if len(h.recycler.killed) != 1 || h.recycler.killed[0] != replicaID {
-		t.Fatalf("escalation did not kill the wedged replica: killed = %v", h.recycler.killed)
+	// The replica survives: the snapshotter has no kill path at all any more, so
+	// the recorded steps are exactly quiesce/copy/thaw/upload and the replica row
+	// is untouched.
+	events := h.rec.all()
+	if !sameOrder(events[:3], []string{"syncfs", "freeze", "copy"}) {
+		t.Fatalf("events = %v, want it to start syncfs,freeze,copy", events)
 	}
-	// The retries make the thaw count vary with timing, so assert the fixed head
-	// and tail: the kill lands after the retries and before the upload — the guest
-	// is unblocked first.
-	if !sameOrder(events[:6], []string{"syncfs", "freeze", "pause", "copy", "resume", "thaw"}) {
-		t.Errorf("order = %v", events)
+	if events[len(events)-1] != "upload" {
+		t.Fatalf("events = %v, want it to end with the upload", events)
 	}
-	if !sameOrder(events[len(events)-2:], []string{"kill-replica", "upload"}) {
-		t.Errorf("order = %v, want it to end kill-replica,upload", events)
+	for _, e := range events[3 : len(events)-1] {
+		if e != "thaw" {
+			t.Fatalf("events = %v: only thaw retries may run between the copy and the upload (no replica kill)", events)
+		}
 	}
-}
-
-// A pause that fails after the freeze took must still thaw: the copy never
-// happens, and the guest cannot be left frozen because of it.
-func TestSnapshot_ThawsWhenThePauseFails(t *testing.T) {
-	var events []string
-	h := newSnapshotHarness(t, &events)
-	appID, resID, _, _, _ := h.attachedVolume(t)
-	h.pauser.pauseErr = errors.New("firecracker api: 500")
-
-	if _, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID); err == nil {
-		t.Fatal("want the pause failure to abort the snapshot")
-	}
-	if !sameOrder(events, []string{"syncfs", "freeze", "pause", "thaw"}) {
-		t.Fatalf("order = %v, want syncfs,freeze,pause,thaw", events)
-	}
-	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
-	if len(rps) != 0 {
-		t.Errorf("recovery points = %d, want 0", len(rps))
+	if _, err := h.replicas.FindByID(context.Background(), replicaID); err != nil {
+		t.Errorf("the replica must be left running after a failed thaw: %v", err)
 	}
 }
 
-func TestSnapshot_ResumesAndThawsOnCopyFailure(t *testing.T) {
-	var events []string
-	h := newSnapshotHarness(t, &events)
+// The thaw budget is 10s and one control call can block for 30s, so before this
+// the "retries" ran exactly once and the deadline was already blown the first
+// time it was checked. Each attempt now carries its own deadline.
+func TestSnapshot_ThawRetriesReallyRetry(t *testing.T) {
+	tests := []struct {
+		name string
+		arm  func(*fakeGuestControl)
+	}{
+		{
+			name: "each attempt outlives its own deadline",
+			arm:  func(g *fakeGuestControl) { g.thawBlocks = true },
+		},
+		{
+			name: "each attempt is refused immediately",
+			arm:  func(g *fakeGuestControl) { g.thawErr = errors.New("guest refused THAW: device busy") },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newSnapshotHarness(t)
+			appID, resID, _, _, _ := h.attachedVolume(t)
+			tt.arm(h.guest)
+
+			started := time.Now()
+			if _, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID); err != nil {
+				t.Fatalf("a thaw failure must not fail the snapshot: %v", err)
+			}
+			if got := h.guest.thawCount(); got < 2 {
+				t.Fatalf("thaw attempts = %d, want more than one — the retry loop must be real", got)
+			}
+			// And the loop still respects its overall budget rather than running per
+			// attempt: 60ms deadline, 10ms attempts, 5ms pauses.
+			if elapsed := time.Since(started); elapsed > 2*time.Second {
+				t.Fatalf("thaw retries took %s, want them bounded by the deadline", elapsed)
+			}
+		})
+	}
+}
+
+func TestSnapshot_ThawsOnCopyFailure(t *testing.T) {
+	h := newSnapshotHarness(t)
 	appID, resID, _, _, _ := h.attachedVolume(t)
-	h.s.copyFile = func(_, _ string) error {
-		events = append(events, "copy")
+	h.s.copyFile = func(context.Context, string, string) error {
+		h.rec.add("copy")
 		return errors.New("disk full")
 	}
 
@@ -401,11 +580,8 @@ func TestSnapshot_ResumesAndThawsOnCopyFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected copy failure")
 	}
-	if h.pauser.resumed != 1 {
-		t.Errorf("engine must be resumed even on copy failure (resumed=%d)", h.pauser.resumed)
-	}
-	if h.guest.thaws != 1 {
-		t.Errorf("guest must be thawed even on copy failure (thaws=%d)", h.guest.thaws)
+	if h.guest.thawCount() != 1 {
+		t.Errorf("guest must be thawed even on copy failure (thaws=%d)", h.guest.thawCount())
 	}
 	if len(h.store.puts) != 0 {
 		t.Errorf("nothing must be uploaded on copy failure")
@@ -417,8 +593,7 @@ func TestSnapshot_ResumesAndThawsOnCopyFailure(t *testing.T) {
 }
 
 func TestSnapshot_NoRowOnUploadFailure(t *testing.T) {
-	var events []string
-	h := newSnapshotHarness(t, &events)
+	h := newSnapshotHarness(t)
 	appID, resID, volID, _, _ := h.attachedVolume(t)
 	h.store.putErr = errors.New("s3 down")
 
@@ -426,11 +601,8 @@ func TestSnapshot_NoRowOnUploadFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected upload failure")
 	}
-	if h.pauser.resumed != 1 {
-		t.Errorf("engine must be resumed (resumed=%d)", h.pauser.resumed)
-	}
-	if h.guest.thaws != 1 {
-		t.Errorf("guest must be thawed (thaws=%d)", h.guest.thaws)
+	if h.guest.thawCount() != 1 {
+		t.Errorf("guest must be thawed (thaws=%d)", h.guest.thawCount())
 	}
 	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
 	if len(rps) != 0 {
@@ -441,9 +613,8 @@ func TestSnapshot_NoRowOnUploadFailure(t *testing.T) {
 	}
 }
 
-func TestSnapshot_UnattachedVolumeNoPauseNoQuiesce(t *testing.T) {
-	var events []string
-	h := newSnapshotHarness(t, &events)
+func TestSnapshot_UnattachedVolumeNoQuiesce(t *testing.T) {
+	h := newSnapshotHarness(t)
 
 	dir := t.TempDir()
 	backing := filepath.Join(dir, "vol.ext4")
@@ -457,11 +628,8 @@ func TestSnapshot_UnattachedVolumeNoPauseNoQuiesce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
-	if h.pauser.paused != 0 || h.pauser.resumed != 0 {
-		t.Errorf("unattached volume must not pause/resume (p=%d r=%d)", h.pauser.paused, h.pauser.resumed)
-	}
 	// There is no guest to talk to when nothing is attached.
-	if !sameOrder(events, []string{"copy", "upload"}) {
+	if events := h.rec.all(); !sameOrder(events, []string{"copy", "upload"}) {
 		t.Errorf("events = %v, want copy,upload", events)
 	}
 	if len(h.store.puts) != 1 || len(points) != 1 {
@@ -490,8 +658,7 @@ func sameOrder(got, want []string) bool {
 // on the SAME single pass as the upload. Until this landed a recovery point
 // carried only its size, so a corrupt blob was indistinguishable from a good one.
 func TestSnapshot_RecordsChecksumOfUploadedBytes(t *testing.T) {
-	var events []string
-	h := newSnapshotHarness(t, &events)
+	h := newSnapshotHarness(t)
 	appID, resID, _, _, _ := h.attachedVolume(t)
 
 	if _, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID); err != nil {
@@ -508,8 +675,7 @@ func TestSnapshot_RecordsChecksumOfUploadedBytes(t *testing.T) {
 // the digest would describe bytes nobody stored, and a later restore would
 // "verify" against it.
 func TestSnapshot_RefusesWhenStoreDidNotConsumeWholeBlob(t *testing.T) {
-	var events []string
-	h := newSnapshotHarness(t, &events)
+	h := newSnapshotHarness(t)
 	appID, resID, _, _, _ := h.attachedVolume(t)
 	h.store.shortRead = true
 
