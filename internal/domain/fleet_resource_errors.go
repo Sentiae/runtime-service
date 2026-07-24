@@ -62,4 +62,14 @@ var (
 	// ErrRestoreIntegrity is returned when downloaded recovery-point bytes do not
 	// match the catalog's recorded size/checksum. The live volume is untouched.
 	ErrRestoreIntegrity = errors.New("fleet resource recovery point failed integrity verification")
+	// ErrSnapshotNotQuiescible is returned when a volume's guest could not be
+	// quiesced (syncfs + fsfreeze over the D-185a control channel) before the
+	// backing file was copied. The snapshot is REFUSED rather than recorded:
+	// pausing the VMM alone does not flush the guest kernel's dirty page cache, so
+	// a copy taken without the freeze can be missing or torn
+	// (#p19-snapshot-not-guest-consistent — two live restores produced a
+	// correctly-sized, NUL-tailed pg_hba.conf). The checksum gate cannot catch
+	// that: it proves transport integrity, not source consistency, so a torn
+	// snapshot verifies clean forever.
+	ErrSnapshotNotQuiescible = errors.New("fleet resource volume snapshot refused: guest could not be quiesced")
 )

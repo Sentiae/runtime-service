@@ -355,6 +355,11 @@ func fleetError(err error) error {
 		return status.Error(codes.FailedPrecondition, "image boot requires the firecracker host")
 	case errors.Is(err, domain.ErrGuestControlUnavailable):
 		return status.Error(codes.FailedPrecondition, "guest control channel unavailable for this workload")
+	case errors.Is(err, domain.ErrSnapshotNotQuiescible):
+		// The curated message carries the actionable half of the refusal: the usual
+		// cause is a VM booted before the control channel existed, and the only
+		// thing that fixes that is a reboot, not a retry.
+		return status.Error(codes.FailedPrecondition, "snapshot refused: the guest filesystem could not be quiesced (a VM booted before the guest control channel existed must be rebooted before it can be snapshotted)")
 	case errors.Is(err, domain.ErrVolumesNotSupported):
 		return status.Error(codes.InvalidArgument, "volumes are only supported for resident workloads")
 	case errors.Is(err, domain.ErrVolumeAppNotScalable):
