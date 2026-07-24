@@ -259,6 +259,19 @@ type FleetResourceRepository interface {
 	// UpdateResourcePhase advances a resource's lifecycle phase. Returns
 	// domain.ErrResourceNotFound when no resource matches the id.
 	UpdateResourcePhase(ctx context.Context, id uuid.UUID, phase domain.FleetResourcePhase) error
+	// CompareAndSwapPhase advances a resource's phase ONLY when its current phase
+	// is one of `from`, and reports whether a row actually changed. This is the
+	// admission gate for a destructive lifecycle operation (D-184 restore): an
+	// unconditional update cannot tell a second caller that the first already
+	// owns the resource.
+	CompareAndSwapPhase(ctx context.Context, id uuid.UUID, from []domain.FleetResourcePhase, to domain.FleetResourcePhase) (bool, error)
+	// SetResourceLastError records (or, with an empty string, clears) the terminal
+	// reason of the last failed lifecycle operation.
+	SetResourceLastError(ctx context.Context, id uuid.UUID, msg string) error
+	// ListResourcesByPhase returns every non-tombstoned resource currently in a
+	// phase. The boot-time restore sweep uses it to find restores interrupted by
+	// a restart.
+	ListResourcesByPhase(ctx context.Context, phase domain.FleetResourcePhase) ([]domain.FleetResource, error)
 	// ListExpiredShared returns the shared-variant resources (app_id IS NULL)
 	// whose TTL has elapsed and that are not yet tombstoned — the reaper's work
 	// list. Dedicated resources (app_id set) are reclaimed via their FleetApp.
@@ -267,6 +280,14 @@ type FleetResourceRepository interface {
 	SaveRecoveryPoint(ctx context.Context, rp *domain.FleetResourceRecoveryPoint) error
 	// ListRecoveryPoints returns a resource's recovery points, newest first.
 	ListRecoveryPoints(ctx context.Context, resourceID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error)
+	// GetRecoveryPointByRef resolves ONE recovery point by (resourceID, objectKey).
+	// It filters on BOTH: a ref is never resolved globally, so a leaked or guessed
+	// object key from another org's resource is not restorable. Returns
+	// domain.ErrRecoveryPointNotFound when none matches.
+	GetRecoveryPointByRef(ctx context.Context, resourceID uuid.UUID, objectKey string) (*domain.FleetResourceRecoveryPoint, error)
+	// MarkRecoveryPointVerified flags a recovery point as proven restorable — set
+	// only after a restore from it booted healthy.
+	MarkRecoveryPointVerified(ctx context.Context, id uuid.UUID) error
 }
 
 // VolumeRepository persists volumes for fleet apps.

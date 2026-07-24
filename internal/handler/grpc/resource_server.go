@@ -36,10 +36,19 @@ type sharedResourceProvisioner interface {
 	ProvisionShared(ctx context.Context, in usecase.ProvisionSharedInput) (usecase.ProvisionSharedOutput, error)
 }
 
-// resourceSnapshotter is the subset of *usecase.FleetVolumeSnapshotter the
-// standalone SnapshotResource RPC drives.
-type resourceSnapshotter interface {
+// ResourceSnapshotPort is the subset of *usecase.FleetVolumeSnapshotter the
+// standalone SnapshotResource RPC drives. Exported so the DI container can hold
+// a genuinely-nil interface for an unwired host (a typed nil pointer wrapped in
+// an interface would defeat the handler's Unavailable guard).
+type ResourceSnapshotPort interface {
 	SnapshotAppVolumes(ctx context.Context, resourceID, appID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error)
+}
+
+// ResourceRestorePort is the subset of *usecase.FleetVolumeRestorer the
+// RestoreResource RPC drives (D-184, in-place restore only). Exported for the
+// same nil-interface reason as ResourceSnapshotPort.
+type ResourceRestorePort interface {
+	Restore(ctx context.Context, in usecase.RestoreResourceInput) (usecase.RestoreResourceOutput, error)
 }
 
 // ResourceServer implements the P19 ResourceProvisioning gRPC service (CP4.5
@@ -50,33 +59,38 @@ type ResourceServer struct {
 	runtimev1.UnimplementedResourceProvisioningServer
 	dedicated   dedicatedResourceProvisioner
 	shared      sharedResourceProvisioner
-	snapshotter resourceSnapshotter
+	snapshotter ResourceSnapshotPort
+	restorer    ResourceRestorePort
 	resources   repository.FleetResourceRepository
 }
 
-// NewResourceServer constructs the handler. shared and snapshotter may be nil on
-// a host that does not serve those tiers (e.g. a non-firecracker host has no
-// snapshotter); the corresponding RPCs then answer Unavailable rather than
-// silently faking a result.
+// NewResourceServer constructs the handler. shared, snapshotter and restorer may
+// be nil on a host that does not serve those tiers (e.g. a non-firecracker host
+// has no snapshotter, and a host with no artifact store cannot fetch a recovery
+// point); the corresponding RPCs then answer Unavailable rather than silently
+// faking a result.
 func NewResourceServer(
 	dedicated dedicatedResourceProvisioner,
 	shared sharedResourceProvisioner,
-	snapshotter resourceSnapshotter,
+	snapshotter ResourceSnapshotPort,
+	restorer ResourceRestorePort,
 	resources repository.FleetResourceRepository,
 ) *ResourceServer {
 	return &ResourceServer{
 		dedicated:   dedicated,
 		shared:      shared,
 		snapshotter: snapshotter,
+		restorer:    restorer,
 		resources:   resources,
 	}
 }
 
 // GetResourceCapabilities reports the classes/tiers the fleet can honestly
 // provision on this host. supports_snapshot/restore/rotation reflect what is
-// actually wired: restore + credential rotation are Unimplemented in v1, so they
-// are always false; snapshot is true only when a snapshotter is wired; the shared
-// tier is advertised only when its provisioner is wired.
+// actually wired: credential rotation is Unimplemented in v1 so it is always
+// false; snapshot is true only when a snapshotter is wired; restore is true only
+// when the restorer is (it needs both the orchestrator and a configured artifact
+// store); the shared tier is advertised only when its provisioner is wired.
 func (s *ResourceServer) GetResourceCapabilities(_ context.Context, req *runtimev1.GetResourceCapabilitiesRequest) (*runtimev1.GetResourceCapabilitiesResponse, error) {
 	if filter := req.GetClass(); filter != "" && filter != resourceClassPostgres {
 		return &runtimev1.GetResourceCapabilitiesResponse{}, nil
@@ -93,7 +107,7 @@ func (s *ResourceServer) GetResourceCapabilities(_ context.Context, req *runtime
 			Class:                      resourceClassPostgres,
 			Tiers:                      tiers,
 			SupportsSnapshot:           s.snapshotter != nil,
-			SupportsRestore:            false,
+			SupportsRestore:            s.restorer != nil,
 			SupportsCredentialRotation: false,
 		}},
 	}, nil
@@ -277,10 +291,29 @@ func (s *ResourceServer) DecommissionResource(ctx context.Context, req *runtimev
 	return &runtimev1.DecommissionResourceResponse{}, nil
 }
 
-// RestoreResource is Unimplemented in v1 (the restore path lands with a later
-// CP4.5 slice; caps report supports_restore=false).
-func (s *ResourceServer) RestoreResource(context.Context, *runtimev1.RestoreResourceRequest) (*runtimev1.RestoreResourceResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "resource restore is not implemented in v1")
+// RestoreResource restores a resource IN PLACE from one of its recovery points
+// (D-184). The by-handle org gate runs first; the recovery-point ref is then
+// resolved STRICTLY within that resource, so a leaked or guessed object key from
+// another org's resource is not restorable. The call returns as soon as the
+// restore is admitted (phase `restoring`); callers poll GetResourceStatus for
+// the outcome.
+func (s *ResourceServer) RestoreResource(ctx context.Context, req *runtimev1.RestoreResourceRequest) (*runtimev1.RestoreResourceResponse, error) {
+	if s.restorer == nil {
+		return nil, status.Error(codes.Unavailable, "resource restorer not configured")
+	}
+	res, ctx, err := s.authorizeHandleOrg(ctx, req.GetHandle())
+	if err != nil {
+		return nil, err
+	}
+	rp, err := s.resources.GetRecoveryPointByRef(ctx, res.ID, req.GetRecoveryPointRef())
+	if err != nil {
+		return nil, resourceError(err)
+	}
+	out, err := s.restorer.Restore(ctx, usecase.RestoreResourceInput{Resource: res, RecoveryPoint: rp})
+	if err != nil {
+		return nil, resourceError(err)
+	}
+	return &runtimev1.RestoreResourceResponse{Handle: out.Handle, Phase: out.Phase}, nil
 }
 
 // RotateResourceCredentials is Unimplemented in v1 (credential rotation lands
@@ -339,6 +372,16 @@ func resourceError(err error) error {
 		return status.Error(codes.FailedPrecondition, "a durable resource requires a final snapshot to decommission")
 	case errors.Is(err, domain.ErrResourceSharedPasswordAmbiguous):
 		return status.Error(codes.FailedPrecondition, "resolved secrets do not identify a single role password")
+	case errors.Is(err, domain.ErrRecoveryPointNotFound):
+		return status.Error(codes.NotFound, "recovery point not found for this resource")
+	case errors.Is(err, domain.ErrRestoreInProgress):
+		return status.Error(codes.FailedPrecondition, "restore already in progress")
+	case errors.Is(err, domain.ErrRestoreNoBackingApp):
+		return status.Error(codes.FailedPrecondition, "resource has no backing app to restore in place")
+	case errors.Is(err, domain.ErrRestoreVolumeAmbiguous):
+		return status.Error(codes.FailedPrecondition, "in-place restore requires exactly one materialized volume")
+	case errors.Is(err, domain.ErrRestoreStoreUnavailable):
+		return status.Error(codes.Unavailable, "restore artifact store not configured on this host")
 	default:
 		// Log the real error server-side before curating a leak-free code for the
 		// caller — an unmapped failure (e.g. a fleet-side Pause/boot/volume error)

@@ -172,3 +172,41 @@ func TestDeleteAppVolumes_ContinuesAfterDeleteErrorAndReturnsFirst(t *testing.T)
 		t.Fatalf("backend.Delete calls = %d, want 2 (%v)", len(backend.deleted), backend.deleted)
 	}
 }
+
+// DetachFrom must not revive a volume the D-184 restore owns: the restore
+// drains the replica itself, so a detach that flipped `restoring` back to
+// `available` would tear down its own boot stand-off.
+func TestDetachFrom_PreservesTerminalAndRestoringStatuses(t *testing.T) {
+	tests := []struct {
+		name string
+		from domain.VolumeStatus
+		want domain.VolumeStatus
+	}{
+		{"attached is released", domain.VolumeStatusAttached, domain.VolumeStatusAvailable},
+		{"degraded stays degraded", domain.VolumeStatusDegraded, domain.VolumeStatusDegraded},
+		{"restoring stays restoring", domain.VolumeStatusRestoring, domain.VolumeStatusRestoring},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			appID := uuid.New()
+			vol := volWithBacking(appID, "/vol/a.ext4")
+			vol.Status = tt.from
+			replicaID := uuid.New()
+			vol.AttachedReplica = &replicaID
+			repo := newVolRepoFake(vol)
+			m := NewFleetVolumeManager(repo, &recordingBackend{}, "/vol")
+
+			if err := m.DetachFrom(context.Background(), appID); err != nil {
+				t.Fatalf("DetachFrom: %v", err)
+			}
+			got, _ := repo.FindByID(context.Background(), vol.ID)
+			if got.Status != tt.want {
+				t.Fatalf("status = %q, want %q", got.Status, tt.want)
+			}
+			if got.AttachedReplica != nil {
+				t.Fatal("detach must always clear the attachment")
+			}
+		})
+	}
+}

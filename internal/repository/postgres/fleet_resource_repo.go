@@ -67,6 +67,46 @@ func (r *fleetResourceRepository) UpdateResourcePhase(ctx context.Context, id uu
 	return nil
 }
 
+// CompareAndSwapPhase advances the phase only from one of `from`, reporting
+// whether a row changed. Single statement — the WHERE runs under the row lock
+// the UPDATE takes, so two concurrent callers cannot both observe 1 row.
+func (r *fleetResourceRepository) CompareAndSwapPhase(ctx context.Context, id uuid.UUID, from []domain.FleetResourcePhase, to domain.FleetResourcePhase) (bool, error) {
+	if len(from) == 0 {
+		return false, nil
+	}
+	res := r.db.WithContext(ctx).
+		Model(&domain.FleetResource{}).
+		Where("id = ? AND phase IN ?", id, from).
+		Updates(map[string]any{"phase": to, "updated_at": time.Now().UTC()})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
+func (r *fleetResourceRepository) SetResourceLastError(ctx context.Context, id uuid.UUID, msg string) error {
+	res := r.db.WithContext(ctx).
+		Model(&domain.FleetResource{}).
+		Where("id = ?", id).
+		Updates(map[string]any{"last_error": msg, "updated_at": time.Now().UTC()})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return domain.ErrResourceNotFound
+	}
+	return nil
+}
+
+func (r *fleetResourceRepository) ListResourcesByPhase(ctx context.Context, phase domain.FleetResourcePhase) ([]domain.FleetResource, error) {
+	var resources []domain.FleetResource
+	err := r.db.WithContext(ctx).
+		Where("phase = ? AND decommissioned_at IS NULL", phase).
+		Order("updated_at ASC").
+		Find(&resources).Error
+	return resources, err
+}
+
 // ListExpiredShared returns shared-variant resources (app_id IS NULL) whose TTL
 // has elapsed and that are not yet tombstoned. Dedicated resources carry an
 // app_id and are reclaimed through their FleetApp, so they are excluded here.
@@ -90,4 +130,37 @@ func (r *fleetResourceRepository) ListRecoveryPoints(ctx context.Context, resour
 		Order("created_at DESC").
 		Find(&points).Error
 	return points, err
+}
+
+// GetRecoveryPointByRef resolves a ref WITHIN one resource. The resource_id
+// predicate is the security boundary, not an optimization: object keys are
+// guessable-shaped (volumes/<vol>/<uuid>.ext4), so a global lookup would let a
+// leaked key from another org's resource be restored into this one.
+func (r *fleetResourceRepository) GetRecoveryPointByRef(ctx context.Context, resourceID uuid.UUID, objectKey string) (*domain.FleetResourceRecoveryPoint, error) {
+	var rp domain.FleetResourceRecoveryPoint
+	err := r.db.WithContext(ctx).
+		Where("resource_id = ? AND object_key = ?", resourceID, objectKey).
+		Order("created_at DESC").
+		First(&rp).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, domain.ErrRecoveryPointNotFound
+		}
+		return nil, err
+	}
+	return &rp, nil
+}
+
+func (r *fleetResourceRepository) MarkRecoveryPointVerified(ctx context.Context, id uuid.UUID) error {
+	res := r.db.WithContext(ctx).
+		Model(&domain.FleetResourceRecoveryPoint{}).
+		Where("id = ?", id).
+		Update("verified", true)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return domain.ErrRecoveryPointNotFound
+	}
+	return nil
 }

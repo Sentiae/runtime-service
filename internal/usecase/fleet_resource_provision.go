@@ -256,7 +256,11 @@ func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uui
 		if herr != nil {
 			return ResourceStatus{}, fmt.Errorf("resource health: %w", herr)
 		}
-		if h.Healthy {
+		// D-184 — a restore owns the phase while it runs. Auto-advancing to ready
+		// here would race the restore's own verification window: the OLD engine can
+		// still be healthy the instant before the restore drains it, and the
+		// restored one is not proven until the restore says so.
+		if h.Healthy && res.Phase != domain.FleetResourcePhaseRestoring {
 			status.Phase = string(domain.FleetResourcePhaseReady)
 			// Keep the durable row honest: advance provisioning → ready once observed.
 			if res.Phase != domain.FleetResourcePhaseReady {

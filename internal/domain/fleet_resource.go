@@ -21,6 +21,11 @@ const (
 	FleetResourcePhaseReady FleetResourcePhase = "ready"
 	// FleetResourcePhaseDegraded — the resource exists but is impaired.
 	FleetResourcePhaseDegraded FleetResourcePhase = "degraded"
+	// FleetResourcePhaseRestoring — an in-place restore from a recovery point is
+	// in flight (D-184). It is a STAND-OFF phase: while it holds, the resource's
+	// volume refuses every boot, so a reconciler tick or an ingress wake cannot
+	// open the backing file the restore is about to swap underneath it.
+	FleetResourcePhaseRestoring FleetResourcePhase = "restoring"
 	// FleetResourcePhaseFailed — provisioning failed terminally.
 	FleetResourcePhaseFailed FleetResourcePhase = "failed"
 	// FleetResourcePhaseDecommissioned — the resource has been torn down
@@ -33,7 +38,8 @@ func (p FleetResourcePhase) IsValid() bool {
 	switch p {
 	case FleetResourcePhasePending, FleetResourcePhaseProvisioning,
 		FleetResourcePhaseReady, FleetResourcePhaseDegraded,
-		FleetResourcePhaseFailed, FleetResourcePhaseDecommissioned:
+		FleetResourcePhaseRestoring, FleetResourcePhaseFailed,
+		FleetResourcePhaseDecommissioned:
 		return true
 	}
 	return false
@@ -72,6 +78,11 @@ type FleetResource struct {
 	SystemID string `json:"system_id" gorm:"column:system_id;type:text;not null;default:''"`
 	// Params carries the extra claim parameters (map<string,string>) as JSONB.
 	Params []byte `json:"params,omitempty" gorm:"type:jsonb"`
+	// LastError is the terminal reason of the last failed lifecycle operation
+	// (today: restore). It is NOT cleared by a phase change, so a resource that
+	// ends in phase 'ready' after a ROLLED-BACK restore is distinguishable from
+	// one whose restore succeeded — both are 'ready', only last_error differs.
+	LastError string `json:"last_error" gorm:"column:last_error;type:text;not null;default:''"`
 	// ExpiresAt is the reclamation deadline for a TTL'd resource; nil never
 	// expires.
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
@@ -96,8 +107,12 @@ type FleetResourceRecoveryPoint struct {
 	ObjectKey  string     `json:"object_key" gorm:"column:object_key;type:text;not null"`
 	Kind       string     `json:"kind" gorm:"type:text;not null"`
 	SizeBytes  int64      `json:"size_bytes" gorm:"column:size_bytes"`
-	Verified   bool       `json:"verified" gorm:"not null;default:false"`
-	CreatedAt  time.Time  `json:"created_at" gorm:"not null;default:now();index:idx_fleet_resource_recovery_points_resource,priority:2"`
+	// Checksum is the lowercase hex sha256 of the uploaded blob, computed while
+	// streaming the upload. Empty on legacy rows written before D-184: those can
+	// only be size-verified on restore, and the restorer says so explicitly.
+	Checksum  string    `json:"checksum" gorm:"column:checksum;type:text;not null;default:''"`
+	Verified  bool      `json:"verified" gorm:"not null;default:false"`
+	CreatedAt time.Time `json:"created_at" gorm:"not null;default:now();index:idx_fleet_resource_recovery_points_resource,priority:2"`
 }
 
 // TableName specifies the GORM table name.

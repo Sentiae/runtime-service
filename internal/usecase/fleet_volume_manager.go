@@ -277,7 +277,11 @@ func (m *FleetVolumeManager) DetachFrom(ctx context.Context, appID uuid.UUID) er
 	for i := range vols {
 		vols[i].AttachedReplica = nil
 		// A degraded volume stays degraded — detach never revives it this cycle.
-		if vols[i].Status != domain.VolumeStatusDegraded {
+		// A RESTORING volume likewise: the restore drains the replica itself
+		// (ScaleApp 0 → DecommissionReplica → here), so reviving the status on
+		// detach would tear down the very stand-off that keeps the reconciler and
+		// the activator off the backing file until the swap lands (D-184).
+		if vols[i].Status != domain.VolumeStatusDegraded && vols[i].Status != domain.VolumeStatusRestoring {
 			vols[i].Status = domain.VolumeStatusAvailable
 		}
 		vols[i].UpdatedAt = now

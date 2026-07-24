@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -37,10 +39,11 @@ func (f *fakePauser) Resume(_ context.Context, _ string) error {
 }
 
 type fakeArtifactStore struct {
-	mu     sync.Mutex
-	events *[]string
-	puts   []string
-	putErr error
+	mu        sync.Mutex
+	events    *[]string
+	puts      []string
+	putErr    error
+	shortRead bool
 }
 
 func (f *fakeArtifactStore) Put(digest string, r io.Reader) error {
@@ -50,7 +53,13 @@ func (f *fakeArtifactStore) Put(digest string, r io.Reader) error {
 	if f.putErr != nil {
 		return f.putErr
 	}
-	_, _ = io.Copy(io.Discard, r)
+	if f.shortRead {
+		// Consume only the first byte — models a store that did not take the whole
+		// blob, which must NOT yield a checksum of the full file.
+		_, _ = io.CopyN(io.Discard, r, 1)
+	} else {
+		_, _ = io.Copy(io.Discard, r)
+	}
 	f.puts = append(f.puts, digest)
 	return nil
 }
@@ -247,5 +256,54 @@ func TestSnapshot_UnattachedVolumeNoPause(t *testing.T) {
 	rps, _ := recovery.ListRecoveryPoints(context.Background(), resID)
 	if len(rps) != 1 {
 		t.Errorf("recovery point missing for unattached volume")
+	}
+}
+
+// D-184 — the recovery point records the sha256 of the uploaded bytes, computed
+// on the SAME single pass as the upload. Until this landed a recovery point
+// carried only its size, so a corrupt blob was indistinguishable from a good one.
+func TestSnapshot_RecordsChecksumOfUploadedBytes(t *testing.T) {
+	var events []string
+	s, _, _, vols, recovery, _ := newSnapshotHarness(t, &events)
+
+	dir := t.TempDir()
+	backing := filepath.Join(dir, "vol.ext4")
+	_ = os.WriteFile(backing, []byte("data"), 0o600)
+	appID := uuid.New()
+	resID := uuid.New()
+	volID := uuid.New()
+	vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: appID, BackingPath: backing}}
+
+	if _, err := s.SnapshotAppVolumes(context.Background(), resID, appID); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	rps, _ := recovery.ListRecoveryPoints(context.Background(), resID)
+	sum := sha256.Sum256([]byte("ext4-bytes")) // what the harness copyFile writes
+	if want := hex.EncodeToString(sum[:]); rps[0].Checksum != want {
+		t.Fatalf("checksum = %q, want %q", rps[0].Checksum, want)
+	}
+}
+
+// A store that consumes only part of the blob must NOT produce a recovery point:
+// the digest would describe bytes nobody stored, and a later restore would
+// "verify" against it.
+func TestSnapshot_RefusesWhenStoreDidNotConsumeWholeBlob(t *testing.T) {
+	var events []string
+	s, _, store, vols, recovery, _ := newSnapshotHarness(t, &events)
+	store.shortRead = true
+
+	dir := t.TempDir()
+	backing := filepath.Join(dir, "vol.ext4")
+	_ = os.WriteFile(backing, []byte("data"), 0o600)
+	appID := uuid.New()
+	resID := uuid.New()
+	vols.byApp[appID] = []domain.Volume{{ID: uuid.New(), AppID: appID, BackingPath: backing}}
+
+	if _, err := s.SnapshotAppVolumes(context.Background(), resID, appID); err == nil {
+		t.Fatal("want an error when the store did not consume the whole blob")
+	}
+	rps, _ := recovery.ListRecoveryPoints(context.Background(), resID)
+	if len(rps) != 0 {
+		t.Fatalf("no recovery point may be recorded, got %d", len(rps))
 	}
 }

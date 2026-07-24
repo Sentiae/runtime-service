@@ -231,6 +231,15 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 			return uc.markDead(ctx, replica, fmt.Errorf("resolve volume: %w", verr))
 		}
 		if ok {
+			// D-184 restore stand-off — REFUSE the boot while a restore owns the
+			// volume. Desired-replicas=0 alone does not close this: the reconciler
+			// ticks every 10s and the scale-to-zero activator scales an app back to
+			// one on ANY ingress request, so a wake landing between the restore's
+			// drain and its rename would boot a VM holding an fd to the OLD inode
+			// while a new backing file is renamed onto the path — silent wrong state.
+			if vol.Status == domain.VolumeStatusRestoring {
+				return uc.markDead(ctx, replica, fmt.Errorf("volume %s: %w", vol.ID, domain.ErrVolumeRestoreInProgress))
+			}
 			dataVolume = true
 			dataDiskPath = vol.BackingPath
 			dataMountPath = vol.MountPath

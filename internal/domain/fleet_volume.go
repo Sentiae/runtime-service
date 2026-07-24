@@ -17,12 +17,18 @@ const (
 	// VolumeStatusDegraded — the volume's affinity host is gone; this cycle the
 	// volume (and its app) is terminal-degraded (no cross-host restore yet).
 	VolumeStatusDegraded VolumeStatus = "degraded"
+	// VolumeStatusRestoring — an in-place restore owns this volume (D-184). It is
+	// the boot STAND-OFF: while it holds, BootReplica refuses to attach the
+	// backing file, so no VM can hold an fd to the inode the restore renames.
+	// Like degraded, a detach never revives it — only the restore clears it.
+	VolumeStatusRestoring VolumeStatus = "restoring"
 )
 
 // IsValid reports whether the volume status is one the fleet recognizes.
 func (s VolumeStatus) IsValid() bool {
 	switch s {
-	case VolumeStatusAvailable, VolumeStatusAttached, VolumeStatusDegraded:
+	case VolumeStatusAvailable, VolumeStatusAttached, VolumeStatusDegraded,
+		VolumeStatusRestoring:
 		return true
 	}
 	return false

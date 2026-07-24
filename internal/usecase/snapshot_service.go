@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -71,6 +73,47 @@ func uploadSnapshotFile(store ArtifactStore, key, path string) error {
 		return fmt.Errorf("put %s: %w", key, err)
 	}
 	return nil
+}
+
+// uploadSnapshotFileHashed streams a local file into the artifact store and
+// returns the lowercase hex sha256 of exactly the bytes the store consumed.
+// Hashing rides the SAME single pass as the upload (io.TeeReader) — a second
+// read of a multi-GB backing file would double the snapshot's IO cost.
+//
+// The byte-count cross-check is the honesty gate: if the store did not consume
+// the whole file, the digest would describe a prefix, and a restore would
+// "verify" against a checksum of bytes nobody stored. Refuse instead.
+func uploadSnapshotFileHashed(store ArtifactStore, key, path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat %s: %w", path, err)
+	}
+	h := sha256.New()
+	counted := &countingReader{r: io.TeeReader(f, h)}
+	if err := store.Put(key, counted); err != nil {
+		return "", fmt.Errorf("put %s: %w", key, err)
+	}
+	if counted.n != st.Size() {
+		return "", fmt.Errorf("artifact store consumed %d of %d bytes for %s", counted.n, st.Size(), key)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// countingReader counts the bytes a consumer actually read.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // ensureLocalFile guarantees a snapshot file is present at localPath,

@@ -192,8 +192,12 @@ type Container struct {
 	// (FailLoudImageBooter), never a silent fake. The volume snapshotter is
 	// firecracker-host-only (it needs a live VMPauser). The shared-tier provisioner
 	// + its TTL reaper are non-nil only when the shared logical engine is wired.
+	// The in-place restorer (D-184) needs BOTH the orchestrator (to stop/start the
+	// data VM) and a configured artifact store (to fetch the recovery point), so
+	// it stays nil elsewhere and Capabilities reports supports_restore=false.
 	FleetResourceRepo     repository.FleetResourceRepository
 	ResourceSnapshotter   *usecase.FleetVolumeSnapshotter
+	ResourceRestorer      *usecase.FleetVolumeRestorer
 	FleetResourceUC       *usecase.FleetResourceProvisioner
 	FleetResourceSharedUC *usecase.FleetResourceSharedProvisioner
 	ResourceServer        *grpchandler.ResourceServer
@@ -598,6 +602,15 @@ func (c *Container) initFleet(cfg *config.Config) {
 	} else {
 		log.Println("Fleet self-registration skipped (executor is not firecracker)")
 	}
+
+	// D-184 — scope the boot-time restore sweep to the resources whose data lives
+	// on THIS host, reusing the volume host-affinity the reconciler already uses
+	// to decide whether a stateful app is ours. Wired only AFTER self-registration
+	// (the host id does not exist before it); without it the sweep is a no-op, so
+	// a restore live on another host is never stamped by this instance.
+	if c.ResourceRestorer != nil && c.fleetSelf != nil && c.FleetVolumeManager != nil {
+		c.ResourceRestorer.SetHostScope(c.fleetSelf.ID, c.FleetVolumeManager)
+	}
 }
 
 // initResourceControlPlane wires the P19 durable resource control plane (CP4.5
@@ -613,15 +626,34 @@ func (c *Container) initFleet(cfg *config.Config) {
 // decommission of a durable resource fails closed (ErrResourceFinalSnapshotRequired).
 func (c *Container) initResourceControlPlane(cfg *config.Config) {
 	// Volume snapshotter — firecracker host only (needs the FC Provider as the
-	// VMPauser). A nil pointer here is deliberate off-host; it is never wrapped in
-	// a non-nil interface (see the explicit branches below).
-	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
+	// VMPauser) AND only with a configured artifact store: the snapshotter calls
+	// store.Put unconditionally, so a nil store here would panic on the first
+	// snapshot instead of failing closed. A nil pointer is deliberate off-host; it
+	// is never wrapped in a non-nil interface (see the explicit branches below).
+	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil && c.snapshotArtifactStore != nil {
 		c.ResourceSnapshotter = usecase.NewFleetVolumeSnapshotter(
 			c.FCProvider,
 			c.snapshotArtifactStore,
 			c.VolumeRepo,
 			c.ReplicaRepo,
 			c.FleetResourceRepo,
+		)
+	} else if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
+		log.Println("Fleet resource snapshotter DISABLED: no snapshot artifact store configured (APP_SNAPSHOT_STORE_ENABLED) — snapshot/restore report unsupported")
+	}
+
+	// In-place restorer (D-184). Needs the orchestrator (stop/start the data VM)
+	// and the artifact store (fetch the recovery point); nil without either, so
+	// GetResourceCapabilities keeps reporting supports_restore honestly.
+	if c.FleetOrchestratorUC != nil && c.snapshotArtifactStore != nil {
+		c.ResourceRestorer = usecase.NewFleetVolumeRestorer(
+			context.Background(),
+			c.FleetResourceRepo,
+			c.VolumeRepo,
+			c.ReplicaRepo,
+			c.FleetOrchestratorUC,
+			c.FleetProvisionUC,
+			c.snapshotArtifactStore,
 		)
 	}
 
@@ -652,11 +684,18 @@ func (c *Container) initResourceControlPlane(cfg *config.Config) {
 	// the shared route answers Unavailable (an honest "not configured" rather than
 	// a silent fake). Pass a true-nil snapshotter off the firecracker host so the
 	// handler's Unavailable guard fires.
+	//
+	// Same typed-nil care for the snapshotter and the restorer: a nil *T wrapped
+	// in a non-nil interface would defeat the handler's Unavailable guards.
+	var snapHandler grpchandler.ResourceSnapshotPort
 	if c.ResourceSnapshotter != nil {
-		c.ResourceServer = grpchandler.NewResourceServer(c.FleetResourceUC, nil, c.ResourceSnapshotter, c.FleetResourceRepo)
-	} else {
-		c.ResourceServer = grpchandler.NewResourceServer(c.FleetResourceUC, nil, nil, c.FleetResourceRepo)
+		snapHandler = c.ResourceSnapshotter
 	}
+	var restoreHandler grpchandler.ResourceRestorePort
+	if c.ResourceRestorer != nil {
+		restoreHandler = c.ResourceRestorer
+	}
+	c.ResourceServer = grpchandler.NewResourceServer(c.FleetResourceUC, nil, snapHandler, restoreHandler, c.FleetResourceRepo)
 }
 
 // initNetworkFabric wires the P21 fleet network fabric (CP4.5 §9#5, D-164).
@@ -1579,6 +1618,11 @@ func (c *Container) StartBackgroundControllers(ctx context.Context) {
 	}
 	c.startFleetHeartbeat(ctx)
 	c.startFleetActivityFeed(ctx)
+	// D-184 — a restore in flight when this process died left its resource in
+	// phase `restoring` (and its volume too, so every boot is refused). Release
+	// THIS host's stuck rows to `failed` before the reconciler starts ticking;
+	// recovery is a re-issued RestoreResource, never an auto-resume.
+	c.sweepInterruptedRestores(ctx)
 	c.startFleetReconciler(ctx)
 	// CP4.5 §9#3 (D-183) — shared-tier TTL reaper. Nil until the shared engine is
 	// wired (NEEDS-DECISION on shared-engine admin credentials); the loop is
@@ -1588,6 +1632,24 @@ func (c *Container) StartBackgroundControllers(ctx context.Context) {
 		log.Println("Fleet shared-resource TTL reaper started")
 	}
 	c.StartConsumers(ctx)
+}
+
+// sweepInterruptedRestores releases the resources of THIS host left mid-restore
+// by a restart (D-184): phase restoring → failed + last_error. Synchronous and
+// log-and-continue — it is a bookkeeping pass over a handful of rows, and a
+// failure must never block startup.
+func (c *Container) sweepInterruptedRestores(ctx context.Context) {
+	if c.ResourceRestorer == nil {
+		return
+	}
+	n, err := c.ResourceRestorer.SweepInterruptedRestores(ctx)
+	if err != nil {
+		log.Printf("[FLEET-RESTORE] interrupted-restore sweep failed: %v", err)
+		return
+	}
+	if n > 0 {
+		log.Printf("[FLEET-RESTORE] released %d resource(s) left mid-restore by a restart to failed — boots stay refused until RestoreResource is re-issued", n)
+	}
 }
 
 // startFleetActivityFeed starts the Caddy access-log tailer that backs the
@@ -1732,6 +1794,12 @@ func (c *Container) Close() error {
 	// their results are persisted before the DB pool closes.
 	if c.FleetProvisionUC != nil {
 		c.FleetProvisionUC.Wait()
+	}
+
+	// D-184 — wait for an in-flight restore to reach its terminal phase before the
+	// DB pool closes, so it never dies between the swap and the phase write.
+	if c.ResourceRestorer != nil {
+		c.ResourceRestorer.Wait()
 	}
 
 	// CP4.5 §9#3 (D-183) — stop the shared-tier TTL reaper (waits for the loop).

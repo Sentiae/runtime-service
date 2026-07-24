@@ -27,6 +27,7 @@ type fakeResourceRepo struct {
 	findNotFoundFirst bool
 	findCalls         int
 	saveDuplicate     bool
+	casErr            error
 }
 
 func newFakeResourceRepo() *fakeResourceRepo {
@@ -94,6 +95,79 @@ func (f *fakeResourceRepo) UpdateResourcePhase(_ context.Context, id uuid.UUID, 
 	}
 	r.Phase = phase
 	return nil
+}
+
+// CompareAndSwapPhase mirrors the postgres UPDATE ... WHERE id = ? AND phase IN
+// (?): it advances the phase only from one of `from` and reports whether a row
+// changed.
+func (f *fakeResourceRepo) CompareAndSwapPhase(_ context.Context, id uuid.UUID, from []domain.FleetResourcePhase, to domain.FleetResourcePhase) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.casErr != nil {
+		return false, f.casErr
+	}
+	r, ok := f.byID[id]
+	if !ok {
+		return false, nil
+	}
+	for _, p := range from {
+		if r.Phase == p {
+			r.Phase = to
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakeResourceRepo) SetResourceLastError(_ context.Context, id uuid.UUID, msg string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.byID[id]
+	if !ok {
+		return domain.ErrResourceNotFound
+	}
+	r.LastError = msg
+	return nil
+}
+
+func (f *fakeResourceRepo) ListResourcesByPhase(_ context.Context, phase domain.FleetResourcePhase) ([]domain.FleetResource, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []domain.FleetResource
+	for _, r := range f.byID {
+		if r.Phase == phase && r.DecommissionedAt == nil {
+			out = append(out, *r)
+		}
+	}
+	return out, nil
+}
+
+// GetRecoveryPointByRef filters on BOTH resource_id and object_key, exactly like
+// the postgres repo — a ref from another resource must not resolve.
+func (f *fakeResourceRepo) GetRecoveryPointByRef(_ context.Context, resourceID uuid.UUID, objectKey string) (*domain.FleetResourceRecoveryPoint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, rp := range f.recovery[resourceID] {
+		if rp.ObjectKey == objectKey {
+			cp := rp
+			return &cp, nil
+		}
+	}
+	return nil, domain.ErrRecoveryPointNotFound
+}
+
+func (f *fakeResourceRepo) MarkRecoveryPointVerified(_ context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for resID := range f.recovery {
+		for i := range f.recovery[resID] {
+			if f.recovery[resID][i].ID == id {
+				f.recovery[resID][i].Verified = true
+				return nil
+			}
+		}
+	}
+	return domain.ErrRecoveryPointNotFound
 }
 
 func (f *fakeResourceRepo) ListExpiredShared(_ context.Context, now time.Time) ([]domain.FleetResource, error) {
@@ -428,6 +502,35 @@ func TestStatusOf_HealthyBecomesReady(t *testing.T) {
 	}
 	if st.LastRecoveryPoint == nil || st.LastRecoveryPoint.ObjectKey != "volumes/x/y.ext4" {
 		t.Errorf("last recovery point = %+v", st.LastRecoveryPoint)
+	}
+}
+
+// D-184 — a healthy observation must NOT auto-advance a resource whose restore
+// is still running: the OLD engine is healthy right up to the drain, and the
+// restored one is not proven until the restore says so.
+func TestStatusOf_DoesNotAdvanceWhileRestoring(t *testing.T) {
+	repo := newFakeResourceRepo()
+	prov := &fakeFleetProvisioner{healthOut: FleetHealthOutput{Healthy: true}}
+	appID := uuid.New()
+	replicas := newFakeResourceReplicaRepo()
+	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine())
+
+	rid := uuid.New()
+	repo.seed(&domain.FleetResource{
+		ID: rid, OwnerOrg: uuid.New(), ClaimKey: "c", Env: "prod",
+		Tier: "dedicated", Phase: domain.FleetResourcePhaseRestoring, AppID: &appID,
+	})
+
+	st, err := uc.StatusOf(context.Background(), rid)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if st.Phase != string(domain.FleetResourcePhaseRestoring) {
+		t.Errorf("reported phase = %q, want restoring", st.Phase)
+	}
+	stored, _ := repo.GetResourceByHandle(context.Background(), rid)
+	if stored.Phase != domain.FleetResourcePhaseRestoring {
+		t.Errorf("stored phase = %q, want restoring (never auto-advanced)", stored.Phase)
 	}
 }
 

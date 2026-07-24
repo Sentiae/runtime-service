@@ -138,7 +138,8 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 	}
 
 	objectKey := fmt.Sprintf("volumes/%s/%s.ext4", vol.ID, snapshotID)
-	if err := uploadSnapshotFile(s.store, objectKey, tmpPath); err != nil {
+	checksum, err := uploadSnapshotFileHashed(s.store, objectKey, tmpPath)
+	if err != nil {
 		// A local-only copy is not a recovery point: abort with no catalog row.
 		return zero, fmt.Errorf("upload snapshot: %w", err)
 	}
@@ -152,6 +153,7 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 		ObjectKey:  objectKey,
 		Kind:       "snapshot",
 		SizeBytes:  size,
+		Checksum:   checksum,
 		Verified:   false,
 		CreatedAt:  now,
 	}

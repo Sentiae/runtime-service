@@ -265,6 +265,58 @@ func TestBootReplica_BootFailure_MarksDead(t *testing.T) {
 	}
 }
 
+// D-184 boot stand-off: a volume being restored REFUSES the boot. Without this
+// a reconciler tick or an ingress wake between the restore's drain and its
+// rename would boot a VM onto the backing file the restore is swapping.
+func TestBootReplica_RefusesWhileVolumeIsRestoring(t *testing.T) {
+	tests := []struct {
+		name       string
+		volStatus  domain.VolumeStatus
+		wantRefuse bool
+	}{
+		{"available boots", domain.VolumeStatusAvailable, false},
+		{"attached boots", domain.VolumeStatusAttached, false},
+		{"restoring is refused", domain.VolumeStatusRestoring, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := newTestApp()
+			rep := newTestReplica(app.ID)
+			replicas := newRTReplicaRepo()
+			_ = replicas.Create(context.Background(), rep)
+
+			vol := volWithBacking(app.ID, "/vol/data.ext4")
+			vol.Status = tt.volStatus
+			booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5"}}
+			uc := NewFleetReplicaRuntime(fakeMaterializer{rootfs: "/work/rootfs.ext4"}, booter, replicas,
+				&rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
+			uc.SetVolumeManager(NewFleetVolumeManager(newVolRepoFake(vol), &recordingBackend{}, "/vol"))
+
+			err := uc.BootReplica(context.Background(), rep.ID)
+			if !tt.wantRefuse {
+				if err != nil {
+					t.Fatalf("BootReplica: %v", err)
+				}
+				if booter.bootInput == nil {
+					t.Fatal("the VM must have been booted")
+				}
+				return
+			}
+			if !errors.Is(err, domain.ErrVolumeRestoreInProgress) {
+				t.Fatalf("err = %v, want ErrVolumeRestoreInProgress", err)
+			}
+			if booter.bootInput != nil {
+				t.Fatal("no VM may be booted onto a volume under restore")
+			}
+			got, _ := replicas.FindByID(context.Background(), rep.ID)
+			if got.State != domain.ReplicaStateDead {
+				t.Fatalf("state = %q, want dead", got.State)
+			}
+		})
+	}
+}
+
 func TestBootReplica_MaterializeFailure_MarksDead(t *testing.T) {
 	app := newTestApp()
 	rep := newTestReplica(app.ID)

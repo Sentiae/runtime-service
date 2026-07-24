@@ -29,6 +29,11 @@ var (
 	// ErrVolumeAppNotScalable is returned when a volume-bearing app is asked to run
 	// more than one replica — a persistent volume is single-writer this cycle.
 	ErrVolumeAppNotScalable = errors.New("volume-bearing app cannot scale beyond one replica")
+	// ErrVolumeRestoreInProgress is returned when a boot is refused because the
+	// app's data volume is being restored in place (D-184). The stand-off is the
+	// point: a VM booted here would hold an fd to the OLD inode while the restore
+	// renames a new backing file onto the path — silent wrong state.
+	ErrVolumeRestoreInProgress = errors.New("volume restore in progress")
 	// ErrVolumesNotSupported is returned when a workload class that has no volume
 	// path (the test class) is provisioned with volumes.
 	ErrVolumesNotSupported = errors.New("volumes are only supported for resident workloads")
