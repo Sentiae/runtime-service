@@ -70,6 +70,9 @@ func (f *restoreVolumeRepo) statusOf(appID uuid.UUID) domain.VolumeStatus {
 type restoreReplicaRepo struct {
 	mu   sync.Mutex
 	live map[uuid.UUID][]domain.Replica
+	// addressless makes every replica come back resident but WITHOUT a guest
+	// address — the state in which the engine cannot be probed at all.
+	addressless bool
 }
 
 func newRestoreReplicaRepo() *restoreReplicaRepo {
@@ -98,7 +101,16 @@ func (f *restoreReplicaRepo) set(appID uuid.UUID, n int) {
 	defer f.mu.Unlock()
 	reps := make([]domain.Replica, 0, n)
 	for i := 0; i < n; i++ {
-		reps = append(reps, domain.Replica{ID: uuid.New(), AppID: appID})
+		// Resident WITH a guest address: the restore's engine-admits gate probes
+		// exactly these, so a replica set without one would be untestable here.
+		r := domain.Replica{
+			ID: uuid.New(), AppID: appID,
+			State: domain.ReplicaStateResident, GuestIP: "10.0.0.2", Port: 5432,
+		}
+		if f.addressless {
+			r.GuestIP, r.Port = "", 0
+		}
+		reps = append(reps, r)
 	}
 	f.live[appID] = reps
 }
@@ -156,6 +168,32 @@ func (f *restoreHealth) Health(context.Context, string) (FleetHealthOutput, erro
 	return FleetHealthOutput{Healthy: healthy, State: "resident"}, nil
 }
 
+// restorePG stands in for the credential-free Postgres readiness probe: it
+// answers whether the engine ADMITS clients, which is the claim a TCP dial
+// cannot make (#p19-restore-false-green-health). Default: admits.
+type restorePG struct {
+	mu     sync.Mutex
+	reject func() error
+	calls  int
+}
+
+func (f *restorePG) probe(context.Context, string, int) error {
+	f.mu.Lock()
+	reject := f.reject
+	f.calls++
+	f.mu.Unlock()
+	if reject == nil {
+		return nil
+	}
+	return reject()
+}
+
+func (f *restorePG) probeCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
 type restoreStore struct {
 	mu      sync.Mutex
 	objects map[string][]byte
@@ -191,6 +229,7 @@ type restoreHarness struct {
 	replicas *restoreReplicaRepo
 	scaler   *restoreScaler
 	health   *restoreHealth
+	pg       *restorePG
 	store    *restoreStore
 	live     string
 	dir      string
@@ -241,9 +280,11 @@ func newRestoreHarness(t *testing.T) *restoreHarness {
 	replicas.set(appID, 1)
 	scaler := &restoreScaler{replicas: replicas}
 	health := &restoreHealth{healthy: true}
+	pg := &restorePG{}
 	store := &restoreStore{objects: map[string][]byte{objectKey: []byte(restoreBytes)}}
 
 	uc := NewFleetVolumeRestorer(context.Background(), repo, vols, replicas, scaler, health, store)
+	uc.pgReady = pg.probe
 	uc.drainTimeout = 2 * time.Second
 	uc.drainPoll = time.Millisecond
 	uc.healthTimeout = 100 * time.Millisecond
@@ -255,7 +296,7 @@ func newRestoreHarness(t *testing.T) *restoreHarness {
 
 	return &restoreHarness{
 		uc: uc, res: res, rp: rp, repo: repo, volumes: vols, replicas: replicas,
-		scaler: scaler, health: health, store: store, live: live, dir: dir,
+		scaler: scaler, health: health, pg: pg, store: store, live: live, dir: dir,
 		selfHost: selfHost,
 	}
 }
@@ -590,6 +631,105 @@ func TestRestore_DegradedWhenRollbackAlsoFailsToBoot(t *testing.T) {
 	}
 	if res.LastError == "" {
 		t.Fatal("last_error must be set")
+	}
+}
+
+// The defect this closes (#p19-restore-false-green-health): the restored engine
+// is ALIVE and its port ACCEPTS connections — fleet health is green — yet it
+// refuses every client because the restored pg_hba.conf came back torn. Twice
+// live, that combination produced phase=ready, verified=true and an EMPTY
+// last_error over a database nobody could reach.
+func TestRestore_NotSuccessfulWhenTheEngineRefusesEveryClient(t *testing.T) {
+	hbaErr := errors.New(`postgres at 10.0.0.2:5432 refused the connection before authentication: FATAL: SQLSTATE 28000: no pg_hba.conf entry for host "10.0.0.1"`)
+
+	tests := []struct {
+		name string
+		// reject decides the probe's verdict; live is the current backing file.
+		reject    func(live string) func() error
+		wantPhase domain.FleetResourcePhase
+		wantBytes string
+	}{
+		{
+			// The recovery point's pg_hba is torn, the original's is fine: the
+			// restore must roll back rather than report success.
+			name: "torn pg_hba in the recovery point rolls the restore back",
+			reject: func(live string) func() error {
+				return func() error {
+					b, err := os.ReadFile(live)
+					if err == nil && string(b) == restoreBytes {
+						return hbaErr
+					}
+					return nil
+				}
+			},
+			wantPhase: domain.FleetResourcePhaseReady, // back in service on the ORIGINAL
+			wantBytes: liveBytes,
+		},
+		{
+			// Nothing admits clients, restored or original: degraded, never ready.
+			name: "an engine that never admits leaves the resource degraded",
+			reject: func(string) func() error {
+				return func() error { return hbaErr }
+			},
+			wantPhase: domain.FleetResourcePhaseDegraded,
+			wantBytes: liveBytes,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newRestoreHarness(t)
+			// Fleet health is GREEN throughout — process alive, port accepting.
+			// Only the engine-admits gate can tell the difference.
+			h.health.healthy = true
+			h.pg.reject = tt.reject(h.live)
+
+			if _, err := h.run(t); err != nil {
+				t.Fatalf("restore: %v", err)
+			}
+			if h.pg.probeCalls() == 0 {
+				t.Fatal("the restore never probed the engine; a TCP dial alone cannot declare a restore successful")
+			}
+			if got := readFile(t, h.live); got != tt.wantBytes {
+				t.Fatalf("live volume = %q, want %q", got, tt.wantBytes)
+			}
+			res := h.resource(t)
+			if res.Phase != tt.wantPhase {
+				t.Fatalf("phase = %q, want %q", res.Phase, tt.wantPhase)
+			}
+			if !strings.Contains(res.LastError, "no pg_hba.conf entry") {
+				t.Fatalf("last_error = %q, must surface why the engine refused clients", res.LastError)
+			}
+			rps, _ := h.repo.ListRecoveryPoints(context.Background(), h.res.ID)
+			if rps[0].Verified {
+				t.Fatal("a recovery point whose engine admits nobody must NOT be marked verified")
+			}
+		})
+	}
+}
+
+// A resident replica with no guest address cannot be probed, so the restore is
+// unprovable — and an unprovable restore is a failed one.
+func TestRestore_FailsClosedWhenTheEngineCannotBeProbed(t *testing.T) {
+	h := newRestoreHarness(t)
+	h.health.healthy = true
+	h.replicas.mu.Lock()
+	h.replicas.addressless = true
+	h.replicas.mu.Unlock()
+
+	if _, err := h.run(t); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	res := h.resource(t)
+	if res.Phase != domain.FleetResourcePhaseDegraded {
+		t.Fatalf("phase = %q, want degraded when the engine could not be probed at all", res.Phase)
+	}
+	if !strings.Contains(res.LastError, "no guest address") {
+		t.Fatalf("last_error = %q, must say the engine could not be probed", res.LastError)
+	}
+	rps, _ := h.repo.ListRecoveryPoints(context.Background(), h.res.ID)
+	if rps[0].Verified {
+		t.Fatal("an unprobeable restore must NOT mark its recovery point verified")
 	}
 }
 

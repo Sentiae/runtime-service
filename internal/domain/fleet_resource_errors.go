@@ -62,6 +62,14 @@ var (
 	// ErrRestoreIntegrity is returned when downloaded recovery-point bytes do not
 	// match the catalog's recorded size/checksum. The live volume is untouched.
 	ErrRestoreIntegrity = errors.New("fleet resource recovery point failed integrity verification")
+	// ErrRestoreEngineNotAdmitting is returned when a restored (or rolled-back)
+	// data engine listens on its port but does not ADMIT clients — the state a
+	// TCP dial cannot see and which twice let a restore with a torn pg_hba.conf
+	// report ready/verified while refusing every connection
+	// (#p19-restore-false-green-health). It also covers the cases where the claim
+	// cannot be checked at all (no addressable resident replica), because a
+	// restore that cannot be proven usable must not be declared successful.
+	ErrRestoreEngineNotAdmitting = errors.New("fleet resource restore: engine is listening but not admitting clients")
 	// ErrSnapshotNotQuiescible is returned when a volume's guest could not be
 	// quiesced (syncfs + fsfreeze over the D-185a control channel) before the
 	// backing file was copied. The snapshot is REFUSED rather than recorded:

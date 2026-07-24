@@ -109,6 +109,14 @@ type FleetVolumeRestorer struct {
 	baseCtx context.Context
 	wg      sync.WaitGroup
 
+	// pgReady decides whether the restored engine ADMITS clients, over and above
+	// the app health probe's process-alive + TCP-dial (see waitHealthy). A field
+	// rather than a direct call so tests drive both verdicts without a live
+	// engine; production is always probePostgresReady. Restores are postgres +
+	// dedicated only (see Restore's tier gate), so the engine-specific probe is
+	// exact here in a way it would not be on the general replica health path.
+	pgReady func(ctx context.Context, host string, port int) error
+
 	// Budgets. Fields (not constants) so tests can drive the state machine
 	// without waiting on real timeouts.
 	budget        time.Duration
@@ -136,6 +144,7 @@ func NewFleetVolumeRestorer(
 		scaler:        scaler,
 		health:        health,
 		store:         store,
+		pgReady:       probePostgresReady,
 		baseCtx:       baseCtx,
 		budget:        30 * time.Minute,
 		drainTimeout:  60 * time.Second,
@@ -401,6 +410,13 @@ func (uc *FleetVolumeRestorer) run(ctx context.Context, resourceID, appID uuid.U
 	// Step 9 — the restore is only real once the engine serves from it.
 	healthErr := uc.waitHealthy(ctx, appID)
 	if healthErr == nil {
+		// ⚠ OVERCLAIM, knowingly retained. The P19 port doc defines `Verified` as
+		// "a restore-VERIFICATION DRILL has passed" — restore this point into a
+		// throwaway target and assert the data. What is actually proven here is
+		// weaker: these bytes booted an engine that admits clients (which is now
+		// genuinely more than a TCP dial, but still says nothing about the CONTENT
+		// of the database). Until a drill exists, `Verified` on this path means
+		// "restored in place and came back serving". The drill lands right here.
 		if verr := uc.resources.MarkRecoveryPointVerified(ctx, rp.ID); verr != nil {
 			log.Warn("fleet restore: mark recovery point verified", "recovery_point_id", rp.ID, "err", verr)
 		}
@@ -644,19 +660,21 @@ func (uc *FleetVolumeRestorer) drain(ctx context.Context, appID uuid.UUID) error
 	}
 }
 
-// waitHealthy polls the app's health until it passes or the budget elapses.
+// waitHealthy polls the app until it is serving, or the budget elapses.
+//
+// "Serving" here is a STRICTER claim than fleet health. The app health probe is
+// process-alive + a TCP dial of the guest port, which proves only that something
+// is listening: a restored Postgres whose pg_hba.conf came back torn passes it
+// while refusing every client (#p19-restore-false-green-health, observed live
+// twice). So a restore — the one operation that hands customers back data they
+// asked to be trusted — additionally requires the engine to ADMIT a connection.
 func (uc *FleetVolumeRestorer) waitHealthy(ctx context.Context, appID uuid.UUID) error {
 	deadline := time.Now().Add(uc.healthTimeout)
 	var last error
 	for {
-		h, err := uc.health.Health(ctx, appID.String())
-		switch {
-		case err != nil:
-			last = fmt.Errorf("health probe: %w", err)
-		case h.Healthy:
+		last = uc.serving(ctx, appID)
+		if last == nil {
 			return nil
-		default:
-			last = fmt.Errorf("app not healthy (state=%s message=%s)", h.State, h.Message)
 		}
 		if !time.Now().Before(deadline) {
 			return last
@@ -667,6 +685,55 @@ func (uc *FleetVolumeRestorer) waitHealthy(ctx context.Context, appID uuid.UUID)
 		case <-time.After(uc.healthPoll):
 		}
 	}
+}
+
+// serving is one round of the two gates: fleet health first (it is cheap and it
+// is what reports a VM that never came back at all), then the engine-admits
+// probe.
+func (uc *FleetVolumeRestorer) serving(ctx context.Context, appID uuid.UUID) error {
+	h, err := uc.health.Health(ctx, appID.String())
+	if err != nil {
+		return fmt.Errorf("health probe: %w", err)
+	}
+	if !h.Healthy {
+		return fmt.Errorf("app not healthy (state=%s message=%s)", h.State, h.Message)
+	}
+	return uc.engineAdmits(ctx, appID)
+}
+
+// engineAdmits checks that every resident replica of the app lets a client
+// through pg_hba to authentication, using the credential-free probe.
+//
+// Fail-closed throughout: a replica listed as resident with no guest address, an
+// app with no resident replica at all, and a repository error are all failures,
+// because each of them means the restore cannot be PROVEN to have produced a
+// usable database — and an unprovable restore must never be reported as one.
+func (uc *FleetVolumeRestorer) engineAdmits(ctx context.Context, appID uuid.UUID) error {
+	if uc.pgReady == nil {
+		return fmt.Errorf("%w: no readiness probe is wired, so the restored engine cannot be confirmed usable", domain.ErrRestoreEngineNotAdmitting)
+	}
+	reps, err := uc.replicas.ListByApp(ctx, appID)
+	if err != nil {
+		return fmt.Errorf("%w: list replicas: %w", domain.ErrRestoreEngineNotAdmitting, err)
+	}
+	probed := 0
+	for i := range reps {
+		r := &reps[i]
+		if r.State != domain.ReplicaStateResident {
+			continue
+		}
+		if r.GuestIP == "" || r.Port <= 0 {
+			return fmt.Errorf("%w: replica %s is resident but carries no guest address to probe", domain.ErrRestoreEngineNotAdmitting, r.ID)
+		}
+		if perr := uc.pgReady(ctx, r.GuestIP, r.Port); perr != nil {
+			return fmt.Errorf("%w: replica %s: %w", domain.ErrRestoreEngineNotAdmitting, r.ID, perr)
+		}
+		probed++
+	}
+	if probed == 0 {
+		return fmt.Errorf("%w: app %s has no resident replica to probe", domain.ErrRestoreEngineNotAdmitting, appID)
+	}
+	return nil
 }
 
 // scale sets the app's desired replica count through the orchestrator.
