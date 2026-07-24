@@ -517,14 +517,27 @@ func (p *Provider) Terminate(ctx context.Context, socketPath string, pid int) er
 	return nil
 }
 
-// Pause pauses a running microVM (for snapshot creation)
+// Pause pauses a running microVM (for snapshot creation). Firecracker exposes VM
+// lifecycle state via PATCH /vm {"state":"Paused"}, NOT PUT /actions (whose
+// action_type only accepts InstanceStart/SendCtrlAltDel/FlushMetrics — "Pause" is
+// rejected 400). Verified live on the .244 fleet host (D-183 §9 #3 integration).
 func (p *Provider) Pause(ctx context.Context, socketPath string) error {
-	return p.sendAction(ctx, socketPath, "Pause")
+	client := p.unixHTTPClient(socketPath)
+	if err := p.apiPatch(ctx, client, "/vm", map[string]string{"state": "Paused"}); err != nil {
+		return fmt.Errorf("pause vm: %w", err)
+	}
+	log.Printf("Firecracker paused (socket=%s)", socketPath)
+	return nil
 }
 
-// Resume resumes a paused microVM
+// Resume resumes a paused microVM (PATCH /vm {"state":"Resumed"}).
 func (p *Provider) Resume(ctx context.Context, socketPath string) error {
-	return p.sendAction(ctx, socketPath, "Resume")
+	client := p.unixHTTPClient(socketPath)
+	if err := p.apiPatch(ctx, client, "/vm", map[string]string{"state": "Resumed"}); err != nil {
+		return fmt.Errorf("resume vm: %w", err)
+	}
+	log.Printf("Firecracker resumed (socket=%s)", socketPath)
+	return nil
 }
 
 // Run executes code inside a dedicated Firecracker microVM using rootfs injection.

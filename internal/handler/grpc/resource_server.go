@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"errors"
+	"log"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -339,6 +340,11 @@ func resourceError(err error) error {
 	case errors.Is(err, domain.ErrResourceSharedPasswordAmbiguous):
 		return status.Error(codes.FailedPrecondition, "resolved secrets do not identify a single role password")
 	default:
+		// Log the real error server-side before curating a leak-free code for the
+		// caller — an unmapped failure (e.g. a fleet-side Pause/boot/volume error)
+		// must never be silently swallowed into a bare Internal (observability gap
+		// found on the .244 integration drive).
+		log.Printf("resource op failed (unmapped): %v", err)
 		return fleetError(err)
 	}
 }
