@@ -156,6 +156,17 @@ func (s *Server) RegisterNetworkFabric(fabric *NetworkFabricServer) {
 	}
 }
 
+// RegisterResourceProvisioning registers the ResourceProvisioning service (P19,
+// CP4.5 §9 #3, D-183). Separate from RegisterFleet because P19 (the durable
+// resource control plane) and P7 (the workload seam) are separate ports. Safe to
+// call after NewServer but before Serve.
+func (s *Server) RegisterResourceProvisioning(resource *ResourceServer) {
+	runtimev1.RegisterResourceProvisioningServer(s.builder.Registrar(), resource)
+	if s.healthServer != nil {
+		s.healthServer.SetServingStatus("runtime.v1.ResourceProvisioning", grpc_health_v1.HealthCheckResponse_SERVING)
+	}
+}
+
 // GetGRPCServer returns a primary underlying gRPC server for introspection.
 // Use Serve for the real listen path so every configured transport is served.
 func (s *Server) GetGRPCServer() *grpc.Server {

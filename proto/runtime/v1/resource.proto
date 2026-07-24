@@ -1,0 +1,140 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/sentiae/runtime-service/gen/proto/runtime/v1;runtimev1";
+
+// ResourceProvisioning is the P19 resource control-plane seam (CP4.5 §9 #3,
+// D-164/D-183). It is a NET-NEW contract, distinct from FleetOrchestration (the
+// frozen P7 workload seam). delivery drives it to claim, snapshot, and reclaim
+// managed resources (databases, caches, queues) that back a resident system;
+// the fleet stores the durable claim ledger and actuates the backend.
+service ResourceProvisioning {
+    rpc GetResourceCapabilities(GetResourceCapabilitiesRequest) returns (GetResourceCapabilitiesResponse);
+    rpc ProvisionResource(ProvisionResourceRequest) returns (ProvisionResourceResponse);
+    rpc GetResourceStatus(GetResourceStatusRequest) returns (ResourceStatusResponse);
+    rpc SnapshotResource(SnapshotResourceRequest) returns (SnapshotResourceResponse);
+    rpc ListResourceRecoveryPoints(ListResourceRecoveryPointsRequest) returns (ListResourceRecoveryPointsResponse);
+    // RestoreResource returns Unimplemented in v1 — the recovery-point restore
+    // path lands with a later CP4.5 slice; the contract is frozen now.
+    rpc RestoreResource(RestoreResourceRequest) returns (RestoreResourceResponse);
+    // RotateResourceCredentials returns Unimplemented in v1 — credential rotation
+    // lands with a later CP4.5 slice; the contract is frozen now.
+    rpc RotateResourceCredentials(RotateResourceCredentialsRequest) returns (RotateResourceCredentialsResponse);
+    rpc DecommissionResource(DecommissionResourceRequest) returns (DecommissionResourceResponse);
+}
+
+// RecoveryPointProto is one snapshot/backup entry in a resource's recovery
+// catalog. `ref` is the object-store key (a reference, never a value); `at` is
+// when it was taken; `verified` reports whether a restore-test proved it sound.
+message RecoveryPointProto {
+    string ref = 1;
+    string kind = 2;
+    google.protobuf.Timestamp at = 3;
+    bool verified = 4;
+}
+
+message GetResourceCapabilitiesRequest {
+    string class = 1; // optional filter; empty returns every class
+}
+message ResourceClassCapability {
+    string class = 1;
+    repeated string tiers = 2;
+    repeated string versions = 3;
+    bool supports_snapshot = 4;
+    bool supports_restore = 5;
+    bool supports_credential_rotation = 6;
+}
+message GetResourceCapabilitiesResponse {
+    repeated ResourceClassCapability classes = 1;
+}
+
+// ProvisionResourceRequest is the resource claim. Idempotency is anchored on
+// (owner_org, claim_key, env): a repeat claim resolves the existing handle
+// rather than provisioning a second backend.
+message ProvisionResourceRequest {
+    string claim_key = 1;
+    // owner_org is the attested tenant (org uuid) that owns this claim, scoped
+    // exactly like ProvisionRequest.owner_org (D-069/I28).
+    string owner_org = 2;
+    string env = 3;
+    int32 revision = 4;
+    string class = 5;
+    string tier = 6;
+    string version = 7;
+    int64 size_mb = 8;
+    // system_id binds the resource to a P21 fleet network (CP4.5 §9 #5). Opaque
+    // scope key resolved by delivery from catalog; the fleet stores and compares
+    // it, never dereferences it.
+    string system_id = 9;
+    string durability = 10;
+    int64 ttl_seconds = 11;
+    string seed_template_key = 12;
+    map<string, string> params = 13;
+    // secret_refs are the delivery-sealed engine credential refs (references
+    // only, resolved per-tenant at provision). Mirrors ProvisionRequest carriage.
+    repeated string secret_refs = 14;
+    // vault_token is the delivery-minted, org-scoped broker token. Memory-only on
+    // the fleet — NEVER persisted to a row, rootfs, or log. Mirrors
+    // DeploymentDescriptor.vault_token (D-125).
+    string vault_token = 15;
+}
+message ProvisionResourceResponse {
+    string handle = 1;
+    string phase = 2;
+    string endpoint = 3;
+}
+
+message GetResourceStatusRequest {
+    string handle = 1;
+}
+message ResourceStatusResponse {
+    string handle = 1;
+    string phase = 2;
+    string endpoint = 3;
+    repeated string secret_refs = 4;
+    int32 conn_budget = 5;
+    repeated string conditions = 6;
+    optional RecoveryPointProto last_recovery_point = 7;
+}
+
+message SnapshotResourceRequest {
+    string handle = 1;
+    string kind = 2; // e.g. "manual" | "scheduled"
+}
+message SnapshotResourceResponse {
+    RecoveryPointProto recovery_point = 1;
+}
+
+message ListResourceRecoveryPointsRequest {
+    string handle = 1;
+}
+message ListResourceRecoveryPointsResponse {
+    repeated RecoveryPointProto recovery_points = 1;
+}
+
+message RestoreResourceRequest {
+    string handle = 1;
+    string recovery_point_ref = 2;
+}
+message RestoreResourceResponse {
+    string handle = 1;
+    string phase = 2;
+}
+
+message RotateResourceCredentialsRequest {
+    string handle = 1;
+}
+message RotateResourceCredentialsResponse {
+    repeated string secret_refs = 1;
+}
+
+message DecommissionResourceRequest {
+    string handle = 1;
+    bool final_snapshot = 2;
+}
+message DecommissionResourceResponse {
+    optional RecoveryPointProto final_recovery_point = 1;
+}

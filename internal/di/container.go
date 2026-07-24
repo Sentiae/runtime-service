@@ -186,6 +186,19 @@ type Container struct {
 	VolumeBackend      usecase.VolumeBackend
 	FleetVolumeManager *usecase.FleetVolumeManager
 
+	// CP4.5 §9#3 (D-183) — P19 durable resource control plane. The repo + the
+	// dedicated provisioner are wired on every host: off the firecracker host the
+	// dedicated path fails loud through the composed FleetProvision
+	// (FailLoudImageBooter), never a silent fake. The volume snapshotter is
+	// firecracker-host-only (it needs a live VMPauser). The shared-tier provisioner
+	// + its TTL reaper are non-nil only when the shared logical engine is wired.
+	FleetResourceRepo     repository.FleetResourceRepository
+	ResourceSnapshotter   *usecase.FleetVolumeSnapshotter
+	FleetResourceUC       *usecase.FleetResourceProvisioner
+	FleetResourceSharedUC *usecase.FleetResourceSharedProvisioner
+	ResourceServer        *grpchandler.ResourceServer
+	snapshotArtifactStore usecase.ArtifactStore
+
 	// CP4.5 §9#5 — P21 fleet network fabric (per-system×env policy scope compiled
 	// to iptables). The enforcer is fail-loud off the firecracker host, and also
 	// whenever the real one could not install or PROVE its FORWARD program at boot
@@ -578,10 +591,71 @@ func (c *Container) initFleet(cfg *config.Config) {
 		)
 	}
 
+	c.initResourceControlPlane(cfg)
+
 	if cfg.App.ExecutorType == "firecracker" {
 		c.registerSelfHost(cfg)
 	} else {
 		log.Println("Fleet self-registration skipped (executor is not firecracker)")
+	}
+}
+
+// initResourceControlPlane wires the P19 durable resource control plane (CP4.5
+// §9#3, D-183): the volume snapshotter (D-080), the dedicated-tier provisioner
+// (R2), and the ResourceProvisioning gRPC handler.
+//
+// The dedicated path composes c.FleetProvisionUC, so it inherits the SAME
+// fail-loud posture as the P7 workload seam: off the firecracker host
+// FleetProvision boots through FailLoudImageBooter and every ProvisionDedicated
+// is refused (ErrImageBootUnavailable) rather than silently faking a data-VM.
+// The snapshotter needs a live VMPauser (the firecracker Provider) and so is
+// firecracker-host-only; off-host it stays nil and the snapshot-first
+// decommission of a durable resource fails closed (ErrResourceFinalSnapshotRequired).
+func (c *Container) initResourceControlPlane(cfg *config.Config) {
+	// Volume snapshotter — firecracker host only (needs the FC Provider as the
+	// VMPauser). A nil pointer here is deliberate off-host; it is never wrapped in
+	// a non-nil interface (see the explicit branches below).
+	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
+		c.ResourceSnapshotter = usecase.NewFleetVolumeSnapshotter(
+			c.FCProvider,
+			c.snapshotArtifactStore,
+			c.VolumeRepo,
+			c.ReplicaRepo,
+			c.FleetResourceRepo,
+		)
+	}
+
+	// Dedicated-tier provisioner (R2) — always wired. Pass the snapshotter as the
+	// VolumeSnapshotter port ONLY when non-nil so DecommissionDedicated's nil-guard
+	// stays honest (a typed-nil interface would defeat it).
+	var snapPort usecase.VolumeSnapshotter
+	if c.ResourceSnapshotter != nil {
+		snapPort = c.ResourceSnapshotter
+	}
+	c.FleetResourceUC = usecase.NewFleetResourceProvisioner(
+		c.FleetProvisionUC,
+		c.FleetResourceRepo,
+		c.ReplicaRepo,
+		snapPort,
+		usecase.DedicatedEngineConfig{
+			Registry:   cfg.Resource.EnginePGImageRegistry,
+			Repository: cfg.Resource.EnginePGImageRepository,
+			Digest:     cfg.Resource.EnginePGImageDigest,
+			ConnBudget: cfg.Resource.ConnBudget,
+		},
+	)
+
+	// ResourceProvisioning handler. The shared-tier provisioner is intentionally
+	// nil here: constructing its testdb.Provisioner backend requires shared-engine
+	// admin credentials (user/password/admin-db/template) that ResourceConfig does
+	// not carry — a NEEDS-DECISION escalated to the session lead. Until that lands,
+	// the shared route answers Unavailable (an honest "not configured" rather than
+	// a silent fake). Pass a true-nil snapshotter off the firecracker host so the
+	// handler's Unavailable guard fires.
+	if c.ResourceSnapshotter != nil {
+		c.ResourceServer = grpchandler.NewResourceServer(c.FleetResourceUC, nil, c.ResourceSnapshotter, c.FleetResourceRepo)
+	} else {
+		c.ResourceServer = grpchandler.NewResourceServer(c.FleetResourceUC, nil, nil, c.FleetResourceRepo)
 	}
 }
 
@@ -990,6 +1064,9 @@ func (c *Container) initRepositories() {
 	c.RouteRepo = postgres.NewRouteRepository(c.DB)
 	c.VolumeRepo = postgres.NewVolumeRepository(c.DB)
 
+	// CP4.5 §9#3 (D-183) — P19 resource control-plane store.
+	c.FleetResourceRepo = postgres.NewFleetResourceRepository(c.DB)
+
 	// CP4.5 §9#5 — P21 fleet network fabric store.
 	c.FleetNetworkRepo = postgres.NewFleetNetworkRepository(c.DB)
 	c.FleetNetworkPolicyRepo = postgres.NewFleetNetworkPolicyRepository(c.DB)
@@ -1010,6 +1087,9 @@ func (c *Container) initUseCases(cfg *config.Config) {
 	// Build the durable snapshot store once and reuse it for both the snapshot
 	// service and the warm-pool template persistence (don't double-build).
 	snapshotStore := c.buildSnapshotStore(cfg)
+	// Stash for initFleet's P19 volume snapshotter (D-183), which streams
+	// recovery points to the same durable artifact store.
+	c.snapshotArtifactStore = snapshotStore
 	if snapshotStore != nil {
 		if injectable, ok := snapSvc.(usecase.SnapshotStoreInjectable); ok {
 			injectable.SetArtifactStore(snapshotStore)
@@ -1435,6 +1515,14 @@ func (c *Container) initHandlers() {
 		// truthful answer rather than an unimplemented one.
 		c.GRPCServer.RegisterNetworkFabric(grpchandler.NewNetworkFabricServer(c.FleetNetworkFabricUC))
 		log.Println("FleetNetworkFabric gRPC service registered")
+
+		// CP4.5 §9#3 (D-183) — P19 ResourceProvisioning. Registered on every host:
+		// off the firecracker host the dedicated path fails loud through the composed
+		// FleetProvision, a truthful answer rather than an unimplemented one.
+		if c.ResourceServer != nil {
+			c.GRPCServer.RegisterResourceProvisioning(c.ResourceServer)
+			log.Println("ResourceProvisioning gRPC service registered")
+		}
 	}
 
 	// Wave-8 uniform ops surface (D-179): /posture reports the declared boot
@@ -1492,6 +1580,13 @@ func (c *Container) StartBackgroundControllers(ctx context.Context) {
 	c.startFleetHeartbeat(ctx)
 	c.startFleetActivityFeed(ctx)
 	c.startFleetReconciler(ctx)
+	// CP4.5 §9#3 (D-183) — shared-tier TTL reaper. Nil until the shared engine is
+	// wired (NEEDS-DECISION on shared-engine admin credentials); the loop is
+	// ctx-aware + panic-recovering and exits on ctx cancel or Stop().
+	if c.FleetResourceSharedUC != nil {
+		c.FleetResourceSharedUC.Start(ctx)
+		log.Println("Fleet shared-resource TTL reaper started")
+	}
 	c.StartConsumers(ctx)
 }
 
@@ -1637,6 +1732,11 @@ func (c *Container) Close() error {
 	// their results are persisted before the DB pool closes.
 	if c.FleetProvisionUC != nil {
 		c.FleetProvisionUC.Wait()
+	}
+
+	// CP4.5 §9#3 (D-183) — stop the shared-tier TTL reaper (waits for the loop).
+	if c.FleetResourceSharedUC != nil {
+		c.FleetResourceSharedUC.Stop()
 	}
 
 	// runtime-fleet P3.4 — stop the Vault client's background lease renewer.

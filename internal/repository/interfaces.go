@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/sentiae/runtime-service/internal/domain"
@@ -241,6 +242,31 @@ type RouteRepository interface {
 	// custom_domain). Returns domain.ErrRouteNotFound when none matches. Used by
 	// the scale-to-zero activator to map a woken request's host to its app (rt#11).
 	FindByHost(ctx context.Context, host string) (*domain.Route, error)
+}
+
+// FleetResourceRepository persists P19 resource control-plane claims and their
+// recovery points (CP4.5 §9 #3, D-164/D-183).
+type FleetResourceRepository interface {
+	// SaveResource upserts a resource claim by primary key.
+	SaveResource(ctx context.Context, resource *domain.FleetResource) error
+	// GetResourceByHandle resolves a resource by its id (handle). Returns
+	// domain.ErrResourceNotFound when none matches.
+	GetResourceByHandle(ctx context.Context, id uuid.UUID) (*domain.FleetResource, error)
+	// FindResource is the idempotency lookup: it resolves the existing claim for
+	// an (ownerOrg, claimKey, env) triple — the pair the unique index enforces.
+	// Returns domain.ErrResourceNotFound when no claim matches.
+	FindResource(ctx context.Context, ownerOrg uuid.UUID, claimKey, env string) (*domain.FleetResource, error)
+	// UpdateResourcePhase advances a resource's lifecycle phase. Returns
+	// domain.ErrResourceNotFound when no resource matches the id.
+	UpdateResourcePhase(ctx context.Context, id uuid.UUID, phase domain.FleetResourcePhase) error
+	// ListExpiredShared returns the shared-variant resources (app_id IS NULL)
+	// whose TTL has elapsed and that are not yet tombstoned — the reaper's work
+	// list. Dedicated resources (app_id set) are reclaimed via their FleetApp.
+	ListExpiredShared(ctx context.Context, now time.Time) ([]domain.FleetResource, error)
+	// SaveRecoveryPoint records a snapshot/backup catalog entry.
+	SaveRecoveryPoint(ctx context.Context, rp *domain.FleetResourceRecoveryPoint) error
+	// ListRecoveryPoints returns a resource's recovery points, newest first.
+	ListRecoveryPoints(ctx context.Context, resourceID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error)
 }
 
 // VolumeRepository persists volumes for fleet apps.

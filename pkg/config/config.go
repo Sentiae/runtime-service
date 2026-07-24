@@ -23,6 +23,34 @@ type Config struct {
 	ImageBoot     ImageBootConfig     `mapstructure:"imageboot"`
 	Fleet         FleetConfig         `mapstructure:"fleet"`
 	Telemetry     TelemetryConfig     `mapstructure:"telemetry"`
+	Resource      ResourceConfig      `mapstructure:"resource"`
+}
+
+// ResourceConfig configures the P19 durable resource control plane (CP4.5 §9 #3,
+// D-183): the dedicated data-VM engine image, the shared logical-database engine
+// endpoint, and the shared-tier reclamation TTL + seed-template allowlist.
+type ResourceConfig struct {
+	// EnginePGImageRegistry/Repository/Digest name the compiled Postgres engine
+	// image the dedicated tier boots as a resident data-VM. All three are required
+	// for a dedicated provision (an empty ref fails the underlying image-boot).
+	EnginePGImageRegistry   string `mapstructure:"engine_pg_image_registry"`
+	EnginePGImageRepository string `mapstructure:"engine_pg_image_repository"`
+	EnginePGImageDigest     string `mapstructure:"engine_pg_image_digest"`
+	// ConnBudget is the advertised connection budget reported in a dedicated
+	// resource's status (informational; defaults to 100).
+	ConnBudget int `mapstructure:"conn_budget"`
+	// SharedPGHost/SharedPGPort address the SEPARATE Postgres engine on the fleet
+	// host that backs the shared tier's logical databases (NOT the control-plane
+	// DB — D-027/D-103). Published as a shared resource's endpoint.
+	SharedPGHost string `mapstructure:"shared_pg_host"`
+	SharedPGPort int    `mapstructure:"shared_pg_port"`
+	// SharedTTL is the lifetime of a shared logical database before the reaper
+	// reclaims it (expires_at = now()+SharedTTL).
+	SharedTTL time.Duration `mapstructure:"shared_ttl"`
+	// SharedSeedTemplates is the operator-controlled allowlist of template
+	// databases a shared logical database may be cloned from. A requested seed
+	// outside this set is rejected (never raw caller input).
+	SharedSeedTemplates []string `mapstructure:"shared_seed_templates"`
 }
 
 // TelemetryConfig configures the OTLP export path (traces/metrics/logs → the
@@ -480,6 +508,16 @@ func Load() (*Config, error) {
 			// never required — telemetry init is non-fatal.
 			"telemetry.service_name":  "runtime-service",
 			"telemetry.otlp_endpoint": "otel-collector:4317",
+
+			// P19 durable resource control plane (CP4.5 §9 #3, D-183).
+			"resource.engine_pg_image_registry":   "",
+			"resource.engine_pg_image_repository": "",
+			"resource.engine_pg_image_digest":     "",
+			"resource.conn_budget":                100,
+			"resource.shared_pg_host":             "",
+			"resource.shared_pg_port":             5432,
+			"resource.shared_ttl":                 "24h",
+			"resource.shared_seed_templates":      []string{},
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -625,6 +663,16 @@ func Load() (*Config, error) {
 			// Telemetry (OTLP export)
 			{"telemetry.service_name", "APP_TELEMETRY_SERVICE_NAME"},
 			{"telemetry.otlp_endpoint", "APP_TELEMETRY_OTLP_ENDPOINT"},
+
+			// P19 durable resource control plane (CP4.5 §9 #3, D-183)
+			{"resource.engine_pg_image_registry", "APP_RESOURCE_ENGINE_PG_IMAGE_REGISTRY"},
+			{"resource.engine_pg_image_repository", "APP_RESOURCE_ENGINE_PG_IMAGE_REPOSITORY"},
+			{"resource.engine_pg_image_digest", "APP_RESOURCE_ENGINE_PG_IMAGE_DIGEST"},
+			{"resource.conn_budget", "APP_RESOURCE_CONN_BUDGET"},
+			{"resource.shared_pg_host", "APP_RESOURCE_SHARED_PG_HOST"},
+			{"resource.shared_pg_port", "APP_RESOURCE_SHARED_PG_PORT"},
+			{"resource.shared_ttl", "APP_RESOURCE_SHARED_TTL"},
+			{"resource.shared_seed_templates", "APP_RESOURCE_SHARED_SEED_TEMPLATES"},
 		},
 	})
 	if err != nil {
