@@ -252,6 +252,12 @@ func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath st
 			"path_on_host":   dataDiskPath,
 			"is_root_device": false,
 			"is_read_only":   false,
+			// SentiaeDB Phase-0 P0 (D-184, #p19-firecracker-cache-type-fsync):
+			// the persistent data volume MUST use Writeback so the guest's fsync
+			// is honored down to the host. Firecracker's default (Unsafe) drops
+			// flushes at the host boundary — every Postgres fsync becomes a no-op
+			// and a host crash loses committed data. Writeback is the durable mode.
+			"cache_type": "Writeback",
 		}); err != nil {
 			b.killVM(cmd, socketPath)
 			return nil, "", fmt.Errorf("configure data drive: %w", err)
