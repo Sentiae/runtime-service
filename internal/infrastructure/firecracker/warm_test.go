@@ -4,21 +4,40 @@ package firecracker
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
+	"strings"
+	"syscall"
 	"testing"
 )
 
 func TestWarmBootArgs(t *testing.T) {
 	got := warmBootArgs(warmGuestIP, warmHostIP, warmNetmask)
-	want := "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/warm-init ip=172.30.0.2::172.30.0.1:255.255.255.252::eth0:off"
+	want := "console=ttyS0 reboot=k panic=1 pci=off ro init=/sbin/warm-init ip=172.30.0.2::172.30.0.1:255.255.255.252::eth0:off"
 	if got != want {
 		t.Fatalf("warmBootArgs:\n got %q\nwant %q", got, want)
 	}
 }
 
+// The warm rootfs is ONE ext4 inode shared by the template and every concurrent
+// clone. `ro` must be stated on the kernel command line, not inherited from the
+// kernel's unstated root_mountflags default — dropping it silently makes / of a
+// shared filesystem writable by every tenant's clone.
+func TestWarmBootArgsMountsRootReadOnly(t *testing.T) {
+	args := warmBootArgs(warmGuestIP, warmHostIP, warmNetmask)
+	if !slices.Contains(strings.Fields(args), "ro") {
+		t.Fatalf("warmBootArgs must carry an explicit `ro` token: %q", args)
+	}
+	if slices.Contains(strings.Fields(args), "rw") {
+		t.Fatalf("warmBootArgs must never carry `rw`: %q", args)
+	}
+}
+
 func TestWarmBootSourceBody(t *testing.T) {
 	body := warmBootSourceBody("/var/lib/firecracker/kernel/vmlinux")
-	wantArgs := "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/warm-init ip=172.30.0.2::172.30.0.1:255.255.255.252::eth0:off"
+	wantArgs := "console=ttyS0 reboot=k panic=1 pci=off ro init=/sbin/warm-init ip=172.30.0.2::172.30.0.1:255.255.255.252::eth0:off"
 	if body["kernel_image_path"] != "/var/lib/firecracker/kernel/vmlinux" {
 		t.Fatalf("kernel_image_path = %v", body["kernel_image_path"])
 	}
@@ -37,16 +56,76 @@ func TestWarmMachineConfigBody(t *testing.T) {
 	}
 }
 
+// is_read_only MUST be true: the same <lang>-warm.ext4 inode is hard-linked into
+// the template's chroot and into every concurrent clone's chroot (the CoW is on
+// memory only). Read-only at the device is what makes sharing one inode safe —
+// flipping it back to false re-arms cross-tenant filesystem corruption.
 func TestWarmRootfsDriveBody(t *testing.T) {
 	body := warmRootfsDriveBody("/var/lib/firecracker/rootfs/python-warm.ext4")
 	want := map[string]any{
 		"drive_id":       "rootfs",
 		"path_on_host":   "/var/lib/firecracker/rootfs/python-warm.ext4",
 		"is_root_device": true,
-		"is_read_only":   false,
+		"is_read_only":   true,
 	}
 	if !reflect.DeepEqual(body, want) {
 		t.Fatalf("warmRootfsDriveBody:\n got %#v\nwant %#v", body, want)
+	}
+}
+
+// TestLinkWarmRootfsDoesNotChown pins the other half of the shared-inode
+// invariant: the warm rootfs is hard-linked into the template's chroot and into
+// EVERY clone's chroot, so it must be linked root-owned and never chowned — a
+// per-clone chown rewrites the owner of the one file every other live clone is
+// reading. The jail uid deliberately differs from the test process's uid, so a
+// chown would be visible either way: unprivileged it fails outright, as root it
+// changes the inode's owner (and it is one inode — the stat taken BEFORE the
+// link is the original).
+func TestLinkWarmRootfsDoesNotChown(t *testing.T) {
+	base := t.TempDir()
+	j := newVMJail(base, cloneJailID(3), 100000+ephUIDOffset)
+	if err := os.MkdirAll(j.rootDir(), 0o755); err != nil {
+		t.Fatalf("prepare jail root: %v", err)
+	}
+
+	src := filepath.Join(base, "python-warm.ext4")
+	if err := os.WriteFile(src, []byte("not-really-ext4"), 0o644); err != nil {
+		t.Fatalf("write warm rootfs: %v", err)
+	}
+	before, err := os.Stat(src)
+	if err != nil {
+		t.Fatalf("stat warm rootfs: %v", err)
+	}
+	beforeSys, ok := before.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("no syscall.Stat_t on this platform")
+	}
+
+	got, err := linkWarmRootfs(j, src)
+	if err != nil {
+		t.Fatalf("linkWarmRootfs: %v", err)
+	}
+	if want := "/" + warmRootfsRel; got != want {
+		t.Fatalf("chroot view = %q, want %q", got, want)
+	}
+
+	after, err := os.Stat(src)
+	if err != nil {
+		t.Fatalf("stat warm rootfs after link: %v", err)
+	}
+	afterSys, ok := after.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("no syscall.Stat_t after link")
+	}
+	if afterSys.Uid != beforeSys.Uid || afterSys.Gid != beforeSys.Gid {
+		t.Fatalf("shared warm rootfs was chowned: %d:%d -> %d:%d",
+			beforeSys.Uid, beforeSys.Gid, afterSys.Uid, afterSys.Gid)
+	}
+	if after.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("shared warm rootfs mode changed: %v -> %v", before.Mode().Perm(), after.Mode().Perm())
+	}
+	if _, err := os.Stat(j.hostPath(warmRootfsRel)); err != nil {
+		t.Fatalf("rootfs not linked into the jail: %v", err)
 	}
 }
 

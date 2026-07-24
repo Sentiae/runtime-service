@@ -48,20 +48,40 @@ const (
 // (the warm pool's index allocator).
 func cloneJailID(n int) string { return fmt.Sprintf("clone%d", n) }
 
+// linkWarmRootfs hard-links the shared warm rootfs into a warm chroot (the
+// template's or a clone's) and returns its chroot view.
+//
+// It NEVER chowns. One <lang>-warm.ext4 inode is linked into the template's
+// chroot and into every concurrent clone's chroot, and the drive is served
+// READ-ONLY (warmRootfsDriveBody), so no VM needs to own it — exactly like the
+// template .state/.mem pair. A chown here would be a per-clone write to an inode
+// every other live clone is using. Both call sites go through this one function
+// so the invariant cannot drift between them.
+//
+// ⚠ Host precondition: <lang>-warm.ext4 must be root-owned mode 0644, or the
+// jailed VMM (running as the unprivileged warm uid) cannot open its root device.
+func linkWarmRootfs(j *vmJail, rootfsPath string) (string, error) {
+	chrootPath, err := j.link(rootfsPath, warmRootfsRel, false)
+	if err != nil {
+		return "", fmt.Errorf("link warm rootfs: %w", err)
+	}
+	return chrootPath, nil
+}
+
 // warmUID is the uid AND gid the warm template and every warm clone run as —
 // ONE shared identity for the whole warm path (D-185d, owner-ruled), drawn from
 // the slot reserved at the bottom of the ephemeral range.
 //
-// Why shared rather than per-VM: the clones' rootfs is a single shared ext4 file
-// opened READ-WRITE by every concurrent clone (the CoW in this path is on memory
-// only — mem_backend File is an mmap; the drive is not copied). A per-clone uid
-// would therefore have to chown that one shared inode per clone, which is a
-// fight no clone wins. It would also be buying clone-to-clone isolation that the
-// shared read-write filesystem defeats anyway. The gap between clones is that
-// shared rootfs, NOT the uid — and closing it is a separate change to the warm
-// path. What the shared uid DOES buy is the point of the ruling: an escaping
-// warm VMM lands as an unprivileged user, not as host root next to every
-// tenant's data volume.
+// Why shared rather than per-VM: the clones' rootfs is a single shared ext4
+// file (the CoW in this path is on memory only — mem_backend File is an mmap;
+// the drive is not copied). It is served READ-ONLY to every VM (see
+// warmRootfsDriveBody), which is what makes one shared inode safe. A per-clone
+// uid would have to chown that one shared inode per clone, which is a fight no
+// clone wins. Handing clones distinct uids is a separate change — it needs its
+// own non-colliding uid sub-range — and is deliberately NOT done here.
+// What the shared uid DOES buy is the point of the ruling: an escaping warm VMM
+// lands as an unprivileged user, not as host root next to every tenant's data
+// volume.
 func (m *WarmManager) warmUID() int {
 	return vmUID(m.p.cfg.VMUIDBase, ephUIDOffset)
 }
@@ -180,10 +200,8 @@ func (m *WarmManager) BootWarm(ctx context.Context, language domain.Language) (*
 		dropTap()
 		return nil, fmt.Errorf("place kernel in warm jail: %w", err)
 	}
-	// The chown is a ONE-TIME owner set on a file that is shared by construction
-	// (the template and every clone of it run as the same warm uid), not a
-	// per-VM claim — see warmUID.
-	rootfsChroot, err := j.link(rootfsPath, warmRootfsRel, true)
+	// Root-owned, NOT chowned — see linkWarmRootfs.
+	rootfsChroot, err := linkWarmRootfs(j, rootfsPath)
 	if err != nil {
 		j.remove()
 		dropTap()
@@ -247,7 +265,7 @@ func (m *WarmManager) BootWarm(ctx context.Context, language domain.Language) (*
 }
 
 // configureWarmVM drives the FC API to set machine config, the warm boot source
-// (init=/sbin/warm-init + kernel ip= arg), the warm rootfs drive (rw, root), and
+// (init=/sbin/warm-init + kernel ip= arg), the warm rootfs drive (read-only, root), and
 // the eth0 interface bound to the standalone TAP. kernelPath and rootfsPath are
 // chroot views.
 func (m *WarmManager) configureWarmVM(ctx context.Context, socketPath, kernelPath, rootfsPath, tapName string) error {
@@ -401,13 +419,13 @@ func (m *WarmManager) CloneFromSnapshot(ctx context.Context, snap *TemplateSnaps
 	// — the template's chroot view — so the same shared inode has to be reachable
 	// at that exact path inside THIS chroot.
 	//
-	// The chown is safe here precisely BECAUSE the warm uid is shared: it asserts
-	// a constant owner, so it is idempotent rather than a per-clone claim other
-	// clones would have to fight. It is also load-bearing on a host whose
-	// template was PULLED from the object store — BootWarm never ran there, so
-	// nothing else would ever set the rootfs owner and every restore would fail
-	// to open its root device.
-	if _, err := j.link(m.warmRootfsForLanguage(snap.Language), warmRootfsRel, true); err != nil {
+	// Root-owned and NOT chowned (see linkWarmRootfs), exactly like the template
+	// .state/.mem pair below: the drive is READ-ONLY — the template snapshot bakes
+	// is_read_only=true in, so every restored clone inherits it — and a read-only
+	// device needs no per-VM ownership. This was the last per-clone write to the
+	// one shared rootfs inode; without it, "N clones, one inode" is structurally
+	// safe rather than accidentally safe.
+	if _, err := linkWarmRootfs(j, m.warmRootfsForLanguage(snap.Language)); err != nil {
 		return failClone(fmt.Errorf("place warm rootfs in clone jail: %w", err))
 	}
 	// The template snapshot pair is read-only to the VMM (mem_backend File is an
@@ -517,9 +535,17 @@ func (m *WarmManager) warmRootfsForLanguage(lang domain.Language) string {
 // warmBootArgs builds the kernel command line for a warm VM. init=/sbin/warm-init
 // runs the agent; the ip= arg statically configures eth0 from the kernel so no
 // in-guest DHCP is needed. Shape: ip=<guest>::<host>:<mask>::eth0:off.
+//
+// `ro` is EXPLICIT and load-bearing: the rootfs is one file shared by the
+// template and every concurrent clone, so / must never be writable. Omitting it
+// happened to work only because the kernel's unstated default root_mountflags is
+// MS_RDONLY — one token away from silent cross-tenant filesystem corruption.
+// State it; do not inherit it. (The device is read-only too — see
+// warmRootfsDriveBody — so this is the guest-side half of a belt-and-braces
+// pair, not the only guard.)
 func warmBootArgs(guestIP, hostIP, netmask string) string {
 	return fmt.Sprintf(
-		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/warm-init ip=%s::%s:%s::eth0:off",
+		"console=ttyS0 reboot=k panic=1 pci=off ro init=/sbin/warm-init ip=%s::%s:%s::eth0:off",
 		guestIP, hostIP, netmask,
 	)
 }
@@ -540,13 +566,30 @@ func warmBootSourceBody(kernelPath string) map[string]any {
 	}
 }
 
-// warmRootfsDriveBody is the /drives/rootfs body: rw root device on the warm image.
+// warmRootfsDriveBody is the /drives/rootfs body: READ-ONLY root device on the
+// warm image.
+//
+// ⚠ is_read_only MUST stay true — do not "optimize" it back to writable.
+// The warm path hard-links ONE <lang>-warm.ext4 inode into the template's chroot
+// and into every concurrent clone's chroot; the CoW here is on memory only
+// (mem_backend File is an mmap), so the drive is genuinely shared, not copied.
+// Read-only at the device is the ONLY thing that makes sharing one inode safe:
+// Firecracker refuses guest writes at the virtio-blk layer, so one tenant's
+// clone cannot corrupt the filesystem every other tenant's clone is reading.
+// Because a Full snapshot bakes the device config in, setting it here also
+// settles it for every restored clone. Guest writes belong on the tmpfs the
+// guest-agent mounts at /tmp.
+//
+// ⚠ Operational trap: a read-only ext4 with a DIRTY journal cannot replay and
+// the guest panics at root mount (the same failure image_boot.go dodges with
+// `ro,noload`). The warm image must be cleanly unmounted / e2fsck-clean on the
+// host before it is served this way.
 func warmRootfsDriveBody(rootfsPath string) map[string]any {
 	return map[string]any{
 		"drive_id":       "rootfs",
 		"path_on_host":   rootfsPath,
 		"is_root_device": true,
-		"is_read_only":   false,
+		"is_read_only":   true,
 	}
 }
 

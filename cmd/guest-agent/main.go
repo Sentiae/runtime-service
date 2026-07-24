@@ -90,6 +90,11 @@ func langCommand(language, file string) (string, []string, bool) {
 }
 
 func main() {
+	// The warm rootfs is READ-ONLY (one shared ext4 inode across the template and
+	// every concurrent clone), so a writable tmpfs on /tmp is what every run's
+	// working directory lives on. Must happen before the first /run.
+	mountRunTmpfs()
+
 	// Running as the guest's init means no inherited PATH — set one so the
 	// interpreter lookup (exec.LookPath at command time) and the child env both
 	// resolve `python3`/`node`.
@@ -167,9 +172,16 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 	// The agent runs as the guest's init, which has no inherited PATH/HOME, so
 	// interpreter lookup (`python3`, `node`) would fail. Seed a sane env for the
 	// child explicitly rather than depend on the init script.
+	//
+	// HOME/TMPDIR/XDG_CACHE_HOME all point at the per-run dir (on the tmpfs) and
+	// NOT at /root: the rootfs is read-only, so an interpreter writing its cache
+	// to $HOME (npm/pip caches, ~/.cache) would hit EROFS. Per-run also means the
+	// caches die with the run — no leakage between two tenants' clones.
 	cmd.Env = append(os.Environ(),
 		"PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
-		"HOME=/root",
+		"HOME="+dir,
+		"TMPDIR="+dir,
+		"XDG_CACHE_HOME="+dir,
 	)
 	if req.Stdin != "" {
 		cmd.Stdin = strings.NewReader(req.Stdin)
