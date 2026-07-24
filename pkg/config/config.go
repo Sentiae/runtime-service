@@ -279,6 +279,20 @@ type FirecrackerConfig struct {
 	PoolSize       int           `mapstructure:"pool_size"`
 	UseJailer      bool          `mapstructure:"use_jailer"`
 
+	// ChrootBase is the jailer chroot base for image-boot microVMs: each VM is
+	// confined to <chroot_base>/firecracker/<vm-id>/root.
+	ChrootBase string `mapstructure:"chroot_base"`
+
+	// VMUIDBase is the first uid handed to a jailed VMM (the per-VM uid is
+	// VMUIDBase + the workload's network index). 100000 sits above Debian's
+	// 0–64999 user range and systemd DynamicUser's 61184–65519, so the ids
+	// collide with no host account and need no /etc/passwd entries.
+	VMUIDBase int `mapstructure:"vm_uid_base"`
+
+	// VMUIDSpan bounds the per-VM uid range. An index outside it refuses the boot
+	// rather than silently handing a VM another tenant's uid.
+	VMUIDSpan int `mapstructure:"vm_uid_span"`
+
 	// §9.1 — pool size per language profile. Separate from PoolSize
 	// which is the legacy single-bucket default. When 0, falls back
 	// to PoolSize; when both are 0, the pool defaults to 2.
@@ -439,6 +453,12 @@ func Load() (*Config, error) {
 			"firecracker.max_timeout":      "300s",
 			"firecracker.pool_size":        5,
 			"firecracker.use_jailer":       false,
+			// Short on purpose: the jail dir and the VM's socket basename both
+			// land in the host socket path, which must stay under the AF_UNIX
+			// sun_path limit of 107 bytes.
+			"firecracker.chroot_base": "/var/lib/firecracker/j",
+			"firecracker.vm_uid_base": 100000,
+			"firecracker.vm_uid_span": 8192,
 			// §9.1 — per-profile warm pool defaults. Per-profile size of
 			// 2 mirrors the spec default; empty language list keeps
 			// backwards-compat (no pool) until operators opt in.
@@ -595,6 +615,9 @@ func Load() (*Config, error) {
 			{"firecracker.max_timeout", "APP_FC_MAX_TIMEOUT"},
 			{"firecracker.pool_size", "APP_FC_POOL_SIZE"},
 			{"firecracker.use_jailer", "APP_FC_USE_JAILER"},
+			{"firecracker.chroot_base", "APP_FC_CHROOT_BASE"},
+			{"firecracker.vm_uid_base", "APP_FC_VM_UID_BASE"},
+			{"firecracker.vm_uid_span", "APP_FC_VM_UID_SPAN"},
 			// §9.1 / §9.3
 			{"firecracker.pool_size_per_profile", "FIRECRACKER_POOL_SIZE"},
 			{"firecracker.pool_size_per_profile", "APP_FC_POOL_SIZE_PER_PROFILE"},

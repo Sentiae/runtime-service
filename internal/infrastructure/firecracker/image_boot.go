@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -147,15 +148,17 @@ func (b *ImageBooter) ensureNAT() error {
 	return b.natErr
 }
 
-// createTap creates the routed /30 TAP for a workload.
-func (b *ImageBooter) createTap(nw imgNet) error {
+// createTap creates the routed /30 TAP for a workload, owned by the VM's
+// unprivileged uid/gid: the jailed VMM has no CAP_NET_ADMIN, so it can only
+// TUNSETIFF-attach to a tap device it owns.
+func (b *ImageBooter) createTap(nw imgNet, uid, gid int) error {
 	// A stale device from a crashed workload blocks TUNSETIFF — delete first.
 	_ = exec.Command("ip", "link", "del", nw.tapName).Run()
 	if err := b.ensureNAT(); err != nil {
 		return err
 	}
 	cmds := [][]string{
-		{"ip", "tuntap", "add", "dev", nw.tapName, "mode", "tap"},
+		{"ip", "tuntap", "add", "dev", nw.tapName, "mode", "tap", "user", strconv.Itoa(uid), "group", strconv.Itoa(gid)},
 		{"ip", "addr", "add", nw.hostIP + "/30", "dev", nw.tapName},
 		{"ip", "link", "set", nw.tapName, "up"},
 	}
@@ -191,19 +194,87 @@ func imageBootArgs(guestIP, hostIP string) string {
 // the given TAP. It returns the running process and socket path. The caller is
 // responsible for killing the process and cleaning the socket.
 func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath string, nw imgNet, vcpu, memMB int, expectSecrets bool, dataDiskPath string) (*exec.Cmd, string, error) {
-	socketPath := b.p.socketPath(vmID)
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0o750); err != nil {
-		return nil, "", fmt.Errorf("create socket dir: %w", err)
+	// The per-VM uid is derived from the network index, which is unique by
+	// construction and reclaimed on restart — outside the span two VMs could
+	// collide on one uid, which is the cross-tenant hole the jail closes.
+	if nw.index <= 0 || nw.index >= b.p.cfg.VMUIDSpan {
+		return nil, "", fmt.Errorf("image-boot network index %d outside the per-VM uid span [1,%d)", nw.index, b.p.cfg.VMUIDSpan)
+	}
+	uid := vmUID(b.p.cfg.VMUIDBase, nw.index)
+
+	// The jail id is the network index, not the VM uuid: the uuid already owns the
+	// socket basename, and a second one would push the host socket path past the
+	// AF_UNIX 107-byte limit. The index is unique across live VMs (same allocator
+	// as the uid), and prepare() clears a stale dir left by whoever held it before.
+	jailID := strconv.Itoa(nw.index)
+	j := newVMJail(b.p.cfg.ChrootBase, jailID, uid)
+	if err := j.prepare(); err != nil {
+		return nil, "", fmt.Errorf("prepare vm jail: %w", err)
+	}
+	if err := j.mkdir("run"); err != nil {
+		j.remove()
+		return nil, "", fmt.Errorf("prepare vm jail: %w", err)
+	}
+	if err := j.mkdir("kernel"); err != nil {
+		j.remove()
+		return nil, "", fmt.Errorf("prepare vm jail: %w", err)
+	}
+
+	// The socket keeps its host view and its <vm-id>.sock basename outside this
+	// function: vmIDFromSocketPath parses that basename, and the vsock UDS is
+	// derived as socketPath+".vsock". The VMM only ever sees the chroot view.
+	socketRel := "run/" + vmID.String() + ".sock"
+	socketPath := j.hostPath(socketRel)
+	chrootSocketPath := j.chrootPath(socketRel)
+	if err := checkSocketPathFits(socketPath); err != nil {
+		j.remove()
+		return nil, "", err
+	}
+
+	kernelChrootPath, err := j.link(b.p.cfg.KernelPath, "kernel/vmlinux", false)
+	if err != nil {
+		j.remove()
+		return nil, "", fmt.Errorf("place kernel in jail: %w", err)
+	}
+	rootfsChrootPath, err := j.link(rootfsPath, "rootfs.ext4", true)
+	if err != nil {
+		j.remove()
+		return nil, "", fmt.Errorf("place rootfs in jail: %w", err)
+	}
+	dataChrootPath := ""
+	if dataDiskPath != "" {
+		dataChrootPath, err = j.link(dataDiskPath, "data.ext4", true)
+		if err != nil {
+			j.remove()
+			return nil, "", fmt.Errorf("place data volume in jail: %w", err)
+		}
 	}
 
 	// Deliberately NOT CommandContext: the VM must outlive the Provision RPC's
 	// request context (a resident VM killed on gRPC return was the CP3 bring-up
 	// bug). Lifecycle is owned by killVM/Decommission and the test timeout.
-	cmd := exec.Command(b.p.cfg.BinaryPath, "--api-sock", socketPath)
+	//
+	// Always through the jailer (chroot + seccomp + cgroup at an unprivileged
+	// per-VM uid) — no flag, no fallback: an unjailed VMM escape lands as host
+	// root, cross-tenant. No --daemonize (it would send the guest console to
+	// /dev/null) and no --new-pid-ns (jailer execve's firecracker in place, so
+	// cmd.Process.Pid stays the pid Decommission signals).
+	cmd := exec.Command(b.p.cfg.JailerPath,
+		"--id", jailID,
+		"--exec-file", b.p.cfg.BinaryPath,
+		"--uid", strconv.Itoa(uid),
+		"--gid", strconv.Itoa(uid),
+		"--chroot-base-dir", b.p.cfg.ChrootBase,
+		"--cgroup-version", "2",
+		"--",
+		"--api-sock", chrootSocketPath,
+	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// The guest serial console (console=ttyS0) arrives on the firecracker
 	// process's stdout — capture it next to the rootfs so a dead workload is
 	// diagnosable (the only place the image's own crash output ever appears).
+	// This is a host-side fd inherited across the jailer's execve, so it stays
+	// outside the chroot on purpose.
 	if f, err := os.OpenFile(filepath.Join(filepath.Dir(rootfsPath), "console.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640); err == nil {
 		cmd.Stdout = f
@@ -211,12 +282,14 @@ func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath st
 		defer f.Close()
 	}
 	if err := cmd.Start(); err != nil {
+		j.remove()
 		return nil, "", fmt.Errorf("start firecracker: %w", err)
 	}
 
 	if err := b.p.waitForSocket(ctx, socketPath); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
+		j.remove()
 		return nil, "", fmt.Errorf("firecracker socket not ready: %w", err)
 	}
 
@@ -226,22 +299,25 @@ func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath st
 		"mem_size_mib": memMB,
 	}); err != nil {
 		b.killVM(cmd, socketPath)
+		j.remove()
 		return nil, "", fmt.Errorf("configure machine: %w", err)
 	}
 	if err := b.p.apiPut(ctx, client, "/boot-source", map[string]any{
-		"kernel_image_path": b.p.cfg.KernelPath,
+		"kernel_image_path": kernelChrootPath,
 		"boot_args":         imageBootArgs(nw.guestIP, nw.hostIP),
 	}); err != nil {
 		b.killVM(cmd, socketPath)
+		j.remove()
 		return nil, "", fmt.Errorf("configure boot source: %w", err)
 	}
 	if err := b.p.apiPut(ctx, client, "/drives/rootfs", map[string]any{
 		"drive_id":       "rootfs",
-		"path_on_host":   rootfsPath,
+		"path_on_host":   rootfsChrootPath,
 		"is_root_device": true,
 		"is_read_only":   false,
 	}); err != nil {
 		b.killVM(cmd, socketPath)
+		j.remove()
 		return nil, "", fmt.Errorf("configure rootfs: %w", err)
 	}
 	// rt#9 — attach the persistent data volume as a 2nd virtio-blk device. The
@@ -249,7 +325,7 @@ func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath st
 	if dataDiskPath != "" {
 		if err := b.p.apiPut(ctx, client, "/drives/data", map[string]any{
 			"drive_id":       "data",
-			"path_on_host":   dataDiskPath,
+			"path_on_host":   dataChrootPath,
 			"is_root_device": false,
 			"is_read_only":   false,
 			// SentiaeDB Phase-0 P0 (D-184, #p19-firecracker-cache-type-fsync):
@@ -260,6 +336,7 @@ func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath st
 			"cache_type": "Writeback",
 		}); err != nil {
 			b.killVM(cmd, socketPath)
+			j.remove()
 			return nil, "", fmt.Errorf("configure data drive: %w", err)
 		}
 	}
@@ -269,6 +346,7 @@ func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath st
 		"host_dev_name": nw.tapName,
 	}); err != nil {
 		b.killVM(cmd, socketPath)
+		j.remove()
 		return nil, "", fmt.Errorf("configure network: %w", err)
 	}
 	// Secret channel: attach a vsock device so the host can push the secret
@@ -276,16 +354,20 @@ func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath st
 	// must NOT warn-and-continue — a secret workload must not boot without its
 	// channel, so a /vsock config failure fails the boot.
 	if expectSecrets {
+		// Chroot view: the VMM creates the UDS at the host path
+		// socketPath+".vsock", which is what pushSecrets dials.
 		if err := b.p.apiPut(ctx, client, "/vsock", map[string]any{
 			"guest_cid": 3,
-			"uds_path":  socketPath + ".vsock",
+			"uds_path":  chrootSocketPath + ".vsock",
 		}); err != nil {
 			b.killVM(cmd, socketPath)
+			j.remove()
 			return nil, "", fmt.Errorf("configure vsock secret channel: %w", err)
 		}
 	}
 	if err := b.p.startInstance(ctx, socketPath); err != nil {
 		b.killVM(cmd, socketPath)
+		j.remove()
 		return nil, "", fmt.Errorf("start instance: %w", err)
 	}
 	return cmd, socketPath, nil
@@ -300,6 +382,11 @@ func (b *ImageBooter) killVM(cmd *exec.Cmd, socketPath string) {
 	if socketPath != "" {
 		_ = os.Remove(socketPath)
 		_ = os.Remove(socketPath + ".vsock")
+		// VMs booted before the image-boot path was jailed have their sockets
+		// outside any chroot and yield "" — the removals above are their cleanup.
+		if dir := jailDirFromSocketPath(b.p.cfg.ChrootBase, socketPath); dir != "" {
+			_ = os.RemoveAll(dir)
+		}
 	}
 }
 
@@ -338,7 +425,14 @@ func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (
 	if err != nil {
 		return usecase.ImageTestResult{}, err
 	}
-	defer func() { _ = os.Remove(socketPath) }()
+	defer func() {
+		_ = os.Remove(socketPath)
+		// The jail holds a hard link to the rootfs, so its removal is also what
+		// frees the rootfs inode the deferred RootfsPath removal unlinks.
+		if dir := jailDirFromSocketPath(b.p.cfg.ChrootBase, socketPath); dir != "" {
+			_ = os.RemoveAll(dir)
+		}
+	}()
 
 	// Push secrets over vsock before the guest execs its workload. Fail-closed:
 	// a push failure kills the VM and aborts the test (invariant I32).
@@ -446,6 +540,9 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 	if err := waitForTCP(ctx, nw.guestIP, in.Port, 60*time.Second); err != nil {
 		_ = cmd.Process.Kill()
 		_ = os.Remove(socketPath)
+		if dir := jailDirFromSocketPath(b.p.cfg.ChrootBase, socketPath); dir != "" {
+			_ = os.RemoveAll(dir)
+		}
 		cleanupNet()
 		return usecase.ImageResidentResult{}, fmt.Errorf("resident workload did not serve %s:%d: %w", nw.guestIP, in.Port, err)
 	}
@@ -485,6 +582,10 @@ func (b *ImageBooter) Decommission(_ context.Context, in usecase.ImageDecommissi
 	if in.SocketPath != "" {
 		_ = os.Remove(in.SocketPath)
 		_ = os.Remove(in.SocketPath + ".vsock")
+		// "" for a pre-jail VM, whose socket lives outside any chroot.
+		if dir := jailDirFromSocketPath(b.p.cfg.ChrootBase, in.SocketPath); dir != "" {
+			_ = os.RemoveAll(dir)
+		}
 	}
 	if in.RootfsPath != "" {
 		_ = os.Remove(in.RootfsPath)
@@ -501,7 +602,8 @@ func (b *ImageBooter) setupNet() (imgNet, func(), error) {
 		return imgNet{}, func() {}, err
 	}
 	nw := deriveNet(idx)
-	if err := b.createTap(nw); err != nil {
+	uid := vmUID(b.p.cfg.VMUIDBase, idx)
+	if err := b.createTap(nw, uid, uid); err != nil {
 		b.freeIndex(idx)
 		return imgNet{}, func() {}, err
 	}
