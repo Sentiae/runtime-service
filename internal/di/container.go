@@ -224,6 +224,11 @@ type Container struct {
 	// only on the firecracker executor (the fleet host); nil otherwise.
 	FleetReplicaRuntimeUC *usecase.FleetReplicaRuntime
 
+	// Reclaims orphaned materialize staging directories under the image-boot work
+	// root (#fleet-image-staging-dirs-no-gc). Wired wherever a work root is
+	// configured — BOTH boot paths stage under it, on every executor.
+	FleetStagingSweeper *usecase.FleetStagingSweeper
+
 	// runtime-fleet P3.4 — the Vault client backing the per-tenant secret
 	// resolver on the fleet host. Non-nil only when the firecracker executor is
 	// selected AND VAULT_ADDR/VAULT_AUTH_MODE are set and the client built.
@@ -487,6 +492,15 @@ func (c *Container) initFleet(cfg *config.Config) {
 	if cfg.Fleet.SecretSelfTest {
 		c.FleetProvisionUC.SetSecretSelfTest(true)
 		log.Println("Fleet secret vsock self-test ENABLED (APP_FLEET_SECRET_SELFTEST) — non-secret marker injected on provisions")
+	}
+
+	// #fleet-image-staging-dirs-no-gc — GC for the materialize staging root.
+	// Deliberately NOT gated on the executor: both the replica path and the
+	// test/job/fallback path stage under this same root, and a host that once ran
+	// as a fleet host still carries their leftovers after a config change. It
+	// needs BOTH repositories to tell an orphan from a live workload's rootfs.
+	if cfg.ImageBoot.WorkDir != "" {
+		c.FleetStagingSweeper = usecase.NewFleetStagingSweeper(c.ReplicaRepo, c.ImageWorkloadRepo, cfg.ImageBoot.WorkDir)
 	}
 
 	// CP4 §9#6 — resident replica runtime (firecracker host only; the fail-loud
@@ -1642,6 +1656,7 @@ func (c *Container) StartBackgroundControllers(ctx context.Context) {
 	// THIS host's stuck rows to `failed` before the reconciler starts ticking;
 	// recovery is a re-issued RestoreResource, never an auto-resume.
 	c.sweepInterruptedRestores(ctx)
+	c.startStagingSweeper(ctx)
 	c.startFleetReconciler(ctx)
 	// CP4.5 §9#3 (D-183) — shared-tier TTL reaper. Nil until the shared engine is
 	// wired (NEEDS-DECISION on shared-engine admin credentials); the loop is
@@ -1670,6 +1685,57 @@ func (c *Container) sweepInterruptedRestores(ctx context.Context) {
 		log.Printf("[FLEET-RESTORE] released %d resource(s) left mid-restore by a restart to failed — boots stay refused until RestoreResource is re-issued", n)
 	}
 }
+
+// startStagingSweeper runs the orphaned-staging-directory GC
+// (#fleet-image-staging-dirs-no-gc): once at startup, then every
+// stagingSweepEvery. A fleet host that fills up takes down EVERY customer VM on
+// it, so this is an availability control, not housekeeping.
+//
+// It is periodic and not startup-only because a process killed between
+// materialize and boot leaves a directory no boot-path cleanup can reach. In its
+// own goroutine (ctx-aware + panic-recovering) because a full work root can hold
+// hundreds of directories and startup must not block on walking them.
+func (c *Container) startStagingSweeper(ctx context.Context) {
+	if c.FleetStagingSweeper == nil {
+		return
+	}
+	sweeper := c.FleetStagingSweeper
+	sweep := func() {
+		out, err := sweeper.Sweep(ctx)
+		if err != nil {
+			log.Printf("[FLEET-STAGING-GC] sweep failed: %v", err)
+			return
+		}
+		if out.Reclaimed > 0 {
+			log.Printf("[FLEET-STAGING-GC] reclaimed %d orphaned staging dir(s), %d byte(s)", out.Reclaimed, out.Bytes)
+		}
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[FLEET-STAGING-GC] sweep loop panicked: %v", r)
+			}
+		}()
+		sweep()
+		ticker := time.NewTicker(stagingSweepEvery)
+		defer ticker.Stop()
+		log.Printf("[FLEET-STAGING-GC] staging sweep started (interval=%s)", stagingSweepEvery)
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("[FLEET-STAGING-GC] staging sweep stopped (context cancelled)")
+				return
+			case <-ticker.C:
+				sweep()
+			}
+		}
+	}()
+}
+
+// stagingSweepEvery is the orphaned-staging-directory GC interval. Hourly: the
+// boot path reclaims its own failures immediately, so this loop only has to
+// catch what a killed process left behind.
+const stagingSweepEvery = time.Hour
 
 // startFleetActivityFeed starts the Caddy access-log tailer that backs the
 // SweepIdle direct-serve guard (#fleet-scale-to-zero-activity-feed, D-122). No-op

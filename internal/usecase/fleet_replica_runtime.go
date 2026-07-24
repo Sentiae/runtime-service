@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -307,6 +308,9 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 	if err := uc.replicas.Update(ctx, replica); err != nil {
 		// The VM is up; tear it down so we don't leak an untracked resident.
 		_ = uc.booter.Decommission(ctx, replicaDecommissionInput(replica))
+		// Decommission unlinks only the rootfs FILE — the staging directory it
+		// sits in is this boot's to reclaim, and this boot has just failed.
+		uc.reclaimStagingDir(ctx, replica.ID)
 		return fmt.Errorf("persist resident replica: %w", err)
 	}
 
@@ -342,6 +346,12 @@ func (uc *FleetReplicaRuntime) DecommissionReplica(ctx context.Context, replicaI
 			logger.FromContext(ctx).Warn("fleet replica: detach volume", "replica_id", replica.ID, "err", derr)
 		}
 	}
+	// The booter unlinks the rootfs FILE, never the staging directory holding it,
+	// so a torn-down replica left an empty directory behind. Reclaimed here rather
+	// than left to the sweep so the invariant is "teardown leaves NOTHING" — a
+	// property that can be checked right after the call, instead of "nothing that
+	// matters, eventually", which cannot. Inodes accumulate too.
+	uc.reclaimStagingDir(ctx, replica.ID)
 	if err := uc.replicas.Delete(ctx, replica.ID); err != nil {
 		return fmt.Errorf("delete replica: %w", err)
 	}
@@ -373,7 +383,9 @@ func (uc *FleetReplicaRuntime) RefreshHealth(ctx context.Context, replica *domai
 }
 
 // markDead records a boot/materialize failure on the replica and returns the
-// original cause wrapped.
+// original cause wrapped. It also reclaims the boot's staging directory — see
+// reclaimStagingDir: every path that reaches markDead is a boot that failed, and
+// a failed boot must not leave its rootfs behind.
 func (uc *FleetReplicaRuntime) markDead(ctx context.Context, replica *domain.Replica, cause error) error {
 	replica.State = domain.ReplicaStateDead
 	replica.Message = cause.Error()
@@ -381,7 +393,39 @@ func (uc *FleetReplicaRuntime) markDead(ctx context.Context, replica *domain.Rep
 	if err := uc.replicas.Update(ctx, replica); err != nil {
 		logger.FromContext(ctx).Error("fleet replica: persist dead-state failed", "replica_id", replica.ID, "err", err)
 	}
+	uc.reclaimStagingDir(ctx, replica.ID)
 	return cause
+}
+
+// reclaimStagingDir removes this replica's materialize staging directory
+// (<workDir>/<replicaID>, holding the OCI staging tree and rootfs.ext4).
+//
+// WHY it exists: nothing else ever reclaimed it. The booter's Decommission
+// unlinks only the rootfs FILE of a replica that reached resident, so a boot
+// that FAILED left the whole directory behind — and the reconciler retries a
+// dead replica every ~10s under a FRESH replica uuid, so one persistently
+// failing app mints a new multi-hundred-MB directory per attempt until the host
+// fills up (#fleet-image-staging-dirs-no-gc: 338 directories / 23GB observed
+// live, fleet host at 100%, every customer VM on it at risk).
+//
+// WHY it is safe at every call site: it runs only after this boot has failed.
+// No VM holds the rootfs — the booter kills whatever it started before returning
+// an error, and the persist-failure path decommissions first — and the jailer
+// keeps its own hard link to the rootfs inode, so unlinking our name could not
+// pull the disk out from under a running VM even if one somehow survived.
+// Best-effort by design: a boot failure is already being reported, and a
+// removal error must not replace that cause.
+func (uc *FleetReplicaRuntime) reclaimStagingDir(ctx context.Context, replicaID uuid.UUID) {
+	// An empty workDir or nil id would join to a relative path (the process
+	// working directory) — never recurse-delete on a half-configured host.
+	if uc.workDir == "" || replicaID == uuid.Nil {
+		return
+	}
+	dir := filepath.Join(uc.workDir, replicaID.String())
+	if err := os.RemoveAll(dir); err != nil {
+		logger.FromContext(ctx).Warn("fleet replica: reclaim staging dir",
+			"replica_id", replicaID, "path", dir, "err", err)
+	}
 }
 
 // replicaDecommissionInput builds the teardown handle from a replica.

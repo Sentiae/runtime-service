@@ -3,6 +3,8 @@ package usecase
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -514,4 +516,143 @@ func TestDecommissionReplica_MissingIsNoop(t *testing.T) {
 // membership and models none, so it matches nothing.
 func (f *rtAppRepo) ListBySystemEnv(context.Context, string, string) ([]domain.FleetApp, error) {
 	return nil, nil
+}
+
+// stagingMaterializer does what the real materializer does to the filesystem —
+// create the per-replica work dir and lay a rootfs image in it — so the staging
+// leak can be tested for real, with real directories, without a VM.
+type stagingMaterializer struct {
+	err error
+}
+
+func (m stagingMaterializer) Materialize(_ context.Context, in ImageMaterializeInput) (ImageMaterializeOutput, error) {
+	if err := os.MkdirAll(in.WorkDir, 0o750); err != nil {
+		return ImageMaterializeOutput{}, err
+	}
+	rootfs := filepath.Join(in.WorkDir, "rootfs.ext4")
+	if err := os.WriteFile(rootfs, make([]byte, 1024), 0o600); err != nil {
+		return ImageMaterializeOutput{}, err
+	}
+	if m.err != nil {
+		// A materialize that fails midway still leaves the tree behind — that is
+		// exactly the state the leak was made of.
+		return ImageMaterializeOutput{}, m.err
+	}
+	return ImageMaterializeOutput{RootfsPath: rootfs}, nil
+}
+
+// TestBootReplica_FailedBootLeavesNoStagingDir is the
+// #fleet-image-staging-dirs-no-gc regression at its source: the reconciler
+// retries a dead replica every ~10s under a FRESH uuid, so a boot that fails
+// without reclaiming its staging directory mints one per attempt until the fleet
+// host fills up (338 dirs / 23GB observed live). A boot that SUCCEEDS must of
+// course keep its rootfs.
+func TestBootReplica_FailedBootLeavesNoStagingDir(t *testing.T) {
+	tests := []struct {
+		name    string
+		matErr  error
+		bootErr error
+		wantDir bool
+	}{
+		{"materialize failure reclaims the staging dir", errors.New("pull failed"), nil, false},
+		{"boot failure reclaims the staging dir", nil, errors.New("kvm exploded"), false},
+		{"successful boot keeps its rootfs", nil, nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			app := newTestApp()
+			rep := newTestReplica(app.ID)
+			replicas := newRTReplicaRepo()
+			_ = replicas.Create(context.Background(), rep)
+
+			booter := &recordingBooter{
+				resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5"},
+				resErr:   tt.bootErr,
+			}
+			uc := NewFleetReplicaRuntime(stagingMaterializer{err: tt.matErr}, booter, replicas,
+				&rtAppRepo{app: app}, workDir, "10.0.0.9")
+
+			err := uc.BootReplica(context.Background(), rep.ID)
+			if (err != nil) != (tt.matErr != nil || tt.bootErr != nil) {
+				t.Fatalf("BootReplica err = %v", err)
+			}
+
+			dir := filepath.Join(workDir, rep.ID.String())
+			_, statErr := os.Stat(dir)
+			if tt.wantDir && statErr != nil {
+				t.Fatalf("a live replica's staging dir must survive: %v", statErr)
+			}
+			if !tt.wantDir && statErr == nil {
+				t.Fatalf("failed boot left its staging dir %s behind", dir)
+			}
+		})
+	}
+}
+
+// TestBootReplica_PersistFailureReclaimsStagingDir covers the one failure path
+// that does not go through markDead: the VM booted but its row could not be
+// written, so it is torn down — and the booter's Decommission unlinks only the
+// rootfs FILE, never the directory holding it.
+func TestBootReplica_PersistFailureReclaimsStagingDir(t *testing.T) {
+	workDir := t.TempDir()
+	app := newTestApp()
+	rep := newTestReplica(app.ID)
+	replicas := &residentPersistFailRepo{rtReplicaRepo: newRTReplicaRepo()}
+	_ = replicas.Create(context.Background(), rep)
+
+	booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5"}}
+	uc := NewFleetReplicaRuntime(stagingMaterializer{}, booter, replicas, &rtAppRepo{app: app}, workDir, "10.0.0.9")
+
+	if err := uc.BootReplica(context.Background(), rep.ID); err == nil {
+		t.Fatal("want an error when the resident row cannot be persisted")
+	}
+	if booter.decommN != 1 {
+		t.Fatalf("the booted VM must be torn down, Decommission called %d times", booter.decommN)
+	}
+	dir := filepath.Join(workDir, rep.ID.String())
+	if _, err := os.Stat(dir); err == nil {
+		t.Fatalf("staging dir %s survived a boot whose replica row was never written", dir)
+	}
+}
+
+// TestDecommissionReplica_LeavesNoStagingDir pins the invariant "teardown leaves
+// NOTHING": the booter unlinks only the rootfs FILE, so without this the torn
+// down replica's directory lingered until an hourly sweep — true only
+// eventually, and therefore not checkable.
+func TestDecommissionReplica_LeavesNoStagingDir(t *testing.T) {
+	workDir := t.TempDir()
+	app := newTestApp()
+	rep := newTestReplica(app.ID)
+	replicas := newRTReplicaRepo()
+	_ = replicas.Create(context.Background(), rep)
+
+	booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5"}}
+	uc := NewFleetReplicaRuntime(stagingMaterializer{}, booter, replicas, &rtAppRepo{app: app}, workDir, "10.0.0.9")
+
+	if err := uc.BootReplica(context.Background(), rep.ID); err != nil {
+		t.Fatalf("BootReplica: %v", err)
+	}
+	dir := filepath.Join(workDir, rep.ID.String())
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("the staging dir must exist while the replica is resident: %v", err)
+	}
+
+	if err := uc.DecommissionReplica(context.Background(), rep.ID); err != nil {
+		t.Fatalf("DecommissionReplica: %v", err)
+	}
+	if _, err := os.Stat(dir); err == nil {
+		t.Fatalf("teardown left its staging dir %s behind", dir)
+	}
+}
+
+// residentPersistFailRepo accepts every Update except the one that records the
+// replica as resident.
+type residentPersistFailRepo struct{ *rtReplicaRepo }
+
+func (f *residentPersistFailRepo) Update(ctx context.Context, r *domain.Replica) error {
+	if r.State == domain.ReplicaStateResident {
+		return errors.New("db gone")
+	}
+	return f.rtReplicaRepo.Update(ctx, r)
 }
