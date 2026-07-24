@@ -166,10 +166,21 @@ func (uc *FleetResourceProvisioner) ProvisionDedicated(ctx context.Context, in P
 	}
 
 	// Idempotency: an existing claim with the same revision is a declarative
-	// no-op; a different revision is a converge the current backend rejects.
+	// ensure; a different revision is a converge the current backend rejects.
 	existing, err := uc.resources.FindResource(ctx, ownerUUID, in.ClaimKey, in.Env)
 	if err == nil {
 		if existing.Revision == revision {
+			// #p19-handed-token-not-rehandable — this is NOT a bare no-op, and must
+			// never be "simplified" back into one. The per-deployment Vault token that
+			// resolves this engine's boot secrets is MEMORY-ONLY BY DESIGN (D-125:
+			// never a row, rootfs, runtime.json, or log), so a runtime-service restart
+			// empties the store and the resource's next (re)boot fails closed with "no
+			// handed token" — permanently, because nothing else ever re-hands it. A
+			// declarative re-provision is the recovery a caller naturally attempts and
+			// the only authenticated moment a fresh token arrives, so it is THE
+			// designed post-restart recovery path. A database you lose on reboot is
+			// not durable.
+			uc.recoverExisting(ctx, existing, in)
 			return ProvisionDedicatedOutput{Handle: existing.ID.String(), Phase: string(existing.Phase)}, nil
 		}
 		return ProvisionDedicatedOutput{}, domain.ErrResourceConvergeNotSupported
@@ -179,24 +190,7 @@ func (uc *FleetResourceProvisioner) ProvisionDedicated(ctx context.Context, in P
 	}
 
 	// Compose FleetProvision: a resident, single-replica, volume-bearing app.
-	provOut, err := uc.provisioner.Provision(ctx, FleetProvisionInput{
-		ComponentID:   "resource/" + in.ClaimKey,
-		Env:           in.Env,
-		OwnerOrg:      in.OwnerOrg,
-		Registry:      uc.engine.Registry,
-		Repository:    uc.engine.Repository,
-		Digest:        uc.engine.Digest,
-		Port:          residentPGPort,
-		WorkloadClass: string(domain.ImageWorkloadClassResident),
-		SecretRefs:    in.SecretRefs,
-		VaultToken:    in.VaultToken,
-		SystemID:      in.SystemID,
-		EnvVars:       map[string]string{"PGDATA": "/data/pgdata"},
-		Volumes:       []VolumeSpecInput{{SizeMB: in.SizeMB, MountPath: "/data"}},
-		MinReplicas:   1,
-		MaxReplicas:   1,
-		ScaleToZero:   false,
-	})
+	provOut, err := uc.provisioner.Provision(ctx, uc.dedicatedDescriptor(in))
 	if err != nil {
 		return ProvisionDedicatedOutput{}, fmt.Errorf("provision dedicated engine: %w", err)
 	}
@@ -231,6 +225,72 @@ func (uc *FleetResourceProvisioner) ProvisionDedicated(ctx context.Context, in P
 		return ProvisionDedicatedOutput{}, fmt.Errorf("persist resource: %w", err)
 	}
 	return ProvisionDedicatedOutput{Handle: res.ID.String(), Phase: string(res.Phase)}, nil
+}
+
+// dedicatedDescriptor builds the FleetProvision descriptor for a dedicated
+// claim: a resident, single-replica, volume-bearing Postgres engine. The first
+// provision and the post-restart recovery re-provision BOTH build it here, so
+// the two can never drift — a "recovery" that handed a different descriptor
+// would silently converge the app to something the claim never asked for.
+func (uc *FleetResourceProvisioner) dedicatedDescriptor(in ProvisionDedicatedInput) FleetProvisionInput {
+	return FleetProvisionInput{
+		ComponentID:   "resource/" + in.ClaimKey,
+		Env:           in.Env,
+		OwnerOrg:      in.OwnerOrg,
+		Registry:      uc.engine.Registry,
+		Repository:    uc.engine.Repository,
+		Digest:        uc.engine.Digest,
+		Port:          residentPGPort,
+		WorkloadClass: string(domain.ImageWorkloadClassResident),
+		SecretRefs:    in.SecretRefs,
+		VaultToken:    in.VaultToken,
+		SystemID:      in.SystemID,
+		EnvVars:       map[string]string{"PGDATA": "/data/pgdata"},
+		Volumes:       []VolumeSpecInput{{SizeMB: in.SizeMB, MountPath: "/data"}},
+		MinReplicas:   1,
+		MaxReplicas:   1,
+		ScaleToZero:   false,
+	}
+}
+
+// recoverExisting re-hands the caller's per-deployment Vault token to an already
+// claimed resource's backing app and lets the reconciler boot whatever is not
+// running (#p19-handed-token-not-rehandable).
+//
+// It re-runs the SAME composed FleetProvisioner.Provision the first provision
+// used rather than inventing a recovery path: that call is an upsert keyed on
+// (component_id, env), so for an app that still exists it re-hands the token
+// into the in-memory store, re-ensures the SAME volume rows and ingress route,
+// and then reconciles once — which is exactly the machinery that already knows
+// how to leave a healthy replica alone and replace a dead or missing one, now
+// with the token in hand.
+//
+// Best-effort by contract: the Handle/Phase this path returns is frozen and
+// callers poll it, so every failure here is logged and swallowed — the resource
+// is never left worse off than before, and the periodic reconcile retries.
+func (uc *FleetResourceProvisioner) recoverExisting(ctx context.Context, res *domain.FleetResource, in ProvisionDedicatedInput) {
+	if res.Phase == domain.FleetResourcePhaseDecommissioned {
+		return // a tombstone was torn down on purpose; never re-boot it
+	}
+	if res.AppID == nil {
+		logger.FromContext(ctx).Warn("fleet resource: re-provision cannot recover a claim with no backing app",
+			"resource_id", res.ID)
+		return
+	}
+	// The re-provision below is an upsert on (component_id, env). If the app row
+	// is GONE it would mint a NEW app id — and with it a NEW, EMPTY data volume —
+	// while this resource row still points at the vanished app: a live but empty
+	// engine masquerading as the customer's database. Refuse loudly instead; an
+	// app-row rebuild / restore-from-recovery-point is a different operation.
+	if _, herr := uc.provisioner.Health(ctx, res.AppID.String()); herr != nil {
+		logger.FromContext(ctx).Error("fleet resource: backing app is gone — re-provision cannot recover it, needs an explicit rebuild or restore",
+			"resource_id", res.ID, "app_id", res.AppID, "err", herr)
+		return
+	}
+	if _, perr := uc.provisioner.Provision(ctx, uc.dedicatedDescriptor(in)); perr != nil {
+		logger.FromContext(ctx).Error("fleet resource: recover dedicated engine failed (token re-hand / re-drive boot)",
+			"resource_id", res.ID, "app_id", res.AppID, "err", perr)
+	}
 }
 
 // StatusOf returns the live status of a dedicated resource: the backing app's

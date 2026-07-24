@@ -333,6 +333,12 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 	// app row) keyed by app id, BEFORE the first reconcile boots a replica, so the
 	// boot's HandedTokenEnvelopeResolver has it. Empty (secret-less deploy / Vault
 	// unset) is a no-op. Renewed for the lifetime; revoked on DecommissionApp.
+	//
+	// Memory-only is deliberate, which makes THIS the only place a token can come
+	// back after a runtime-service restart: a durable resource's re-provision is
+	// routed here precisely so the store is repopulated before the reconcile below
+	// tries to boot (#p19-handed-token-not-rehandable). Put is idempotent for the
+	// same value, so a re-provision of a healthy app costs nothing here.
 	if uc.tokenStore != nil {
 		uc.tokenStore.Put(app.ID, in.VaultToken)
 	}

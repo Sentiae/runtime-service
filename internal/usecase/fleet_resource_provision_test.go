@@ -3,11 +3,13 @@ package usecase
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/secret"
 	"github.com/sentiae/runtime-service/internal/domain"
 )
 
@@ -200,6 +202,7 @@ type fakeFleetProvisioner struct {
 	lastInput       FleetProvisionInput
 	provisionOut    FleetProvisionOutput
 	provisionErr    error
+	healthCalls     int
 	healthOut       FleetHealthOutput
 	healthErr       error
 	decommissioned  []string
@@ -216,6 +219,7 @@ func (f *fakeFleetProvisioner) Provision(_ context.Context, in FleetProvisionInp
 }
 
 func (f *fakeFleetProvisioner) Health(_ context.Context, _ string) (FleetHealthOutput, error) {
+	f.healthCalls++
 	return f.healthOut, f.healthErr
 }
 
@@ -399,50 +403,139 @@ func TestProvisionDedicated_HappyPath(t *testing.T) {
 	}
 }
 
+// TestProvisionDedicated_IdempotentSameRevision pins the declarative-ensure
+// contract of #p19-handed-token-not-rehandable: a same-revision re-provision
+// re-drives the existing app (which is what re-hands the memory-only Vault
+// token), and it does so WITHOUT ever changing the frozen Handle/Phase response
+// or minting a second app. The refusal cases matter as much as the recovery one:
+// re-provisioning a claim whose app row is gone would upsert a brand-new app —
+// and a brand-new EMPTY volume — behind a resource row still pointing at the
+// vanished app.
 func TestProvisionDedicated_IdempotentSameRevision(t *testing.T) {
-	repo := newFakeResourceRepo()
-	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine())
+	appID := uuid.New()
 
-	in := validDedicatedInput()
-	owner := uuid.MustParse(in.OwnerOrg)
-	existingID := uuid.New()
-	repo.seed(&domain.FleetResource{
-		ID: existingID, OwnerOrg: owner, ClaimKey: in.ClaimKey, Env: in.Env,
-		Revision: 1, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady,
-	})
-
-	out, err := uc.ProvisionDedicated(context.Background(), in)
-	if err != nil {
-		t.Fatalf("provision: %v", err)
+	tests := []struct {
+		name          string
+		revision      int
+		existingPhase domain.FleetResourcePhase
+		appID         *uuid.UUID
+		healthErr     error
+		wantErr       error
+		wantHealth    int
+		wantProvision int
+	}{
+		{
+			name:          "live claim is re-driven so the token is re-handed",
+			revision:      1,
+			existingPhase: domain.FleetResourcePhaseReady,
+			appID:         &appID,
+			wantHealth:    1,
+			wantProvision: 1,
+		},
+		{
+			name:          "provisioning claim is re-driven too",
+			revision:      1,
+			existingPhase: domain.FleetResourcePhaseProvisioning,
+			appID:         &appID,
+			wantHealth:    1,
+			wantProvision: 1,
+		},
+		{
+			name:          "tombstone is never re-booted",
+			revision:      1,
+			existingPhase: domain.FleetResourcePhaseDecommissioned,
+			appID:         &appID,
+			wantHealth:    0,
+			wantProvision: 0,
+		},
+		{
+			name:          "claim with no backing app cannot be recovered here",
+			revision:      1,
+			existingPhase: domain.FleetResourcePhaseReady,
+			appID:         nil,
+			wantHealth:    0,
+			wantProvision: 0,
+		},
+		{
+			name:          "vanished app row refuses rather than minting a new one",
+			revision:      1,
+			existingPhase: domain.FleetResourcePhaseReady,
+			appID:         &appID,
+			healthErr:     domain.ErrWorkloadNotFound,
+			wantHealth:    1,
+			wantProvision: 0,
+		},
+		{
+			name:          "different revision still rejects converge",
+			revision:      2,
+			existingPhase: domain.FleetResourcePhaseReady,
+			appID:         &appID,
+			wantErr:       domain.ErrResourceConvergeNotSupported,
+			wantHealth:    0,
+			wantProvision: 0,
+		},
 	}
-	if out.Handle != existingID.String() {
-		t.Errorf("handle = %q, want existing %q", out.Handle, existingID)
-	}
-	if prov.provisionCalls != 0 {
-		t.Errorf("declarative ensure must not re-provision (calls=%d)", prov.provisionCalls)
-	}
-}
 
-func TestProvisionDedicated_ConvergeRejected(t *testing.T) {
-	repo := newFakeResourceRepo()
-	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newFakeResourceRepo()
+			prov := &fakeFleetProvisioner{
+				healthErr:    tt.healthErr,
+				provisionOut: FleetProvisionOutput{Handle: appID.String()},
+			}
+			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine())
 
-	in := validDedicatedInput()
-	in.Revision = 2
-	owner := uuid.MustParse(in.OwnerOrg)
-	repo.seed(&domain.FleetResource{
-		ID: uuid.New(), OwnerOrg: owner, ClaimKey: in.ClaimKey, Env: in.Env,
-		Revision: 1, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady,
-	})
+			in := validDedicatedInput()
+			in.Revision = tt.revision
+			owner := uuid.MustParse(in.OwnerOrg)
+			existingID := uuid.New()
+			repo.seed(&domain.FleetResource{
+				ID: existingID, OwnerOrg: owner, ClaimKey: in.ClaimKey, Env: in.Env,
+				Revision: 1, Tier: "dedicated", Phase: tt.existingPhase, AppID: tt.appID,
+			})
 
-	_, err := uc.ProvisionDedicated(context.Background(), in)
-	if !errors.Is(err, domain.ErrResourceConvergeNotSupported) {
-		t.Fatalf("got %v, want ErrResourceConvergeNotSupported", err)
-	}
-	if prov.provisionCalls != 0 {
-		t.Errorf("converge reject must not provision (calls=%d)", prov.provisionCalls)
+			out, err := uc.ProvisionDedicated(context.Background(), in)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("got %v, want %v", err, tt.wantErr)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("provision: %v", err)
+				}
+				// The frozen P19 response shape: the claim's own handle + its stored
+				// phase, identical on every idempotent path.
+				if out.Handle != existingID.String() {
+					t.Errorf("handle = %q, want existing %q", out.Handle, existingID)
+				}
+				if out.Phase != string(tt.existingPhase) {
+					t.Errorf("phase = %q, want %q", out.Phase, tt.existingPhase)
+				}
+			}
+			if prov.healthCalls != tt.wantHealth {
+				t.Errorf("health calls = %d, want %d", prov.healthCalls, tt.wantHealth)
+			}
+			if prov.provisionCalls != tt.wantProvision {
+				t.Errorf("provision calls = %d, want %d", prov.provisionCalls, tt.wantProvision)
+			}
+			if tt.wantProvision > 0 {
+				// The recovery must hand back the SAME descriptor the claim was created
+				// from — including the freshly supplied token — never a drifted one.
+				if got := prov.lastInput; got.ComponentID != "resource/"+in.ClaimKey ||
+					got.VaultToken != in.VaultToken || got.Port != residentPGPort {
+					t.Errorf("recovery descriptor = %+v", got)
+				}
+			}
+			// A recovery failure must never surface as a provision failure or leave a
+			// mutated row: the caller polls this handle.
+			row, gerr := repo.GetResourceByHandle(context.Background(), existingID)
+			if gerr != nil {
+				t.Fatalf("row lookup: %v", gerr)
+			}
+			if row.Phase != tt.existingPhase || row.Revision != 1 {
+				t.Errorf("row mutated: phase=%q revision=%d", row.Phase, row.Revision)
+			}
+		})
 	}
 }
 
@@ -597,5 +690,258 @@ func TestDecommissionDedicated_SnapshotFailureAborts(t *testing.T) {
 	row, _ := repo.GetResourceByHandle(context.Background(), rid)
 	if row.Phase == domain.FleetResourcePhaseDecommissioned {
 		t.Errorf("row must not be tombstoned when snapshot fails")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// #p19-handed-token-not-rehandable — post-restart recovery, driven through the
+// REAL orchestrator + the REAL in-memory token store. A fake provisioner could
+// only pretend the token came back; these tests must observe the actual store.
+// ─────────────────────────────────────────────────────────────────────
+
+// orchProvisioner adapts the real *FleetOrchestrator to the FleetProvisioner
+// port the resource control plane composes — the same three methods
+// *FleetProvision routes to the orchestrator for the resident class.
+type orchProvisioner struct{ orch *FleetOrchestrator }
+
+func (p orchProvisioner) Provision(ctx context.Context, in FleetProvisionInput) (FleetProvisionOutput, error) {
+	handle, url, err := p.orch.ProvisionApp(ctx, in)
+	if err != nil {
+		return FleetProvisionOutput{}, err
+	}
+	return FleetProvisionOutput{Handle: handle, URL: url}, nil
+}
+
+func (p orchProvisioner) Health(ctx context.Context, handle string) (FleetHealthOutput, error) {
+	id, err := uuid.Parse(handle)
+	if err != nil {
+		return FleetHealthOutput{}, domain.ErrWorkloadNotFound
+	}
+	out, isApp, herr := p.orch.HealthApp(ctx, id)
+	if herr != nil {
+		return FleetHealthOutput{}, herr
+	}
+	if !isApp {
+		return FleetHealthOutput{}, domain.ErrWorkloadNotFound
+	}
+	return out, nil
+}
+
+func (p orchProvisioner) Decommission(ctx context.Context, handle string) error {
+	id, err := uuid.Parse(handle)
+	if err != nil {
+		return domain.ErrWorkloadNotFound
+	}
+	_, derr := p.orch.DecommissionApp(ctx, id)
+	return derr
+}
+
+// handedTokenGateResolver reproduces the ONE property of the deployed
+// HandedTokenEnvelopeResolver these tests depend on: with no handed token it
+// fails closed with ErrNoHandedToken and never resolves anything. With a token
+// it delegates to a REAL EnvelopeVaultResolver, because secret.SecretValue
+// cannot be constructed with a value from outside the secret package.
+type handedTokenGateResolver struct{ inner secret.Resolver }
+
+func (r handedTokenGateResolver) Resolve(ctx context.Context, ref string, p secret.Principal) (secret.SecretValue, error) {
+	if p.Token == "" {
+		return secret.SecretValue{}, fmt.Errorf("%w: %s", secret.ErrNoHandedToken, ref)
+	}
+	return r.inner.Resolve(ctx, ref, p)
+}
+
+// resourceRecoveryHarness wires a resource provisioner over a real orchestrator,
+// a real handed-token store, and a token-gated secret resolver.
+type resourceRecoveryHarness struct {
+	orch     orchHarness
+	store    *FleetSecretTokenStore
+	resource *FleetResourceProvisioner
+	repo     *fakeResourceRepo
+}
+
+func newResourceRecoveryHarness(t *testing.T) resourceRecoveryHarness {
+	t.Helper()
+	h := newOrchHarness(oneLiveHost())
+	h.orch.runtime.SetSecretResolver(handedTokenGateResolver{
+		inner: secret.NewEnvelopeVaultResolver(stubKV{val: "vault:v1:ct"}, stubKEK{pt: []byte("s3cr3t")}),
+	})
+	store := NewFleetSecretTokenStore(context.Background(), nil, 0)
+	h.orch.SetTokenStore(store)
+	h.orch.runtime.SetTokenStore(store)
+
+	repo := newFakeResourceRepo()
+	return resourceRecoveryHarness{
+		orch:     h,
+		store:    store,
+		repo:     repo,
+		resource: NewFleetResourceProvisioner(orchProvisioner{h.orch}, repo, h.replicas, &fakeSnapshotter{}, testEngine()),
+	}
+}
+
+// restart swaps in a FRESH token store on both seams — exactly what a
+// runtime-service process restart does to a map that is memory-only by design,
+// while every durable row survives.
+func (h *resourceRecoveryHarness) restart() {
+	h.store = NewFleetSecretTokenStore(context.Background(), nil, 0)
+	h.orch.orch.SetTokenStore(h.store)
+	h.orch.orch.runtime.SetTokenStore(h.store)
+}
+
+func dedicatedInputWithSecret(org uuid.UUID) ProvisionDedicatedInput {
+	in := validDedicatedInput()
+	in.OwnerOrg = org.String()
+	in.SecretRefs = []string{secret.TenantRef(org, "prod/pg", "password")}
+	return in
+}
+
+// TestProvisionDedicated_RecoversAfterRestart is the regression for
+// #p19-handed-token-not-rehandable. It proves the whole failure mode end to end:
+// after a restart the token store is empty, a reconcile alone can NEVER boot the
+// engine again (every attempt dies with ErrNoHandedToken), and the declarative
+// re-provision — the recovery a caller naturally attempts — puts the token back
+// and gets the engine running.
+func TestProvisionDedicated_RecoversAfterRestart(t *testing.T) {
+	origAlive := processAlive
+	processAlive = func(int) bool { return true }
+	defer func() { processAlive = origAlive }()
+
+	ctx := context.Background()
+	org := uuid.New()
+	h := newResourceRecoveryHarness(t)
+	in := dedicatedInputWithSecret(org)
+
+	first, err := h.resource.ProvisionDedicated(ctx, in)
+	if err != nil {
+		t.Fatalf("first provision: %v", err)
+	}
+	resourceID := uuid.MustParse(first.Handle)
+	row, err := h.repo.GetResourceByHandle(ctx, resourceID)
+	if err != nil || row.AppID == nil {
+		t.Fatalf("resource row not persisted with an app: row=%+v err=%v", row, err)
+	}
+	appID := *row.AppID
+	if _, ok := h.store.Get(appID); !ok {
+		t.Fatalf("first provision must hand the token for app %s", appID)
+	}
+	if got := h.orch.replicas.countState(domain.ReplicaStateResident); got != 1 {
+		t.Fatalf("resident replicas after first provision = %d, want 1", got)
+	}
+
+	// ── the restart ──────────────────────────────────────────────────────
+	h.restart()
+	if _, ok := h.store.Get(appID); ok {
+		t.Fatalf("precondition: the token store must be EMPTY after a restart")
+	}
+
+	// The replica is gone with the host process; the reconciler sees it dead.
+	replicas, err := h.orch.replicas.ListByApp(ctx, appID)
+	if err != nil || len(replicas) != 1 {
+		t.Fatalf("list replicas: %v (n=%d)", err, len(replicas))
+	}
+	preRestartReplica := replicas[0].ID
+	dead := replicas[0]
+	dead.State = domain.ReplicaStateDead
+	if uerr := h.orch.replicas.Update(ctx, &dead); uerr != nil {
+		t.Fatalf("mark replica dead: %v", uerr)
+	}
+
+	// The defect: reconcile alone can never bring it back — the boot fails closed
+	// on the missing handed token, forever, with no path to re-supply one.
+	if rerr := h.orch.orch.ReconcileApp(ctx, appID); rerr != nil {
+		t.Fatalf("ReconcileApp: %v", rerr)
+	}
+	if got := h.orch.replicas.countState(domain.ReplicaStateResident); got != 0 {
+		t.Fatalf("resident replicas after token-less reconcile = %d, want 0 (boot must fail closed)", got)
+	}
+	if got := h.orch.replicas.countState(domain.ReplicaStateDead); got == 0 {
+		t.Fatalf("token-less boot should have left a dead replica")
+	}
+
+	// ── the recovery: an idempotent, same-revision re-provision ───────────
+	second, err := h.resource.ProvisionDedicated(ctx, in)
+	if err != nil {
+		t.Fatalf("re-provision after restart: %v", err)
+	}
+	if second != first {
+		t.Fatalf("response changed: %+v, want identical to %+v", second, first)
+	}
+	tok, ok := h.store.Get(appID)
+	if !ok {
+		t.Fatalf("re-provision must re-hand the token into the store")
+	}
+	if tok != in.VaultToken {
+		t.Fatalf("re-handed token = %q, want the freshly supplied one", tok)
+	}
+	if got := h.orch.replicas.countState(domain.ReplicaStateResident); got != 1 {
+		t.Fatalf("resident replicas after recovery = %d, want 1", got)
+	}
+	if got := h.orch.replicas.countState(domain.ReplicaStateDead); got != 0 {
+		t.Fatalf("dead replicas after recovery = %d, want 0", got)
+	}
+
+	// The claim still points at the SAME app (no second app, no empty new volume).
+	after, err := h.repo.GetResourceByHandle(ctx, resourceID)
+	if err != nil {
+		t.Fatalf("resource lookup: %v", err)
+	}
+	if after.AppID == nil || *after.AppID != appID {
+		t.Fatalf("app_id = %v, want unchanged %v", after.AppID, appID)
+	}
+	apps, err := h.orch.apps.List(ctx)
+	if err != nil || len(apps) != 1 {
+		t.Fatalf("apps = %d, want exactly 1 (recovery must not mint a second app): %v", len(apps), err)
+	}
+	// The replacement is a NEW replica — the pre-restart one was dead and replaced,
+	// which is what recovery means here.
+	live, _ := h.orch.replicas.ListByApp(ctx, appID)
+	if len(live) != 1 || live[0].ID == preRestartReplica {
+		t.Fatalf("expected one fresh replica, got %+v", live)
+	}
+}
+
+// TestProvisionDedicated_HealthyReProvisionDoesNotChurn pins the other half of
+// the contract: a re-provision of a perfectly healthy resource re-hands a token
+// the store already holds (harmless) and touches NOTHING else — the running VM
+// is not restarted and the replica is not churned.
+func TestProvisionDedicated_HealthyReProvisionDoesNotChurn(t *testing.T) {
+	origAlive := processAlive
+	processAlive = func(int) bool { return true }
+	defer func() { processAlive = origAlive }()
+
+	ctx := context.Background()
+	org := uuid.New()
+	h := newResourceRecoveryHarness(t)
+	in := dedicatedInputWithSecret(org)
+
+	first, err := h.resource.ProvisionDedicated(ctx, in)
+	if err != nil {
+		t.Fatalf("first provision: %v", err)
+	}
+	row, _ := h.repo.GetResourceByHandle(ctx, uuid.MustParse(first.Handle))
+	appID := *row.AppID
+	before, _ := h.orch.replicas.ListByApp(ctx, appID)
+	if len(before) != 1 || before[0].State != domain.ReplicaStateResident {
+		t.Fatalf("expected one resident replica, got %+v", before)
+	}
+
+	second, err := h.resource.ProvisionDedicated(ctx, in)
+	if err != nil {
+		t.Fatalf("re-provision: %v", err)
+	}
+	if second != first {
+		t.Fatalf("response changed: %+v, want identical to %+v", second, first)
+	}
+	if tok, ok := h.store.Get(appID); !ok || tok != in.VaultToken {
+		t.Fatalf("token store after re-hand = %q,%v", tok, ok)
+	}
+	after, _ := h.orch.replicas.ListByApp(ctx, appID)
+	if len(after) != 1 {
+		t.Fatalf("replicas after re-provision = %d, want 1", len(after))
+	}
+	if after[0].ID != before[0].ID {
+		t.Fatalf("replica was churned: %s → %s", before[0].ID, after[0].ID)
+	}
+	if after[0].State != domain.ReplicaStateResident || after[0].PID == nil || before[0].PID == nil || *after[0].PID != *before[0].PID {
+		t.Fatalf("running VM was restarted: before=%+v after=%+v", before[0], after[0])
 	}
 }
