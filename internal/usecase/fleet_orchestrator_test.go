@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/runtime-service/internal/domain"
 )
 
@@ -528,6 +530,128 @@ func TestReconcileApp_BackingFilePreconditionIsNotALatch(t *testing.T) {
 	}
 	if got := h.replicas.countState(domain.ReplicaStateResident); got != 1 {
 		t.Fatalf("resident replicas = %d, want 1", got)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Condition-log throttling. The precondition is re-evaluated every ~10s tick
+// forever, so an unconvergeable resource used to emit its blocked line every
+// tick and bury every other line in the journal. The CHECK still runs each
+// tick — only the line is throttled.
+// ─────────────────────────────────────────────────────────────────────
+
+// condCountHandler counts emitted records by their "condition" attribute.
+type condCountHandler struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func newCondCountHandler() *condCountHandler {
+	return &condCountHandler{counts: map[string]int{}}
+}
+func (h *condCountHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *condCountHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "condition" {
+			h.counts[a.Value.String()]++
+		}
+		return true
+	})
+	return nil
+}
+func (h *condCountHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *condCountHandler) WithGroup(string) slog.Handler      { return h }
+func (h *condCountHandler) count(condition string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.counts[condition]
+}
+
+func TestPlaceableOnBackingFile_ConditionLogThrottle(t *testing.T) {
+	tests := []struct {
+		name      string
+		condition string
+		// backingPath returns the volume's backing path under root.
+		backingPath func(root string) string
+		// breakIt makes the condition true; heal makes the app placeable again.
+		breakIt func(t *testing.T, backing string)
+		heal    func(t *testing.T, backing string)
+	}{
+		{
+			name:        "backing file missing from a mounted store",
+			condition:   conditionBackingFileMissing,
+			backingPath: func(root string) string { return filepath.Join(root, "vol.ext4") },
+			breakIt: func(t *testing.T, backing string) {
+				if err := os.RemoveAll(backing); err != nil {
+					t.Fatal(err)
+				}
+			},
+			heal: func(t *testing.T, backing string) {
+				if err := os.WriteFile(backing, []byte("DATA"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:        "volume store unavailable",
+			condition:   conditionVolumeStoreUnavailable,
+			backingPath: func(root string) string { return filepath.Join(root, "not-mounted", "vol.ext4") },
+			breakIt: func(t *testing.T, backing string) {
+				if err := os.RemoveAll(filepath.Dir(backing)); err != nil {
+					t.Fatal(err)
+				}
+			},
+			heal: func(t *testing.T, backing string) {
+				if err := os.MkdirAll(filepath.Dir(backing), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(backing, []byte("DATA"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backing := tt.backingPath(t.TempDir())
+			h, app := newStatefulOrchHarness(t, backing)
+
+			clock := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+			h.orch.clock = func() time.Time { return clock }
+
+			sink := newCondCountHandler()
+			ctx := logger.NewContext(context.Background(), slog.New(sink))
+
+			tick := func(wantPlaceable bool, wantLines int, step string) {
+				t.Helper()
+				if got := h.orch.placeableOnBackingFile(ctx, app.ID); got != wantPlaceable {
+					t.Fatalf("%s: placeable = %v, want %v (throttling must not change placement)", step, got, wantPlaceable)
+				}
+				if got := sink.count(tt.condition); got != wantLines {
+					t.Fatalf("%s: %s lines = %d, want %d", step, tt.condition, got, wantLines)
+				}
+			}
+
+			tt.breakIt(t, backing)
+			tick(false, 1, "first occurrence logs immediately")
+			tick(false, 1, "second tick inside the window is suppressed")
+
+			clock = clock.Add(conditionLogInterval - time.Second)
+			tick(false, 1, "still inside the window")
+
+			clock = clock.Add(2 * time.Second)
+			tick(false, 2, "window elapsed logs again")
+
+			// The condition clears, then recurs: the recurrence must log on its
+			// first tick rather than wait out a stale timestamp.
+			tt.heal(t, backing)
+			tick(true, 2, "healed places and logs nothing")
+			tt.breakIt(t, backing)
+			tick(false, 3, "recurrence logs immediately")
+		})
 	}
 }
 

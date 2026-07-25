@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -62,6 +63,16 @@ type FleetOrchestrator struct {
 	// materialize (the image pull), and DecommissionApp drops it. Nil leaves the
 	// materialize path on the shared registry service key (back-compat).
 	registryTokenStore *FleetRegistryTokenStore
+
+	// condLogLast throttles the placement-blocked condition LINES (never the
+	// checks themselves — see placeableOnBackingFile). Keyed
+	// "<app_id>|<condition>" → the time that line was last emitted. A sync.Map
+	// because reconcile ticks run concurrently across apps.
+	condLogLast sync.Map
+
+	// clock is the time seam (§30.6). Defaults to time.Now; tests drive the
+	// throttle window through it rather than sleeping.
+	clock func() time.Time
 }
 
 // ActivityFeed reports per-host request activity observed at the ingress gateway
@@ -84,7 +95,7 @@ func NewFleetOrchestrator(
 	scheduler *FleetScheduler,
 	runtime *FleetReplicaRuntime,
 ) *FleetOrchestrator {
-	return &FleetOrchestrator{apps: apps, replicas: replicas, scheduler: scheduler, runtime: runtime}
+	return &FleetOrchestrator{apps: apps, replicas: replicas, scheduler: scheduler, runtime: runtime, clock: time.Now}
 }
 
 // SetVolumeManager wires the persistent-volume manager (rt#9). Optional: a nil
@@ -604,6 +615,48 @@ const (
 	conditionVolumeStoreUnavailable = "volume-store-unavailable"
 )
 
+// conditionLogInterval is how often ONE (app, condition) placement-blocked line
+// may be emitted. The reconciler re-evaluates the condition every tick (~10s)
+// and an unconvergeable resource never stops failing it, so logging every
+// evaluation buries every other line in the journal. It throttles the LINE only:
+// the check still runs every tick and still answers the same thing.
+const conditionLogInterval = 10 * time.Minute
+
+// shouldLogCondition reports whether this (app, condition) line may be emitted
+// now, recording the emission when it may. The first occurrence always logs;
+// afterwards at most one line per conditionLogInterval.
+func (uc *FleetOrchestrator) shouldLogCondition(appID uuid.UUID, condition string) bool {
+	key := appID.String() + "|" + condition
+	now := uc.now()
+	prev, loaded := uc.condLogLast.LoadOrStore(key, now)
+	if !loaded {
+		return true // first occurrence: log immediately
+	}
+	last, ok := prev.(time.Time)
+	if ok && now.Sub(last) < conditionLogInterval {
+		return false
+	}
+	// CompareAndSwap so a concurrent tick that already claimed this window does
+	// not produce a second line.
+	return uc.condLogLast.CompareAndSwap(key, prev, now)
+}
+
+// clearConditionLogs drops this app's throttle entries. Called whenever the app
+// is placeable again: without it a stale timestamp would silently swallow the
+// first line of a RECURRENCE, which is exactly the line an operator needs.
+func (uc *FleetOrchestrator) clearConditionLogs(appID uuid.UUID) {
+	uc.condLogLast.Delete(appID.String() + "|" + conditionBackingFileMissing)
+	uc.condLogLast.Delete(appID.String() + "|" + conditionVolumeStoreUnavailable)
+}
+
+// now reads the clock seam, tolerating an orchestrator built without one.
+func (uc *FleetOrchestrator) now() time.Time {
+	if uc.clock != nil {
+		return uc.clock()
+	}
+	return time.Now()
+}
+
 // placeableOnBackingFile reports whether a shortfall replica may be placed for
 // this app on THIS tick, by checking that the data it would attach still exists.
 //
@@ -618,6 +671,18 @@ const (
 // attaches and the snapshotter copies the backing file locally on the host that
 // holds the app's affinity).
 func (uc *FleetOrchestrator) placeableOnBackingFile(ctx context.Context, appID uuid.UUID) bool {
+	placeable := uc.evalPlaceableOnBackingFile(ctx, appID)
+	if placeable {
+		// The condition (if any) has cleared — forget the throttle so a
+		// recurrence logs on its first tick.
+		uc.clearConditionLogs(appID)
+	}
+	return placeable
+}
+
+// evalPlaceableOnBackingFile is the check itself. It runs on every tick and its
+// answer is the sole input to placement; only the LOGGING it does is throttled.
+func (uc *FleetOrchestrator) evalPlaceableOnBackingFile(ctx context.Context, appID uuid.UUID) bool {
 	if uc.volumes == nil {
 		return true // no volume support wired: every app is stateless here
 	}
@@ -645,14 +710,18 @@ func (uc *FleetOrchestrator) placeableOnBackingFile(ctx context.Context, appID u
 	// makes every file under it vanish at once, and reporting that as customer
 	// data loss sends an operator hunting a restore for data that is intact.
 	if _, derr := os.Stat(filepath.Dir(vol.BackingPath)); derr != nil {
-		logger.FromContext(ctx).Warn("fleet reconcile: volume store unavailable, deferring placement (this is NOT data loss — the store is not mounted)",
-			"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath,
-			"condition", conditionVolumeStoreUnavailable, "err", derr)
+		if uc.shouldLogCondition(appID, conditionVolumeStoreUnavailable) {
+			logger.FromContext(ctx).Warn("fleet reconcile: volume store unavailable, deferring placement (this is NOT data loss — the store is not mounted)",
+				"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath,
+				"condition", conditionVolumeStoreUnavailable, "err", derr)
+		}
 		return false
 	}
-	logger.FromContext(ctx).Error("fleet reconcile: backing file is missing from a mounted volume store — skipping placement (no replica, no image materialize, no secret resolve) until the file returns or the resource is restored from a recovery point",
-		"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath,
-		"condition", conditionBackingFileMissing)
+	if uc.shouldLogCondition(appID, conditionBackingFileMissing) {
+		logger.FromContext(ctx).Error("fleet reconcile: backing file is missing from a mounted volume store — skipping placement (no replica, no image materialize, no secret resolve) until the file returns or the resource is restored from a recovery point",
+			"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath,
+			"condition", conditionBackingFileMissing)
+	}
 	return false
 }
 
