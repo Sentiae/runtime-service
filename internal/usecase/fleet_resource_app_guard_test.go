@@ -220,7 +220,7 @@ func TestDecommissionDedicated_LegitimatePathStillTearsDownEndToEnd(t *testing.T
 
 	snap := &fakeSnapshotter{}
 	uc := NewFleetResourceProvisioner(
-		orchProvisioner{orch: g.orch.orch}, g.orch.resources, g.orch.replicas, snap, testEngine())
+		orchProvisioner{orch: g.orch.orch}, g.orch.resources, g.orch.replicas, snap, testEngine(), testEndpointNaming())
 
 	final, err := uc.DecommissionDedicated(ctx, res.ID, true)
 	if err != nil {
@@ -267,7 +267,7 @@ func TestDecommissionDedicated_FailedTeardownLeavesTheAppGuarded(t *testing.T) {
 
 	boom := errors.New("host unreachable")
 	uc := NewFleetResourceProvisioner(
-		&fakeFleetProvisioner{decommissionErr: boom}, repo, nil, &fakeSnapshotter{}, testEngine())
+		&fakeFleetProvisioner{decommissionErr: boom}, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
 
 	if _, err := uc.DecommissionDedicated(ctx, res.ID, true); !errors.Is(err, boom) {
 		t.Fatalf("DecommissionDedicated err = %v, want the teardown failure", err)

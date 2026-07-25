@@ -59,6 +59,12 @@ type DedicatedEngineConfig struct {
 // FleetResourceProvisioner use case (R2, CP4.5 §9 #3, D-183).
 // ─────────────────────────────────────────────────────────────────────
 
+// endpointMintAttempts bounds the re-mint retry on an endpoint-id collision. The
+// space is ~4×10^8, so a single collision is already unlikely and four in a row
+// is not bad luck — it is a broken entropy source or a broken store, and looping
+// on either is worse than refusing.
+const endpointMintAttempts = 4
+
 // FleetResourceProvisioner provisions a dedicated resident Postgres data-VM as a
 // durable P19 resource. It composes FleetProvision (boot + volume + secret) and
 // records a fleet_resources claim keyed on (owner_org, claim_key, env).
@@ -68,6 +74,12 @@ type FleetResourceProvisioner struct {
 	replicas    repository.ReplicaRepository
 	snapshotter VolumeSnapshotter
 	engine      DedicatedEngineConfig
+	// naming is the configured zone + region a resource's PERMANENT
+	// customer-facing name is minted into (D-190). Unset ⇒ every dedicated
+	// provision is refused: a resource born with no servable name, or with one
+	// minted under a guessed zone, can never be corrected once its connection
+	// string is in a customer's config.
+	naming domain.EndpointNaming
 
 	// pgReady decides whether the provisioned engine ADMITS clients, over and
 	// above the app health probe's process-alive + TCP-dial (see engineAdmits). A
@@ -87,6 +99,7 @@ func NewFleetResourceProvisioner(
 	replicas repository.ReplicaRepository,
 	snapshotter VolumeSnapshotter,
 	engine DedicatedEngineConfig,
+	naming domain.EndpointNaming,
 ) *FleetResourceProvisioner {
 	return &FleetResourceProvisioner{
 		provisioner: provisioner,
@@ -94,6 +107,7 @@ func NewFleetResourceProvisioner(
 		replicas:    replicas,
 		snapshotter: snapshotter,
 		engine:      engine,
+		naming:      naming,
 		pgReady:     probePostgresReady,
 	}
 }
@@ -212,6 +226,14 @@ func (uc *FleetResourceProvisioner) ProvisionDedicated(ctx context.Context, in P
 	if uc.engine.Registry == "" || uc.engine.Repository == "" || uc.engine.Digest == "" {
 		return ProvisionDedicatedOutput{}, domain.ErrImageRefIncomplete
 	}
+	// Checked HERE, before anything is created, and not at mint time: a host with
+	// no configured zone/region cannot give this database a name a customer could
+	// ever connect to, and the cheapest moment to say so is before a VM boots and
+	// a volume is materialized. Fail-closed — there is no default, because a
+	// plausible-looking one produces a PERMANENT name nothing will serve (D-190).
+	if err := uc.naming.Validate(); err != nil {
+		return ProvisionDedicatedOutput{}, err
+	}
 	revision := in.Revision
 	if revision <= 0 {
 		revision = 1
@@ -253,11 +275,15 @@ func (uc *FleetResourceProvisioner) ProvisionDedicated(ctx context.Context, in P
 
 	now := time.Now().UTC()
 	res := &domain.FleetResource{
-		ID:         uuid.New(),
-		OwnerOrg:   ownerUUID,
-		ClaimKey:   in.ClaimKey,
-		Env:        in.Env,
-		Revision:   revision,
+		ID:       uuid.New(),
+		OwnerOrg: ownerUUID,
+		ClaimKey: in.ClaimKey,
+		Env:      in.Env,
+		Revision: revision,
+		// The data's first incarnation. Stamped explicitly because GORM writes
+		// every field it saves and a zero here would be a generation-0 object
+		// prefix (refused by the 0021 CHECK).
+		Generation: domain.FleetResourceInitialGeneration,
 		Class:      resourceClassPostgres,
 		Tier:       resourceTierDedicated,
 		Phase:      domain.FleetResourcePhaseProvisioning,
@@ -267,16 +293,48 @@ func (uc *FleetResourceProvisioner) ProvisionDedicated(ctx context.Context, in P
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
-	if err := uc.resources.SaveResource(ctx, res); err != nil {
-		// Lost the insert race on (owner_org, claim_key, env): another concurrent
-		// claim won. The FleetApp upsert is idempotent per (component_id, env), so
-		// both racers converged on one app — return the winning resource row.
-		if winner, ferr := uc.resources.FindResource(ctx, ownerUUID, in.ClaimKey, in.Env); ferr == nil {
-			return ProvisionDedicatedOutput{Handle: winner.ID.String(), Phase: string(winner.Phase)}, nil
+
+	// The endpoint identity is minted HERE — at birth, in the same INSERT that
+	// creates the row — and nowhere else. Not in a later "assign endpoints" pass:
+	// a resource that exists without its permanent name is a resource something
+	// can hand out before it has one. The claim above returns early for an
+	// EXISTING resource, so a re-provision can never mint a second name for it.
+	var saveErr error
+	for attempt := 1; attempt <= endpointMintAttempts; attempt++ {
+		endpoint, mintErr := uc.naming.Mint()
+		if mintErr != nil {
+			return ProvisionDedicatedOutput{}, fmt.Errorf("mint resource endpoint: %w", mintErr)
 		}
-		return ProvisionDedicatedOutput{}, fmt.Errorf("persist resource: %w", err)
+		endpointID := endpoint.ID()
+		res.EndpointID = &endpointID
+		res.Region = endpoint.Region()
+
+		saveErr = uc.resources.SaveResource(ctx, res)
+		if saveErr == nil {
+			return ProvisionDedicatedOutput{Handle: res.ID.String(), Phase: string(res.Phase)}, nil
+		}
+		// The unique index — never this process — decides endpoint uniqueness. A
+		// collision means re-mint, not fail: nothing else about the claim is wrong.
+		if !errors.Is(saveErr, domain.ErrEndpointTaken) {
+			break
+		}
+		logger.FromContext(ctx).Warn("fleet resource: minted endpoint id was already taken, re-minting",
+			"resource_id", res.ID, "endpoint_id", endpointID, "attempt", attempt)
 	}
-	return ProvisionDedicatedOutput{Handle: res.ID.String(), Phase: string(res.Phase)}, nil
+	if errors.Is(saveErr, domain.ErrEndpointTaken) {
+		// Four collisions in a ~4×10^8 space is not luck. Refuse rather than loop:
+		// the entropy source or the store is wrong, and a database is not worth
+		// minting a name for under either.
+		return ProvisionDedicatedOutput{}, fmt.Errorf("%w after %d attempts", domain.ErrEndpointMintExhausted, endpointMintAttempts)
+	}
+	// Lost the insert race on (owner_org, claim_key, env): another concurrent
+	// claim won. The FleetApp upsert is idempotent per (component_id, env), so
+	// both racers converged on one app — return the winning resource row (and with
+	// it the winner's endpoint identity; this call's minted id was never stored).
+	if winner, ferr := uc.resources.FindResource(ctx, ownerUUID, in.ClaimKey, in.Env); ferr == nil {
+		return ProvisionDedicatedOutput{Handle: winner.ID.String(), Phase: string(winner.Phase)}, nil
+	}
+	return ProvisionDedicatedOutput{}, fmt.Errorf("persist resource: %w", saveErr)
 }
 
 // dedicatedDescriptor builds the FleetProvision descriptor for a dedicated

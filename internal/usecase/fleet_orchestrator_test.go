@@ -972,7 +972,7 @@ func TestProvisionApp_ResourceClaim_GetsNoIngressRoute(t *testing.T) {
 	// drift from what P19 actually provisions. "postgres-main" is the plausible claim
 	// key whose derived label overflows 63 octets once the 36-char org uuid is inside
 	// the id — so the truncation path is exercised end to end too.
-	resources := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, testEngine())
+	resources := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
 	provision := func(org string) (uuid.UUID, string) {
 		t.Helper()
 		claim := validDedicatedInput()

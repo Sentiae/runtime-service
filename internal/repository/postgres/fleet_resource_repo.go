@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/repository"
 	"gorm.io/gorm"
@@ -23,8 +24,31 @@ func NewFleetResourceRepository(db *gorm.DB) *fleetResourceRepository {
 	return &fleetResourceRepository{db: db}
 }
 
+// endpointIDUniqueIndex is the arbiter of customer-facing endpoint uniqueness
+// (migration 0021). Named explicitly so the translation below cannot swallow an
+// unrelated 23505 — the claim-triple collision in particular means something
+// completely different to the caller (another racer won the claim, adopt it),
+// while this one means "re-mint and try again".
+const endpointIDUniqueIndex = "fleet_resources_endpoint_id_key"
+
 func (r *fleetResourceRepository) SaveResource(ctx context.Context, resource *domain.FleetResource) error {
-	return r.db.WithContext(ctx).Save(resource).Error
+	err := r.db.WithContext(ctx).Save(resource).Error
+	if isEndpointIDConflict(err) {
+		return domain.ErrEndpointTaken
+	}
+	return err
+}
+
+// isEndpointIDConflict reports whether err is the unique violation on the
+// endpoint_id index specifically. Matched on SQLSTATE + constraint name via the
+// pgconn error (never on message text, §16.5) — the same driver-level inspection
+// routeRepository uses, because this driver is not configured with gorm's
+// TranslateError.
+func isEndpointIDConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) &&
+		pgErr.Code == pgUniqueViolation &&
+		pgErr.ConstraintName == endpointIDUniqueIndex
 }
 
 func (r *fleetResourceRepository) GetResourceByHandle(ctx context.Context, id uuid.UUID) (*domain.FleetResource, error) {

@@ -51,6 +51,24 @@ type ResourceConfig struct {
 	// databases a shared logical database may be cloned from. A requested seed
 	// outside this set is rejected (never raw caller input).
 	SharedSeedTemplates []string `mapstructure:"shared_seed_templates"`
+	// EndpointZone and EndpointRegion are the two config halves of a resource's
+	// PERMANENT customer-facing name (D-190):
+	//
+	//	<endpoint-id>.<EndpointRegion>.<EndpointZone>
+	//	quiet-forest-4821.eu-central.db.sentiae.com
+	//
+	// ⚠ BOTH DEFAULT TO EMPTY, AND EMPTY REFUSES A DEDICATED PROVISION. There is
+	// deliberately no plausible-looking fallback here (`fleet.sentiae.local` is
+	// the in-repo anti-pattern this avoids): a hostname is permanent from the
+	// moment a customer pastes it into an application, so a guessed zone or a
+	// guessed region mints names nothing will ever serve and nothing can ever
+	// correct. A misconfigured host must create no database at all.
+	//
+	// EndpointRegion is deliberately NOT Fleet.Region: that one is a placement
+	// label with a legacy non-DNS default ("homelab") that a customer-facing name
+	// must never inherit. An operator sets both, and they should agree.
+	EndpointZone   string `mapstructure:"endpoint_zone"`
+	EndpointRegion string `mapstructure:"endpoint_region"`
 }
 
 // TelemetryConfig configures the OTLP export path (traces/metrics/logs → the
@@ -569,6 +587,10 @@ func Load() (*Config, error) {
 			"resource.shared_pg_port":             5432,
 			"resource.shared_ttl":                 "24h",
 			"resource.shared_seed_templates":      []string{},
+			// D-190 — EMPTY ON PURPOSE. A missing zone/region refuses a dedicated
+			// provision; it must never fall back to a plausible-looking name.
+			"resource.endpoint_zone":   "",
+			"resource.endpoint_region": "",
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -730,6 +752,8 @@ func Load() (*Config, error) {
 			{"resource.shared_pg_port", "APP_RESOURCE_SHARED_PG_PORT"},
 			{"resource.shared_ttl", "APP_RESOURCE_SHARED_TTL"},
 			{"resource.shared_seed_templates", "APP_RESOURCE_SHARED_SEED_TEMPLATES"},
+			{"resource.endpoint_zone", "APP_RESOURCE_ENDPOINT_ZONE"},
+			{"resource.endpoint_region", "APP_RESOURCE_ENDPOINT_REGION"},
 		},
 	})
 	if err != nil {

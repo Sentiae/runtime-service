@@ -111,4 +111,43 @@ var (
 	// growing it is a separate, deliberate operation (resize2fs), never a side
 	// effect of an attach.
 	ErrVolumeBackingFileUndersized = errors.New("fleet volume backing file is smaller than its recorded size")
+
+	// ── Customer-facing endpoint identity (D-190) ───────────────────────────
+	// These are all REFUSALS by design. A resource's hostname is permanent, so
+	// there is no repair, no fallback and no plausible default: a host that
+	// cannot mint a servable name must not create the resource at all.
+
+	// ErrEndpointZoneRequired is returned when no DB zone is configured. It is
+	// deliberately a refusal rather than a default — `fleet.sentiae.local` is the
+	// in-repo anti-pattern: a plausible-looking fallback mints permanent names no
+	// gate will ever serve, and by the time anyone notices they cannot be changed.
+	ErrEndpointZoneRequired = errors.New("fleet resource endpoint zone required")
+	// ErrEndpointRegionRequired is returned when no region is configured. Same
+	// reason: the region is IN the permanent name, so guessing it is unfixable.
+	ErrEndpointRegionRequired = errors.New("fleet resource endpoint region required")
+	// ErrEndpointZoneInvalid is returned when the configured zone is not a
+	// delegable, DNS-legal, multi-label zone.
+	ErrEndpointZoneInvalid = errors.New("fleet resource endpoint zone invalid")
+	// ErrEndpointRegionInvalid is returned when the configured region is not a
+	// single legal DNS label.
+	ErrEndpointRegionInvalid = errors.New("fleet resource endpoint region invalid")
+	// ErrEndpointIDInvalid is returned when an endpoint id does not have the
+	// minted shape <adjective>-<noun>-<nnnn> or is not a legal DNS label.
+	ErrEndpointIDInvalid = errors.New("fleet resource endpoint id invalid")
+	// ErrEndpointHostTooLong is returned when the assembled hostname exceeds the
+	// 253-octet DNS limit — an unresolvable name, refused at mint rather than
+	// discovered by a customer whose client cannot connect.
+	ErrEndpointHostTooLong = errors.New("fleet resource endpoint host exceeds the DNS name limit")
+	// ErrEndpointMintFailed is returned when the entropy source itself fails. A
+	// name is never minted from a weaker source as a consolation.
+	ErrEndpointMintFailed = errors.New("fleet resource endpoint mint failed")
+	// ErrEndpointTaken is returned by the store when an insert collides with the
+	// unique index on fleet_resources.endpoint_id — the ONLY arbiter of endpoint
+	// uniqueness. The provision path re-mints and retries a bounded number of
+	// times on it.
+	ErrEndpointTaken = errors.New("fleet resource endpoint id already taken")
+	// ErrEndpointMintExhausted is returned when every bounded re-mint attempt
+	// collided. At a ~4×10^8 space this means something is wrong with the entropy
+	// source or the store, so it refuses rather than looping.
+	ErrEndpointMintExhausted = errors.New("fleet resource endpoint mint exhausted")
 )

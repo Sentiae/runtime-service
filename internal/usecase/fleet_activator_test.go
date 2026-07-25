@@ -153,7 +153,7 @@ func TestActivator_UnknownAppReturnsRouteNotFound(t *testing.T) {
 func TestActivator_RefusesWhatItCannotProveIsAScaleToZeroHTTPWorkload(t *testing.T) {
 	// The REAL dedicated data-engine descriptor decides what the refused app looks
 	// like, so this test cannot drift from what P19 actually provisions.
-	resources := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, testEngine())
+	resources := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
 	dedicated := resources.dedicatedDescriptor(validDedicatedInput())
 
 	tests := []struct {

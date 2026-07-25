@@ -730,6 +730,13 @@ func (c *Container) initResourceControlPlane(cfg *config.Config) {
 			Digest:     cfg.Resource.EnginePGImageDigest,
 			ConnBudget: cfg.Resource.ConnBudget,
 		},
+		// The permanent customer-facing naming context (D-190). Unset ⇒ every
+		// dedicated provision is refused rather than minting a name under a guessed
+		// zone or region.
+		domain.EndpointNaming{
+			Zone:   cfg.Resource.EndpointZone,
+			Region: cfg.Resource.EndpointRegion,
+		},
 	)
 
 	// ResourceProvisioning handler. The shared-tier provisioner is intentionally

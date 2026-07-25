@@ -292,7 +292,10 @@ type RouteRepository interface {
 // FleetResourceRepository persists P19 resource control-plane claims and their
 // recovery points (CP4.5 §9 #3, D-164/D-183).
 type FleetResourceRepository interface {
-	// SaveResource upserts a resource claim by primary key.
+	// SaveResource upserts a resource claim by primary key. A collision on the
+	// customer-facing endpoint identity (the unique index on endpoint_id, the
+	// ONLY arbiter of it) is returned as domain.ErrEndpointTaken so the caller
+	// re-mints and retries; every other constraint violation is returned raw.
 	SaveResource(ctx context.Context, resource *domain.FleetResource) error
 	// GetResourceByHandle resolves a resource by its id (handle). Returns
 	// domain.ErrResourceNotFound when none matches.

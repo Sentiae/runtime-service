@@ -45,6 +45,10 @@ func (p FleetResourcePhase) IsValid() bool {
 	return false
 }
 
+// FleetResourceInitialGeneration is the generation a resource is born with. See
+// FleetResource.Generation — it must be set explicitly on every insert.
+const FleetResourceInitialGeneration = 1
+
 // FleetResource is a durable P19 resource claim (a database, cache, or queue
 // backing a resident system). It doubles as the GORM model (see Volume). DDL is
 // owned by golang-migrate (migrations/), not AutoMigrate. Idempotency is
@@ -69,7 +73,45 @@ type FleetResource struct {
 	DBName string `json:"db_name" gorm:"column:db_name;type:text;not null;default:''"`
 	// RoleName is the shared-variant role/user name (empty for dedicated).
 	RoleName string `json:"role_name" gorm:"column:role_name;type:text;not null;default:''"`
+	// Endpoint is the INTERNAL placement address ("guest-ip:5432") of the backing
+	// engine — where the fleet currently reaches it. It is NOT what a customer
+	// connects to and it moves whenever the workload moves; EndpointID below is
+	// the permanent public identity.
 	Endpoint string `json:"endpoint" gorm:"type:text;not null;default:''"`
+	// EndpointID is the minted, PERMANENT customer-facing name of this resource
+	// (D-190): `quiet-forest-4821`, which db-gate will serve as
+	// <endpoint_id>.<region>.<zone>. Minted from crypto/rand at birth and
+	// IMMUTABLE for life — a claim rename, a host move or an internal key rotation
+	// must never change it, because it lives in a connection string a customer has
+	// already pasted into an application.
+	//
+	// A POINTER on purpose: absence must be SQL NULL, never ''. Postgres does not
+	// collide NULLs in a unique index, so every endpoint-less row (a shared-tier
+	// claim, or a row created before D-190) coexists — whereas two '' rows would
+	// be a spurious uniqueness conflict.
+	//
+	// ⚠ The GORM tag must match migration 0021 EXACTLY (column `endpoint_id`,
+	// TEXT, nullable, unique index `fleet_resources_endpoint_id_key`): a
+	// divergence here is a schema change the migration never authored, which is
+	// how a security index silently reopened once (D-187).
+	EndpointID *string `json:"endpoint_id,omitempty" gorm:"column:endpoint_id;type:text;uniqueIndex:fleet_resources_endpoint_id_key"`
+	// Region is the region label encoded in the customer-facing name, stamped at
+	// birth from config and never inferred per request (D-190). Empty on a
+	// resource that has no endpoint identity.
+	Region string `json:"region" gorm:"column:region;type:text;not null;default:''"`
+	// Generation counts the incarnations of this resource's data. It is the fence
+	// the durability sequencing needs: recovery-point / archive object prefixes are
+	// GENERATION-SCOPED, so a restore or a rebuild starts a new prefix instead of
+	// interleaving artifacts with the incarnation it replaced. It rides along with
+	// the endpoint identity deliberately — adding it after archiving has started is
+	// a repository-layout migration under live tenant data, whereas today no
+	// customer holds anything.
+	//
+	// ⚠ Set EXPLICITLY at creation (FleetResourceInitialGeneration): GORM writes
+	// every field of a struct it saves, so a zero value would be written as 0 —
+	// which the migration's CHECK (generation >= 1) refuses, loudly, rather than
+	// letting a generation-0 prefix exist.
+	Generation int `json:"generation" gorm:"column:generation;type:int;not null;default:1"`
 	// SecretRefs are the resolver-resolvable engine credential refs — references
 	// ONLY, never a credential value.
 	SecretRefs pq.StringArray `json:"secret_refs,omitempty" gorm:"type:text[];not null;default:'{}'"`

@@ -207,11 +207,17 @@ func (uc *FleetResourceSharedProvisioner) ProvisionShared(ctx context.Context, i
 	expires := now.Add(uc.cfg.TTL)
 	endpoint := fmt.Sprintf("%s:%d", uc.cfg.Host, uc.cfg.Port)
 	res := &domain.FleetResource{
-		ID:         uuid.New(),
-		OwnerOrg:   ownerUUID,
-		ClaimKey:   in.ClaimKey,
-		Env:        in.Env,
-		Revision:   revision,
+		ID:       uuid.New(),
+		OwnerOrg: ownerUUID,
+		ClaimKey: in.ClaimKey,
+		Env:      in.Env,
+		Revision: revision,
+		// Stamped explicitly (GORM writes every field it saves, and generation 0 is
+		// refused by the 0021 CHECK). No endpoint identity is minted here: a shared
+		// claim is a logical database on a SHARED engine, so what a customer would
+		// connect to is the engine's name, not a name of its own — and inventing one
+		// per logical database is a decision the shared tier's gate has not made.
+		Generation: domain.FleetResourceInitialGeneration,
 		Class:      resourceClassPostgres,
 		Tier:       resourceTierShared,
 		Phase:      domain.FleetResourcePhaseReady,
