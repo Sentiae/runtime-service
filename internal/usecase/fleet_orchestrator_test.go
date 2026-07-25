@@ -960,17 +960,21 @@ func TestProvisionApp_SameResourceClaimDifferentOrgs_GetsSeparateIngressHosts(t 
 	routes := newOrchRouteRepo()
 	h.orch.SetIngress(routes, "fleet.sentiae.local", &fakeIngressSyncer{})
 
-	// The component id a dedicated resource derives (fleet_resource_provision.go
-	// dedicatedDescriptor): org-namespaced claim key. "postgres-main" is the
-	// plausible claim key that overflows the DNS label once the 36-char org uuid is
-	// inside the id — so this also covers the truncation path end to end.
-	const claim = "postgres-main"
+	// The component id comes from the REAL dedicatedDescriptor, so this test also
+	// guards the org-namespacing that produces it. "postgres-main" is the plausible
+	// claim key whose derived label overflows 63 octets once the 36-char org uuid is
+	// inside the id — so the truncation path is exercised end to end too.
+	resources := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, testEngine())
 	provision := func(org string) (uuid.UUID, string) {
 		t.Helper()
+		claim := validDedicatedInput()
+		claim.OwnerOrg = org
+		claim.ClaimKey = "postgres-main"
+		desc := resources.dedicatedDescriptor(claim)
 		handle, url, err := h.orch.ProvisionApp(context.Background(), FleetProvisionInput{
-			ComponentID: "resource/" + org + "/" + claim, Env: "prod", OwnerOrg: org,
-			Registry: "reg", Repository: "org/pg", Digest: "sha256:abc",
-			VCPU: 2, MemoryMB: 1024, Port: 5432,
+			ComponentID: desc.ComponentID, Env: desc.Env, OwnerOrg: desc.OwnerOrg,
+			Registry: desc.Registry, Repository: desc.Repository, Digest: desc.Digest,
+			VCPU: 2, MemoryMB: 1024, Port: desc.Port,
 		})
 		if err != nil {
 			t.Fatalf("ProvisionApp(%s): %v", org, err)
@@ -1041,10 +1045,11 @@ func TestHostForApp(t *testing.T) {
 	sixtyFour := strings.Repeat("b", 59)
 	longClaim := "resource/" + orgA + "/postgres-main-primary-eu-central"
 	longUUID := "resource/" + strings.Repeat("f", 80) + "/pg"
-	// Same first 54 slug octets, differing only past the truncation point: without
-	// the hash these two would collapse onto ONE host.
-	twinA := strings.Repeat("c", 54) + "-alpha"
-	twinB := strings.Repeat("c", 54) + "-omega"
+	// Identical for the first 63 slug octets, differing only past ANY truncation
+	// point: without the hash these two collapse onto ONE host — and one org's
+	// traffic then reaches the other app.
+	twinA := strings.Repeat("c", 63) + "/alpha"
+	twinB := strings.Repeat("c", 63) + "/omega"
 
 	tests := []struct {
 		name        string

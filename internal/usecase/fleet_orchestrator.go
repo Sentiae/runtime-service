@@ -189,9 +189,10 @@ func dnsLabel(label string) string {
 	if len(label) <= dnsLabelMaxLen {
 		return label
 	}
-	_ = sha256.Size
-	_ = hex.EncodedLen
-	return strings.TrimRight(label[:dnsLabelMaxLen], "-")
+	sum := sha256.Sum256([]byte(label))
+	suffix := hex.EncodeToString(sum[:])[:hostLabelHashLen]
+	prefix := strings.TrimRight(label[:dnsLabelMaxLen-1-hostLabelHashLen], "-")
+	return prefix + "-" + suffix
 }
 
 // sanitizeSlug lowercases and reduces a label to DNS-safe [a-z0-9-], collapsing
