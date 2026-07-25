@@ -16,6 +16,7 @@ import (
 
 	pkerrors "github.com/sentiae/platform-kit/errors"
 	"github.com/sentiae/platform-kit/secret"
+	"github.com/sentiae/runtime-service/internal/domain"
 
 	"google.golang.org/grpc/codes"
 )
@@ -67,4 +68,12 @@ func RegisterErrors() {
 	// ErrSecurityGateUnavailable (503 + FailedPrecondition).
 	pkerrors.Register(secret.ErrVaultUnavailable, http.StatusServiceUnavailable, codes.FailedPrecondition)
 	pkerrors.Register(secret.ErrNoHandedToken, http.StatusServiceUnavailable, codes.FailedPrecondition)
+
+	// The fleet-app tenancy guard (#two-orgs-same-claim-key-share-one-database). A
+	// provision without an owner org is a CALLER-INPUT fault, not a host fault: the
+	// app row is the tenancy boundary for fleet_apps (no RLS there) and an org-less
+	// row is unscoped, so it is refused before anything is written. fleetError
+	// hand-maps it to the same codes.InvalidArgument with a caller-facing message;
+	// this registration covers the paths that translate through the registry.
+	pkerrors.Register(domain.ErrFleetAppOwnerOrgRequired, http.StatusBadRequest, codes.InvalidArgument)
 }

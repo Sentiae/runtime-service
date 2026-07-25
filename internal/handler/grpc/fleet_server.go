@@ -345,6 +345,8 @@ func fleetError(err error) error {
 		return status.Error(codes.InvalidArgument, "idempotency_key requires an owner org")
 	case errors.Is(err, domain.ErrSecretResolverUnavailable):
 		return status.Error(codes.FailedPrecondition, "secret resolver unavailable on this host")
+	case errors.Is(err, domain.ErrFleetAppOwnerOrgRequired):
+		return status.Error(codes.InvalidArgument, "a resident fleet app requires an owner org")
 	case errors.Is(err, domain.ErrSecretOwnerOrgMissing):
 		return status.Error(codes.InvalidArgument, "secret refs require an owner org")
 	case errors.Is(err, domain.ErrImageRefIncomplete):

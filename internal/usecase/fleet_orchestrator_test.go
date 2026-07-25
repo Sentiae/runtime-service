@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -147,11 +148,14 @@ func (f *orchAppRepo) FindByID(_ context.Context, id uuid.UUID) (*domain.FleetAp
 	cp := *a
 	return &cp, nil
 }
-func (f *orchAppRepo) FindByComponentEnv(_ context.Context, componentID, env string) (*domain.FleetApp, error) {
+func (f *orchAppRepo) FindByComponentEnv(_ context.Context, componentID, env, ownerOrg string) (*domain.FleetApp, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, a := range f.store {
-		if a.ComponentID == componentID && a.Env == env {
+		// Keyed on (component, env, owner) exactly like the unique index in
+		// migrations/0014. A fake that matched on (component, env) alone would keep
+		// passing while the real cross-tenant defect was reintroduced.
+		if a.ComponentID == componentID && a.Env == env && a.OwnerOrg == ownerOrg {
 			cp := *a
 			return &cp, nil
 		}
@@ -291,6 +295,13 @@ func oneLiveHost() []domain.Host {
 		Status:         domain.HostStatusActive,
 	}}
 }
+
+// Two distinct owning organisations. Real uuids because owner_org carries the
+// attested tenant all the way into secret resolution.
+const (
+	orgA = "11111111-1111-1111-1111-111111111111"
+	orgB = "22222222-2222-2222-2222-222222222222"
+)
 
 func testFleetApp(desired int) *domain.FleetApp {
 	now := time.Now().UTC()
@@ -679,7 +690,7 @@ func TestOrchestrator_ProvisionNilSecretRefsPersistsNonNil(t *testing.T) {
 	// No SecretRefs — the every-secret-less-provision path that wrote SQL NULL into
 	// the JSONB NOT NULL secret_refs column before the nil→[] normalization.
 	in := FleetProvisionInput{
-		ComponentID: "comp-1", Env: "prod",
+		ComponentID: "comp-1", Env: "prod", OwnerOrg: orgA,
 		Registry: "reg", Repository: "org/app", Digest: "sha256:abc",
 		VCPU: 2, MemoryMB: 1024, Port: 8080,
 	}
@@ -729,7 +740,7 @@ func TestOrchestrator_IngressRouteAndSync(t *testing.T) {
 	h.orch.SetIngress(routes, "fleet.sentiae.local", syncer)
 
 	in := FleetProvisionInput{
-		ComponentID: "urlshortener", Env: "prod",
+		ComponentID: "urlshortener", Env: "prod", OwnerOrg: orgA,
 		Registry: "reg", Repository: "org/app", Digest: "sha256:abc",
 		VCPU: 2, MemoryMB: 1024, Port: 8080,
 	}
@@ -796,7 +807,7 @@ func TestOrchestrator_ProvisionThenScaleThenDecommission(t *testing.T) {
 
 	h := newOrchHarness(oneLiveHost())
 	in := FleetProvisionInput{
-		ComponentID: "comp-1", Env: "prod",
+		ComponentID: "comp-1", Env: "prod", OwnerOrg: orgA,
 		Registry: "reg", Repository: "org/app", Digest: "sha256:abc",
 		VCPU: 2, MemoryMB: 1024, Port: 8080,
 	}
@@ -837,4 +848,102 @@ func TestOrchestrator_ProvisionThenScaleThenDecommission(t *testing.T) {
 // membership and models none, so it matches nothing.
 func (f *orchAppRepo) ListBySystemEnv(context.Context, string, string) ([]domain.FleetApp, error) {
 	return nil, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// #two-orgs-same-claim-key-share-one-database. fleet_apps was unique on
+// (component_id, env) with no org, and the upsert looked apps up the same way,
+// so two organisations naming the same component+env CONVERGED ON ONE app row —
+// one VM, one volume, one Postgres, and one owner_org used to scope BOTH orgs'
+// secret resolution. Both must now get their own app.
+// ─────────────────────────────────────────────────────────────────────
+
+func TestProvisionApp_SameComponentEnvDifferentOrgs_GetsSeparateApps(t *testing.T) {
+	origAlive := processAlive
+	processAlive = func(int) bool { return true }
+	defer func() { processAlive = origAlive }()
+
+	h := newOrchHarness(oneLiveHost())
+	vols := newVolRepoFake()
+	h.orch.SetVolumeManager(NewFleetVolumeManager(vols, &recordingBackend{}, "/vol"))
+
+	provision := func(org string) uuid.UUID {
+		t.Helper()
+		handle, _, err := h.orch.ProvisionApp(context.Background(), FleetProvisionInput{
+			ComponentID: "shared-comp", Env: "prod", OwnerOrg: org,
+			Registry: "reg", Repository: "org/app", Digest: "sha256:abc",
+			VCPU: 2, MemoryMB: 1024, Port: 8080,
+			Volumes: []VolumeSpecInput{{SizeMB: 1024, MountPath: "/data"}},
+		})
+		if err != nil {
+			t.Fatalf("ProvisionApp(%s): %v", org, err)
+		}
+		id, perr := uuid.Parse(handle)
+		if perr != nil {
+			t.Fatalf("handle is not a uuid: %v", perr)
+		}
+		return id
+	}
+
+	appA := provision(orgA)
+	appB := provision(orgB)
+
+	// Two app rows, not one re-owned row.
+	if appA == appB {
+		t.Fatalf("both orgs converged on one app row %s — the cross-tenant defect", appA)
+	}
+	rowA, err := h.apps.FindByID(context.Background(), appA)
+	if err != nil {
+		t.Fatalf("load app A: %v", err)
+	}
+	rowB, err := h.apps.FindByID(context.Background(), appB)
+	if err != nil {
+		t.Fatalf("load app B: %v", err)
+	}
+	if rowA.OwnerOrg != orgA || rowB.OwnerOrg != orgB {
+		t.Fatalf("owner orgs = %q / %q, want %q / %q", rowA.OwnerOrg, rowB.OwnerOrg, orgA, orgB)
+	}
+
+	// Two volume sets. One shared volume would be one org's data mounted into the
+	// other org's VM.
+	volsA, err := vols.ListByApp(context.Background(), appA)
+	if err != nil {
+		t.Fatalf("list volumes A: %v", err)
+	}
+	volsB, err := vols.ListByApp(context.Background(), appB)
+	if err != nil {
+		t.Fatalf("list volumes B: %v", err)
+	}
+	if len(volsA) != 1 || len(volsB) != 1 {
+		t.Fatalf("volumes = %d / %d, want 1 each", len(volsA), len(volsB))
+	}
+	if volsA[0].ID == volsB[0].ID {
+		t.Fatalf("both orgs share volume %s — one org's data in the other's VM", volsA[0].ID)
+	}
+
+	// And the first org's row was not mutated into the second's on the way.
+	if reloaded, rerr := h.apps.FindByID(context.Background(), appA); rerr != nil || reloaded.OwnerOrg != orgA {
+		t.Fatalf("app A after B's provision: owner=%v err=%v, want %s", reloaded, rerr, orgA)
+	}
+}
+
+func TestProvisionApp_EmptyOwnerOrg_Rejected(t *testing.T) {
+	h := newOrchHarness(oneLiveHost())
+
+	_, _, err := h.orch.ProvisionApp(context.Background(), FleetProvisionInput{
+		ComponentID: "comp-1", Env: "prod", // no OwnerOrg
+		Registry: "reg", Repository: "org/app", Digest: "sha256:abc",
+		VCPU: 2, MemoryMB: 1024, Port: 8080,
+	})
+	if !errors.Is(err, domain.ErrFleetAppOwnerOrgRequired) {
+		t.Fatalf("err = %v, want ErrFleetAppOwnerOrgRequired", err)
+	}
+	// Refused BEFORE anything was written: an unscoped row is exactly what the
+	// guard exists to prevent, so a rejected provision must leave none behind.
+	if apps, lerr := h.apps.List(context.Background()); lerr != nil || len(apps) != 0 {
+		t.Fatalf("apps after rejected provision = %v (err=%v), want none", apps, lerr)
+	}
+	if got := h.replicas.count(); got != 0 {
+		t.Fatalf("replicas after rejected provision = %d, want 0", got)
+	}
 }

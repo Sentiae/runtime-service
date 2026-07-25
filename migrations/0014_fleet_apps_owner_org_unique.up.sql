@@ -1,0 +1,11 @@
+-- SentiaeDB — fix `#two-orgs-same-claim-key-share-one-database` (cross-tenant).
+-- fleet_apps was unique on (component_id, env) only, so two organisations claiming
+-- the same key converged on ONE app row — one VM, one volume, one Postgres, and one
+-- owner_org used to scope BOTH orgs' secret resolution. owner_org was recorded and
+-- then ignored by the constraint; this index makes the tenancy boundary real.
+--
+-- Added BEFORE 0016 drops the old constraint so the table is never unguarded for an
+-- instant. CONCURRENTLY keeps the table writable during the build; a single
+-- statement so the golang-migrate runner executes it outside a transaction block
+-- (CONCURRENTLY cannot run inside one).
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS fleet_apps_component_env_owner_key ON fleet_apps (component_id, env, owner_org);

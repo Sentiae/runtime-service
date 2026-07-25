@@ -9,6 +9,13 @@ var (
 	ErrFleetHostNotFound = errors.New("fleet host not found")
 	// ErrFleetAppNotFound is returned when no fleet app matches an id or component+env.
 	ErrFleetAppNotFound = errors.New("fleet app not found")
+	// ErrFleetAppOwnerOrgRequired is returned when an app provision carries no
+	// owner org. The app row IS the tenancy boundary for fleet_apps — there is no
+	// RLS on this table (migrations/0012_create_fleet_resources.up.sql: "owner_org
+	// is a column, not a policy") — and the row also carries the secret refs the
+	// replica runtime resolves under whatever org the row happens to hold. An
+	// org-less row is therefore not a benign default, it is an unscoped row.
+	ErrFleetAppOwnerOrgRequired = errors.New("fleet app requires an owner org")
 	// ErrReplicaNotFound is returned when no replica matches an id.
 	ErrReplicaNotFound = errors.New("fleet replica not found")
 	// ErrPlacementNotFound is returned when no placement matches a replica.

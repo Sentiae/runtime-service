@@ -42,10 +42,10 @@ func (r *fleetAppRepository) FindByID(ctx context.Context, id uuid.UUID) (*domai
 	return &app, nil
 }
 
-func (r *fleetAppRepository) FindByComponentEnv(ctx context.Context, componentID, env string) (*domain.FleetApp, error) {
+func (r *fleetAppRepository) FindByComponentEnv(ctx context.Context, componentID, env, ownerOrg string) (*domain.FleetApp, error) {
 	var app domain.FleetApp
 	err := r.db.WithContext(ctx).
-		Where("component_id = ? AND env = ?", componentID, env).
+		Where("component_id = ? AND env = ? AND owner_org = ?", componentID, env, ownerOrg).
 		First(&app).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {

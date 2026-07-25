@@ -242,6 +242,21 @@ func (uc *FleetOrchestrator) SyncIngress(ctx context.Context) error {
 // reconciles it once synchronously, and returns the app handle plus a resident
 // replica's endpoint (empty when none is resident yet — delivery polls Health).
 func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvisionInput) (string, string, error) {
+	// The owning org is REQUIRED, checked before any row is written and before any
+	// placement happens. The app row is the tenancy boundary for fleet_apps —
+	// there is no RLS on this table (see
+	// migrations/0012_create_fleet_resources.up.sql: "owner_org is a column, not a
+	// policy") — and an org-less row also carries the secret refs that
+	// fleet_replica_runtime.go resolves under whatever org the row happens to
+	// hold. An empty org is therefore not a benign default, it is an UNSCOPED row:
+	// the next provision with an empty org would match it on
+	// (component_id, env, '') and inherit it. Live data holds zero such rows in
+	// either control-plane DB, so this fails closed on a case that does not
+	// currently occur.
+	if in.OwnerOrg == "" {
+		return "", "", domain.ErrFleetAppOwnerOrgRequired
+	}
+
 	vcpu := in.VCPU
 	if vcpu < 1 {
 		vcpu = 1
@@ -285,7 +300,7 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 		}
 	}
 
-	app, err := uc.apps.FindByComponentEnv(ctx, in.ComponentID, in.Env)
+	app, err := uc.apps.FindByComponentEnv(ctx, in.ComponentID, in.Env, in.OwnerOrg)
 	switch {
 	case err == nil:
 		app.SystemID = in.SystemID

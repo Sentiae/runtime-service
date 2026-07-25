@@ -381,7 +381,7 @@ func TestProvisionDedicated_HappyPath(t *testing.T) {
 	}
 	// Descriptor shape.
 	gi := prov.lastInput
-	if gi.ComponentID != "resource/orders-db" {
+	if gi.ComponentID != "resource/"+in.OwnerOrg+"/orders-db" {
 		t.Errorf("component_id = %q", gi.ComponentID)
 	}
 	if gi.WorkloadClass != string(domain.ImageWorkloadClassResident) {
@@ -540,7 +540,7 @@ func TestProvisionDedicated_IdempotentSameRevision(t *testing.T) {
 			if tt.wantProvision > 0 {
 				// The recovery must hand back the SAME descriptor the claim was created
 				// from — including the freshly supplied token — never a drifted one.
-				if got := prov.lastInput; got.ComponentID != "resource/"+in.ClaimKey ||
+				if got := prov.lastInput; got.ComponentID != "resource/"+in.OwnerOrg+"/"+in.ClaimKey ||
 					got.VaultToken != in.VaultToken || got.Port != residentPGPort {
 					t.Errorf("recovery descriptor = %+v", got)
 				}
@@ -1220,5 +1220,39 @@ func TestProvisionDedicated_HealthyReProvisionDoesNotChurn(t *testing.T) {
 	}
 	if after[0].State != domain.ReplicaStateResident || after[0].PID == nil || before[0].PID == nil || *after[0].PID != *before[0].PID {
 		t.Fatalf("running VM was restarted: before=%+v after=%+v", before[0], after[0])
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// #two-orgs-same-claim-key-share-one-database. A dedicated resource's app was
+// keyed 'resource/<claim_key>' with no org, and the ingress host is DERIVED from
+// the component id (sanitizeSlug(component_id)-sanitizeSlug(env), unique-indexed
+// by migrations/0006). Org-scoping the app row alone would therefore leave the
+// second org's provision dying on a duplicate host: the org must live inside the
+// component id too.
+// ─────────────────────────────────────────────────────────────────────
+
+func TestDedicatedDescriptor_ComponentIDIsOrgNamespaced(t *testing.T) {
+	uc := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, testEngine())
+
+	in := validDedicatedInput()
+	got := uc.dedicatedDescriptor(in).ComponentID
+	if want := "resource/" + in.OwnerOrg + "/" + in.ClaimKey; got != want {
+		t.Fatalf("component_id = %q, want %q", got, want)
+	}
+
+	// Two organisations, IDENTICAL claim key + env: the component ids must differ,
+	// or both converge on one app row, one volume and one derived ingress host.
+	a := validDedicatedInput()
+	a.OwnerOrg = "11111111-1111-1111-1111-111111111111"
+	b := validDedicatedInput()
+	b.OwnerOrg = "22222222-2222-2222-2222-222222222222"
+	if a.ClaimKey != b.ClaimKey || a.Env != b.Env {
+		t.Fatalf("test setup: claims must be identical apart from the org")
+	}
+	idA := uc.dedicatedDescriptor(a).ComponentID
+	idB := uc.dedicatedDescriptor(b).ComponentID
+	if idA == idB {
+		t.Fatalf("both orgs derive component_id %q — the cross-tenant defect", idA)
 	}
 }

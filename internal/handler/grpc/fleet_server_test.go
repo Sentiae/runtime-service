@@ -130,7 +130,7 @@ func (f *fakeAppRepo) FindByID(_ context.Context, id uuid.UUID) (*domain.FleetAp
 	}
 	return nil, domain.ErrFleetAppNotFound
 }
-func (f *fakeAppRepo) FindByComponentEnv(context.Context, string, string) (*domain.FleetApp, error) {
+func (f *fakeAppRepo) FindByComponentEnv(context.Context, string, string, string) (*domain.FleetApp, error) {
 	return nil, domain.ErrFleetAppNotFound
 }
 func (f *fakeAppRepo) List(context.Context) ([]domain.FleetApp, error) { return nil, nil }

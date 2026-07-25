@@ -128,9 +128,12 @@ func (r *fakeNetAppRepo) FindByID(_ context.Context, id uuid.UUID) (*domain.Flee
 	}
 	return nil, domain.ErrFleetAppNotFound
 }
-func (r *fakeNetAppRepo) FindByComponentEnv(_ context.Context, componentID, env string) (*domain.FleetApp, error) {
+func (r *fakeNetAppRepo) FindByComponentEnv(_ context.Context, componentID, env, ownerOrg string) (*domain.FleetApp, error) {
 	for i := range r.apps {
-		if r.apps[i].ComponentID == componentID && r.apps[i].Env == env {
+		// owner_org is part of the identity, not a filter — matching without it here
+		// would let the fake serve a foreign org's app and hide the very defect the
+		// org-scoped key exists to prevent.
+		if r.apps[i].ComponentID == componentID && r.apps[i].Env == env && r.apps[i].OwnerOrg == ownerOrg {
 			return &r.apps[i], nil
 		}
 	}

@@ -178,7 +178,11 @@ type FleetAppRepository interface {
 	Create(ctx context.Context, app *domain.FleetApp) error
 	Update(ctx context.Context, app *domain.FleetApp) error
 	FindByID(ctx context.Context, id uuid.UUID) (*domain.FleetApp, error)
-	FindByComponentEnv(ctx context.Context, componentID, env string) (*domain.FleetApp, error)
+	// FindByComponentEnv looks an app up by its FULL identity. ownerOrg is part of
+	// that identity, not a filter: fleet_apps is unique on
+	// (component_id, env, owner_org) and there is no RLS on this table, so an
+	// org-blind lookup would hand one org's app row to another org's provision.
+	FindByComponentEnv(ctx context.Context, componentID, env, ownerOrg string) (*domain.FleetApp, error)
 	List(ctx context.Context) ([]domain.FleetApp, error)
 	// ListBySystemEnv returns the apps that are members of one P21 fleet network
 	// (CP4.5 §9 #5). An empty systemID matches NOTHING: '' means "no network

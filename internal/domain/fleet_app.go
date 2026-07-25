@@ -29,16 +29,22 @@ func (p RestartPolicy) IsValid() bool {
 // owned by golang-migrate (migrations/), not AutoMigrate.
 type FleetApp struct {
 	ID              uuid.UUID `json:"id" gorm:"type:uuid;primary_key"`
-	ComponentID     string    `json:"component_id" gorm:"type:varchar(255);not null;index;uniqueIndex:uq_fleet_apps_component_env"`
-	Env             string    `json:"env" gorm:"type:varchar(64);not null;uniqueIndex:uq_fleet_apps_component_env"`
+	ComponentID     string    `json:"component_id" gorm:"type:varchar(255);not null;index;uniqueIndex:fleet_apps_component_env_owner_key"`
+	Env             string    `json:"env" gorm:"type:varchar(64);not null;uniqueIndex:fleet_apps_component_env_owner_key"`
 	ImageRepository string    `json:"image_repository" gorm:"type:varchar(512);not null"`
 	ImageDigest     string    `json:"image_digest" gorm:"type:varchar(255);not null"`
 	// OwnerOrg is the attested tenant (org uuid) that owns this app's secrets
 	// (D-069). The resident replica runtime scopes every secret_ref resolution to
-	// it (I28): secrets resolve only under this org's per-tenant KEK. Empty is
-	// valid only when SecretRefs is empty — a secret-bearing app without an owner
-	// org fails closed at boot (no org to scope to).
-	OwnerOrg string `json:"owner_org" gorm:"type:text;not null;default:''"`
+	// it (I28): secrets resolve only under this org's per-tenant KEK. It is now
+	// REQUIRED — ProvisionApp refuses an empty org outright rather than accepting
+	// an unscoped row (see the rationale there).
+	//
+	// ⚠ OwnerOrg is the THIRD column of the app's uniqueness key, alongside
+	// ComponentID and Env (migrations/0014). The index name here MUST stay equal to
+	// the one 0014 creates: the fleet host runs with APP_DATABASE_AUTO_MIGRATE=true,
+	// so a name or column-set mismatch makes AutoMigrate build a second, org-blind
+	// index and silently reopen #two-orgs-same-claim-key-share-one-database.
+	OwnerOrg string `json:"owner_org" gorm:"type:text;not null;default:'';uniqueIndex:fleet_apps_component_env_owner_key"`
 	// SystemID binds this app to a P21 fleet network (CP4.5 §9 #5, D-164). It is
 	// the opaque scope key delivery resolves from catalog — the fleet stores and
 	// compares it, never dereferences it. Non-empty requires an ACTIVE

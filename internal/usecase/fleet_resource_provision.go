@@ -275,10 +275,18 @@ func (uc *FleetResourceProvisioner) ProvisionDedicated(ctx context.Context, in P
 // claim: a resident, single-replica, volume-bearing Postgres engine. The first
 // provision and the post-restart recovery re-provision BOTH build it here, so
 // the two can never drift — a "recovery" that handed a different descriptor
-// would silently converge the app to something the claim never asked for.
+// would silently converge the app to something the claim never asked for. That
+// single seam is also why the org namespace below cannot drift: the first
+// provision and the recovery re-provision derive the SAME component id, so a
+// recovery can never fall back to the old org-blind key and re-collide.
 func (uc *FleetResourceProvisioner) dedicatedDescriptor(in ProvisionDedicatedInput) FleetProvisionInput {
 	return FleetProvisionInput{
-		ComponentID:   "resource/" + in.ClaimKey,
+		// The owning org is INSIDE the component id, not just beside it in a column:
+		// the ingress host is derived from the component id
+		// (sanitizeSlug(component_id)-sanitizeSlug(env), unique-indexed by
+		// migrations/0006), so an org-blind 'resource/<claim_key>' collides across
+		// organisations on the route even once the app row itself is org-scoped.
+		ComponentID:   "resource/" + in.OwnerOrg + "/" + in.ClaimKey,
 		Env:           in.Env,
 		OwnerOrg:      in.OwnerOrg,
 		Registry:      uc.engine.Registry,

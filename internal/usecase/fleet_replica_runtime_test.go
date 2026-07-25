@@ -76,7 +76,7 @@ func (f *rtAppRepo) FindByID(_ context.Context, id uuid.UUID) (*domain.FleetApp,
 }
 func (f *rtAppRepo) Create(context.Context, *domain.FleetApp) error { return nil }
 func (f *rtAppRepo) Update(context.Context, *domain.FleetApp) error { return nil }
-func (f *rtAppRepo) FindByComponentEnv(context.Context, string, string) (*domain.FleetApp, error) {
+func (f *rtAppRepo) FindByComponentEnv(context.Context, string, string, string) (*domain.FleetApp, error) {
 	return nil, domain.ErrFleetAppNotFound
 }
 func (f *rtAppRepo) List(context.Context) ([]domain.FleetApp, error) {
