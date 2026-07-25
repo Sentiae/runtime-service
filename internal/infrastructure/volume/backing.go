@@ -21,6 +21,25 @@ import (
 // down a valid filesystem when a descriptor requests a tiny (or zero) volume.
 const minBackingMB = 32
 
+// stampLabel is written into the ext4 volume LABEL at create, alongside the
+// filesystem UUID that carries the volume id. It is what makes identity
+// verification possible AT ALL, and it is not decoration:
+//
+// every ext4 filesystem has a UUID, so "the UUID does not match the volume id"
+// cannot by itself distinguish a volume this code stamped and an OLD volume
+// formatted before the stamp existed (which carries mkfs's random UUID). Without
+// a marker the only safe reading of every mismatch is "probably legacy, adopt",
+// i.e. the check could never refuse anything. The label says "this file was
+// created by the stamping code, so its UUID is authoritative" — and only then is
+// a mismatch a real mismatch.
+//
+// ext4 labels are capped at 16 bytes; this is 11.
+//
+// Under the future CoW backend (ZFS, D-184 Phase 2) the same two facts become a
+// dataset user property — presence of the property replaces the label, its value
+// replaces the UUID — so the shape carries forward unchanged.
+const stampLabel = "sentiae-vol"
+
 // The siblings a restore parks beside a live backing file (see
 // usecase/fleet_volume_restore.go). Both are FULL-VOLUME-SIZE and nothing ever
 // removed them, so each rolled-back or interrupted restore stranded one forever
@@ -75,9 +94,20 @@ func (b *BackingStore) Ensure(ctx context.Context, in usecase.VolumeEnsureInput)
 	}
 	path := filepath.Join(in.Dir, in.VolumeID.String()+".ext4")
 
-	if _, err := os.Stat(path); err == nil {
+	if st, err := os.Stat(path); err == nil {
 		// Backing file already materialized — idempotent under BOTH modes, and
 		// never re-formatted (that would destroy the persisted data).
+		//
+		// Under ADOPT the ledger is asserting "this volume's data is here", and a
+		// stat proves only that A FILE is here. Those are different claims, so the
+		// adopt path checks the file actually IS this volume before handing it to a
+		// VM. Create is deliberately not checked: there is no ledger row yet, so
+		// there is no identity to check the file against.
+		if in.Mode == usecase.VolumeEnsureAdopt {
+			if verr := b.verifyAdopted(ctx, in, path, st.Size()); verr != nil {
+				return usecase.VolumeEnsureOutput{}, verr
+			}
+		}
 		return usecase.VolumeEnsureOutput{BackingPath: path}, nil
 	} else if !os.IsNotExist(err) {
 		return usecase.VolumeEnsureOutput{}, fmt.Errorf("stat backing file: %w", err)
@@ -93,17 +123,12 @@ func (b *BackingStore) Ensure(ctx context.Context, in usecase.VolumeEnsureInput)
 		return usecase.VolumeEnsureOutput{}, fmt.Errorf("%w: %s", domain.ErrVolumeBackingFileMissing, path)
 	}
 
-	sizeMB := in.SizeMB
-	if sizeMB < minBackingMB {
-		sizeMB = minBackingMB
-	}
-
 	// Sparse backing file: truncate to the requested size, then format ext4.
 	f, err := os.Create(path)
 	if err != nil {
 		return usecase.VolumeEnsureOutput{}, fmt.Errorf("create backing file: %w", err)
 	}
-	if terr := f.Truncate(sizeMB * 1024 * 1024); terr != nil {
+	if terr := f.Truncate(backingBytes(in.SizeMB)); terr != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
 		return usecase.VolumeEnsureOutput{}, fmt.Errorf("truncate backing file: %w", terr)
@@ -114,11 +139,116 @@ func (b *BackingStore) Ensure(ctx context.Context, in usecase.VolumeEnsureInput)
 	}
 
 	// TODO(rt#9-luks): wrap backing file with LUKS + Vault-Transit DEK once Vault is productionized
-	if o, e := exec.Command("mkfs.ext4", "-q", "-F", path).CombinedOutput(); e != nil {
+	//
+	// -U stamps the volume id INTO the filesystem, so the file carries its own
+	// identity and a later adopt can prove the data at this path is this volume's
+	// rather than inferring it from the path (which is only a naming convention an
+	// operator can break with one mv). -L marks it as stamped at all — see
+	// stampLabel for why presence and value are two different facts.
+	if o, e := exec.CommandContext(ctx, "mkfs.ext4", "-q", "-F",
+		"-U", in.VolumeID.String(), "-L", stampLabel, path).CombinedOutput(); e != nil {
 		_ = os.Remove(path)
 		return usecase.VolumeEnsureOutput{}, fmt.Errorf("mkfs.ext4 backing file: %s: %w", strings.TrimSpace(string(o)), e)
 	}
 	return usecase.VolumeEnsureOutput{BackingPath: path}, nil
+}
+
+// backingBytes is the size a backing file is materialized at, and therefore the
+// size an adopt expects to find. It is ONE function on purpose: create clamps
+// tiny/zero requests up to minBackingMB, so a verifier that compared against the
+// raw ledger size would flag every small volume as undersized.
+func backingBytes(sizeMB int64) int64 {
+	if sizeMB < minBackingMB {
+		sizeMB = minBackingMB
+	}
+	return sizeMB * 1024 * 1024
+}
+
+// verifyAdopted proves that the file already at a volume's backing path is that
+// volume, before it is handed to a VM as the customer's data.
+//
+// Two independent claims are checked, and each has its own refusal:
+//
+//   - SIZE — the file must be at least what the ledger row says. A row whose
+//     size was raised otherwise keeps attaching the smaller old filesystem
+//     forever, and the guest hits ENOSPC far from the cause. Growing the file is
+//     a deliberate operation (resize2fs), never a side effect of an attach, so
+//     this refuses rather than repairs.
+//   - IDENTITY — a STAMPED file's filesystem UUID must equal the volume id.
+//
+// Legacy files (created before the stamp) and files carrying no readable
+// filesystem signature at all are ADOPTED, with a Warn recording that identity
+// could not be verified. Refusing them would hard-fail every volume that predates
+// this check — turning a hardening measure into a fleet-wide outage over data
+// that is almost certainly fine. The Warn is the migration signal: once it stops
+// appearing, every live volume is stamped.
+//
+// A failure to run the probe at all (blkid absent, unreadable) is treated the
+// same way, for the same reason: an unverifiable file is not a proven-wrong file.
+// The size check runs first and does NOT have that tolerance — it needs no tool.
+func (b *BackingStore) verifyAdopted(ctx context.Context, in usecase.VolumeEnsureInput, path string, actualBytes int64) error {
+	if want := backingBytes(in.SizeMB); actualBytes < want {
+		logger.FromContext(ctx).Error(
+			"fleet volume: backing file is SMALLER than its ledger row records — refusing to attach it; the row's size was raised without growing the filesystem, or this is not the file the row means",
+			"volume_id", in.VolumeID, "backing_path", path, "actual_bytes", actualBytes, "expected_bytes", want)
+		return fmt.Errorf("%w: %s is %d bytes, ledger records %d", domain.ErrVolumeBackingFileUndersized, path, actualBytes, want)
+	}
+
+	id, label, err := probeExtIdentity(ctx, path)
+	switch {
+	case err != nil:
+		logger.FromContext(ctx).Warn(
+			"fleet volume: could not read the backing file's filesystem identity, adopting UNVERIFIED — this file is being attached on the strength of its path alone",
+			"volume_id", in.VolumeID, "backing_path", path, "err", err)
+		return nil
+	case label != stampLabel:
+		logger.FromContext(ctx).Warn(
+			"fleet volume: backing file carries no Sentiae identity stamp (created before stamping), adopting UNVERIFIED — its filesystem uuid is not authoritative, so it is being attached on the strength of its path alone",
+			"volume_id", in.VolumeID, "backing_path", path, "fs_uuid", id, "fs_label", label)
+		return nil
+	case !strings.EqualFold(id, in.VolumeID.String()):
+		// Stamped, and stamped as SOMETHING ELSE. This is the one case the whole
+		// check exists for, and it is refused without touching the file: whatever
+		// this is, it is evidence, and it is not this volume.
+		logger.FromContext(ctx).Error(
+			"fleet volume: the backing file at this volume's path belongs to a DIFFERENT volume — refusing to attach it; the path was reused or a sibling copy was renamed into place",
+			"volume_id", in.VolumeID, "backing_path", path, "fs_uuid", id)
+		return fmt.Errorf("%w: %s carries volume id %s, expected %s", domain.ErrVolumeIdentityMismatch, path, id, in.VolumeID)
+	}
+	return nil
+}
+
+// probeExtIdentity reads the filesystem UUID and LABEL off a backing file.
+//
+// blkid is run in LOW-LEVEL PROBE mode (-p). That is not a detail: without it
+// blkid answers from its on-disk cache (/run/blkid/blkid.tab), keyed by device
+// name — so a path whose file was replaced could be verified against the identity
+// of the file that used to be there, which is precisely the failure this check
+// exists to catch. -p reads the superblock every time.
+//
+// An empty/unformatted file makes blkid exit non-zero with no output; that is
+// reported as an error and the caller treats it as unverifiable, not as wrong.
+func probeExtIdentity(ctx context.Context, path string) (fsUUID string, label string, err error) {
+	out, err := exec.CommandContext(ctx, "blkid", "-p", "-s", "UUID", "-s", "LABEL", "-o", "export", path).Output()
+	if err != nil {
+		return "", "", fmt.Errorf("blkid probe %s: %w", path, err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "UUID":
+			fsUUID = v
+		case "LABEL":
+			label = v
+		}
+	}
+	if fsUUID == "" {
+		return "", "", fmt.Errorf("blkid probe %s reported no filesystem uuid", path)
+	}
+	return fsUUID, label, nil
 }
 
 // Delete removes a backing file AND the siblings this layout owns. A missing

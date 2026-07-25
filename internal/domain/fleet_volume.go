@@ -38,12 +38,25 @@ func (s VolumeStatus) IsValid() bool {
 // host. It doubles as the GORM model (see ImageWorkload). DDL is owned by
 // golang-migrate (migrations/), not AutoMigrate.
 type Volume struct {
-	ID           uuid.UUID  `json:"id" gorm:"type:uuid;primary_key"`
-	AppID        uuid.UUID  `json:"app_id" gorm:"type:uuid;not null;index"`
+	ID uuid.UUID `json:"id" gorm:"type:uuid;primary_key"`
+	// AppID + MountPath are the volume's REAL key, and they are unique together
+	// (migrations/0017). EnsureAppVolumes does a read-then-write on that pair with
+	// no transaction, so without the constraint two concurrent provisions of one
+	// app mint two rows and two backing files — after which the in-place restore
+	// refuses the resource forever (soleVolume wants exactly one), PrimaryVolume
+	// picks by created_at luck, and a final snapshot can capture the empty
+	// duplicate.
+	//
+	// ⚠ The index name here MUST stay equal to the one 0017 creates, over the same
+	// columns: the fleet host runs with APP_DATABASE_AUTO_MIGRATE=true, so a name
+	// or column-set mismatch makes AutoMigrate build a second, differently-keyed
+	// index and silently reopen the race (the same trap documented on
+	// FleetApp.OwnerOrg for 0014).
+	AppID        uuid.UUID  `json:"app_id" gorm:"type:uuid;not null;index;uniqueIndex:fleet_volumes_app_mount_key"`
 	SizeMB       int64      `json:"size_mb" gorm:"not null"`
 	HostAffinity *uuid.UUID `json:"host_affinity,omitempty" gorm:"type:uuid"`
 	SnapshotRef  string     `json:"snapshot_ref" gorm:"type:varchar(255);not null;default:''"`
-	MountPath    string     `json:"mount_path" gorm:"type:varchar(255);not null;default:'/data'"`
+	MountPath    string     `json:"mount_path" gorm:"type:varchar(255);not null;default:'/data';uniqueIndex:fleet_volumes_app_mount_key"`
 	// BackingPath is the host path of the ext4 backing file the guest attaches as
 	// its data disk (/dev/vdb). Empty until the backend has materialized it.
 	BackingPath string `json:"backing_path" gorm:"column:backing_path;type:varchar(512);not null;default:''"`

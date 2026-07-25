@@ -3,10 +3,14 @@ package volume
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -111,8 +115,15 @@ func TestEnsureModeDecidesWhatAnAbsentFileMeans(t *testing.T) {
 			id := uuid.New()
 			path := filepath.Join(dir, id.String()+".ext4")
 			if tt.filePresent {
+				// Seeded at the FULL ledger size (sparse), because adoption now also
+				// asserts the file is at least as large as its row records — a 35-byte
+				// "volume" is legitimately refused. The sentinel still sits at offset 0,
+				// so "was it re-formatted" is answered exactly as before.
 				if err := os.WriteFile(path, sentinel, 0o600); err != nil {
 					t.Fatalf("seed backing file: %v", err)
+				}
+				if err := os.Truncate(path, backingBytes(32)); err != nil {
+					t.Fatalf("size seeded backing file: %v", err)
 				}
 			}
 
@@ -155,16 +166,224 @@ func TestEnsureModeDecidesWhatAnAbsentFileMeans(t *testing.T) {
 				}
 			}
 			if tt.wantPreserved {
-				got, rerr := os.ReadFile(path)
+				got := make([]byte, len(sentinel))
+				f, rerr := os.Open(path)
+				if rerr != nil {
+					t.Fatalf("open backing file: %v", rerr)
+				}
+				_, rerr = io.ReadFull(f, got)
+				_ = f.Close()
 				if rerr != nil {
 					t.Fatalf("read backing file: %v", rerr)
 				}
 				if !bytes.Equal(got, sentinel) {
-					t.Fatalf("backing file content was rewritten (mkfs ran over live data): got %d bytes, want the %d-byte sentinel", len(got), len(sentinel))
+					t.Fatalf("backing file content was rewritten (mkfs ran over live data): got %q, want the %d-byte sentinel", got, len(sentinel))
 				}
 			}
 		})
 	}
+}
+
+// requireMkfs skips a row that needs a real filesystem, so the table still runs
+// on a non-Linux dev host. blkid is required alongside mkfs.ext4: a probe that
+// cannot run is deliberately TOLERATED by the code (unverifiable ≠ wrong), so
+// without the tool every identity row would "pass" by taking the legacy branch.
+func requireMkfs(t *testing.T) {
+	t.Helper()
+	for _, bin := range []string{"mkfs.ext4", "blkid"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not on PATH (non-Linux dev host) — this row needs a real ext4 filesystem", bin)
+		}
+	}
+}
+
+// formatVolume lays down a real stamped volume at path, as Ensure's create path
+// does. It goes through mkfs directly (not through Ensure) so a row can stamp an
+// identity that is NOT the volume being adopted — which is the whole point.
+func formatVolume(t *testing.T, path string, fsUUID string, label string, sizeMB int64) {
+	t.Helper()
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("create %s: %v", path, err)
+	}
+	if err := os.Truncate(path, sizeMB*1024*1024); err != nil {
+		t.Fatalf("truncate %s: %v", path, err)
+	}
+	args := []string{"-q", "-F", "-U", fsUUID}
+	if label != "" {
+		args = append(args, "-L", label)
+	}
+	args = append(args, path)
+	if o, err := exec.Command("mkfs.ext4", args...).CombinedOutput(); err != nil {
+		t.Fatalf("mkfs.ext4 %v: %s: %v", args, o, err)
+	}
+}
+
+// TestAdoptVerifiesIdentityNotMereExistence is the #adopt-verifies-existence
+// regression. Adoption was `os.Stat(path) == nil → return path`: it proved a FILE
+// was there and then handed it to a VM as the customer's database. A stale file
+// left at a reused uuid-derived path, a `.prerestore`/`.failed-*` sibling an
+// operator renamed into place, and a row whose size was raised all adopted
+// silently.
+//
+// The mismatch row is the dangerous one, and it asserts the refusal touches
+// NOTHING: the foreign file is evidence, and destroying or re-formatting it would
+// be strictly worse than the bug.
+//
+// The legacy row is the deliberate tolerance and is load-bearing in the other
+// direction: every volume created before the stamp carries mkfs's own random
+// UUID, so refusing on "uuid ≠ volume id" alone would hard-fail every existing
+// volume in the fleet. The LABEL is what separates "stamped as something else"
+// from "never stamped", which is why it exists.
+func TestAdoptVerifiesIdentityNotMereExistence(t *testing.T) {
+	const ledgerMB = 64
+	otherVolume := uuid.MustParse("a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d")
+
+	tests := []struct {
+		name string
+		// stampUUID: "" → format with the adopting volume's own id (the happy path).
+		stampUUID string
+		// label: "" → format with no label, i.e. a pre-stamp legacy volume.
+		label string
+		// sizeMB the file is actually laid down at.
+		fileMB  int64
+		wantErr error
+	}{
+		{
+			name:   "identity matches → adopted",
+			label:  stampLabel,
+			fileMB: ledgerMB,
+		},
+		{
+			name:      "stamped as a DIFFERENT volume → refused",
+			stampUUID: otherVolume.String(),
+			label:     stampLabel,
+			fileMB:    ledgerMB,
+			wantErr:   domain.ErrVolumeIdentityMismatch,
+		},
+		{
+			name:      "legacy volume, no stamp → adopted unverified",
+			stampUUID: otherVolume.String(), // mkfs's own random uuid, in effect
+			fileMB:    ledgerMB,
+		},
+		{
+			name:    "smaller than the ledger records → refused",
+			label:   stampLabel,
+			fileMB:  ledgerMB / 2,
+			wantErr: domain.ErrVolumeBackingFileUndersized,
+		},
+		{
+			name:      "undersized AND foreign → still refused (size is checked first, needs no tool)",
+			stampUUID: otherVolume.String(),
+			label:     stampLabel,
+			fileMB:    ledgerMB / 2,
+			wantErr:   domain.ErrVolumeBackingFileUndersized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requireMkfs(t)
+			dir := t.TempDir()
+			id := uuid.New()
+			path := filepath.Join(dir, id.String()+".ext4")
+
+			stamp := tt.stampUUID
+			if stamp == "" {
+				stamp = id.String()
+			}
+			formatVolume(t, path, stamp, tt.label, tt.fileMB)
+			before, serr := os.Stat(path)
+			if serr != nil {
+				t.Fatalf("stat seeded volume: %v", serr)
+			}
+			digest := fileDigest(t, path)
+
+			out, err := NewBackingStore().Ensure(context.Background(), usecase.VolumeEnsureInput{
+				VolumeID: id, SizeMB: ledgerMB, Dir: dir, Mode: usecase.VolumeEnsureAdopt,
+			})
+
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("got err %v, want %v", err, tt.wantErr)
+				}
+				if out.BackingPath != "" {
+					t.Errorf("a refusal must return no path, got %q", out.BackingPath)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Ensure: %v", err)
+				}
+				if out.BackingPath != path {
+					t.Fatalf("BackingPath = %q, want %q", out.BackingPath, path)
+				}
+			}
+
+			// EVERY row — refusal and adoption alike — must leave the file exactly as
+			// it found it. Nothing here may ever format, grow, or delete.
+			after, serr := os.Stat(path)
+			if serr != nil {
+				t.Fatalf("the backing file must survive untouched: %v", serr)
+			}
+			if after.Size() != before.Size() {
+				t.Errorf("backing file size changed: %d → %d", before.Size(), after.Size())
+			}
+			if got := fileDigest(t, path); got != digest {
+				t.Errorf("backing file CONTENT changed — something formatted or wrote over it")
+			}
+		})
+	}
+}
+
+// TestCreateStampsTheVolumeIdIntoTheFilesystem proves the other half: without the
+// stamp at create there is nothing for adopt to verify against, so this asserts
+// the created filesystem carries BOTH facts — the volume id as its UUID and the
+// marker label that makes that UUID authoritative.
+func TestCreateStampsTheVolumeIdIntoTheFilesystem(t *testing.T) {
+	requireMkfs(t)
+	dir := t.TempDir()
+	id := uuid.New()
+
+	out, err := NewBackingStore().Ensure(context.Background(), usecase.VolumeEnsureInput{
+		VolumeID: id, SizeMB: 64, Dir: dir, Mode: usecase.VolumeEnsureCreate,
+	})
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	fsUUID, label, perr := probeExtIdentity(context.Background(), out.BackingPath)
+	if perr != nil {
+		t.Fatalf("probe the volume just created: %v", perr)
+	}
+	if !strings.EqualFold(fsUUID, id.String()) {
+		t.Errorf("filesystem uuid = %s, want the volume id %s — adoption can never verify identity without this", fsUUID, id)
+	}
+	if label != stampLabel {
+		t.Errorf("filesystem label = %q, want %q — without the marker every mismatch reads as a legacy volume and the check can refuse nothing", label, stampLabel)
+	}
+
+	// And the volume it just created must adopt cleanly: create → adopt is the
+	// reboot/re-provision path, and a check that refuses its own output is worse
+	// than no check.
+	if _, aerr := NewBackingStore().Ensure(context.Background(), usecase.VolumeEnsureInput{
+		VolumeID: id, SizeMB: 64, Dir: dir, Mode: usecase.VolumeEnsureAdopt,
+	}); aerr != nil {
+		t.Fatalf("a freshly created volume must adopt: %v", aerr)
+	}
+}
+
+// fileDigest hashes a file so "untouched" is asserted on content, not on size.
+func fileDigest(t *testing.T, path string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		t.Fatalf("hash %s: %v", path, err)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // errUnsetModeMarker is a table-only marker: an unset mode is refused with a

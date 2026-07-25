@@ -496,9 +496,11 @@ func residentEndpointOf(replicas []domain.Replica) string {
 }
 
 // DecommissionDedicated tears down a dedicated resource. A durable tier is torn
-// down snapshot-first: the final snapshot MUST succeed AND MUST have produced a
-// recovery point, or the decommission fails. The row becomes a tombstone
-// (recovery points retained).
+// down snapshot-first: a recovery point MUST exist when the teardown proceeds, or
+// the decommission fails. Normally that means the final snapshot succeeded and
+// produced one; when it captured nothing — or could not run at all because the
+// backing file is gone — a PRIOR recovery point satisfies the guarantee and is
+// what gets reported. The row becomes a tombstone (recovery points retained).
 //
 // It RETURNS the final recovery point so the caller can verify the guarantee
 // instead of inferring it from a status code. Without that, `final_snapshot=true`
@@ -529,9 +531,31 @@ func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, r
 			return nil, fmt.Errorf("dedicated resource %s has no backing app to snapshot", res.ID)
 		}
 		// Snapshot-first: fail the decommission if the snapshot fails.
+		//
+		// ⚠ With ONE exception, and it is the same exception the catalog fallback
+		// below already exists for. A resource whose backing file is GONE fails the
+		// snapshot with ErrVolumeBackingFileMissing, and aborting on it made that
+		// resource undecommissionable FOREVER — no retry can invent the file, so the
+		// call could never reach the fallback that was written precisely for
+		// "this call produced nothing". The guarantee is that a recovery point
+		// EXISTS, not that this call produced one, so a missing backing file is
+		// routed into the same question the empty-points path asks: is there a prior
+		// recovery point? If yes the teardown proceeds on it (and reports THAT one,
+		// never a point it did not make); if not it is still refused with
+		// ErrResourceFinalSnapshotRequired. Every OTHER snapshot error still aborts:
+		// those describe a snapshot that COULD have been taken (a failed upload, an
+		// unquiesciable guest), and retrying them is the right answer.
 		points, serr := uc.snapshotter.SnapshotAppVolumes(ctx, res.ID, *res.AppID)
-		if serr != nil {
+		backingGone := errors.Is(serr, domain.ErrVolumeBackingFileMissing)
+		if serr != nil && !backingGone {
 			return nil, fmt.Errorf("final snapshot: %w", serr)
+		}
+		if backingGone {
+			// The snapshotter aborts the whole app on the first failed volume, so
+			// whatever it returned alongside the error is a partial answer that must
+			// not be mistaken for "this call captured something". Drop it and let the
+			// catalog answer.
+			points = nil
 		}
 		// ZERO NEW recovery points is not automatically a refusal — the guarantee
 		// is that a recovery point EXISTS, not that this call produced one.
@@ -557,11 +581,26 @@ func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, r
 				return nil, fmt.Errorf("resource %s produced no recovery point and its catalog is unreadable: %w", res.ID, perr)
 			}
 			if len(prior) == 0 {
+				if backingGone {
+					// Both sentinels: the refusal IS ErrResourceFinalSnapshotRequired
+					// (the precondition that held), and the cause the operator has to
+					// act on is that the data is gone — neither is inferable from the
+					// other, and the boundary reads both.
+					return nil, fmt.Errorf("%w: resource %s has NO recovery point on record and its backing file is gone, so tearing it down would leave nothing to restore from: %w",
+						domain.ErrResourceFinalSnapshotRequired, res.ID, serr)
+				}
 				return nil, fmt.Errorf("%w: resource %s produced NO recovery point and has none on record, so tearing it down would leave nothing to restore from",
 					domain.ErrResourceFinalSnapshotRequired, res.ID)
 			}
-			logger.FromContext(ctx).Warn("fleet decommission: final snapshot captured nothing; proceeding on an existing recovery point",
-				"resource_id", res.ID, "prior_recovery_points", len(prior))
+			if backingGone {
+				logger.FromContext(ctx).Warn("fleet decommission: the volume's backing file is GONE, so no final snapshot could be taken; proceeding on an existing recovery point — the data on that host is NOT in this teardown's recovery point",
+					"resource_id", res.ID, "app_id", res.AppID, "missing_backing", serr.Error(),
+					"recovery_point_id", prior[0].ID, "recovery_point_object_key", prior[0].ObjectKey,
+					"recovery_point_created_at", prior[0].CreatedAt, "prior_recovery_points", len(prior))
+			} else {
+				logger.FromContext(ctx).Warn("fleet decommission: final snapshot captured nothing; proceeding on an existing recovery point",
+					"resource_id", res.ID, "prior_recovery_points", len(prior))
+			}
 			final = &prior[0]
 		} else {
 			// The dedicated tier is single-volume by construction (dedicatedDescriptor

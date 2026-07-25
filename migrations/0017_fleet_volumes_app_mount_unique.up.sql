@@ -1,0 +1,21 @@
+-- fleet_volumes had no uniqueness on (app_id, mount_path) even though the whole
+-- application treats that pair as the volume's key: EnsureAppVolumes reads the
+-- app's volumes, looks the mount up in a map, and creates a row when it misses —
+-- a read-then-write with no transaction and nothing behind it. Two concurrent
+-- provisions of one app therefore mint two rows AND two backing files, and every
+-- consumer downstream then picks by luck or refuses outright: soleVolume (the
+-- in-place restore) demands exactly one volume, so restore is permanently bricked
+-- for that resource; PrimaryVolume takes vols[0] by created_at, so which file the
+-- app boots on is a race; and DecommissionDedicated takes points[0], so the
+-- "final recovery point" can be the snapshot of the EMPTY duplicate.
+--
+-- CONCURRENTLY (the 0014 precedent) keeps the table writable during the build, and
+-- it is the only statement in the file so the golang-migrate runner executes it
+-- outside a transaction block — CREATE INDEX CONCURRENTLY cannot run inside one.
+--
+-- ⚠ The index NAME and column set must stay equal to the uniqueIndex tag on
+-- domain.Volume: the fleet host runs with APP_DATABASE_AUTO_MIGRATE=true, so a
+-- mismatch makes AutoMigrate quietly build a SECOND, differently-keyed index and
+-- leave this constraint looking present while it guards nothing (the same trap
+-- documented on FleetApp.OwnerOrg for 0014).
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS fleet_volumes_app_mount_key ON fleet_volumes (app_id, mount_path);

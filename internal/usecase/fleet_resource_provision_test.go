@@ -1028,6 +1028,133 @@ func TestDecommissionDedicated_RefusesWhenNoRecoveryPointWasCreated(t *testing.T
 	}
 }
 
+// TestDecommissionDedicated_MissingBackingFileFallsBackToTheCatalog is the
+// #undecommissionable-resource regression. A resource whose data is GONE fails
+// the final snapshot with ErrVolumeBackingFileMissing, and aborting on that error
+// meant it could never reach the catalog fallback written for exactly this shape
+// — no retry can invent the file, so the resource was stuck forever even while a
+// perfectly good recovery point sat in the store. The guarantee is that a
+// recovery point EXISTS, not that this call produced one.
+//
+// The table states the whole rule, and each row kills a different mis-fix:
+//   - a broad "any snapshot error falls through" would tear down a resource whose
+//     snapshot merely failed to UPLOAD, which is retryable and must abort — the
+//     upload-failure rows (with and without prior points) are that guard;
+//   - a fallback that forgot the zero-points precondition would destroy the one
+//     resource that really has nothing to restore from;
+//   - reporting a recovery point this call did not make is a lie the caller uses
+//     to verify the guarantee, so the reported point is asserted to be the PRIOR
+//     one, by id.
+func TestDecommissionDedicated_MissingBackingFileFallsBackToTheCatalog(t *testing.T) {
+	// The real snapshotter wraps the sentinel with the path; wrap it here too so
+	// the fake exercises errors.Is against a wrapped error, not the bare value.
+	backingGone := fmt.Errorf("upload snapshot: %w: /fleet/volumes/x.ext4: no such file",
+		domain.ErrVolumeBackingFileMissing)
+	uploadFailed := errors.New("upload snapshot: put object: connection reset")
+
+	tests := []struct {
+		name      string
+		snapErr   error
+		priorPts  int
+		wantErr   error
+		wantTorn  bool
+		wantFinal bool
+	}{
+		{
+			name:      "backing file gone, a prior recovery point exists → tears down on that point",
+			snapErr:   backingGone,
+			priorPts:  2,
+			wantTorn:  true,
+			wantFinal: true,
+		},
+		{
+			name:     "backing file gone, NO recovery point on record → still refused",
+			snapErr:  backingGone,
+			priorPts: 0,
+			wantErr:  domain.ErrResourceFinalSnapshotRequired,
+		},
+		{
+			name:     "a retryable snapshot failure still aborts, even with prior points",
+			snapErr:  uploadFailed,
+			priorPts: 2,
+			wantErr:  uploadFailed,
+		},
+		{
+			name:    "a retryable snapshot failure still aborts with no prior points",
+			snapErr: uploadFailed,
+			wantErr: uploadFailed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newFakeResourceRepo()
+			snap := &fakeSnapshotter{err: tt.snapErr}
+			prov := &fakeFleetProvisioner{}
+			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine())
+
+			rid := uuid.New()
+			appID := uuid.New()
+			repo.seed(&domain.FleetResource{ID: rid, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady, AppID: &appID})
+			// Newest first, matching the repository's ordering — the fallback reports
+			// prior[0], and which one that is matters to the operator.
+			var newest uuid.UUID
+			for i := 0; i < tt.priorPts; i++ {
+				rp := domain.FleetResourceRecoveryPoint{
+					ID: uuid.New(), ResourceID: rid,
+					ObjectKey: fmt.Sprintf("volumes/v/%d.ext4", i),
+					CreatedAt: time.Now().UTC().Add(time.Duration(i) * time.Hour),
+				}
+				if err := repo.SaveRecoveryPoint(context.Background(), &rp); err != nil {
+					t.Fatalf("seed recovery point: %v", err)
+				}
+				newest = rp.ID
+			}
+
+			final, err := uc.DecommissionDedicated(context.Background(), rid, true)
+
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tt.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("decommission: %v", err)
+			}
+			// The missing-file refusal must ALSO stay legible as the missing file:
+			// ErrResourceFinalSnapshotRequired says which precondition held, the
+			// backing-file sentinel says what the operator has to act on.
+			if tt.snapErr == backingGone && tt.wantErr != nil && !errors.Is(err, domain.ErrVolumeBackingFileMissing) {
+				t.Errorf("the refusal lost the missing-backing-file cause: %v", err)
+			}
+			if torn := len(prov.decommissioned) == 1; torn != tt.wantTorn {
+				t.Fatalf("app torn down = %v, want %v", torn, tt.wantTorn)
+			}
+			row, _ := repo.GetResourceByHandle(context.Background(), rid)
+			if tombstoned := row.Phase == domain.FleetResourcePhaseDecommissioned; tombstoned != tt.wantTorn {
+				t.Fatalf("tombstoned = %v, want %v", tombstoned, tt.wantTorn)
+			}
+			if !tt.wantFinal {
+				if final != nil {
+					t.Fatalf("a refused teardown must report no recovery point, got %+v", final)
+				}
+				return
+			}
+			if final == nil {
+				t.Fatal("a teardown that proceeded on a prior recovery point must report it")
+			}
+			// The point reported is the PRE-EXISTING one. Nothing was captured here,
+			// and a caller verifying the guarantee must not be handed an invention.
+			if final.ID != newest {
+				t.Errorf("final recovery point = %s, want the newest prior one %s", final.ID, newest)
+			}
+			pts, _ := repo.ListRecoveryPoints(context.Background(), rid)
+			if len(pts) != tt.priorPts {
+				t.Errorf("recovery points = %d, want the %d that already existed — none may be invented", len(pts), tt.priorPts)
+			}
+		})
+	}
+}
+
 // A resource whose backing fleet_apps row has VANISHED must still be retirable.
 // fleet_volumes cascades on fleet_apps (migrations/0001 :89) while
 // fleet_resources.app_id carries no FK (migrations/0012), so a teardown that

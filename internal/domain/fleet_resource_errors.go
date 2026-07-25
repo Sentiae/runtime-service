@@ -94,4 +94,21 @@ var (
 	// sentinel it reached the caller as a bare Internal, indistinguishable from a
 	// panic (#resource-final-snapshot-failure-is-a-bare-500).
 	ErrVolumeBackingFileMissing = errors.New("fleet resource volume backing file is missing")
+	// ErrVolumeIdentityMismatch is returned when the file at a volume's backing
+	// path IS a Sentiae-stamped volume but belongs to a DIFFERENT volume. Adoption
+	// used to be a bare os.Stat: "something is here" was accepted as "this volume's
+	// data is here", which are not the same claim. A stale file left at a reused
+	// uuid-derived path, or a `.prerestore`/`.failed-*` sibling an operator renamed
+	// into place, would then be attached to a live database as if it were the
+	// customer's current data. The filesystem UUID is set to the volume id at
+	// create (mkfs.ext4 -U), so identity is checkable and a mismatch is refused.
+	ErrVolumeIdentityMismatch = errors.New("fleet volume backing file belongs to a different volume")
+	// ErrVolumeBackingFileUndersized is returned when a volume's backing file is
+	// smaller than the size its ledger row records. Adoption ignored SizeMB
+	// entirely, so a row whose size was raised silently kept attaching the old,
+	// smaller filesystem and the guest simply ran out of space later, far from the
+	// cause. Refusing is the honest answer: the file cannot satisfy the row, and
+	// growing it is a separate, deliberate operation (resize2fs), never a side
+	// effect of an attach.
+	ErrVolumeBackingFileUndersized = errors.New("fleet volume backing file is smaller than its recorded size")
 )

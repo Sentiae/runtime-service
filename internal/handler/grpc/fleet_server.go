@@ -402,6 +402,14 @@ func fleetError(err error) error {
 	// server-side (in the Error log); these messages are tenant-visible.
 	case errors.Is(err, domain.ErrVolumeBackingFileMissing):
 		return status.Error(codes.FailedPrecondition, "this app's persistent volume is recorded but its backing file is not on the host — refusing to attach an empty replacement; restore from a recovery point")
+	// The identity refusals MUST be mapped, not left to the default: their errors
+	// carry the host backing PATH and the foreign volume id, and the default branch
+	// echoes err.Error() straight to the tenant. Both name the condition only; the
+	// path stays server-side in the Error log the backend already writes.
+	case errors.Is(err, domain.ErrVolumeIdentityMismatch):
+		return status.Error(codes.FailedPrecondition, "the file at this volume's backing path belongs to a DIFFERENT volume — refusing to attach it; the volume's own data must be put back, or restore from a recovery point")
+	case errors.Is(err, domain.ErrVolumeBackingFileUndersized):
+		return status.Error(codes.FailedPrecondition, "this volume's backing file is smaller than the size recorded for it — refusing to attach it; the filesystem must be grown to match before it can be used")
 	case errors.Is(err, domain.ErrFleetNetworkNotFound):
 		return status.Error(codes.FailedPrecondition, "no active fleet network for this system and env — EnsureNetwork first")
 	case errors.Is(err, domain.ErrNetworkEnforcerUnavailable):
