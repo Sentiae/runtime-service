@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 )
 
 // Listener is a TCP-based fallback for non-Linux platforms (macOS, etc.)
@@ -68,7 +69,8 @@ func (l *Listener) Accept(ctx context.Context, vmID uuid.UUID) (*Client, error) 
 		l.clients[vmID] = client
 		l.mu.Unlock()
 
-		log.Printf("vmcomm: accepted TCP connection from %s (VM %s)", r.conn.RemoteAddr(), vmID)
+		logger.FromContext(ctx).Info("vmcomm: accepted TCP connection",
+			"vm_id", vmID, "remote_addr", r.conn.RemoteAddr().String())
 		return client, nil
 	}
 }

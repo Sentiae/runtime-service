@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 )
 
 const (
@@ -141,7 +142,7 @@ func (l *Listener) Accept(ctx context.Context, vmID uuid.UUID) (*Client, error) 
 		l.clients[vmID] = client
 		l.mu.Unlock()
 
-		log.Printf("vmcomm: accepted connection from CID %d (VM %s)", r.cid, vmID)
+		logger.FromContext(ctx).Info("vmcomm: accepted vsock connection", "vm_id", vmID, "cid", r.cid)
 		return client, nil
 	}
 }

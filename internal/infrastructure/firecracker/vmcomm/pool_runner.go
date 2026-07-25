@@ -3,8 +3,8 @@ package vmcomm
 import (
 	"context"
 	"fmt"
-	"log"
 
+	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/runtime-service/internal/domain"
 	pb "github.com/sentiae/runtime-service/internal/infrastructure/firecracker/agentpb"
 	"github.com/sentiae/runtime-service/internal/usecase"
@@ -54,13 +54,15 @@ func (r *PoolRunner) Run(ctx context.Context, vm *domain.MicroVM, execution *dom
 		MemoryLimitMb: int64(execution.Resources.MemoryMB),
 	}
 
-	log.Printf("pool-runner: sending task %s to VM %s (lang=%s)", taskID, pooledVM.VM.ID, execution.Language)
+	logger.FromContext(ctx).Info("vmcomm pool-runner: sending task to VM",
+		"task_id", taskID, "vm_id", pooledVM.VM.ID, "language", execution.Language)
 
 	result, err := pooledVM.Client.ExecuteTask(ctx, task, nil)
 	if err != nil {
 		// Connection might be broken (broken pipe). Remove from pool
 		// and boot a fresh VM.
-		log.Printf("pool-runner: task failed on warm VM %s, retrying with fresh VM: %v", pooledVM.VM.ID, err)
+		logger.FromContext(ctx).Warn("vmcomm pool-runner: task failed on warm VM, retrying with a fresh VM",
+			"task_id", taskID, "vm_id", pooledVM.VM.ID, "err", err)
 		r.pool.ReleaseVM(pooledVM.VM.ID) // release first so defer doesn't double-release
 		r.pool.removeVM(pooledVM.VM.ID)  // remove from pool entirely
 

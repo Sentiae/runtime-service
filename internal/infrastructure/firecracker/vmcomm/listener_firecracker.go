@@ -4,13 +4,13 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 )
 
 // FirecrackerListener manages vsock connections via Firecracker's UDS-based vsock.
@@ -35,7 +35,7 @@ func (l *FirecrackerListener) ConnectToVM(ctx context.Context, vmID uuid.UUID, s
 	// Firecracker vsock UDS is at <socket_path>.vsock (configured via /vsock API)
 	udsPath := socketPath + ".vsock"
 
-	log.Printf("vmcomm: connecting to VM %s vsock at %s", vmID, udsPath)
+	logger.FromContext(ctx).Debug("vmcomm: connecting to VM vsock", "vm_id", vmID, "uds_path", udsPath)
 
 	// Wait for the UDS file to appear (VM needs to boot first)
 	deadline, ok := ctx.Deadline()
@@ -110,7 +110,8 @@ func (l *FirecrackerListener) ConnectToVM(ctx context.Context, vmID uuid.UUID, s
 		return nil, fmt.Errorf("vsock handshake timed out for VM %s", vmID)
 	}
 
-	log.Printf("vmcomm: vsock handshake complete for VM %s (%s)", vmID, strings.TrimSpace(response))
+	logger.FromContext(ctx).Info("vmcomm: vsock handshake complete",
+		"vm_id", vmID, "response", strings.TrimSpace(response))
 
 	client := newClient(conn, vmID, 0)
 

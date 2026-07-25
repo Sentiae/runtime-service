@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/runtime-service/internal/domain"
 	pb "github.com/sentiae/runtime-service/internal/infrastructure/firecracker/agentpb"
 	"github.com/sentiae/runtime-service/internal/usecase"
@@ -36,7 +37,8 @@ func (r *Runner) Run(ctx context.Context, vm *domain.MicroVM, execution *domain.
 	client := r.fcListener.GetClient(vm.ID)
 	if client == nil {
 		// Agent not connected yet — connect to the VM's vsock UDS
-		log.Printf("vmcomm: connecting to agent on VM %s (socket=%s)...", vm.ID, vm.SocketPath)
+		logger.FromContext(ctx).Debug("vmcomm: connecting to guest agent",
+			"vm_id", vm.ID, "socket_path", vm.SocketPath)
 		connectCtx, cancel := context.WithTimeout(ctx, r.readyTimeout)
 		defer cancel()
 
@@ -52,8 +54,8 @@ func (r *Runner) Run(ctx context.Context, vm *domain.MicroVM, execution *domain.
 			r.fcListener.RemoveClient(vm.ID)
 			return nil, fmt.Errorf("agent not ready on VM %s: %w", vm.ID, err)
 		}
-		log.Printf("vmcomm: agent ready on VM %s (version=%s, langs=%v)",
-			vm.ID, info.AgentVersion, info.SupportedLanguages)
+		logger.FromContext(ctx).Info("vmcomm: guest agent ready",
+			"vm_id", vm.ID, "agent_version", info.AgentVersion, "supported_languages", info.SupportedLanguages)
 	}
 
 	taskID := execution.ID.String()
@@ -78,7 +80,8 @@ func (r *Runner) Run(ctx context.Context, vm *domain.MicroVM, execution *domain.
 		MemoryLimitMb: int64(execution.Resources.MemoryMB),
 	}
 
-	log.Printf("vmcomm: sending task %s to VM %s (lang=%s)", taskID, vm.ID, execution.Language)
+	logger.FromContext(ctx).Info("vmcomm: sending task to VM",
+		"task_id", taskID, "vm_id", vm.ID, "language", execution.Language)
 
 	result, err := client.ExecuteTask(ctx, task, nil)
 	if err != nil {

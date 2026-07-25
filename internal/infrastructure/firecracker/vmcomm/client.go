@@ -3,12 +3,12 @@ package vmcomm
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 	pb "github.com/sentiae/runtime-service/internal/infrastructure/firecracker/agentpb"
 )
 
@@ -164,7 +164,8 @@ func (c *Client) ExecuteTask(ctx context.Context, task *pb.ExecuteTask, onOutput
 			continue
 
 		default:
-			log.Printf("vmcomm: unexpected guest message type %T", p)
+			logger.FromContext(ctx).Warn("vmcomm: unexpected guest message type",
+				"vm_id", c.vmID, "task_id", task.GetTaskId(), "message_type", fmt.Sprintf("%T", p))
 		}
 	}
 }

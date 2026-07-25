@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
@@ -130,13 +131,14 @@ func (p *Pool) AcquireVM(ctx context.Context, language domain.Language, resource
 		vm.InUse = true
 		p.busyVMs[vm.VM.ID] = vm
 		p.mu.Unlock()
-		log.Printf("pool: reusing warm VM %s for %s", vm.VM.ID, language)
+		logger.FromContext(ctx).Debug("vmcomm pool: reusing warm VM", "vm_id", vm.VM.ID, "language", language)
 
 		// Health-check the existing connection. If it's dead (broken pipe,
 		// connection reset), reconnect to the agent via vsock UDS.
 		// The agent stays alive and re-accepts connections.
 		if err := p.ensureConnected(ctx, vm); err != nil {
-			log.Printf("pool: warm VM %s connection dead, removing: %v", vm.VM.ID, err)
+			logger.FromContext(ctx).Warn("vmcomm pool: warm VM connection dead, removing",
+				"vm_id", vm.VM.ID, "language", language, "err", err)
 			p.mu.Lock()
 			delete(p.busyVMs, vm.VM.ID)
 			delete(p.allVMs, vm.VM.ID)
@@ -150,7 +152,7 @@ func (p *Pool) AcquireVM(ctx context.Context, language domain.Language, resource
 	}
 
 	// No warm VM — boot a new one
-	log.Printf("pool: no warm VM for %s, booting new one...", language)
+	logger.FromContext(ctx).Info("vmcomm pool: no warm VM available, booting a new one", "language", language)
 	return p.bootAndConnect(ctx, language, resources)
 }
 
@@ -165,7 +167,7 @@ func (p *Pool) ensureConnected(ctx context.Context, vm *PooledVM) error {
 	if _, err := vm.Client.Ping(pingCtx); err == nil {
 		return nil // connection is alive
 	}
-	log.Printf("pool: VM %s connection stale, reconnecting...", vm.VM.ID)
+	logger.FromContext(ctx).Warn("vmcomm pool: VM connection stale, reconnecting", "vm_id", vm.VM.ID)
 
 	// Close old connection.
 	_ = vm.Client.Close()
@@ -186,7 +188,8 @@ func (p *Pool) ensureConnected(ctx context.Context, vm *PooledVM) error {
 		return fmt.Errorf("agent not ready after reconnect on VM %s: %w", vm.VM.ID, err)
 	}
 
-	log.Printf("pool: reconnected to VM %s (agent=%s)", vm.VM.ID, info.AgentVersion)
+	logger.FromContext(ctx).Info("vmcomm pool: reconnected to VM",
+		"vm_id", vm.VM.ID, "agent_version", info.AgentVersion)
 	vm.Client = client
 	return nil
 }
@@ -261,8 +264,9 @@ func (p *Pool) bootAndConnect(ctx context.Context, language domain.Language, res
 		return nil, fmt.Errorf("agent not ready: %w", err)
 	}
 
-	log.Printf("pool: new VM %s ready (boot=%dms, agent=%s, langs=%v)",
-		vmID, result.BootTimeMS, info.AgentVersion, info.SupportedLanguages)
+	logger.FromContext(ctx).Info("vmcomm pool: new VM ready",
+		"vm_id", vmID, "boot_time_ms", result.BootTimeMS, "agent_version", info.AgentVersion,
+		"supported_languages", info.SupportedLanguages)
 
 	pooledVM := &PooledVM{
 		VM:     vm,
