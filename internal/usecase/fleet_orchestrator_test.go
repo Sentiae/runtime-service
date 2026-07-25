@@ -943,6 +943,187 @@ func TestProvisionApp_SameComponentEnvDifferentOrgs_GetsSeparateApps(t *testing.
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// The ingress-wired sibling of the test above. The org-separation test runs with
+// uc.routes nil, so ensureRoute returns early and the ROUTE path — where the
+// derived host is the shared key — is never exercised, while production wires
+// ingress unconditionally (internal/di/container.go). Two orgs claiming the same
+// resource claim key must get two distinct hosts and two route rows.
+// ─────────────────────────────────────────────────────────────────────
+
+func TestProvisionApp_SameResourceClaimDifferentOrgs_GetsSeparateIngressHosts(t *testing.T) {
+	origAlive := processAlive
+	processAlive = func(int) bool { return true }
+	defer func() { processAlive = origAlive }()
+
+	h := newOrchHarness(oneLiveHost())
+	routes := newOrchRouteRepo()
+	h.orch.SetIngress(routes, "fleet.sentiae.local", &fakeIngressSyncer{})
+
+	// The component id a dedicated resource derives (fleet_resource_provision.go
+	// dedicatedDescriptor): org-namespaced claim key. "postgres-main" is the
+	// plausible claim key that overflows the DNS label once the 36-char org uuid is
+	// inside the id — so this also covers the truncation path end to end.
+	const claim = "postgres-main"
+	provision := func(org string) (uuid.UUID, string) {
+		t.Helper()
+		handle, url, err := h.orch.ProvisionApp(context.Background(), FleetProvisionInput{
+			ComponentID: "resource/" + org + "/" + claim, Env: "prod", OwnerOrg: org,
+			Registry: "reg", Repository: "org/pg", Digest: "sha256:abc",
+			VCPU: 2, MemoryMB: 1024, Port: 5432,
+		})
+		if err != nil {
+			t.Fatalf("ProvisionApp(%s): %v", org, err)
+		}
+		id, perr := uuid.Parse(handle)
+		if perr != nil {
+			t.Fatalf("handle is not a uuid: %v", perr)
+		}
+		return id, url
+	}
+
+	appA, urlA := provision(orgA)
+	appB, urlB := provision(orgB)
+
+	if urlA == urlB {
+		t.Fatalf("both orgs got ingress url %q — one org's traffic reaches the other's database", urlA)
+	}
+
+	rsA, err := routes.ListByApp(context.Background(), appA)
+	if err != nil {
+		t.Fatalf("list routes A: %v", err)
+	}
+	rsB, err := routes.ListByApp(context.Background(), appB)
+	if err != nil {
+		t.Fatalf("list routes B: %v", err)
+	}
+	if len(rsA) != 1 || len(rsB) != 1 {
+		t.Fatalf("routes = %d / %d, want 1 each", len(rsA), len(rsB))
+	}
+	if rsA[0].HostPattern == rsB[0].HostPattern {
+		t.Fatalf("both orgs routed host %q — the cross-tenant defect", rsA[0].HostPattern)
+	}
+	// Each url is the app's own route host, and each host is a valid DNS name.
+	for _, c := range []struct {
+		org, url string
+		route    domain.Route
+	}{{orgA, urlA, rsA[0]}, {orgB, urlB, rsB[0]}} {
+		if c.url != "https://"+c.route.HostPattern {
+			t.Fatalf("%s: url = %q, want https://%s", c.org, c.url, c.route.HostPattern)
+		}
+		label := strings.SplitN(c.route.HostPattern, ".", 2)[0]
+		if len(label) > dnsLabelMaxLen {
+			t.Fatalf("%s: first label %q is %d octets, over the %d-octet DNS limit", c.org, label, len(label), dnsLabelMaxLen)
+		}
+	}
+}
+
+// TestHostForApp covers the DNS-label boundary. The first label is
+// sanitizeSlug(component_id)-sanitizeSlug(env) and component_id is unvalidated
+// free text, so an over-long label must be folded deterministically — an invalid
+// label is a host no resolver accepts and no CA will certify.
+func TestHostForApp(t *testing.T) {
+	const domainSuffix = "fleet.sentiae.local"
+	uc := &FleetOrchestrator{ingressDomain: domainSuffix}
+
+	// wantFolded is the expected fold of an over-long label, recomputed here from
+	// the SPEC (prefix of the full label + '-' + 8 hex of sha256(full label)) rather
+	// than by calling the code under test.
+	wantFolded := func(fullLabel string) string {
+		sum := sha256.Sum256([]byte(fullLabel))
+		prefix := strings.TrimRight(fullLabel[:dnsLabelMaxLen-1-hostLabelHashLen], "-")
+		return prefix + "-" + hex.EncodeToString(sum[:])[:hostLabelHashLen] + "." + domainSuffix
+	}
+
+	// Exactly 63: 58 + len("-prod") = 63, the last length that must pass through.
+	exactly63 := strings.Repeat("a", 58)
+	// 64: one octet over — the case a plausible claim key produces.
+	sixtyFour := strings.Repeat("b", 59)
+	longClaim := "resource/" + orgA + "/postgres-main-primary-eu-central"
+	longUUID := "resource/" + strings.Repeat("f", 80) + "/pg"
+	// Same first 54 slug octets, differing only past the truncation point: without
+	// the hash these two would collapse onto ONE host.
+	twinA := strings.Repeat("c", 54) + "-alpha"
+	twinB := strings.Repeat("c", 54) + "-omega"
+
+	tests := []struct {
+		name        string
+		componentID string
+		env         string
+		want        string
+	}{
+		{
+			// ⚠ Byte-identical to what this has always produced. Changing an existing
+			// host would silently orphan the live route pointing at the old one.
+			name:        "short id is unchanged",
+			componentID: "urlshortener",
+			env:         "prod",
+			want:        "urlshortener-prod." + domainSuffix,
+		},
+		{
+			name:        "label of exactly 63 octets passes through",
+			componentID: exactly63,
+			env:         "prod",
+			want:        exactly63 + "-prod." + domainSuffix,
+		},
+		{
+			name:        "label of 64 octets is folded",
+			componentID: sixtyFour,
+			env:         "prod",
+			want:        wantFolded(sixtyFour + "-prod"),
+		},
+		{
+			name:        "long resource claim key is folded",
+			componentID: longClaim,
+			env:         "prod",
+			want:        wantFolded(sanitizeSlug(longClaim) + "-prod"),
+		},
+		{
+			name:        "over-long component uuid is folded",
+			componentID: longUUID,
+			env:         "staging",
+			want:        wantFolded(sanitizeSlug(longUUID) + "-staging"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := &domain.FleetApp{ComponentID: tt.componentID, Env: tt.env}
+			got := uc.hostForApp(app)
+			if got != tt.want {
+				t.Fatalf("hostForApp = %q, want %q", got, tt.want)
+			}
+			label := strings.SplitN(got, ".", 2)[0]
+			if len(label) > dnsLabelMaxLen {
+				t.Fatalf("first label %q is %d octets, over the %d-octet DNS limit", label, len(label), dnsLabelMaxLen)
+			}
+			if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+				t.Fatalf("first label %q begins or ends with '-' — not a legal DNS label", label)
+			}
+			// ensureRoute re-derives the host (migration 0015 deletes resource routes so
+			// they regenerate), so the derivation must be stable across calls.
+			if again := uc.hostForApp(app); again != got {
+				t.Fatalf("hostForApp is not deterministic: %q then %q", got, again)
+			}
+		})
+	}
+
+	// Truncation must not merge two distinct ids.
+	a := uc.hostForApp(&domain.FleetApp{ComponentID: twinA, Env: "prod"})
+	b := uc.hostForApp(&domain.FleetApp{ComponentID: twinB, Env: "prod"})
+	if a == b {
+		t.Fatalf("two ids differing past the truncation point collapsed onto host %q", a)
+	}
+
+	// A cut landing on the separator must not leave a trailing '-'.
+	cutOnDash := uc.hostForApp(&domain.FleetApp{
+		ComponentID: strings.Repeat("d", 53) + "/" + strings.Repeat("e", 40), Env: "prod",
+	})
+	if label := strings.SplitN(cutOnDash, ".", 2)[0]; strings.Contains(label, "--") || strings.HasSuffix(label, "-") {
+		t.Fatalf("label %q has a doubled or trailing '-'", label)
+	}
+}
+
 func TestProvisionApp_EmptyOwnerOrg_Rejected(t *testing.T) {
 	h := newOrchHarness(oneLiveHost())
 

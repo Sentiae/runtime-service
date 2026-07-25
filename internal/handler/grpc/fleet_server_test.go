@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -107,6 +108,27 @@ func TestFleetProvision_ShadowForeignOrg_DoesNotDeny(t *testing.T) {
 	}
 	if code := status.Code(err); code != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument (unsupported class), got %s (%v)", code, err)
+	}
+}
+
+// A duplicate ingress host used to fall through to codes.Internal "internal
+// server error" — indistinguishable from a crash, on a provision that then
+// re-failed forever (the app row is committed before the route insert).
+func TestFleetError_IngressHostTaken(t *testing.T) {
+	// As the orchestrator delivers it: the repository's sentinel + host, wrapped.
+	err := fleetError(fmt.Errorf("create route: %w",
+		fmt.Errorf("%w: %s", domain.ErrIngressHostTaken, "pg-prod.fleet.sentiae.local")))
+
+	if code := status.Code(err); code != codes.AlreadyExists {
+		t.Fatalf("code = %s, want AlreadyExists", code)
+	}
+	msg := status.Convert(err).Message()
+	if !strings.Contains(msg, "component id must be globally unique") {
+		t.Fatalf("message %q does not name the cause", msg)
+	}
+	// The hand-map never echoes wrapped error text (pkerrors.ToGRPC's default would).
+	if strings.Contains(msg, "create route") {
+		t.Fatalf("message %q leaks the internal error chain", msg)
 	}
 }
 

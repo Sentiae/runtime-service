@@ -970,6 +970,185 @@ func TestDecommissionDedicated_RefusesWhenNoRecoveryPointWasCreated(t *testing.T
 	}
 }
 
+// A resource whose backing fleet_apps row has VANISHED must still be retirable.
+// fleet_volumes cascades on fleet_apps (migrations/0001 :89) while
+// fleet_resources.app_id carries no FK (migrations/0012), so a teardown that
+// deletes the app and then dies before writing the tombstone leaves a row that
+// can neither boot (recoverExisting refuses it) nor retire (Decommission on an
+// unknown handle returns ErrWorkloadNotFound and used to abort the whole call).
+//
+// The tolerance is NARROW by design, and the table proves both halves of that:
+// only already-gone is forgiven, and the snapshot-first precondition still
+// refuses a resource with nothing to restore from.
+func TestDecommissionDedicated_VanishedBackingAppStillRetires(t *testing.T) {
+	priorID := uuid.New()
+
+	tests := []struct {
+		name string
+		// noVolumes reproduces the post-cascade shape: the final snapshot walks zero
+		// volumes and succeeds having captured NOTHING.
+		noVolumes       bool
+		priorPoints     bool
+		decommissionErr error
+		wantErr         error
+		wantTombstoned  bool
+		// wantFinalPrior — the reported recovery point must be the PRE-EXISTING one,
+		// never a claimed fresh point the vacuous snapshot did not make.
+		wantFinalPrior bool
+	}{
+		{
+			name:            "vanished app with a prior recovery point retires on it",
+			noVolumes:       true,
+			priorPoints:     true,
+			decommissionErr: domain.ErrWorkloadNotFound,
+			wantTombstoned:  true,
+			wantFinalPrior:  true,
+		},
+		{
+			name:            "vanished app reported as a missing fleet app row retires too",
+			noVolumes:       true,
+			priorPoints:     true,
+			decommissionErr: fmt.Errorf("load app: %w", domain.ErrFleetAppNotFound),
+			wantTombstoned:  true,
+			wantFinalPrior:  true,
+		},
+		{
+			// THE GUARD-RAIL. If someone later "simplifies" the tolerance into skipping
+			// the snapshot-first precondition, this case starts passing a teardown that
+			// destroys a resource with nothing to restore from.
+			name:            "vanished app with ZERO recovery points is still refused",
+			noVolumes:       true,
+			priorPoints:     false,
+			decommissionErr: domain.ErrWorkloadNotFound,
+			wantErr:         domain.ErrResourceFinalSnapshotRequired,
+		},
+		{
+			name:            "any OTHER teardown error still aborts",
+			priorPoints:     true,
+			decommissionErr: errors.New("host unreachable"),
+			wantErr:         nil, // asserted as "some error" below
+		},
+		{
+			name:           "normal teardown is unchanged",
+			wantTombstoned: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newFakeResourceRepo()
+			snap := &fakeSnapshotter{noVolumes: tt.noVolumes}
+			prov := &fakeFleetProvisioner{decommissionErr: tt.decommissionErr}
+			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine())
+
+			rid := uuid.New()
+			appID := uuid.New()
+			repo.seed(&domain.FleetResource{ID: rid, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady, AppID: &appID})
+			if tt.priorPoints {
+				repo.recovery[rid] = []domain.FleetResourceRecoveryPoint{{
+					ID: priorID, ResourceID: rid, ObjectKey: "volumes/prior/final.ext4", Kind: "snapshot",
+				}}
+			}
+
+			final, err := uc.DecommissionDedicated(context.Background(), rid, true)
+			switch {
+			case tt.wantErr != nil:
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tt.wantErr)
+				}
+			case tt.wantTombstoned:
+				if err != nil {
+					t.Fatalf("teardown must succeed: %v", err)
+				}
+			default:
+				// The narrow-tolerance case: not our sentinel, so it must still abort.
+				if err == nil {
+					t.Fatal("a teardown error that is not already-gone must abort")
+				}
+				if errors.Is(err, domain.ErrWorkloadNotFound) || errors.Is(err, domain.ErrFleetAppNotFound) {
+					t.Fatalf("unexpected already-gone classification: %v", err)
+				}
+			}
+
+			row, gerr := repo.GetResourceByHandle(context.Background(), rid)
+			if gerr != nil {
+				t.Fatalf("reload resource: %v", gerr)
+			}
+			if tombstoned := row.Phase == domain.FleetResourcePhaseDecommissioned; tombstoned != tt.wantTombstoned {
+				t.Fatalf("tombstoned = %v, want %v", tombstoned, tt.wantTombstoned)
+			}
+			if tt.wantTombstoned && row.DecommissionedAt == nil {
+				t.Error("a tombstone must carry decommissioned_at")
+			}
+			if !tt.wantTombstoned {
+				if final != nil {
+					t.Fatalf("a refused/aborted teardown must report no recovery point, got %+v", final)
+				}
+				return
+			}
+			if final == nil {
+				t.Fatal("a successful snapshot-first teardown must report its recovery point")
+			}
+			if tt.wantFinalPrior {
+				// The vacuous snapshot created nothing, so the reported point MUST be the
+				// pre-existing one — asserted against the store, not against the call.
+				stored, lerr := repo.ListRecoveryPoints(context.Background(), rid)
+				if lerr != nil || len(stored) != 1 || stored[0].ID != priorID {
+					t.Fatalf("recovery catalog = %+v (err %v), want exactly the prior point %s", stored, lerr, priorID)
+				}
+				if final.ID != priorID || final.ObjectKey != "volumes/prior/final.ext4" {
+					t.Fatalf("reported recovery point = %+v, want the pre-existing %s", final, priorID)
+				}
+			}
+		})
+	}
+}
+
+// Retiring a vanished-app resource must be idempotent: the operator retries, and
+// the second call is a no-op that neither errors nor writes a second tombstone.
+func TestDecommissionDedicated_VanishedBackingAppIsIdempotent(t *testing.T) {
+	repo := newFakeResourceRepo()
+	snap := &fakeSnapshotter{noVolumes: true}
+	prov := &fakeFleetProvisioner{decommissionErr: domain.ErrWorkloadNotFound}
+	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine())
+
+	rid := uuid.New()
+	appID := uuid.New()
+	repo.seed(&domain.FleetResource{ID: rid, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady, AppID: &appID})
+	repo.recovery[rid] = []domain.FleetResourceRecoveryPoint{{
+		ID: uuid.New(), ResourceID: rid, ObjectKey: "volumes/prior/final.ext4", Kind: "snapshot",
+	}}
+
+	if _, err := uc.DecommissionDedicated(context.Background(), rid, true); err != nil {
+		t.Fatalf("first teardown: %v", err)
+	}
+	firstRow, _ := repo.GetResourceByHandle(context.Background(), rid)
+	firstAt := firstRow.DecommissionedAt
+	if firstAt == nil {
+		t.Fatal("first teardown must tombstone")
+	}
+
+	final, err := uc.DecommissionDedicated(context.Background(), rid, true)
+	if err != nil {
+		t.Fatalf("second teardown must be a no-op: %v", err)
+	}
+	if final != nil {
+		t.Fatalf("an already-tombstoned resource reports no recovery point, got %+v", final)
+	}
+	// Not double-tombstoned: no second snapshot attempt, no second teardown call,
+	// and the original decommissioned_at stands.
+	if snap.calls != 1 {
+		t.Errorf("snapshot calls = %d, want 1", snap.calls)
+	}
+	if len(prov.decommissioned) != 1 {
+		t.Errorf("teardown calls = %v, want exactly 1", prov.decommissioned)
+	}
+	secondRow, _ := repo.GetResourceByHandle(context.Background(), rid)
+	if secondRow.DecommissionedAt == nil || !secondRow.DecommissionedAt.Equal(*firstAt) {
+		t.Errorf("decommissioned_at rewritten: %v → %v", firstAt, secondRow.DecommissionedAt)
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // #p19-handed-token-not-rehandable — post-restart recovery, driven through the
 // REAL orchestrator + the REAL in-memory token store. A fake provisioner could

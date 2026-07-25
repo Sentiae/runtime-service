@@ -577,7 +577,32 @@ func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, r
 	}
 	if res.AppID != nil {
 		if derr := uc.provisioner.Decommission(ctx, res.AppID.String()); derr != nil {
-			return nil, fmt.Errorf("decommission app: %w", derr)
+			// An app row that is ALREADY GONE is not a teardown failure — there is
+			// nothing left to tear down, and the only work still owed is the tombstone.
+			// Without this the resource is stuck forever: fleet_volumes cascades on
+			// fleet_apps (migrations/0001 :89) while fleet_resources.app_id carries no
+			// FK (migrations/0012), so a teardown that deletes the app and then fails
+			// writing the tombstone leaves a row pointing at a vanished app that can
+			// neither boot (recoverExisting refuses it, correctly — a re-provision
+			// would mint a NEW empty volume) nor retire (this call aborted). The
+			// snapshot-first guarantee above is UNTOUCHED: reaching here means a
+			// recovery point provably exists, and a resource with none is still refused.
+			//
+			// The tolerance lives HERE and not in FleetProvision.Decommission on
+			// purpose: making an unknown handle idempotent success at the P7 seam would
+			// widen that shared contract's semantics for every caller of it.
+			if !errors.Is(derr, domain.ErrWorkloadNotFound) && !errors.Is(derr, domain.ErrFleetAppNotFound) {
+				return nil, fmt.Errorf("decommission app: %w", derr)
+			}
+			// Abnormal path — an operator needs to see that this teardown completed
+			// over a backing app that had already vanished, and on which recovery
+			// point it is leaving the customer.
+			reliedOn := "none"
+			if final != nil {
+				reliedOn = final.ID.String()
+			}
+			logger.FromContext(ctx).Warn("fleet decommission: backing app was already gone; retiring the resource row on its existing recovery point",
+				"resource_id", res.ID, "missing_app_id", res.AppID, "recovery_point_id", reliedOn, "err", derr)
 		}
 	}
 	now := time.Now().UTC()
