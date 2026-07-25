@@ -25,11 +25,11 @@ package firecracker
 import (
 	"context"
 	"errors"
-	"log"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
@@ -133,7 +133,7 @@ func (p *VMPool) Start(ctx context.Context) {
 		p.started = true
 		p.mu.Unlock()
 		go p.refillLoop(ctx)
-		log.Printf("[VM-POOL] started (size=%d language=%s)", p.size, p.language)
+		logger.FromContext(ctx).Info("vm-pool: started", "size", p.size, "language", p.language)
 	})
 }
 
@@ -205,7 +205,7 @@ func (p *VMPool) Close(ctx context.Context) {
 				}
 				return true
 			})
-			log.Printf("[VM-POOL] closed")
+			logger.FromContext(ctx).Info("vm-pool: closed")
 			return
 		}
 	}
@@ -245,7 +245,7 @@ func (p *VMPool) topUp(ctx context.Context) {
 	for len(p.available) < p.size {
 		vm, err := p.bootFresh(ctx)
 		if err != nil {
-			log.Printf("[VM-POOL] refill boot failed: %v", err)
+			logger.FromContext(ctx).Warn("vm-pool: refill boot failed", "language", p.language, "err", err)
 			return
 		}
 		select {
@@ -289,6 +289,6 @@ func (p *VMPool) terminateAndForget(ctx context.Context, vm *PooledVM) {
 	}
 	p.tracked.Delete(vm)
 	if err := p.terminate(ctx, vm.SocketPath, vm.PID); err != nil {
-		log.Printf("[VM-POOL] terminate %s: %v", vm.VMID, err)
+		logger.FromContext(ctx).Warn("vm-pool: terminate failed", "vm_id", vm.VMID, "pid", vm.PID, "err", err)
 	}
 }

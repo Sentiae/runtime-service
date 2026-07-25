@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/runtime-service/internal/domain"
 )
 
@@ -262,8 +263,9 @@ func (m *WarmManager) BootWarm(ctx context.Context, language domain.Language) (*
 		return nil, fmt.Errorf("warm agent never became ready: %w", err)
 	}
 
-	log.Printf("Warm VM booted: lang=%s pid=%d socket=%s tap=%s guest=%s endpoint=%s",
-		language, pid, socketPath, tapName, warmGuestIP, endpoint)
+	logger.FromContext(ctx).Info("warm: template VM booted",
+		"vm_id", vmID, "language", language, "pid", pid, "socket_path", socketPath,
+		"tap_name", tapName, "guest_ip", warmGuestIP, "endpoint", endpoint)
 
 	return &WarmVM{
 		ID:         vmID,
@@ -306,7 +308,8 @@ func (m *WarmManager) configureWarmVM(ctx context.Context, socketPath, kernelPat
 	// and continue so BootWarm still succeeds (the device is hardening, not a
 	// hard requirement).
 	if err := m.p.apiPut(ctx, client, "/entropy", warmEntropyBody()); err != nil {
-		log.Printf("Warning: virtio-rng entropy device not configured (continuing without it): %v", err)
+		logger.FromContext(ctx).Warn("warm: virtio-rng entropy device not configured, continuing without it",
+			"socket_path", socketPath, "err", err)
 	}
 	return nil
 }
@@ -396,7 +399,8 @@ func (m *WarmManager) CreateTemplateSnapshot(ctx context.Context, warm *WarmVM) 
 		return nil, fmt.Errorf("collect template memory file: %w", err)
 	}
 
-	log.Printf("Template snapshot created: lang=%s state=%s mem=%s", warm.Language, statePath, memPath)
+	logger.FromContext(ctx).Info("warm: template snapshot created",
+		"vm_id", warm.ID, "language", warm.Language, "state_path", statePath, "mem_path", memPath)
 	return &TemplateSnapshot{StatePath: statePath, MemPath: memPath, Language: warm.Language}, nil
 }
 
@@ -499,8 +503,9 @@ func (m *WarmManager) CloneFromSnapshot(ctx context.Context, snap *TemplateSnaps
 		return nil, fmt.Errorf("clone agent never became ready: %w", err)
 	}
 
-	log.Printf("Clone %d restored: ns=%s pid=%d socket=%s endpoint=%s veth=%s",
-		n, d.namespace, pid, cloneSock, endpoint, d.vethHost)
+	logger.FromContext(ctx).Info("warm: clone restored",
+		"clone_id", n, "namespace", d.namespace, "pid", pid, "socket_path", cloneSock,
+		"endpoint", endpoint, "veth_host", d.vethHost)
 
 	return &Clone{
 		ID:         n,

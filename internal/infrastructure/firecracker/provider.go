@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
 	"github.com/sentiae/runtime-service/pkg/config"
@@ -75,14 +75,14 @@ func NewProvider(cfg config.FirecrackerConfig) *Provider {
 
 // setupBridge creates the fcbr0 bridge if it does not already exist.
 // It is safe to call multiple times; the actual work runs only once.
-func (p *Provider) setupBridge() error {
+func (p *Provider) setupBridge(ctx context.Context) error {
 	p.bridgeOnce.Do(func() {
-		p.bridgeErr = p.doSetupBridge()
+		p.bridgeErr = p.doSetupBridge(ctx)
 	})
 	return p.bridgeErr
 }
 
-func (p *Provider) doSetupBridge() error {
+func (p *Provider) doSetupBridge(ctx context.Context) error {
 	// Create the bridge if it doesn't already exist.
 	if err := exec.Command("ip", "link", "show", bridgeName).Run(); err != nil {
 		cmds := [][]string{
@@ -95,9 +95,9 @@ func (p *Provider) doSetupBridge() error {
 				return fmt.Errorf("bridge setup %v: %s: %w", args, string(out), err)
 			}
 		}
-		log.Printf("Bridge %s created with %s", bridgeName, bridgeIP)
+		logger.FromContext(ctx).Info("firecracker: bridge created", "bridge", bridgeName, "bridge_ip", bridgeIP)
 	} else {
-		log.Printf("Bridge %s already exists", bridgeName)
+		logger.FromContext(ctx).Debug("firecracker: bridge already exists", "bridge", bridgeName)
 	}
 
 	// The firewall rules below are idempotent and applied on EVERY setup (not
@@ -109,7 +109,8 @@ func (p *Provider) doSetupBridge() error {
 	// NAT masquerade for VM egress (idempotent with -C check).
 	if exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", bridgeSubnet, "-j", "MASQUERADE").Run() != nil {
 		if out, err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", bridgeSubnet, "-j", "MASQUERADE").CombinedOutput(); err != nil {
-			log.Printf("Warning: iptables masquerade failed: %s: %v", string(out), err)
+			logger.FromContext(ctx).Warn("firecracker: iptables masquerade failed",
+				"subnet", bridgeSubnet, "output", string(out), "err", err)
 		}
 	}
 
@@ -125,7 +126,8 @@ func (p *Provider) doSetupBridge() error {
 		if out, err := exec.Command("iptables", "-I", "FORWARD", "1", "-s", bridgeSubnet, "-d", bridgeSubnet, "-j", "DROP").CombinedOutput(); err != nil {
 			return fmt.Errorf("install VM-to-VM default-deny: %s: %w", string(out), err)
 		}
-		log.Printf("Installed VM-to-VM default-deny (FORWARD %s -> %s DROP)", bridgeSubnet, bridgeSubnet)
+		logger.FromContext(ctx).Info("firecracker: installed VM-to-VM default-deny",
+			"chain", "FORWARD", "source_subnet", bridgeSubnet, "dest_subnet", bridgeSubnet)
 	}
 
 	return nil
@@ -136,8 +138,8 @@ func (p *Provider) doSetupBridge() error {
 //
 // The device is owned by the VM's unprivileged uid/gid: a jailed VMM has no
 // CAP_NET_ADMIN, so it can only TUNSETIFF-attach to a tap it owns.
-func (p *Provider) createTapDevice(vmID uuid.UUID, uid, gid int) (tapName string, hostIP string, guestIP string, err error) {
-	if err = p.setupBridge(); err != nil {
+func (p *Provider) createTapDevice(ctx context.Context, vmID uuid.UUID, uid, gid int) (tapName string, hostIP string, guestIP string, err error) {
+	if err = p.setupBridge(ctx); err != nil {
 		return "", "", "", fmt.Errorf("setup bridge: %w", err)
 	}
 
@@ -173,22 +175,23 @@ func (p *Provider) createTapDevice(vmID uuid.UUID, uid, gid int) (tapName string
 		}
 	}
 
-	log.Printf("Created TAP %s: host=%s guest=%s", tapName, hostIP, guestIP)
+	logger.FromContext(ctx).Info("firecracker: created tap device",
+		"vm_id", vmID, "tap_name", tapName, "host_ip", hostIP, "guest_ip", guestIP)
 	return tapName, hostIP, guestIP, nil
 }
 
 // destroyTapDevice removes a TAP device.
-func (p *Provider) destroyTapDevice(tapName string) error {
+func (p *Provider) destroyTapDevice(ctx context.Context, tapName string) error {
 	if out, err := exec.Command("ip", "link", "del", tapName).CombinedOutput(); err != nil {
 		return fmt.Errorf("delete tap %s: %s: %w", tapName, string(out), err)
 	}
-	log.Printf("Destroyed TAP %s", tapName)
+	logger.FromContext(ctx).Info("firecracker: destroyed tap device", "tap_name", tapName)
 	return nil
 }
 
 // cleanupTap is a no-op when tapName is empty (isolated mode). Otherwise
 // it tears down both the device and any iptables rules installed for it.
-func (p *Provider) cleanupTap(tapName string, policy domain.NetworkPolicy) {
+func (p *Provider) cleanupTap(ctx context.Context, tapName string, policy domain.NetworkPolicy) {
 	if tapName == "" {
 		return
 	}
@@ -196,8 +199,8 @@ func (p *Provider) cleanupTap(tapName string, policy domain.NetworkPolicy) {
 		// Warm path: parent stays FORWARD (see applyEgressList).
 		p.flushEgressList("FORWARD", tapName)
 	}
-	if err := p.destroyTapDevice(tapName); err != nil {
-		log.Printf("Warning: failed to destroy TAP %s: %v", tapName, err)
+	if err := p.destroyTapDevice(ctx, tapName); err != nil {
+		logger.FromContext(ctx).Warn("firecracker: destroy tap device failed", "tap_name", tapName, "err", err)
 	}
 }
 
@@ -222,7 +225,7 @@ func (p *Provider) cleanupTap(tapName string, policy domain.NetworkPolicy) {
 // Hostnames are resolved once at boot. Failed lookups are logged but do
 // not abort boot: the caller still gets a working (but more locked-down)
 // network rather than a dead VM.
-func (p *Provider) applyEgressList(parentChain, tapName string, allowed []string) error {
+func (p *Provider) applyEgressList(ctx context.Context, parentChain, tapName string, allowed []string) error {
 	chain := egressChainName(tapName)
 	// Create a dedicated chain so we never collide with another VM.
 	cmds := [][]string{
@@ -247,7 +250,8 @@ func (p *Provider) applyEgressList(parentChain, tapName string, allowed []string
 			if ip := net.ParseIP(host); ip == nil {
 				ips, dnsErr := net.LookupIP(host)
 				if dnsErr != nil {
-					log.Printf("Warning: failed to resolve %s for egress allowlist: %v", host, dnsErr)
+					logger.FromContext(ctx).Warn("firecracker: resolve host for egress allowlist failed",
+						"tap_name", tapName, "host", host, "err", dnsErr)
 					continue
 				}
 				dests = nil
@@ -261,7 +265,8 @@ func (p *Provider) applyEgressList(parentChain, tapName string, allowed []string
 		for _, d := range dests {
 			args := []string{"iptables", "-A", chain, "-d", d, "-j", "ACCEPT"}
 			if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
-				log.Printf("Warning: failed to add ACCEPT rule for %s: %s: %v", d, string(out), err)
+				logger.FromContext(ctx).Warn("firecracker: add egress ACCEPT rule failed",
+					"tap_name", tapName, "dest", d, "output", string(out), "err", err)
 			}
 		}
 	}
@@ -270,7 +275,8 @@ func (p *Provider) applyEgressList(parentChain, tapName string, allowed []string
 	if out, err := exec.Command("iptables", "-A", chain, "-j", "DROP").CombinedOutput(); err != nil {
 		return fmt.Errorf("egress trailing DROP: %s: %w", string(out), err)
 	}
-	log.Printf("Egress allowlist installed on %s with %d host(s)", tapName, len(allowed))
+	logger.FromContext(ctx).Info("firecracker: egress allowlist installed",
+		"tap_name", tapName, "parent_chain", parentChain, "allowed_count", len(allowed))
 	return nil
 }
 
@@ -512,7 +518,7 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 	attachNetwork := policy.Mode != domain.NetworkPolicyIsolated
 	if attachNetwork {
 		var err error
-		tapName, _, guestIP, err = p.createTapDevice(bootCfg.VMID, jv.jail.uid, jv.jail.gid)
+		tapName, _, guestIP, err = p.createTapDevice(ctx, bootCfg.VMID, jv.jail.uid, jv.jail.gid)
 		if err != nil {
 			releaseVM()
 			return nil, fmt.Errorf("failed to create TAP device: %w", err)
@@ -522,20 +528,20 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 		// unfiltered packet leaving the new TAP.
 		if policy.Mode == domain.NetworkPolicyEgressList {
 			// Warm path: parent stays FORWARD — unchanged from pre-#5.
-			if err := p.applyEgressList("FORWARD", tapName, policy.AllowedHosts); err != nil {
-				_ = p.destroyTapDevice(tapName)
+			if err := p.applyEgressList(ctx, "FORWARD", tapName, policy.AllowedHosts); err != nil {
+				_ = p.destroyTapDevice(ctx, tapName)
 				releaseVM()
 				return nil, fmt.Errorf("failed to apply egress list: %w", err)
 			}
 		}
 	} else {
-		log.Printf("VM %s booting in isolated mode (no network)", bootCfg.VMID)
+		logger.FromContext(ctx).Info("firecracker: VM booting in isolated mode (no network)", "vm_id", bootCfg.VMID)
 	}
 
 	cmd := p.jailerCommand(ctx, jv)
 
 	if err := cmd.Start(); err != nil {
-		p.cleanupTap(tapName, policy)
+		p.cleanupTap(ctx, tapName, policy)
 		releaseVM()
 		return nil, fmt.Errorf("failed to start firecracker: %w", err)
 	}
@@ -545,7 +551,7 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 	// Wait for the API socket to be available
 	if err := p.waitForSocket(ctx, socketPath); err != nil {
 		_ = cmd.Process.Kill()
-		p.cleanupTap(tapName, policy)
+		p.cleanupTap(ctx, tapName, policy)
 		releaseVM()
 		return nil, fmt.Errorf("firecracker socket not ready: %w", err)
 	}
@@ -553,7 +559,7 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 	// Configure the VM via Firecracker API
 	if err := p.configureVMWithPolicy(ctx, socketPath, jv.chrootSock, jv.kernelPath, jv.rootfsPath, bootCfg, attachNetwork, tapName); err != nil {
 		_ = cmd.Process.Kill()
-		p.cleanupTap(tapName, policy)
+		p.cleanupTap(ctx, tapName, policy)
 		releaseVM()
 		return nil, fmt.Errorf("failed to configure VM: %w", err)
 	}
@@ -561,14 +567,15 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 	// Start the VM instance
 	if err := p.startInstance(ctx, socketPath); err != nil {
 		_ = cmd.Process.Kill()
-		p.cleanupTap(tapName, policy)
+		p.cleanupTap(ctx, tapName, policy)
 		releaseVM()
 		return nil, fmt.Errorf("failed to start VM instance: %w", err)
 	}
 
 	bootTimeMS := time.Since(start).Milliseconds()
-	log.Printf("Firecracker VM booted: pid=%d, socket=%s, tap=%s, guest=%s, boot=%dms",
-		pid, socketPath, tapName, guestIP, bootTimeMS)
+	logger.FromContext(ctx).Info("firecracker: VM booted",
+		"vm_id", bootCfg.VMID, "pid", pid, "socket_path", socketPath,
+		"tap_name", tapName, "guest_ip", guestIP, "boot_time_ms", bootTimeMS)
 
 	// CS-2 G2.8 — register with the per-VM checkpoint scheduler. Nil
 	// scheduler leaves the legacy (no auto-snapshot) behaviour intact.
@@ -581,7 +588,8 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 			SocketPath: socketPath,
 			Class:      VMClassPausable,
 		}); err != nil {
-			log.Printf("[FC-CHECKPOINT] VM %s not registered: %v", bootCfg.VMID, err)
+			logger.FromContext(ctx).Warn("firecracker: VM not registered with the checkpoint scheduler",
+				"vm_id", bootCfg.VMID, "err", err)
 		}
 	}
 
@@ -636,8 +644,9 @@ func (p *Provider) Terminate(ctx context.Context, socketPath string, pid int) er
 	if socketPath != "" {
 		if vmID, err := vmIDFromSocketPath(socketPath); err == nil {
 			tapName := "tap-" + vmID.String()[:8]
-			if err := p.destroyTapDevice(tapName); err != nil {
-				log.Printf("Warning: failed to destroy TAP %s: %v", tapName, err)
+			if err := p.destroyTapDevice(ctx, tapName); err != nil {
+				logger.FromContext(ctx).Warn("firecracker: destroy tap device failed",
+					"vm_id", vmID, "tap_name", tapName, "err", err)
 			}
 			// Nothing else references the copy; a leaked one is a whole rootfs
 			// image of dead disk per terminated VM.
@@ -669,7 +678,7 @@ func (p *Provider) Pause(ctx context.Context, socketPath string) error {
 	if err := p.apiPatch(ctx, client, "/vm", map[string]string{"state": "Paused"}); err != nil {
 		return fmt.Errorf("pause vm: %w", err)
 	}
-	log.Printf("Firecracker paused (socket=%s)", socketPath)
+	logger.FromContext(ctx).Info("firecracker: VM paused", "socket_path", socketPath)
 	return nil
 }
 
@@ -679,7 +688,7 @@ func (p *Provider) Resume(ctx context.Context, socketPath string) error {
 	if err := p.apiPatch(ctx, client, "/vm", map[string]string{"state": "Resumed"}); err != nil {
 		return fmt.Errorf("resume vm: %w", err)
 	}
-	log.Printf("Firecracker resumed (socket=%s)", socketPath)
+	logger.FromContext(ctx).Info("firecracker: VM resumed", "socket_path", socketPath)
 	return nil
 }
 
@@ -729,11 +738,11 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 
 	// Create TAP device (networking is set up even though we don't use SSH;
 	// Firecracker requires a network config or explicit opt-out per API)
-	tapName, _, guestIP, err := p.createTapDevice(execVMID, jv.jail.uid, jv.jail.gid)
+	tapName, _, guestIP, err := p.createTapDevice(ctx, execVMID, jv.jail.uid, jv.jail.gid)
 	if err != nil {
 		return nil, fmt.Errorf("create TAP for exec VM: %w", err)
 	}
-	defer func() { _ = p.destroyTapDevice(tapName) }()
+	defer func() { _ = p.destroyTapDevice(ctx, tapName) }()
 
 	cmd := p.jailerCommand(ctx, jv)
 
@@ -829,7 +838,8 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 		"uds_path": jv.chrootSock + ".vsock",
 	}
 	if err := p.apiPut(ctx, client, "/vsock", vsockCfg); err != nil {
-		log.Printf("Warning: failed to configure vsock (agent communication disabled): %v", err)
+		logger.FromContext(ctx).Warn("firecracker: configure vsock failed, agent communication disabled",
+			"vm_id", execVMID, "err", err)
 		// Don't fail — rootfs-injection still works without vsock
 	}
 
@@ -1236,11 +1246,14 @@ func (p *Provider) configureVMWithPolicy(ctx context.Context, socketPath, chroot
 		"uds_path":  chrootSocketPath + ".vsock",
 	}
 	if err := p.apiPut(ctx, client, "/vsock", vsockCfg); err != nil {
-		log.Printf("Warning: vsock config failed (agent communication disabled): %v", err)
+		logger.FromContext(ctx).Warn("firecracker: configure vsock failed, agent communication disabled",
+			"vm_id", cfg.VMID, "err", err)
 	}
 
-	log.Printf("Configured VM via socket %s: kernel=%s, rootfs=%s, vcpu=%d, mem=%dMB, network=%v",
-		socketPath, kernelPath, rootfsPath, cfg.VCPU, cfg.MemoryMB, attachNetwork)
+	logger.FromContext(ctx).Info("firecracker: VM configured",
+		"vm_id", cfg.VMID, "socket_path", socketPath, "kernel_path", kernelPath,
+		"rootfs_path", rootfsPath, "vcpu", cfg.VCPU, "memory_mb", cfg.MemoryMB,
+		"network_attached", attachNetwork)
 	return nil
 }
 
@@ -1303,13 +1316,15 @@ func (p *Provider) configureVM(ctx context.Context, socketPath, kernelPath, root
 		"uds_path":  socketPath + ".vsock",
 	}
 	if err := p.apiPut(ctx, client, "/vsock", vsockCfg); err != nil {
-		log.Printf("Warning: vsock config failed (agent communication disabled): %v", err)
+		logger.FromContext(ctx).Warn("firecracker: configure vsock failed, agent communication disabled",
+			"vm_id", cfg.VMID, "err", err)
 	} else {
-		log.Printf("Vsock configured: guest_cid=%d", guestCID)
+		logger.FromContext(ctx).Debug("firecracker: vsock configured", "vm_id", cfg.VMID, "guest_cid", guestCID)
 	}
 
-	log.Printf("Configured VM via socket %s: kernel=%s, rootfs=%s, vcpu=%d, mem=%dMB",
-		socketPath, kernelPath, rootfsPath, cfg.VCPU, cfg.MemoryMB)
+	logger.FromContext(ctx).Info("firecracker: VM configured",
+		"vm_id", cfg.VMID, "socket_path", socketPath, "kernel_path", kernelPath,
+		"rootfs_path", rootfsPath, "vcpu", cfg.VCPU, "memory_mb", cfg.MemoryMB)
 	return nil
 }
 
@@ -1325,7 +1340,7 @@ func (p *Provider) sendAction(ctx context.Context, socketPath, action string) er
 	if err := p.apiPut(ctx, client, "/actions", payload); err != nil {
 		return fmt.Errorf("action %s: %w", action, err)
 	}
-	log.Printf("Firecracker action: %s (socket=%s)", action, socketPath)
+	logger.FromContext(ctx).Debug("firecracker: action sent", "action", action, "socket_path", socketPath)
 	return nil
 }
 
@@ -1484,7 +1499,8 @@ func (p *Provider) CreateSnapshot(ctx context.Context, socketPath string, snapsh
 		totalSize += info.Size()
 	}
 
-	log.Printf("Snapshot created: %s (mem=%s, state=%s, size=%d bytes)", snapshotID, memPath, statePath, totalSize)
+	logger.FromContext(ctx).Info("firecracker: snapshot created",
+		"snapshot_id", snapshotID, "mem_path", memPath, "state_path", statePath, "size_bytes", totalSize)
 
 	return &usecase.SnapshotResult{
 		MemoryFilePath: memPath,
@@ -1539,7 +1555,7 @@ func (p *Provider) RestoreSnapshot(ctx context.Context, socketPath, memPath, sta
 		return fmt.Errorf("firecracker snapshot load: %w", err)
 	}
 
-	log.Printf("Snapshot restored from %s", statePath)
+	logger.FromContext(ctx).Info("firecracker: snapshot restored", "state_path", statePath, "mem_path", memPath)
 	return nil
 }
 
@@ -1573,7 +1589,7 @@ func (p *Provider) discoverIPAddress(ctx context.Context, socketPath string, vmI
 	// Convention: host tap IP is x.x.x.1, guest IP is x.x.x.2 on a /30 subnet.
 	ip, err := p.discoverIPFromTap(ctx, vmID)
 	if err == nil && ip != "" {
-		log.Printf("Discovered VM %s IP from tap: %s", vmID, ip)
+		logger.FromContext(ctx).Info("firecracker: discovered VM IP from tap", "vm_id", vmID, "ip", ip)
 		return ip, nil
 	}
 
@@ -1581,7 +1597,7 @@ func (p *Provider) discoverIPAddress(ctx context.Context, socketPath string, vmI
 	// This works when the guest has a DHCP-assigned address or a known static IP.
 	sshIP, err := p.discoverIPViaSSH(ctx, vmID)
 	if err == nil && sshIP != "" {
-		log.Printf("Discovered VM %s IP via SSH: %s", vmID, sshIP)
+		logger.FromContext(ctx).Info("firecracker: discovered VM IP via SSH", "vm_id", vmID, "ip", sshIP)
 		return sshIP, nil
 	}
 

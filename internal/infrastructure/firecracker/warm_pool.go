@@ -4,12 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
@@ -158,7 +158,8 @@ func (p *WarmPool) RunCode(ctx context.Context, language domain.Language, code, 
 	defer p.freeIndex(n)
 	defer func() {
 		if derr := p.mgr.DestroyClone(clone); derr != nil {
-			log.Printf("Warning: destroy clone %d: %v", n, derr)
+			logger.FromContext(ctx).Warn("warm-pool: destroy used clone failed",
+				"clone_id", n, "language", language, "err", derr)
 		}
 	}()
 
@@ -280,7 +281,7 @@ func (p *WarmPool) buildTemplate(ctx context.Context, language domain.Language) 
 	}
 
 	if p.store != nil {
-		p.persistTemplate(snap, language)
+		p.persistTemplate(ctx, snap, language)
 	}
 	return snap, templateSourceLocal, nil
 }
@@ -299,7 +300,8 @@ func (p *WarmPool) buildTemplateLocal(ctx context.Context, language domain.Langu
 		return nil, fmt.Errorf("create template snapshot: %w", err)
 	}
 	if derr := p.mgr.DestroyWarm(warm); derr != nil {
-		log.Printf("Warning: destroy warm template VM for %s: %v", language, derr)
+		logger.FromContext(ctx).Warn("warm-pool: destroy warm template VM failed",
+			"language", language, "vm_id", warm.ID, "err", derr)
 	}
 	return snap, nil
 }
@@ -341,19 +343,23 @@ func (p *WarmPool) pullTemplate(ctx context.Context, language domain.Language) (
 
 	statePath, memPath := p.templateLocalPaths(language)
 	if err := os.MkdirAll(filepath.Dir(statePath), 0750); err != nil {
-		log.Printf("Warning: pull template %s: mkdir local dir: %v", language, err)
+		logger.FromContext(ctx).Warn("warm-pool: pull template mkdir local dir failed",
+			"language", language, "path", filepath.Dir(statePath), "err", err)
 		return nil, false
 	}
 	if err := p.pullObject(stateKey, statePath); err != nil {
-		log.Printf("Warning: pull template %s state: %v", language, err)
+		logger.FromContext(ctx).Warn("warm-pool: pull template state failed",
+			"language", language, "object_key", stateKey, "err", err)
 		return nil, false
 	}
 	if err := p.pullObject(memKey, memPath); err != nil {
-		log.Printf("Warning: pull template %s mem: %v", language, err)
+		logger.FromContext(ctx).Warn("warm-pool: pull template mem failed",
+			"language", language, "object_key", memKey, "err", err)
 		return nil, false
 	}
 
-	log.Printf("[WARM-POOL] template for %s restored from object store (state=%s mem=%s)", language, statePath, memPath)
+	logger.FromContext(ctx).Info("warm-pool: template restored from object store",
+		"language", language, "state_path", statePath, "mem_path", memPath)
 	return &TemplateSnapshot{StatePath: statePath, MemPath: memPath, Language: language}, true
 }
 
@@ -400,17 +406,20 @@ func (p *WarmPool) pullObject(key, localPath string) error {
 // durable store under the language's template keys. Best-effort: a failed
 // upload is logged but never fails the build (the template is usable locally;
 // the next process that needs it just rebuilds).
-func (p *WarmPool) persistTemplate(snap *TemplateSnapshot, language domain.Language) {
+func (p *WarmPool) persistTemplate(ctx context.Context, snap *TemplateSnapshot, language domain.Language) {
 	stateKey, memKey := templateObjectKeys(language)
 	if err := p.putObject(stateKey, snap.StatePath); err != nil {
-		log.Printf("Warning: persist template %s state: %v", language, err)
+		logger.FromContext(ctx).Warn("warm-pool: persist template state failed",
+			"language", language, "object_key", stateKey, "err", err)
 		return
 	}
 	if err := p.putObject(memKey, snap.MemPath); err != nil {
-		log.Printf("Warning: persist template %s mem: %v", language, err)
+		logger.FromContext(ctx).Warn("warm-pool: persist template mem failed",
+			"language", language, "object_key", memKey, "err", err)
 		return
 	}
-	log.Printf("[WARM-POOL] template for %s persisted to object store (keys=%s,%s)", language, stateKey, memKey)
+	logger.FromContext(ctx).Info("warm-pool: template persisted to object store",
+		"language", language, "state_key", stateKey, "mem_key", memKey)
 }
 
 // putObject streams a local file into the durable store under key.
@@ -495,7 +504,8 @@ func (p *WarmPool) replenishLoop(language domain.Language, snap *TemplateSnapsho
 	defer p.wg.Done()
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("Warning: warm-pool replenisher for %s panicked: %v", language, r)
+			logger.FromContext(p.rootCtx).Error("warm-pool: replenisher panicked",
+				"language", language, "panic", r)
 		}
 	}()
 
@@ -537,7 +547,8 @@ func (p *WarmPool) replenishLoop(language domain.Language, snap *TemplateSnapsho
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("Warning: warm-pool replenish clone for %s (index %d): %v", language, n, err)
+			logger.FromContext(ctx).Warn("warm-pool: replenish clone failed",
+				"language", language, "clone_id", n, "err", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -552,7 +563,8 @@ func (p *WarmPool) replenishLoop(language domain.Language, snap *TemplateSnapsho
 		case ch <- clone:
 		case <-ctx.Done():
 			if derr := p.mgr.DestroyClone(clone); derr != nil {
-				log.Printf("Warning: destroy ready clone %d on shutdown: %v", n, derr)
+				logger.FromContext(ctx).Warn("warm-pool: destroy ready clone on shutdown failed",
+					"language", language, "clone_id", n, "err", derr)
 			}
 			p.freeIndex(n)
 			return
@@ -582,7 +594,8 @@ func (p *WarmPool) Close() error {
 				select {
 				case c := <-ch:
 					if derr := p.mgr.DestroyClone(c); derr != nil {
-						log.Printf("Warning: destroy buffered clone %d on close: %v", c.ID, derr)
+						logger.FromContext(p.rootCtx).Warn("warm-pool: destroy buffered clone on close failed",
+							"clone_id", c.ID, "err", derr)
 					}
 					p.freeIndex(c.ID)
 				default:

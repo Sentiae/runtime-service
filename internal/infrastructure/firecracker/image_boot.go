@@ -3,7 +3,6 @@ package firecracker
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -246,12 +245,12 @@ func (b *ImageBooter) createTap(nw imgNet, uid, gid int) error {
 }
 
 // destroyTap removes the TAP device (best-effort).
-func (b *ImageBooter) destroyTap(tapName string) {
+func (b *ImageBooter) destroyTap(ctx context.Context, tapName string) {
 	if tapName == "" {
 		return
 	}
 	if out, err := exec.Command("ip", "link", "del", tapName).CombinedOutput(); err != nil {
-		log.Printf("image-boot: warning: delete tap %s: %s: %v", tapName, string(out), err)
+		logger.FromContext(ctx).Warn("image-boot: delete tap failed", "tap_name", tapName, "output", string(out), "err", err)
 	}
 }
 
@@ -470,7 +469,7 @@ func (b *ImageBooter) killVM(cmd *exec.Cmd, socketPath string) {
 // same path plus a secret push (already handled below via ExpectSecrets) and an
 // egress allowlist (in.EgressAllow).
 func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (usecase.ImageTestResult, error) {
-	nw, cleanupNet, err := b.setupNet()
+	nw, cleanupNet, err := b.setupNet(ctx)
 	if err != nil {
 		return usecase.ImageTestResult{}, err
 	}
@@ -487,7 +486,7 @@ func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (
 	// Fail closed: if the chain cannot be installed the boot aborts rather than run
 	// a secret-bearing job with unrestricted egress.
 	if len(in.EgressAllow) > 0 {
-		if err := b.p.applyEgressList(netfabric.EgressParentChain, nw.tapName, in.EgressAllow); err != nil {
+		if err := b.p.applyEgressList(ctx, netfabric.EgressParentChain, nw.tapName, in.EgressAllow); err != nil {
 			b.p.flushEgressList(netfabric.EgressParentChain, nw.tapName)
 			return usecase.ImageTestResult{}, fmt.Errorf("apply egress allowlist: %w", err)
 		}
@@ -585,7 +584,7 @@ func (b *ImageBooter) readTestOutput(vmID uuid.UUID, rootfsPath string) (stdout,
 func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInput) (usecase.ImageResidentResult, error) {
 	// rt#8 — no host-port allocation: the fleet reaches the guest directly on its
 	// routed /30 (Caddy proxies the public host to guestIP:appPort).
-	nw, cleanupNet, err := b.setupNet()
+	nw, cleanupNet, err := b.setupNet(ctx)
 	if err != nil {
 		return usecase.ImageResidentResult{}, err
 	}
@@ -660,7 +659,7 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 // its rootfs) with no way to release it.
 func (b *ImageBooter) Decommission(ctx context.Context, in usecase.ImageDecommissionInput) error {
 	b.stopVM(ctx, in)
-	b.destroyTap(in.TapName)
+	b.destroyTap(ctx, in.TapName)
 	b.freeIndex(in.NetIndex)
 	if in.SocketPath != "" {
 		// The VM is gone; stop bearing its control token (D-185a). This MUST stay
@@ -801,7 +800,7 @@ func waitForProcessExit(ctx context.Context, proc vmProcess, timeout, poll time.
 // setupNet allocates an index and creates the routed /30 TAP. It returns the
 // derived addressing plus a cleanup func that reverses exactly what it did. rt#8
 // retired the per-VM DNAT, so ingress is served by Caddy, not iptables rules.
-func (b *ImageBooter) setupNet() (imgNet, func(), error) {
+func (b *ImageBooter) setupNet(ctx context.Context) (imgNet, func(), error) {
 	idx, err := b.allocIndex()
 	if err != nil {
 		return imgNet{}, func() {}, err
@@ -813,7 +812,7 @@ func (b *ImageBooter) setupNet() (imgNet, func(), error) {
 		return imgNet{}, func() {}, err
 	}
 	cleanup := func() {
-		b.destroyTap(nw.tapName)
+		b.destroyTap(ctx, nw.tapName)
 		b.freeIndex(idx)
 	}
 	return nw, cleanup, nil
