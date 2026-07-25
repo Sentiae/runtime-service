@@ -1111,6 +1111,141 @@ func TestSweepInterruptedRestores_ReleasedResourceIsRestorableAgain(t *testing.T
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Boot-time sweep: reclaiming abandoned staging files
+// ─────────────────────────────────────────────────────────────────────
+
+// stuckRestoring leaves the harness resource in phase restoring, exactly as a
+// restore killed mid-flight would have.
+func (h *restoreHarness) stuckRestoring(t *testing.T) {
+	t.Helper()
+	if _, err := h.repo.CompareAndSwapPhase(context.Background(), h.res.ID,
+		[]domain.FleetResourcePhase{domain.FleetResourcePhaseReady}, domain.FleetResourcePhaseRestoring); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seedStagedStuckRestore adds a SECOND stuck resource of this host, on its own
+// volume directory, whose one recovery point has a staging file on disk.
+func (h *restoreHarness) seedStagedStuckRestore(t *testing.T) (uuid.UUID, string) {
+	t.Helper()
+	dir := t.TempDir()
+	appID, resID, rpID := uuid.New(), uuid.New(), uuid.New()
+	h.repo.seed(&domain.FleetResource{
+		ID: resID, OwnerOrg: uuid.New(), ClaimKey: uuid.NewString(), Env: "prod",
+		Tier: resourceTierDedicated, Phase: domain.FleetResourcePhaseRestoring, AppID: &appID,
+	})
+	if err := h.repo.SaveRecoveryPoint(context.Background(), &domain.FleetResourceRecoveryPoint{
+		ID: rpID, ResourceID: resID, ObjectKey: "volumes/" + rpID.String() + ".ext4", Kind: "snapshot",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.volumes.mu.Lock()
+	h.volumes.byApp[appID] = []domain.Volume{{
+		ID: uuid.New(), AppID: appID, BackingPath: filepath.Join(dir, "vol.ext4"),
+		Status: domain.VolumeStatusRestoring, HostAffinity: &h.selfHost,
+	}}
+	h.volumes.mu.Unlock()
+	staged := restoreStagingPath(dir, rpID)
+	if err := os.WriteFile(staged, []byte("STAGED-BYTES"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return resID, staged
+}
+
+// A restore killed mid-copy (panic, process kill) never reaches the branches
+// that remove `staged`, and what it leaves is the size of the WHOLE volume. The
+// boot sweep is the only thing that can reclaim it.
+func TestSweepInterruptedRestores_ReclaimsAbandonedStagingFile(t *testing.T) {
+	h := newRestoreHarness(t)
+	h.stuckRestoring(t)
+	staged := restoreStagingPath(h.dir, h.rp.ID)
+	if err := os.WriteFile(staged, []byte("HALF-COPIED-VOLUME"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A staging file of ANOTHER volume's restore, in the SAME shared directory —
+	// it may be live, and reclaiming by recovery-point id must never reach it.
+	// This is what a `.restore-*.tmp` glob would have destroyed.
+	foreign := restoreStagingPath(h.dir, uuid.New())
+	if err := os.WriteFile(foreign, []byte("ANOTHER-VOLUMES-IN-FLIGHT-RESTORE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := h.uc.SweepInterruptedRestores(context.Background())
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	// The int is restores RELEASED, not files removed.
+	if n != 1 {
+		t.Fatalf("released = %d, want 1", n)
+	}
+	if _, serr := os.Stat(staged); !os.IsNotExist(serr) {
+		t.Fatalf("abandoned staging file not reclaimed: %v", serr)
+	}
+	if got := readFile(t, foreign); got != "ANOTHER-VOLUMES-IN-FLIGHT-RESTORE" {
+		t.Fatalf("foreign staging file = %q, want it untouched", got)
+	}
+	if got := readFile(t, h.live); got != liveBytes {
+		t.Fatalf("live volume = %q, want it untouched", got)
+	}
+}
+
+// The normal case by far: the restore exited through one of the branches that
+// already removes its staging file. A missing file is not an error.
+func TestSweepInterruptedRestores_NoStagingFileIsNotAnError(t *testing.T) {
+	h := newRestoreHarness(t)
+	h.stuckRestoring(t)
+
+	n, err := h.uc.SweepInterruptedRestores(context.Background())
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("released = %d, want 1", n)
+	}
+	if h.resource(t).Phase != domain.FleetResourcePhaseFailed {
+		t.Fatalf("phase = %q, want failed", h.resource(t).Phase)
+	}
+}
+
+// Reclaiming is best-effort: it must never cost the sweep its actual job
+// (releasing stuck restores) nor the reclaim of any OTHER resource's file. A
+// non-empty directory at the staging path fails os.Remove with something that is
+// not IsNotExist, which is the failure mode to prove.
+func TestSweepInterruptedRestores_ReclaimFailureDoesNotAbortTheSweep(t *testing.T) {
+	h := newRestoreHarness(t)
+	h.stuckRestoring(t)
+	unremovable := restoreStagingPath(h.dir, h.rp.ID)
+	if err := os.MkdirAll(filepath.Join(unremovable, "child"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	otherID, otherStaged := h.seedStagedStuckRestore(t)
+
+	n, err := h.uc.SweepInterruptedRestores(context.Background())
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("released = %d, want 2", n)
+	}
+	if h.resource(t).Phase != domain.FleetResourcePhaseFailed {
+		t.Fatalf("phase = %q, want failed", h.resource(t).Phase)
+	}
+	other, err := h.repo.GetResourceByHandle(context.Background(), otherID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Phase != domain.FleetResourcePhaseFailed {
+		t.Fatalf("second resource phase = %q, want failed", other.Phase)
+	}
+	if _, serr := os.Stat(otherStaged); !os.IsNotExist(serr) {
+		t.Fatalf("a failed reclaim stopped the next one: %v", serr)
+	}
+	if _, serr := os.Stat(unremovable); serr != nil {
+		t.Fatalf("the unremovable path should be left as it was: %v", serr)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Staging: compressed transfer, sparse materialization
 // ─────────────────────────────────────────────────────────────────────
 

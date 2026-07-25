@@ -65,6 +65,16 @@ const (
 	restoreInterruptedMsg = "restore interrupted by restart; re-issue RestoreResource to recover"
 )
 
+// restoreStagingPath is THE name a restore stages a recovery point under, keyed
+// by the recovery point (never by the volume). It is a function rather than an
+// inline join because two places must agree on it exactly — the restore that
+// creates the file (run) and the boot sweep that reclaims an abandoned one
+// (reclaimStagingFiles). A drift between them would silently reintroduce the
+// full-volume-size leak the sweep exists to close.
+func restoreStagingPath(dir string, recoveryPointID uuid.UUID) string {
+	return filepath.Join(dir, ".restore-"+recoveryPointID.String()+".tmp")
+}
+
 // restoreFromPhases are the phases a restore may be admitted from.
 //
 // `restoring` is deliberately EXCLUDED: the durable CAS is the cross-process
@@ -259,6 +269,14 @@ func (uc *FleetVolumeRestorer) Restore(ctx context.Context, in RestoreResourceIn
 // scope wired, no backing app, no pinned affinity, or a lookup error) is LEFT
 // ALONE: skipping an ambiguous row is always safer than stamping a restore that
 // is live on another host. Returns the number of resources released.
+//
+// Each released resource also has its abandoned restore STAGING files reclaimed
+// (see reclaimStagingFiles) — a restore killed mid-copy leaves a file the size of
+// the whole volume and nothing else ever removes it.
+//
+// Known residue, deliberately not covered: an interrupted restore whose resource
+// has since left the `restoring` phase by some other route keeps its staging
+// file, because this sweep only walks ListResourcesByPhase(restoring).
 func (uc *FleetVolumeRestorer) SweepInterruptedRestores(ctx context.Context) (int, error) {
 	log := logger.FromContext(ctx)
 	if uc.selfHost == uuid.Nil || uc.affinity == nil {
@@ -292,8 +310,73 @@ func (uc *FleetVolumeRestorer) SweepInterruptedRestores(ctx context.Context) (in
 		log.Warn("fleet restore sweep: restore interrupted by restart; resource released to failed, boots stay refused until it is re-issued",
 			"resource_id", res.ID)
 		released++
+		uc.reclaimStagingFiles(ctx, res)
 	}
 	return released, nil
+}
+
+// reclaimStagingFiles removes the staging files left behind by this resource's
+// interrupted restores. A restore that dies mid-copy (panic in run, process
+// kill) never reaches the error branches that remove `staged`, and the file it
+// leaves is the size of the whole volume.
+//
+// Why it is safe to remove them HERE and nowhere else. The staging name is keyed
+// by RECOVERY POINT, and the directory is shared by every volume on the host, so
+// a sweep over the DIRECTORY (a `.restore-*.tmp` glob) could destroy another
+// volume's in-flight staging file mid-copy. This walks the other way: it probes
+// the exact name of each recovery point OF THIS RESOURCE, and a recovery point
+// belongs to exactly one resource — so a match can only ever be a file that a
+// restore of this resource created. Ownership is proven, never guessed.
+//
+// And it is safe to remove it NOW because the caller has just CAS'd this
+// resource out of `restoring`: no restore of it can be in flight, so nothing can
+// be writing any of these paths.
+//
+// Probing every recovery point rather than only the last one is intentional — it
+// also reclaims the residue of earlier interrupted attempts. This runs at boot
+// over released resources only, so the extra stats cost nothing.
+//
+// Best-effort throughout: nothing here may fail the sweep. A missing file is the
+// normal case (most restores exit cleanly), so it is not an error.
+func (uc *FleetVolumeRestorer) reclaimStagingFiles(ctx context.Context, res *domain.FleetResource) {
+	log := logger.FromContext(ctx)
+	if res.AppID == nil {
+		return
+	}
+	vol, err := uc.soleVolume(ctx, *res.AppID)
+	if err != nil {
+		log.Warn("fleet restore sweep: resolve volume to reclaim restore staging files",
+			"resource_id", res.ID, "err", err)
+		return
+	}
+	dir := filepath.Dir(vol.BackingPath)
+	points, err := uc.resources.ListRecoveryPoints(ctx, res.ID)
+	if err != nil {
+		log.Warn("fleet restore sweep: list recovery points to reclaim restore staging files",
+			"resource_id", res.ID, "err", err)
+		return
+	}
+	for i := range points {
+		rp := &points[i]
+		path := restoreStagingPath(dir, rp.ID)
+		// Stat first: the reclaimed size is the whole point of the log line, and it
+		// is unrecoverable after the remove.
+		fi, serr := os.Stat(path)
+		if serr != nil {
+			if !os.IsNotExist(serr) {
+				log.Warn("fleet restore sweep: stat abandoned restore staging file", "path", path, "err", serr)
+			}
+			continue
+		}
+		if rerr := os.Remove(path); rerr != nil {
+			if !os.IsNotExist(rerr) {
+				log.Warn("fleet restore sweep: remove abandoned restore staging file", "path", path, "err", rerr)
+			}
+			continue
+		}
+		log.Info("fleet restore sweep: reclaimed abandoned restore staging file",
+			"resource_id", res.ID, "recovery_point_id", rp.ID, "path", path, "bytes_reclaimed", fi.Size())
+	}
 }
 
 // ownedByThisHost reports whether a resource's data lives on this host, via the
@@ -354,7 +437,7 @@ func (uc *FleetVolumeRestorer) run(ctx context.Context, resourceID, appID uuid.U
 	log := logger.FromContext(ctx)
 	live := vol.BackingPath
 	dir := filepath.Dir(live)
-	staged := filepath.Join(dir, ".restore-"+rp.ID.String()+".tmp")
+	staged := restoreStagingPath(dir, rp.ID)
 	pre := live + prerestoreSuffix
 
 	// Step 4 — fetch and VERIFY before anything live is touched. Staging in the
