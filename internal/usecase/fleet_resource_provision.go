@@ -442,15 +442,36 @@ func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, r
 		if serr != nil {
 			return nil, fmt.Errorf("final snapshot: %w", serr)
 		}
-		// ZERO recovery points is a REFUSAL, not a success. The snapshotter walks
-		// the app's volumes, so an app carrying none returns ([], nil) — the call
-		// worked and captured nothing. Tearing the resource down on that answer is
-		// the irreversible move: the customer's engine is destroyed and the
-		// "snapshot-first" guarantee it was destroyed under is vacuous. Refusing
-		// costs an operator a question; proceeding costs the data.
+		// ZERO NEW recovery points is not automatically a refusal — the guarantee
+		// is that a recovery point EXISTS, not that this call produced one.
+		//
+		// The snapshotter walks the app's volumes, so an app carrying none returns
+		// ([], nil): the call worked and captured nothing. That happens in two very
+		// different situations, and conflating them creates a permanently stuck
+		// resource. Consider a teardown that snapshots successfully, deletes the
+		// app (cascading its volumes away), and then fails writing the tombstone:
+		// the retry finds no volumes, produces no points, and would be refused
+		// forever — on a resource that provably HAS a good final recovery point
+		// sitting in the store. Recovery points deliberately outlive the tombstone
+		// precisely so this is answerable.
+		//
+		// So: fall back to the catalog. A prior recovery point satisfies the
+		// guarantee and the teardown proceeds. None at all means the resource
+		// really would be destroyed with nothing to restore from, and that is the
+		// refusal worth keeping — refusing costs an operator a question, proceeding
+		// costs the data.
 		if len(points) == 0 {
-			return nil, fmt.Errorf("%w: resource %s produced NO recovery point (its backing app has no volume to snapshot), so tearing it down would leave nothing to restore from",
-				domain.ErrResourceFinalSnapshotRequired, res.ID)
+			prior, perr := uc.resources.ListRecoveryPoints(ctx, res.ID)
+			if perr != nil {
+				return nil, fmt.Errorf("resource %s produced no recovery point and its catalog is unreadable: %w", res.ID, perr)
+			}
+			if len(prior) == 0 {
+				return nil, fmt.Errorf("%w: resource %s produced NO recovery point and has none on record, so tearing it down would leave nothing to restore from",
+					domain.ErrResourceFinalSnapshotRequired, res.ID)
+			}
+			logger.FromContext(ctx).Warn("fleet decommission: final snapshot captured nothing; proceeding on an existing recovery point",
+				"resource_id", res.ID, "prior_recovery_points", len(prior))
+			final = &prior[0]
 		}
 		// The dedicated tier is single-volume by construction (dedicatedDescriptor
 		// requests exactly one, and in-place restore refuses anything else), so the
