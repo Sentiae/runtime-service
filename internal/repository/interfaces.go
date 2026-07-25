@@ -236,6 +236,41 @@ type ReplicaRepository interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 
+// NetLeaseRepository persists microVM addressing leases — the durable
+// allocations of the /30, uid, TAP and jail id every microVM runs under (see
+// domain/fleet_net_lease.go and migrations/0020).
+//
+// It is the SERIALIZATION POINT of the whole plane: Acquire's INSERT either wins
+// a unique index or is refused, so there is no in-process lock to get wrong and
+// no restart that forgets what is held.
+type NetLeaseRepository interface {
+	// Acquire inserts the lease. It returns domain.ErrNetLeaseConflict when any
+	// unique fence rejects it (net_index, (host,slot), (host,uid), (host,tap),
+	// (owner_kind,owner_id)) — the caller retries with the next free slot rather
+	// than assuming the insert succeeded.
+	Acquire(ctx context.Context, lease *domain.NetLease) error
+	// UsedSlots returns the local slots this host currently holds, so the
+	// allocator can pick the lowest free one. It is a hint, never a guarantee:
+	// the INSERT is what decides.
+	UsedSlots(ctx context.Context, hostID uuid.UUID) ([]int, error)
+	// FindByOwner returns the lease held by an owner row, or
+	// domain.ErrNetLeaseNotFound. This is what makes allocation idempotent per
+	// owner: a retried boot re-uses its own addresses instead of taking a second
+	// set and leaking the first.
+	FindByOwner(ctx context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) (*domain.NetLease, error)
+	// ListByHost returns every lease held on a host — the input to the boot-time
+	// reconcile.
+	ListByHost(ctx context.Context, hostID uuid.UUID) ([]domain.NetLease, error)
+	// Release deletes an owner's lease. Idempotent: releasing a lease that is
+	// already gone is a success, because teardown must never be blockable.
+	Release(ctx context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) error
+	// EnsureHostOrdinal assigns the host the lowest free net_ordinal and returns
+	// it, or returns the one it already has. Idempotent, and racing callers are
+	// serialized by the UNIQUE index (never by a read-then-write). Returns
+	// domain.ErrNetOrdinalExhausted when every ordinal is taken.
+	EnsureHostOrdinal(ctx context.Context, hostID uuid.UUID) (int, error)
+}
+
 // PlacementRepository persists replica-to-host placements.
 type PlacementRepository interface {
 	Upsert(ctx context.Context, placement *domain.Placement) error

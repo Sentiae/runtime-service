@@ -130,19 +130,23 @@ func (j *vmJail) remove() {
 	_ = os.RemoveAll(j.jailDir())
 }
 
-// vmUID derives a VM's unprivileged uid from its per-workload network index,
-// which is already unique by construction and reclaimed across restarts.
+// vmUID derives a VM's unprivileged uid from its allocator slot. The image-boot
+// path no longer calls it — its uid is RECORDED on the lease (domain.NetLease) and
+// re-checked at exec time, so it cannot drift from the fence that protects it —
+// but the warm/ephemeral paths still derive theirs, and both must agree on the
+// same base+slot arithmetic to stay in their carved-out ranges.
 func vmUID(base, index int) int {
 	return base + index
 }
 
 // ephUIDOffset opens the uid (and jail-id) sub-range the EPHEMERAL boot paths
-// draw from. The image-boot path derives uid = VMUIDBase + network index from a
-// persisted, restart-reclaimed index in [1,imgMaxIndex]; the cold-exec / single-
-// shot paths have no such durable index and allocate in memory instead. Starting
-// their range above imgMaxIndex makes the two schemes disjoint by construction,
-// so an in-memory allocator that forgets everything on restart can never hand a
-// VM the uid — or the chroot — a live image-boot VM already holds.
+// draw from. The image-boot path derives uid = VMUIDBase + the host-local slot of
+// a DURABLE lease (domain.NetLease), so its slots live in [1,domain.NetMaxSlot];
+// the cold-exec / single-shot paths have no such durable allocation and allocate
+// in memory instead. Starting their range above domain.NetMaxSlot makes the two
+// schemes disjoint by construction, so an in-memory allocator that forgets
+// everything on restart can never hand a VM the uid — or the chroot — a live
+// image-boot VM already holds.
 //
 // The offset itself is NOT allocatable: it is the fixed slot reserved for the
 // single warm template VM (only one runs at a time, like its fixed tap name).

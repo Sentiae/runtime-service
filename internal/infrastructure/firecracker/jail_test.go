@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/pkg/config"
 )
 
@@ -244,10 +245,11 @@ func TestCheckSocketPathFits(t *testing.T) {
 	vmID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
 	socketRel := "run/" + vmID.String() + ".sock"
 
-	// The longest jail ids either allocator can hand out: imgMaxIndex for the
-	// image-boot path, VMUIDSpan-1 for the ephemeral (cold-exec / single-shot)
-	// paths, which is what prepareJailedVM builds its socket under.
-	for _, id := range []string{"1", "4000", strconv.Itoa(ephSlotFloor), "8191"} {
+	// The longest jail ids either allocator can hand out: domain.NetMaxSlot for the
+	// image-boot path (its jail id is the lease's host-local slot), VMUIDSpan-1 for
+	// the ephemeral (cold-exec / single-shot) paths, which is what prepareJailedVM
+	// builds its socket under.
+	for _, id := range []string{"1", strconv.Itoa(domain.NetMaxSlot), strconv.Itoa(ephSlotFloor), "8191"} {
 		sock := newVMJail(defaultChrootBaseForTest, id, 100001).hostPath(socketRel)
 		if err := checkSocketPathFits(sock); err != nil {
 			t.Fatalf("default chroot base rejected for jail id %s (%d bytes): %v", id, len(sock), err)
@@ -255,7 +257,7 @@ func TestCheckSocketPathFits(t *testing.T) {
 	}
 
 	long := "/var/lib/firecracker/" + strings.Repeat("x", 64)
-	sock := newVMJail(long, "4000", 100001).hostPath(socketRel)
+	sock := newVMJail(long, "1023", 100001).hostPath(socketRel)
 	err := checkSocketPathFits(sock)
 	if err == nil {
 		t.Fatalf("over-long chroot base accepted: %s (%d bytes)", sock, len(sock))
@@ -298,7 +300,7 @@ type uidRange struct {
 // out. Every producer of a jail uid must draw from exactly one of these.
 func uidSpaceRanges(span int) []uidRange {
 	return []uidRange{
-		{"image-boot", 1, imgMaxIndex},
+		{"image-boot", 1, domain.NetMaxSlot},
 		{"warm-template", ephUIDOffset, ephUIDOffset},
 		{"warm-clone", ephUIDOffset + 1, ephUIDOffset + maxCloneIndex},
 		{"ephemeral", ephSlotFloor, span - 1},

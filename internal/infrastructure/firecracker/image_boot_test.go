@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/port/gateway"
 	"github.com/sentiae/runtime-service/internal/usecase"
@@ -23,36 +24,6 @@ func TestImageBootArgs(t *testing.T) {
 	want := "console=ttyS0 reboot=k panic=1 pci=off init=/sentiae/init ip=10.201.0.6::10.201.0.5:255.255.255.252::eth0:off"
 	if got != want {
 		t.Errorf("imageBootArgs =\n %q\nwant\n %q", got, want)
-	}
-}
-
-func TestDeriveNet(t *testing.T) {
-	tests := []struct {
-		n                int
-		tap, host, guest string
-	}{
-		{1, "img1", "10.201.0.5", "10.201.0.6"},       // base = 4
-		{2, "img2", "10.201.0.9", "10.201.0.10"},      // base = 8
-		{63, "img63", "10.201.0.253", "10.201.0.254"}, // base = 252
-		{64, "img64", "10.201.1.1", "10.201.1.2"},     // base = 256 → octet3 rolls
-	}
-	for _, tt := range tests {
-		nw := deriveNet(tt.n)
-		if nw.tapName != tt.tap || nw.hostIP != tt.host || nw.guestIP != tt.guest {
-			t.Errorf("deriveNet(%d) = {tap:%s host:%s guest:%s}, want {tap:%s host:%s guest:%s}",
-				tt.n, nw.tapName, nw.hostIP, nw.guestIP, tt.tap, tt.host, tt.guest)
-		}
-	}
-}
-
-func TestDeriveNetUniqueAndValid(t *testing.T) {
-	seen := map[string]bool{}
-	for n := 1; n <= imgMaxIndex; n++ {
-		nw := deriveNet(n)
-		if seen[nw.guestIP] {
-			t.Fatalf("duplicate guest IP %s at index %d", nw.guestIP, n)
-		}
-		seen[nw.guestIP] = true
 	}
 }
 
@@ -239,6 +210,7 @@ func newStopTestBooter(t *testing.T, gc gateway.GuestControl, proc vmProcess) *I
 		NewProvider(config.FirecrackerConfig{ChrootBase: t.TempDir()}),
 		"10.0.0.1",
 		NewGuestControlTokens(),
+		newFakeNetAlloc(),
 	)
 	b.guestControl = gc
 	b.stop = stopTimings{
@@ -338,7 +310,12 @@ func TestDecommissionStopsGuestBeforeSignallingVMM(t *testing.T) {
 			writeStopTestFile(t, socketPath)
 			writeStopTestFile(t, rootfsPath)
 			b.controlTokens.Put(socketPath, "vm-token")
-			b.Seed([]int{1, 2, 3, 4, 5, 6, 7})
+			ownerID := uuid.New()
+			alloc := b.alloc.(*fakeNetAlloc)
+			lease, aerr := alloc.Acquire(context.Background(), domain.NetLeaseOwnerReplica, ownerID)
+			if aerr != nil {
+				t.Fatalf("seed lease: %v", aerr)
+			}
 
 			ctx := context.Background()
 			if tt.cancelCtx {
@@ -348,9 +325,11 @@ func TestDecommissionStopsGuestBeforeSignallingVMM(t *testing.T) {
 			}
 
 			if err := b.Decommission(ctx, usecase.ImageDecommissionInput{
+				OwnerKind:  domain.NetLeaseOwnerReplica,
+				OwnerID:    ownerID,
 				PID:        4242,
 				SocketPath: socketPath,
-				NetIndex:   7,
+				NetIndex:   lease.NetIndex,
 				RootfsPath: rootfsPath,
 			}); err != nil {
 				t.Fatalf("Decommission: %v", err)
@@ -369,8 +348,11 @@ func TestDecommissionStopsGuestBeforeSignallingVMM(t *testing.T) {
 			if _, ok := b.controlTokens.Get(socketPath); ok {
 				t.Error("control token still held after teardown")
 			}
-			if n, err := b.allocIndex(); err != nil || n != 7 {
-				t.Errorf("net index not freed: allocIndex = %d, %v; want 7", n, err)
+			// The addressing lease is released by OWNER, so the slot is free again —
+			// and it is released on EVERY branch of this table, including the ones
+			// where the guest refused to die and where the caller was cancelled.
+			if alloc.held(domain.NetLeaseOwnerReplica, ownerID) {
+				t.Errorf("addressing lease still held after teardown (slot %d permanently burned)", lease.LocalSlot)
 			}
 		})
 	}
@@ -412,7 +394,7 @@ func TestDecommissionHoldsControlTokenUntilShutdown(t *testing.T) {
 // would silently degrade to a kill.
 func TestNewImageBooterSharesControlTokenStore(t *testing.T) {
 	tokens := NewGuestControlTokens()
-	b := NewImageBooter(nil, "10.0.0.1", tokens)
+	b := NewImageBooter(nil, "10.0.0.1", tokens, newFakeNetAlloc())
 
 	client, ok := b.guestControl.(*GuestControlClient)
 	if !ok {
@@ -454,17 +436,109 @@ func writeStopTestFile(t *testing.T, path string) {
 	}
 }
 
-func TestAllocIndex(t *testing.T) {
-	// rt#8 retired per-VM host-port DNAT: only the /30 network index is allocated.
-	b := NewImageBooter(nil, "10.0.0.1", NewGuestControlTokens())
-	b.Seed([]int{1})
+// TestSetupNetRefusesWithoutAllocator pins the no-fallback rule: a booter with no
+// addressing plane must refuse to boot, never compute an address locally. The old
+// in-memory allocator IS the vulnerability this plane replaces, so "degrade to
+// local allocation" must not exist as a code path.
+func TestSetupNetRefusesWithoutAllocator(t *testing.T) {
+	b := NewImageBooter(NewProvider(config.FirecrackerConfig{ChrootBase: t.TempDir()}), "10.0.0.1", nil, nil)
+	_, _, err := b.setupNet(context.Background(), domain.NetLeaseOwnerReplica, uuid.New())
+	if !errors.Is(err, domain.ErrNetPlaneUnreconciled) {
+		t.Fatalf("setupNet without an allocator = %v, want ErrNetPlaneUnreconciled", err)
+	}
+}
 
-	n, err := b.allocIndex()
-	if err != nil || n != 2 {
-		t.Fatalf("allocIndex = %d,%v; want 2 (1 seeded used)", n, err)
+// TestSetupNetRefusesWhenLeaseRefused pins that a refused lease refuses the BOOT.
+// A booter that swallowed an allocation error and continued would run a VM with no
+// fenced address, uid or chroot at all.
+func TestSetupNetRefusesWhenLeaseRefused(t *testing.T) {
+	alloc := newFakeNetAlloc()
+	alloc.acquireErr = domain.ErrNetLeaseExhausted
+	b := NewImageBooter(NewProvider(config.FirecrackerConfig{ChrootBase: t.TempDir()}), "10.0.0.1", nil, alloc)
+	_, _, err := b.setupNet(context.Background(), domain.NetLeaseOwnerReplica, uuid.New())
+	if !errors.Is(err, domain.ErrNetLeaseExhausted) {
+		t.Fatalf("setupNet with a refused lease = %v, want ErrNetLeaseExhausted", err)
 	}
-	b.freeIndex(2)
-	if n, _ := b.allocIndex(); n != 2 {
-		t.Fatalf("allocIndex after free = %d, want 2", n)
+}
+
+// TestDecommissionReleasesLeaseWhenTeardownFails pins the "teardown is never
+// blockable" contract at the plane's expense-free end: even when stopping the guest
+// fails outright, the lease is released, because a lease that outlives its VM burns
+// its slot (address + uid + chroot) until the next boot-time reconcile.
+func TestDecommissionReleasesLeaseWhenTeardownFails(t *testing.T) {
+	rec := &stopRecorder{}
+	// A guest that refuses SHUTDOWN and a VMM that never dies: the worst teardown.
+	b := newStopTestBooter(t, &fakeGuestControl{rec: rec, err: errors.New("dial: connection refused")},
+		newFakeProcess(rec, -1, false))
+	alloc := b.alloc.(*fakeNetAlloc)
+	ownerID := uuid.New()
+	if _, err := alloc.Acquire(context.Background(), domain.NetLeaseOwnerWorkload, ownerID); err != nil {
+		t.Fatalf("seed lease: %v", err)
 	}
+
+	if err := b.Decommission(context.Background(), usecase.ImageDecommissionInput{
+		OwnerKind: domain.NetLeaseOwnerWorkload,
+		OwnerID:   ownerID,
+		PID:       4242,
+	}); err != nil {
+		t.Fatalf("Decommission: %v", err)
+	}
+	if alloc.held(domain.NetLeaseOwnerWorkload, ownerID) {
+		t.Fatal("lease still held after a failed teardown — its slot is burned")
+	}
+}
+
+// fakeNetAlloc is an in-memory NetLeaseAllocator for the adapter's tests. It
+// derives real coordinates through domain.DeriveNetLease so a test can never
+// assert on addressing the production path would not produce.
+type fakeNetAlloc struct {
+	mu         sync.Mutex
+	leases     map[string]domain.NetLease
+	nextSlot   int
+	acquireErr error
+	releaseErr error
+}
+
+var _ usecase.NetLeaseAllocator = (*fakeNetAlloc)(nil)
+
+func newFakeNetAlloc() *fakeNetAlloc {
+	return &fakeNetAlloc{leases: map[string]domain.NetLease{}, nextSlot: 1}
+}
+
+func (f *fakeNetAlloc) Acquire(_ context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) (domain.NetLease, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.acquireErr != nil {
+		return domain.NetLease{}, f.acquireErr
+	}
+	key := string(kind) + ":" + ownerID.String()
+	if held, ok := f.leases[key]; ok {
+		return held, nil
+	}
+	lease, err := domain.DeriveNetLease(0, f.nextSlot, 100000)
+	if err != nil {
+		return domain.NetLease{}, err
+	}
+	f.nextSlot++
+	lease.ID = uuid.New()
+	lease.OwnerKind, lease.OwnerID = kind, ownerID
+	f.leases[key] = lease
+	return lease, nil
+}
+
+func (f *fakeNetAlloc) Release(_ context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.releaseErr != nil {
+		return f.releaseErr
+	}
+	delete(f.leases, string(kind)+":"+ownerID.String())
+	return nil
+}
+
+func (f *fakeNetAlloc) held(kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.leases[string(kind)+":"+ownerID.String()]
+	return ok
 }

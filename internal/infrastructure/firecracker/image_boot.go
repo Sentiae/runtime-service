@@ -8,29 +8,30 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/sentiae/platform-kit/logger"
+	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/infrastructure/netfabric"
 	"github.com/sentiae/runtime-service/internal/port/gateway"
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
 
-// imgSubnetBase is the /16 the image-boot path carves per-workload /30s out of.
-// Each workload index N gets the /30 based at N*4 within 10.201.0.0/16:
+// imgSubnet16 is the /16 the image-boot path carves per-workload /30s out of.
 //
-//	network = 10.201.<(N*4)>>8>.<(N*4)&0xff>
-//	host    = network + 1   (the gateway the guest sees)
-//	guest   = network + 2
-//
-// N in [1,imgMaxIndex] keeps every octet valid and every /30 aligned, and stays
-// well inside 10.201.0.0/16. (This realizes the CP3 spec's "unique /30 per
-// workload, ~4000 capacity" intent with valid octets — see image_boot notes.)
+// ⚠ The ADDRESSING ITSELF IS NOT COMPUTED HERE ANY MORE. Every coordinate — the
+// /30, the TAP name, the jail id and the per-VM uid — comes from a durable lease
+// acquired through usecase.NetLeaseAllocator and derived in exactly one place
+// (domain.DeriveNetLease). What used to live here was a process-local map: it
+// forgot everything on restart, was seeded from a query whose errors were logged
+// and ignored, never counted `dead` replicas whose VMM was still running, and had
+// no host term at all. Any one of those hands a second tenant a live VM's address,
+// uid AND chroot.
 const (
-	imgMaxIndex = 4000
 	imgNetmask  = "255.255.255.252"
 	imgSubnet16 = "10.201.0.0/16"
 )
@@ -69,16 +70,25 @@ type ImageBooter struct {
 	natOnce sync.Once
 	natErr  error
 
-	mu        sync.Mutex
-	usedIndex map[int]bool
+	// alloc is the durable addressing plane. It is the ONLY way this adapter
+	// obtains a /30, a TAP name, a jail id or a uid — there is deliberately no
+	// local fallback allocator to degrade into.
+	alloc usecase.NetLeaseAllocator
 }
 
-var _ usecase.ImageBooter = (*ImageBooter)(nil)
+var (
+	_ usecase.ImageBooter       = (*ImageBooter)(nil)
+	_ usecase.NetLeaseReclaimer = (*ImageBooter)(nil)
+)
 
 // NewImageBooter constructs an ImageBooter over an existing Provider. rt#8
 // retired per-VM host-port DNAT (the fleet owns ingress via Caddy), so no host
 // port range is tracked — guests are reached directly on their routed /30.
-func NewImageBooter(p *Provider, advertiseHost string, controlTokens *GuestControlTokens) *ImageBooter {
+//
+// alloc is the durable addressing plane and is required for any BOOT; a nil
+// allocator refuses every boot (see setupNet) rather than falling back to
+// computing an address locally.
+func NewImageBooter(p *Provider, advertiseHost string, controlTokens *GuestControlTokens, alloc usecase.NetLeaseAllocator) *ImageBooter {
 	if controlTokens == nil {
 		controlTokens = NewGuestControlTokens()
 	}
@@ -91,7 +101,7 @@ func NewImageBooter(p *Provider, advertiseHost string, controlTokens *GuestContr
 		guestControl: NewGuestControlClient(controlTokens),
 		stop:         defaultStopTimings(),
 		findProcess:  osFindProcess,
-		usedIndex:    make(map[int]bool),
+		alloc:        alloc,
 	}
 }
 
@@ -136,57 +146,27 @@ var _ vmProcess = (*os.Process)(nil)
 
 func osFindProcess(pid int) (vmProcess, error) { return os.FindProcess(pid) }
 
-// Seed marks network indices already in use by active workloads so the allocator
-// (re)started from a persisted set never double-allocates a /30.
-func (b *ImageBooter) Seed(indices []int) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, n := range indices {
-		if n > 0 {
-			b.usedIndex[n] = true
-		}
-	}
-}
-
-func (b *ImageBooter) allocIndex() (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for n := 1; n <= imgMaxIndex; n++ {
-		if !b.usedIndex[n] {
-			b.usedIndex[n] = true
-			return n, nil
-		}
-	}
-	return 0, fmt.Errorf("image-boot network index space exhausted (max %d)", imgMaxIndex)
-}
-
-func (b *ImageBooter) freeIndex(n int) {
-	if n <= 0 {
-		return
-	}
-	b.mu.Lock()
-	delete(b.usedIndex, n)
-	b.mu.Unlock()
-}
-
-// imgNet holds the derived addressing for a workload index.
+// imgNet is one boot's addressing, read straight off its lease. Nothing here is
+// recomputed: the lease's RECORDED values are what the VM is configured with, so
+// that a future change to the index arithmetic cannot move a running VM.
 type imgNet struct {
 	index   int
+	slot    int
+	uid     int
 	tapName string
 	hostIP  string
 	guestIP string
 }
 
-// deriveNet computes the /30 addressing for index n.
-func deriveNet(n int) imgNet {
-	base := n * 4
-	o3 := (base >> 8) & 0xff
-	o4 := base & 0xff
+// imgNetFromLease projects a lease onto the adapter's boot-local view.
+func imgNetFromLease(lease domain.NetLease) imgNet {
 	return imgNet{
-		index:   n,
-		tapName: fmt.Sprintf("img%d", n),
-		hostIP:  fmt.Sprintf("10.201.%d.%d", o3, o4+1),
-		guestIP: fmt.Sprintf("10.201.%d.%d", o3, o4+2),
+		index:   lease.NetIndex,
+		slot:    lease.LocalSlot,
+		uid:     lease.VMUID,
+		tapName: lease.TapName,
+		hostIP:  lease.HostIP,
+		guestIP: lease.GuestIP,
 	}
 }
 
@@ -209,12 +189,43 @@ func deriveNet(n int) imgNet {
 //
 // Two uncoordinated writers to one ordered chain IS the bug. MASQUERADE stays
 // here: it is the nat table, a different resource with no ordering contention.
+// The MASQUERADE is qualified with `! -d 10.201.0.0/16`: it must translate
+// EGRESS to the outside world only, never fleet-internal traffic. Unqualified it
+// also matched VM→VM packets, and once those hosts stop sharing one machine (or
+// once inter-VM traffic is routed rather than link-local) SNAT'ing them would
+// rewrite the source address the network policy program matches on — i.e. it
+// would silently defeat the cross-tenant DROP. It is a no-op on a single host
+// today and a prerequisite for the day it is not, which is exactly when it must
+// already be right.
+//
+// The old unqualified form is DELETED first (check-then-delete): leaving both in
+// place would leave the broader rule reachable, and a host that has run an older
+// build carries it.
 func (b *ImageBooter) ensureNAT() error {
 	b.natOnce.Do(func() {
 		_ = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0o644)
-		if exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", imgSubnet16, "-j", "MASQUERADE").Run() != nil {
-			if out, err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", imgSubnet16, "-j", "MASQUERADE").CombinedOutput(); err != nil {
+
+		nat := func(op string, spec ...string) *exec.Cmd {
+			return exec.Command("iptables", append([]string{"-t", "nat", op, "POSTROUTING"}, spec...)...)
+		}
+		// The rule that stays, and the unqualified one that used to be here.
+		qualified := []string{"-s", imgSubnet16, "!", "-d", imgSubnet16, "-j", "MASQUERADE"}
+		unqualified := []string{"-s", imgSubnet16, "-j", "MASQUERADE"}
+
+		// ADD before DELETE, deliberately: a host upgrading from the unqualified rule
+		// has live guests behind it, and doing it the other way round would leave a
+		// window with no MASQUERADE at all (their egress would black-hole). During the
+		// overlap the broader rule is still present, which is exactly today's state, so
+		// the ordering costs nothing in strictness.
+		if nat("-C", qualified...).Run() != nil {
+			if out, err := nat("-A", qualified...).CombinedOutput(); err != nil {
 				b.natErr = fmt.Errorf("install image-boot MASQUERADE: %s: %w", string(out), err)
+				return
+			}
+		}
+		if nat("-C", unqualified...).Run() == nil {
+			if out, err := nat("-D", unqualified...).CombinedOutput(); err != nil {
+				b.natErr = fmt.Errorf("remove the unqualified image-boot MASQUERADE (both rules are now installed, so fleet-internal traffic is still being SNAT'd): %s: %w", string(out), err)
 			}
 		}
 	})
@@ -267,19 +278,27 @@ func imageBootArgs(guestIP, hostIP string) string {
 // the given TAP. It returns the running process and socket path. The caller is
 // responsible for killing the process and cleaning the socket.
 func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath string, nw imgNet, vcpu, memMB int, expectSecrets bool, dataDiskPath string) (*exec.Cmd, string, error) {
-	// The per-VM uid is derived from the network index, which is unique by
-	// construction and reclaimed on restart — outside the span two VMs could
-	// collide on one uid, which is the cross-tenant hole the jail closes.
-	if nw.index <= 0 || nw.index >= b.p.cfg.VMUIDSpan {
-		return nil, "", fmt.Errorf("image-boot network index %d outside the per-VM uid span [1,%d)", nw.index, b.p.cfg.VMUIDSpan)
+	// The uid and the jail id come from the LEASE (the host-local slot), and both
+	// are re-checked here against the configured span. This is the last gate before
+	// a VMM is executed under an identity: a uid outside the span, or a lease that
+	// somehow carried no slot, means two VMs could share one (uid,gid) and one
+	// chroot — the cross-tenant hole the jail exists to close — so it refuses the
+	// boot instead of substituting a value.
+	if nw.slot <= 0 || nw.slot > domain.NetMaxSlot {
+		return nil, "", fmt.Errorf("image-boot lease has no usable host-local slot (%d): refusing to boot without a fenced jail id", nw.slot)
 	}
-	uid := vmUID(b.p.cfg.VMUIDBase, nw.index)
+	uid := nw.uid
+	if uid < b.p.cfg.VMUIDBase || uid >= b.p.cfg.VMUIDBase+b.p.cfg.VMUIDSpan {
+		return nil, "", fmt.Errorf("image-boot leased vm uid %d outside the per-VM uid span [%d,%d)",
+			uid, b.p.cfg.VMUIDBase, b.p.cfg.VMUIDBase+b.p.cfg.VMUIDSpan)
+	}
 
-	// The jail id is the network index, not the VM uuid: the uuid already owns the
+	// The jail id is the host-local slot, not the VM uuid: the uuid already owns the
 	// socket basename, and a second one would push the host socket path past the
-	// AF_UNIX 107-byte limit. The index is unique across live VMs (same allocator
-	// as the uid), and prepare() clears a stale dir left by whoever held it before.
-	jailID := strconv.Itoa(nw.index)
+	// AF_UNIX 107-byte limit. The slot is fenced unique per host by
+	// fleet_net_leases_host_slot_key, and prepare() clears a stale dir left by
+	// whoever held it before.
+	jailID := strconv.Itoa(nw.slot)
 	j := newVMJail(b.p.cfg.ChrootBase, jailID, uid)
 	if err := j.prepare(); err != nil {
 		return nil, "", fmt.Errorf("prepare vm jail: %w", err)
@@ -458,7 +477,7 @@ func (b *ImageBooter) killVM(cmd *exec.Cmd, socketPath string) {
 // same path plus a secret push (already handled below via ExpectSecrets) and an
 // egress allowlist (in.EgressAllow).
 func (b *ImageBooter) BootTest(ctx context.Context, in usecase.ImageBootInput) (usecase.ImageTestResult, error) {
-	nw, cleanupNet, err := b.setupNet(ctx)
+	nw, cleanupNet, err := b.setupNet(ctx, in.OwnerKind, in.WorkloadID)
 	if err != nil {
 		return usecase.ImageTestResult{}, err
 	}
@@ -573,7 +592,7 @@ func (b *ImageBooter) readTestOutput(vmID uuid.UUID, rootfsPath string) (stdout,
 func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInput) (usecase.ImageResidentResult, error) {
 	// rt#8 — no host-port allocation: the fleet reaches the guest directly on its
 	// routed /30 (Caddy proxies the public host to guestIP:appPort).
-	nw, cleanupNet, err := b.setupNet(ctx)
+	nw, cleanupNet, err := b.setupNet(ctx, in.OwnerKind, in.WorkloadID)
 	if err != nil {
 		return usecase.ImageResidentResult{}, err
 	}
@@ -649,7 +668,11 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 func (b *ImageBooter) Decommission(ctx context.Context, in usecase.ImageDecommissionInput) error {
 	b.stopVM(ctx, in)
 	b.destroyTap(ctx, in.TapName)
-	b.freeIndex(in.NetIndex)
+	// The lease is released by OWNER, not by index: the index is only an address,
+	// whereas the lease row is the allocation. Releasing runs even when the guest
+	// refused to die and even when the caller's context is already cancelled —
+	// a lease that outlives its VM burns its slot until the next reconcile.
+	b.releaseLease(ctx, in.OwnerKind, in.OwnerID)
 	if in.SocketPath != "" {
 		// The VM is gone; stop bearing its control token (D-185a). This MUST stay
 		// after stopVM: that token is what authenticates the guest SHUTDOWN, so
@@ -786,25 +809,85 @@ func waitForProcessExit(ctx context.Context, proc vmProcess, timeout, poll time.
 	}
 }
 
-// setupNet allocates an index and creates the routed /30 TAP. It returns the
-// derived addressing plus a cleanup func that reverses exactly what it did. rt#8
-// retired the per-VM DNAT, so ingress is served by Caddy, not iptables rules.
-func (b *ImageBooter) setupNet(ctx context.Context) (imgNet, func(), error) {
-	idx, err := b.allocIndex()
-	if err != nil {
-		return imgNet{}, func() {}, err
+// setupNet acquires this owner's addressing lease and creates the routed /30 TAP.
+// It returns the leased addressing plus a cleanup func that reverses exactly what
+// it did. rt#8 retired the per-VM DNAT, so ingress is served by Caddy, not
+// iptables rules.
+//
+// The lease is taken BEFORE the TAP exists and released only after it is gone,
+// which is the invariant that makes the plane safe across a crash at any point:
+// a lease with no device is a slot temporarily unused, while a device with no
+// lease is a slot that could be handed to a second tenant.
+func (b *ImageBooter) setupNet(ctx context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) (imgNet, func(), error) {
+	if b.alloc == nil {
+		// No fallback: the whole point of the lease plane is that there is no second
+		// way to obtain an address.
+		return imgNet{}, func() {}, fmt.Errorf("%w: this booter has no addressing allocator wired",
+			domain.ErrNetPlaneUnreconciled)
 	}
-	nw := deriveNet(idx)
-	uid := vmUID(b.p.cfg.VMUIDBase, idx)
-	if err := b.createTap(nw, uid, uid); err != nil {
-		b.freeIndex(idx)
+	lease, err := b.alloc.Acquire(ctx, kind, ownerID)
+	if err != nil {
+		return imgNet{}, func() {}, fmt.Errorf("acquire microVM addressing lease: %w", err)
+	}
+	nw := imgNetFromLease(lease)
+	if err := b.createTap(nw, nw.uid, nw.uid); err != nil {
+		b.releaseLease(ctx, kind, ownerID)
 		return imgNet{}, func() {}, err
 	}
 	cleanup := func() {
 		b.destroyTap(ctx, nw.tapName)
-		b.freeIndex(idx)
+		b.releaseLease(ctx, kind, ownerID)
 	}
 	return nw, cleanup, nil
+}
+
+// releaseLease frees an owner's addressing lease. It never propagates: every
+// caller is on a teardown or boot-failure path, where the operation that matters
+// has already been decided. A failure is logged at ERROR because a lease that
+// outlives its VM burns its slot until the next boot-time reconcile — the
+// fail-CLOSED direction (the slot is never re-used), but still an operator event.
+func (b *ImageBooter) releaseLease(ctx context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) {
+	if b.alloc == nil {
+		return
+	}
+	if err := b.alloc.Release(ctx, kind, ownerID); err != nil {
+		logger.FromContext(ctx).Error("image-boot: release microVM addressing lease failed; its slot stays held until the next reconcile",
+			"owner_kind", kind, "owner_id", ownerID, "err", err)
+	}
+}
+
+// ReclaimLeaseArtifacts removes the host-side artifacts a lease names: its TAP
+// device and the jailer chroot keyed by its host-local slot. It is the
+// boot-time reconcile's hook for a lease whose owner row is gone — there is no VM
+// handle to decommission, only the lease's own recorded coordinates.
+//
+// It reports failures rather than refusing to continue (the caller is a cleanup
+// path), but it reports them: a TAP that could not be deleted is a device the next
+// boot on that slot will have to delete itself, and a chroot left behind holds
+// mknod'd device nodes owned by that slot's uid.
+func (b *ImageBooter) ReclaimLeaseArtifacts(ctx context.Context, lease domain.NetLease) error {
+	var problems []string
+	if lease.TapName != "" {
+		if out, err := exec.Command("ip", "link", "del", lease.TapName).CombinedOutput(); err != nil {
+			// A device that was already gone is the desired state, not a failure, but it
+			// is indistinguishable from a real error here without parsing output — so it
+			// is reported and the caller logs it at WARN.
+			problems = append(problems, fmt.Sprintf("delete tap %s: %s: %v", lease.TapName, strings.TrimSpace(string(out)), err))
+		}
+	}
+	// A nil provider (or an unconfigured chroot base) means there is no jail layout
+	// to reason about; removing a path derived from an empty base could delete an
+	// unrelated directory, so it is skipped rather than guessed.
+	if b.p != nil && b.p.cfg.ChrootBase != "" && lease.LocalSlot > 0 {
+		jail := newVMJail(b.p.cfg.ChrootBase, strconv.Itoa(lease.LocalSlot), lease.VMUID)
+		if err := os.RemoveAll(jail.jailDir()); err != nil {
+			problems = append(problems, fmt.Sprintf("remove jail dir %s: %v", jail.jailDir(), err))
+		}
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("reclaim lease %s artifacts: %s", lease.ID, strings.Join(problems, "; "))
+	}
+	return nil
 }
 
 // waitForTCP dials host:port until it connects or the deadline passes.

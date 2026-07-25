@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -55,7 +56,7 @@ func TestRegisterHost_ClampsAllocatableToRefreshedCapacity(t *testing.T) {
 	hostID := uuid.New()
 
 	tests := []struct {
-		name                                   string
+		name                                    string
 		seededVCPU, seededMem, seededDisk       int
 		measuredVCPU, measuredMem, measuredDisk int
 		wantVCPU, wantMem, wantDisk             int
@@ -94,7 +95,7 @@ func TestRegisterHost_ClampsAllocatableToRefreshedCapacity(t *testing.T) {
 				AllocatableDiskMB: int64(tt.seededDisk),
 			}}
 
-			got, err := NewFleetHostRegistry(repo).RegisterHost(context.Background(), domain.Host{
+			got, err := NewFleetHostRegistry(repo, newNetFakeLeaseRepo()).RegisterHost(context.Background(), domain.Host{
 				ID:             hostID,
 				CapacityVCPU:   tt.measuredVCPU,
 				CapacityMemMB:  int64(tt.measuredMem),
@@ -133,5 +134,64 @@ func TestRegisterHost_ClampsAllocatableToRefreshedCapacity(t *testing.T) {
 					repo.updated.CapacityVCPU, repo.updated.CapacityMemMB, repo.updated.CapacityDiskMB)
 			}
 		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Net ordinal assignment (SentiaeDB Phase 0 — the microVM addressing plane)
+// ─────────────────────────────────────────────────────────────────────
+
+// Registration is where a host gets its addressing BLOCK. Without one it can
+// allocate no /30, uid or jail id at all, so this is the seam that decides whether
+// a host can boot anything — and it must be idempotent, because every restart
+// re-registers.
+func TestRegisterHostAssignsAndKeepsItsNetOrdinal(t *testing.T) {
+	leases := newNetFakeLeaseRepo()
+	first := uuid.New()
+	second := uuid.New()
+
+	reg := NewFleetHostRegistry(&stubHostRepo{}, leases)
+	got, err := reg.RegisterHost(context.Background(), domain.Host{ID: first})
+	if err != nil {
+		t.Fatalf("RegisterHost: %v", err)
+	}
+	if got.NetOrdinal == nil || *got.NetOrdinal != 0 {
+		t.Fatalf("first host ordinal = %v, want 0 (the existing host keeps the block its live VMs are addressed out of)", got.NetOrdinal)
+	}
+
+	// A SECOND host must get a different block; sharing one would alias every
+	// address, uid and chroot on both machines.
+	second2, err := NewFleetHostRegistry(&stubHostRepo{}, leases).
+		RegisterHost(context.Background(), domain.Host{ID: second})
+	if err != nil {
+		t.Fatalf("RegisterHost (second host): %v", err)
+	}
+	if second2.NetOrdinal == nil || *second2.NetOrdinal != 1 {
+		t.Fatalf("second host ordinal = %v, want 1", second2.NetOrdinal)
+	}
+
+	// Re-registering must return the SAME ordinal: moving it would re-point a block
+	// whose leases (and whose running VMs) are already addressed out of it.
+	again, err := NewFleetHostRegistry(&stubHostRepo{existing: &domain.Host{ID: first}}, leases).
+		RegisterHost(context.Background(), domain.Host{ID: first})
+	if err != nil {
+		t.Fatalf("re-RegisterHost: %v", err)
+	}
+	if again.NetOrdinal == nil || *again.NetOrdinal != 0 {
+		t.Fatalf("re-registered ordinal = %v, want a stable 0", again.NetOrdinal)
+	}
+}
+
+// A fleet with no free block must REFUSE the registration. Admitting a host that
+// would have to share another host's addressing block is worse than not admitting
+// it: it would be a machine whose every VM aliases another machine's.
+func TestRegisterHostRefusedWhenOrdinalsAreExhausted(t *testing.T) {
+	leases := newNetFakeLeaseRepo()
+	leases.ordinalErr = domain.ErrNetOrdinalExhausted
+
+	_, err := NewFleetHostRegistry(&stubHostRepo{}, leases).
+		RegisterHost(context.Background(), domain.Host{ID: uuid.New()})
+	if !errors.Is(err, domain.ErrNetOrdinalExhausted) {
+		t.Fatalf("RegisterHost with no free ordinal = %v, want ErrNetOrdinalExhausted", err)
 	}
 }

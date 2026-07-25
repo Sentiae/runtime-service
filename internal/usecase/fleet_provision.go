@@ -106,7 +106,14 @@ type HostSecret struct {
 
 // ImageBootInput is the common boot request.
 type ImageBootInput struct {
-	WorkloadID     uuid.UUID
+	WorkloadID uuid.UUID
+	// OwnerKind names which control-plane table WorkloadID points at, and it is
+	// REQUIRED: the booter acquires this VM's addressing lease keyed by
+	// (OwnerKind, WorkloadID), and both fleet_replicas and image_workloads boot
+	// into the SAME index space, so an owner reference without its table is
+	// ambiguous. An empty value refuses the boot rather than defaulting — a lease
+	// filed under the wrong kind could be reclaimed while its VM is still running.
+	OwnerKind      domain.NetLeaseOwnerKind
 	RootfsPath     string
 	VCPU           int
 	MemoryMB       int
@@ -157,6 +164,13 @@ type ImageResidentResult struct {
 
 // ImageDecommissionInput tears down a resident workload.
 type ImageDecommissionInput struct {
+	// OwnerKind + OwnerID identify the control-plane row this VM belongs to, which
+	// is what the booter releases the addressing lease by. They are required for
+	// the RELEASE to happen: a teardown that cannot name its owner leaves the
+	// lease held, which permanently burns the slot (fail-closed — never reused —
+	// until the next boot-time reconcile).
+	OwnerKind  domain.NetLeaseOwnerKind
+	OwnerID    uuid.UUID
 	PID        int
 	SocketPath string
 	TapName    string
@@ -168,22 +182,50 @@ type ImageDecommissionInput struct {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Fail-loud booter (non-firecracker executor).
+// Fail-loud booter (non-firecracker executor / unreconciled net plane).
 // ─────────────────────────────────────────────────────────────────────
 
-// FailLoudImageBooter is wired when the executor is not firecracker. Every call
-// fails with ErrImageBootUnavailable so the image-boot path is never silently
-// faked on a host without KVM.
-type FailLoudImageBooter struct{}
+// FailLoudImageBooter refuses to BOOT. It is wired when the executor is not
+// firecracker (no KVM — the image-boot path must never be silently faked) and when
+// the host's microVM addressing plane could not be reconciled at startup (a host
+// that cannot prove which addresses are held must not hand any out).
+//
+// Teardown is the deliberate asymmetry. When Teardown is set, Decommission is
+// DELEGATED to the real booter: refusing to boot protects data, whereas refusing
+// to tear down protects nothing and strands a customer's resource — a running VM,
+// its /30, its lease, its rootfs — with no way to release it. Off a firecracker
+// host there is nothing real to delegate to, so Teardown stays nil there and
+// Decommission refuses like everything else.
+type FailLoudImageBooter struct {
+	// Reason is the error every boot fails with. Nil means
+	// domain.ErrImageBootUnavailable (the no-KVM case), so the zero value keeps
+	// its original meaning.
+	Reason error
+	// Teardown is the real booter this shim delegates Decommission to, or nil.
+	Teardown ImageBooter
+}
 
-func (FailLoudImageBooter) BootTest(context.Context, ImageBootInput) (ImageTestResult, error) {
-	return ImageTestResult{}, domain.ErrImageBootUnavailable
-}
-func (FailLoudImageBooter) BootResident(context.Context, ImageBootInput) (ImageResidentResult, error) {
-	return ImageResidentResult{}, domain.ErrImageBootUnavailable
-}
-func (FailLoudImageBooter) Decommission(context.Context, ImageDecommissionInput) error {
+var _ ImageBooter = FailLoudImageBooter{}
+
+// reason resolves the refusal error.
+func (b FailLoudImageBooter) reason() error {
+	if b.Reason != nil {
+		return b.Reason
+	}
 	return domain.ErrImageBootUnavailable
+}
+
+func (b FailLoudImageBooter) BootTest(context.Context, ImageBootInput) (ImageTestResult, error) {
+	return ImageTestResult{}, b.reason()
+}
+func (b FailLoudImageBooter) BootResident(context.Context, ImageBootInput) (ImageResidentResult, error) {
+	return ImageResidentResult{}, b.reason()
+}
+func (b FailLoudImageBooter) Decommission(ctx context.Context, in ImageDecommissionInput) error {
+	if b.Teardown != nil {
+		return b.Teardown.Decommission(ctx, in)
+	}
+	return b.reason()
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -644,6 +686,7 @@ func (uc *FleetProvision) startJobRun(wl *domain.ImageWorkload, matIn ImageMater
 
 		res, err := uc.booter.BootTest(ctx, ImageBootInput{
 			WorkloadID:     wl.ID,
+			OwnerKind:      domain.NetLeaseOwnerWorkload,
 			RootfsPath:     mat.RootfsPath,
 			VCPU:           vcpu,
 			MemoryMB:       memMB,
@@ -808,6 +851,7 @@ func (uc *FleetProvision) startTestRun(wl *domain.ImageWorkload, matIn ImageMate
 
 		res, err := uc.booter.BootTest(ctx, ImageBootInput{
 			WorkloadID:     wl.ID,
+			OwnerKind:      domain.NetLeaseOwnerWorkload,
 			RootfsPath:     mat.RootfsPath,
 			VCPU:           vcpu,
 			MemoryMB:       memMB,
@@ -848,6 +892,7 @@ func (uc *FleetProvision) runResident(ctx context.Context, wl *domain.ImageWorkl
 
 	res, err := uc.booter.BootResident(ctx, ImageBootInput{
 		WorkloadID:     wl.ID,
+		OwnerKind:      domain.NetLeaseOwnerWorkload,
 		RootfsPath:     mat.RootfsPath,
 		VCPU:           vcpu,
 		MemoryMB:       memMB,
@@ -1009,6 +1054,8 @@ func decommissionInput(wl *domain.ImageWorkload) ImageDecommissionInput {
 		pid = *wl.PID
 	}
 	return ImageDecommissionInput{
+		OwnerKind:  domain.NetLeaseOwnerWorkload,
+		OwnerID:    wl.ID,
 		PID:        pid,
 		SocketPath: wl.SocketPath,
 		TapName:    wl.TapName,

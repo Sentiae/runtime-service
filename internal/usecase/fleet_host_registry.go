@@ -16,17 +16,32 @@ import (
 // (§9#5) consumes. It holds no placement, scheduling, or reconciliation logic.
 type FleetHostRegistry struct {
 	repo repository.HostRepository
+	// leases assigns each host its net_ordinal — the /1024 block of the microVM
+	// addressing plane it may allocate /30s, uids and jail ids from. Registration
+	// is the right moment for it: it is the one place a host's existence is
+	// established, and a host that never got an ordinal cannot boot anything.
+	leases repository.NetLeaseRepository
 }
 
 // NewFleetHostRegistry constructs the registry use case.
-func NewFleetHostRegistry(repo repository.HostRepository) *FleetHostRegistry {
-	return &FleetHostRegistry{repo: repo}
+//
+// leases may be nil only in tests; a nil store means RegisterHost assigns no
+// ordinal, and a host with no ordinal allocates no addresses at all (the
+// addressing plane refuses every boot on it) — so the omission fails closed
+// rather than silently defaulting a host into ordinal 0's block.
+func NewFleetHostRegistry(repo repository.HostRepository, leases repository.NetLeaseRepository) *FleetHostRegistry {
+	return &FleetHostRegistry{repo: repo, leases: leases}
 }
 
-// RegisterHost upserts a host by id. A new host is created healthy/active with
-// allocatable seeded from capacity; re-registering an existing host refreshes
-// its spec (region/labels/capacity/endpoint) and marks it healthy/active
-// without clobbering the live allocatable accounting a heartbeat maintains.
+// RegisterHost upserts a host by id, then makes sure it has a net ordinal. A new
+// host is created healthy/active with allocatable seeded from capacity;
+// re-registering an existing host refreshes its spec
+// (region/labels/capacity/endpoint) and marks it healthy/active without clobbering
+// the live allocatable accounting a heartbeat maintains.
+//
+// The ordinal assignment is a REFUSAL point: if the fleet has no free ordinal the
+// registration fails, because admitting a host that would have to share another
+// host's addressing block is worse than not admitting it.
 func (uc *FleetHostRegistry) RegisterHost(ctx context.Context, host domain.Host) (domain.Host, error) {
 	now := time.Now().UTC()
 	if host.ID == uuid.Nil {
@@ -75,6 +90,11 @@ func (uc *FleetHostRegistry) RegisterHost(ctx context.Context, host domain.Host)
 		if err := uc.repo.Update(ctx, existing); err != nil {
 			return domain.Host{}, fmt.Errorf("update host: %w", err)
 		}
+		ord, err := uc.ensureNetOrdinal(ctx, existing.ID)
+		if err != nil {
+			return domain.Host{}, err
+		}
+		existing.NetOrdinal = ord
 		return *existing, nil
 	}
 
@@ -89,7 +109,30 @@ func (uc *FleetHostRegistry) RegisterHost(ctx context.Context, host domain.Host)
 	if err := uc.repo.Create(ctx, &host); err != nil {
 		return domain.Host{}, fmt.Errorf("create host: %w", err)
 	}
+	// AFTER the insert, never before: the ordinal is assigned by an UPDATE against
+	// the host row, and the UNIQUE index on net_ordinal is what serializes racing
+	// hosts. Assigning it as part of the insert payload would make the row's
+	// creation fail on someone else's ordinal collision.
+	ord, err := uc.ensureNetOrdinal(ctx, host.ID)
+	if err != nil {
+		return domain.Host{}, err
+	}
+	host.NetOrdinal = ord
 	return host, nil
+}
+
+// ensureNetOrdinal assigns (or re-reads) this host's addressing block. A nil lease
+// store leaves the host without one, which the addressing plane treats as "boot
+// nothing here" — see NewFleetHostRegistry.
+func (uc *FleetHostRegistry) ensureNetOrdinal(ctx context.Context, hostID uuid.UUID) (*int, error) {
+	if uc.leases == nil {
+		return nil, nil
+	}
+	ord, err := uc.leases.EnsureHostOrdinal(ctx, hostID)
+	if err != nil {
+		return nil, fmt.Errorf("assign microVM addressing block to host %s: %w", hostID, err)
+	}
+	return &ord, nil
 }
 
 // Heartbeat refreshes a host's liveness + allocatable capacity. An empty health

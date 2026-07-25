@@ -61,9 +61,16 @@ type Host struct {
 	Health            HostHealth        `json:"health" gorm:"type:varchar(20);not null;default:'unknown';index"`
 	Status            HostStatus        `json:"status" gorm:"type:varchar(20);not null;default:'active';index"`
 	Endpoint          string            `json:"endpoint" gorm:"type:varchar(255);not null;default:''"`
-	LastHeartbeat     *time.Time        `json:"last_heartbeat,omitempty"`
-	CreatedAt         time.Time         `json:"created_at" gorm:"not null"`
-	UpdatedAt         time.Time         `json:"updated_at" gorm:"not null"`
+	// NetOrdinal is this host's term in the microVM addressing plane — the /1024
+	// block of net indices it may allocate /30s, uids and jail ids from (see
+	// fleet_net_lease.go). It is a POINTER because it is genuinely unknown until
+	// assigned: NULL must not read as ordinal 0, which is a real block another
+	// host owns, so a host with no ordinal allocates nothing rather than
+	// defaulting into someone else's addresses. UNIQUE in the DDL.
+	NetOrdinal    *int       `json:"net_ordinal,omitempty" gorm:"column:net_ordinal"`
+	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
+	CreatedAt     time.Time  `json:"created_at" gorm:"not null"`
+	UpdatedAt     time.Time  `json:"updated_at" gorm:"not null"`
 }
 
 // TableName specifies the GORM table name.

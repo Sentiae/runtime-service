@@ -198,6 +198,28 @@ type CreateExecutionInput struct {
 // (iptables); fail-loud off the firecracker host.
 // ─────────────────────────────────────────────────────────────────────
 
+// NetLeaseAllocator hands a booting microVM its addressing: the /30, the TAP
+// name, the jail id and the unprivileged uid it runs under, all held by a durable
+// lease row (see domain.NetLease).
+//
+// It is a PORT so the Firecracker boot adapter depends on this interface rather
+// than on the allocator's repository: the adapter must not be able to reach the
+// lease table by any route except acquire/release.
+//
+// Both methods are keyed by the OWNER row, not by an index. Acquire is therefore
+// idempotent — a retried boot re-uses its own addresses instead of taking a second
+// set and orphaning the first — and Release needs no bookkeeping to be correct.
+type NetLeaseAllocator interface {
+	// Acquire returns the lease this owner holds, allocating one if it holds none.
+	// Every failure REFUSES the boot: there is no fallback allocation, because an
+	// address handed out twice is cross-tenant access to customer data.
+	Acquire(ctx context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) (domain.NetLease, error)
+	// Release frees an owner's lease. Idempotent, and it must be callable on a
+	// teardown path that has already failed — a lease that outlives its VM
+	// permanently burns a slot.
+	Release(ctx context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) error
+}
+
 // NetworkEnforcer realizes fleet network policy on the host. The real
 // implementation owns the whole FORWARD program (see the netfabric package doc);
 // FailLoudNetworkEnforcer rejects every call so a workload is NEVER booted into

@@ -377,6 +377,22 @@ func fleetError(err error) error {
 		return status.Error(codes.InvalidArgument, "resident workload requires a guest port")
 	case errors.Is(err, domain.ErrImageBootUnavailable):
 		return status.Error(codes.FailedPrecondition, "image boot requires the firecracker host")
+	// SentiaeDB Phase 0 — the microVM addressing plane's refusals. All four are
+	// HOST-state faults, never caller-input faults, so none of them is
+	// InvalidArgument: the caller asked for something legitimate on a host that
+	// cannot safely serve it. The messages say what an operator must do, because a
+	// retry alone can only fix the transient conflict case.
+	case errors.Is(err, domain.ErrNetPlaneUnreconciled):
+		return status.Error(codes.FailedPrecondition, "this fleet host cannot prove which microVM addresses it holds, so it refuses to boot anything — see the host's startup log for the unreconciled lease and resolve it (teardown and health still work)")
+	case errors.Is(err, domain.ErrHostNetOrdinalUnset):
+		return status.Error(codes.FailedPrecondition, "this fleet host has no assigned microVM addressing block, so it cannot allocate an address; it must register successfully before it can boot")
+	case errors.Is(err, domain.ErrNetLeaseExhausted):
+		return status.Error(codes.ResourceExhausted, "this fleet host has no free microVM address slot")
+	// Aborted, not Internal: a lease conflict is a lost race on a unique fence, so
+	// the caller may retry — but the boot did NOT happen, which is what Aborted
+	// says and Internal does not.
+	case errors.Is(err, domain.ErrNetLeaseConflict):
+		return status.Error(codes.Aborted, "microVM address allocation lost a race on this host; retry")
 	// ⚠ Order matters, and it was wrong before: a quiesce refusal wraps BOTH
 	// sentinels, so with ErrGuestControlUnavailable tested first every
 	// "no channel" refusal answered with the generic channel message and only the

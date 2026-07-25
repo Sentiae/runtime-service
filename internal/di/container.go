@@ -173,12 +173,17 @@ type Container struct {
 	ImageWorkloadRepo repository.ImageWorkloadRepository
 
 	// runtime-fleet CP4 — durable fleet control-plane store.
-	HostRepo          repository.HostRepository
-	FleetAppRepo      repository.FleetAppRepository
-	ReplicaRepo       repository.ReplicaRepository
-	PlacementRepo     repository.PlacementRepository
-	RouteRepo         repository.RouteRepository
-	VolumeRepo        repository.VolumeRepository
+	HostRepo      repository.HostRepository
+	FleetAppRepo  repository.FleetAppRepository
+	ReplicaRepo   repository.ReplicaRepository
+	PlacementRepo repository.PlacementRepository
+	RouteRepo     repository.RouteRepository
+	VolumeRepo    repository.VolumeRepository
+	// SentiaeDB Phase 0 — the durable microVM addressing plane's allocation store.
+	// It is also what the host registry assigns net ordinals through. The allocator
+	// built over it is host-scoped and lives inside initNetPlane, which hands it
+	// straight to the booter — no other component may reach it.
+	NetLeaseRepo      repository.NetLeaseRepository
 	ImageBooter       usecase.ImageBooter
 	ImageMaterializer usecase.ImageMaterializer
 	FleetProvisionUC  *usecase.FleetProvision
@@ -427,36 +432,28 @@ func (c *Container) initFleet(cfg *config.Config) error {
 	// finds no token for any VM.
 	c.guestControlTokens = firecracker.NewGuestControlTokens()
 
+	// CP4 §9#4 — durable host registry + this instance's self-registration. Both
+	// run FIRST now, because the microVM addressing plane below cannot allocate an
+	// address until this host knows its own identity AND its assigned net ordinal:
+	// the ordinal is the high half of every net index, and there is no safe default
+	// for it (0 is a real block another host may own). Self-registration is
+	// firecracker-only, and so is the fatal host-identity check inside it — a
+	// container-executor instance has no fleet identity to mint.
+	c.FleetHostRegistry = usecase.NewFleetHostRegistry(c.HostRepo, c.NetLeaseRepo)
+	if cfg.App.ExecutorType == "firecracker" {
+		if err := c.registerSelfHost(cfg); err != nil {
+			return err
+		}
+	} else {
+		log.Println("Fleet self-registration skipped (executor is not firecracker)")
+	}
+
 	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
-		booter := firecracker.NewImageBooter(
-			c.FCProvider,
-			cfg.ImageBoot.AdvertiseHost,
-			c.guestControlTokens,
-		)
-		// Seed the allocator from any workloads still active in the store so a
-		// restart never double-allocates a /30 index. rt#8 retired host-port DNAT.
-		if active, err := c.ImageWorkloadRepo.FindActive(context.Background()); err == nil {
-			indices := make([]int, 0, len(active))
-			for i := range active {
-				indices = append(indices, active[i].NetIndex)
-			}
-			booter.Seed(indices)
-		} else {
-			log.Printf("Warning: image-boot seed from active workloads failed: %v", err)
+		booter, planeErr := c.initNetPlane(cfg)
+		if planeErr != nil {
+			log.Printf("ERROR: fleet microVM addressing plane UNRECONCILED — every boot on this host is REFUSED (teardown, health and ingress still served): %v", planeErr)
 		}
-		// Also seed from live replicas (resident + booting) so the CP4 replica
-		// path and the CP3 workload path never collide on a /30 index. Seed is
-		// additive (merges into the used-set), so a second call is safe.
-		if replicas, err := activeReplicas(c.ReplicaRepo); err == nil {
-			indices := make([]int, 0, len(replicas))
-			for i := range replicas {
-				indices = append(indices, replicas[i].NetIndex)
-			}
-			booter.Seed(indices)
-		} else {
-			log.Printf("Warning: image-boot seed from live replicas failed: %v", err)
-		}
-		c.ImageBooter = booter
+		c.ImageBooter = publishImageBooter(booter, planeErr)
 		c.GuestControl = firecracker.NewGuestControlClient(c.guestControlTokens)
 		log.Println("Image-boot Firecracker booter initialized")
 	} else {
@@ -570,9 +567,6 @@ func (c *Container) initFleet(cfg *config.Config) error {
 		}
 	}
 
-	// CP4 §9#4 — durable host registry + this instance's self-registration.
-	c.FleetHostRegistry = usecase.NewFleetHostRegistry(c.HostRepo)
-
 	// CP4 §9#5 — placement scheduler. Staleness = 3× the heartbeat interval so a
 	// host that misses a couple of beats drops out of the candidate set.
 	schedStaleness := 3 * cfg.Fleet.HeartbeatInterval
@@ -653,17 +647,6 @@ func (c *Container) initFleet(cfg *config.Config) error {
 	}
 
 	c.initResourceControlPlane(cfg)
-
-	// Self-registration is firecracker-only, and so is the fatal host-identity
-	// check inside it: a container-executor instance (the compose deployment) never
-	// reaches this branch and has no fleet identity to mint.
-	if cfg.App.ExecutorType == "firecracker" {
-		if err := c.registerSelfHost(cfg); err != nil {
-			return err
-		}
-	} else {
-		log.Println("Fleet self-registration skipped (executor is not firecracker)")
-	}
 
 	// D-184 — scope the boot-time restore sweep to the resources whose data lives
 	// on THIS host, reusing the volume host-affinity the reconciler already uses
@@ -870,20 +853,114 @@ func (c *Container) buildSecretResolver() secret.Resolver {
 	return secret.NewHandedTokenEnvelopeResolverWithClient(vc.Raw(), "secret", "transit-tenants")
 }
 
-// activeReplicas returns replicas currently holding a /30 index + host port
-// (resident or mid-boot) so the image-boot allocator can be seeded from them on
-// restart. Any query error aborts (the caller logs a warning).
-func activeReplicas(repo repository.ReplicaRepository) ([]domain.Replica, error) {
+// publishImageBooter decides what the fleet's booter seam becomes given the
+// addressing plane's outcome. It is a pure function so the fail-closed rule is
+// assertable without a live host.
+//
+// planeErr != nil ⇒ FAIL CLOSED: every boot is refused with an error naming the
+// unreconciled plane, while teardown is DELEGATED to the real booter. The
+// asymmetry is the point — refusing to boot protects customer data, whereas
+// refusing to tear down protects nothing and strands a running VM together with
+// its /30, its lease and its rootfs.
+func publishImageBooter(real usecase.ImageBooter, planeErr error) usecase.ImageBooter {
+	if planeErr == nil {
+		return real
+	}
+	return usecase.FailLoudImageBooter{
+		Reason:   fmt.Errorf("%w: %v", domain.ErrNetPlaneUnreconciled, planeErr),
+		Teardown: real,
+	}
+}
+
+// initNetPlane wires the durable microVM addressing plane (SentiaeDB Phase 0) and
+// reconciles it against this host's reality. It returns the real booter — ALWAYS
+// non-nil, so the caller has something to delegate teardown to — plus the error
+// that must make every boot fail closed.
+//
+// ⚠ WHAT THIS REPLACES, and why the fail-closed posture is not optional. Boots
+// used to draw their /30, TAP name, jail id and per-VM uid from a process-local
+// map inside the booter, SEEDED here from the net_index columns of live rows. Both
+// seed calls logged their errors and continued — so a DB blip at startup produced
+// an EMPTY used-set, and the next boot allocated index 1, which a live customer VM
+// already held: same address, same uid/gid, same chroot. The seed also never
+// covered `dead` replicas, whose VMM RefreshHealth leaves running. The plane is
+// now a table with unique fences, and the only honest response to "I cannot tell
+// which addresses are held" is to hand out none.
+//
+// The sequence is: resolve this host's ordinal → build the allocator → build the
+// booter over it → reconcile the host's leases. A failure at any step is returned;
+// the caller publishes FailLoudImageBooter and logs loudly (the initNetworkFabric
+// precedent).
+func (c *Container) initNetPlane(cfg *config.Config) (*firecracker.ImageBooter, error) {
 	ctx := context.Background()
-	resident, err := repo.ListByState(ctx, domain.ReplicaStateResident)
-	if err != nil {
-		return nil, err
+
+	// A negative ordinal is the "unknown" sentinel the allocator refuses to
+	// allocate from. It is carried rather than short-circuited so the booter (and
+	// therefore teardown, which releases leases by owner and needs no ordinal) is
+	// still built on every failure path.
+	ordinal := -1
+	var planeErr error
+
+	selfHost := uuid.Nil
+	if c.fleetSelf != nil {
+		selfHost = c.fleetSelf.ID
 	}
-	booting, err := repo.ListByState(ctx, domain.ReplicaStateBooting)
-	if err != nil {
-		return nil, err
+	switch {
+	case selfHost == uuid.Nil:
+		// Self-registration is fatal on missing identity and only swallows an
+		// unmeasurable host, so reaching here means this host never joined the
+		// registry — it has no block to allocate from.
+		planeErr = fmt.Errorf("this fleet host is not registered, so it has no addressing block: %w", domain.ErrHostNetOrdinalUnset)
+	case c.fleetSelf.NetOrdinal == nil:
+		planeErr = fmt.Errorf("host %s has no assigned net ordinal: %w", selfHost, domain.ErrHostNetOrdinalUnset)
+	default:
+		ordinal = *c.fleetSelf.NetOrdinal
 	}
-	return append(resident, booting...), nil
+
+	alloc := usecase.NewFleetNetAllocator(
+		c.NetLeaseRepo,
+		selfHost,
+		ordinal,
+		cfg.Firecracker.VMUIDBase,
+		cfg.Firecracker.VMUIDSpan,
+	)
+	booter := firecracker.NewImageBooter(
+		c.FCProvider,
+		cfg.ImageBoot.AdvertiseHost,
+		c.guestControlTokens,
+		alloc,
+	)
+	if planeErr != nil {
+		return booter, planeErr
+	}
+
+	reconciler := usecase.NewFleetNetLeaseReconciler(
+		c.NetLeaseRepo,
+		c.HostRepo,
+		c.ReplicaRepo,
+		c.ImageWorkloadRepo,
+		// The reconcile tears a reclaimed lease's VM down through the REAL booter
+		// (never the fail-loud one), because a lease is only released after its VM is
+		// actually stopped.
+		booter,
+		booter,
+		selfHost,
+		cfg.Firecracker.VMUIDBase,
+	)
+	report, err := reconciler.Reconcile(ctx)
+	if err != nil {
+		return booter, err
+	}
+	// Logged, not stashed: /posture reports DECLARED CONTROLS (opshttp.PostureHandler
+	// over a posture.Set), and a control there is asserted by MustHold, which
+	// REFUSES BOOT when it does not hold. Declaring the plane's state that way would
+	// turn "refuse every boot, keep serving teardown/health/ingress" into "do not
+	// come up at all", which is a different and worse posture than the one this
+	// change is specified to have. The report therefore stays a boot-log fact until
+	// the ops surface grows a non-fatal report channel.
+	log.Printf("Fleet microVM addressing plane: host_ordinal=%d leases=%d adopted=%d torn_down=%d reclaimed=%d left=%d",
+		report.HostOrdinal, report.Leases, report.Adopted, report.TornDown, report.Reclaimed, report.Left)
+	return booter, nil
 }
 
 // fleetVolumeDir resolves the host root under which per-volume backing files are
@@ -1254,6 +1331,12 @@ func (c *Container) initRepositories() {
 	c.PlacementRepo = postgres.NewPlacementRepository(c.DB)
 	c.RouteRepo = postgres.NewRouteRepository(c.DB)
 	c.VolumeRepo = postgres.NewVolumeRepository(c.DB)
+
+	// SentiaeDB Phase 0 — the durable microVM addressing plane (migrations/0020).
+	// Wired on EVERY executor: the host registry assigns net ordinals through it,
+	// and teardown releases leases through it, neither of which is
+	// firecracker-only.
+	c.NetLeaseRepo = postgres.NewNetLeaseRepository(c.DB)
 
 	// CP4.5 §9#3 (D-183) — P19 resource control-plane store.
 	c.FleetResourceRepo = postgres.NewFleetResourceRepository(c.DB)

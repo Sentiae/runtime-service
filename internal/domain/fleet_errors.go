@@ -109,4 +109,35 @@ var (
 	// undeclared VM is refused, so a future caller cannot wire a resident VM into a
 	// pause path by simply not setting a flag.
 	ErrVMClassUndeclared = errors.New("VM class must be declared before registering with a component that pauses it")
+
+	// ── microVM addressing plane (fleet_net_leases, see fleet_net_lease.go) ──
+	// Every one of these REFUSES a boot. That direction is the whole design: an
+	// address/uid/chroot handed out twice is cross-tenant access to customer data,
+	// so an allocation the plane cannot prove is unique is not made at all.
+
+	// ErrNetCoordinateOutOfRange is returned when a host ordinal, local slot or
+	// derived net index falls outside the plane's fences. It is a refusal rather
+	// than a clamp: a clamped coordinate lands on a /30 another live VM holds.
+	ErrNetCoordinateOutOfRange = errors.New("microVM net coordinate out of range")
+	// ErrNetLeaseExhausted is returned when this host has no free local slot. The
+	// allocator refuses the boot rather than wrapping around, because wrapping
+	// means handing a running VM's uid and chroot to a second tenant.
+	ErrNetLeaseExhausted = errors.New("microVM net lease slots exhausted on this host")
+	// ErrNetLeaseConflict is returned when a lease INSERT lost a race on one of
+	// the unique fences and the allocator exhausted its retries. The conflict is
+	// the fence working — the loser must not boot.
+	ErrNetLeaseConflict = errors.New("microVM net lease conflict")
+	// ErrNetLeaseNotFound is returned when no lease matches an owner.
+	ErrNetLeaseNotFound = errors.New("microVM net lease not found")
+	// ErrHostNetOrdinalUnset is returned when this host has no assigned
+	// net_ordinal. Without it there is no /30 block to allocate from, and
+	// defaulting to 0 would collide with whichever host legitimately owns it.
+	ErrHostNetOrdinalUnset = errors.New("fleet host has no assigned net ordinal")
+	// ErrNetOrdinalExhausted is returned when every host ordinal is taken. The
+	// fleet cannot admit a further host at this stride without a re-split.
+	ErrNetOrdinalExhausted = errors.New("fleet host net ordinals exhausted")
+	// ErrNetPlaneUnreconciled is returned by every boot on a host whose
+	// addressing plane could not be reconciled at startup. A host that cannot
+	// prove which addresses are held must not hand any out.
+	ErrNetPlaneUnreconciled = errors.New("microVM net addressing plane is unreconciled on this host")
 )

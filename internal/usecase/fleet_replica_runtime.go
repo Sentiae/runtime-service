@@ -276,6 +276,7 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 
 	res, err := uc.booter.BootResident(ctx, ImageBootInput{
 		WorkloadID:     replica.ID,
+		OwnerKind:      domain.NetLeaseOwnerReplica,
 		RootfsPath:     mat.RootfsPath,
 		VCPU:           app.ResourcesVCPU,
 		MemoryMB:       int(app.ResourcesMemMB),
@@ -435,6 +436,8 @@ func replicaDecommissionInput(replica *domain.Replica) ImageDecommissionInput {
 		pid = *replica.PID
 	}
 	return ImageDecommissionInput{
+		OwnerKind:  domain.NetLeaseOwnerReplica,
+		OwnerID:    replica.ID,
 		PID:        pid,
 		SocketPath: replica.SocketPath,
 		TapName:    replica.TapName,
