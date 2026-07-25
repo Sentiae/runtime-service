@@ -67,17 +67,28 @@ func main() {
 	// Initialize telemetry (traces, metrics & logs → OTLP collector) early so
 	// the promauto→OTLP metric bridge is active before any component records
 	// (D-179 Wave-8). Non-fatal: a collector outage must not block boot.
+	//
+	// APP_TELEMETRY_ENABLED=false skips the bootstrap entirely: no exporter, no
+	// periodic reader, no background upload goroutine. Hosts with no reachable
+	// collector (the bare Firecracker fleet host) set it so the OTel globals
+	// stay no-ops instead of retrying an unresolvable endpoint every 60s.
 	otelCtx, otelCancel := context.WithCancel(context.Background())
 	defer otelCancel()
-	shutdownTelemetry, err := otelkit.Init(otelCtx, otelkit.Config{
-		ServiceName:    cfg.Telemetry.ServiceName,
-		ServiceVersion: Version,
-		Environment:    cfg.App.Environment,
-		Endpoint:       cfg.Telemetry.OTLPEndpoint,
-		Insecure:       true,
-	})
-	if err != nil {
-		log.Printf("Failed to init telemetry (continuing without it): %v", err)
+	var shutdownTelemetry otelkit.Shutdown
+	if cfg.Telemetry.Enabled {
+		log.Printf("Telemetry: enabled (OTLP endpoint: %s)", cfg.Telemetry.OTLPEndpoint)
+		shutdownTelemetry, err = otelkit.Init(otelCtx, otelkit.Config{
+			ServiceName:    cfg.Telemetry.ServiceName,
+			ServiceVersion: Version,
+			Environment:    cfg.App.Environment,
+			Endpoint:       cfg.Telemetry.OTLPEndpoint,
+			Insecure:       true,
+		})
+		if err != nil {
+			log.Printf("Failed to init telemetry (continuing without it): %v", err)
+		}
+	} else {
+		log.Printf("Telemetry: disabled (APP_TELEMETRY_ENABLED=false) — no OTLP exporter started")
 	}
 	defer func() {
 		if shutdownTelemetry != nil {

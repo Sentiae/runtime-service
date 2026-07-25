@@ -54,9 +54,15 @@ type ResourceConfig struct {
 }
 
 // TelemetryConfig configures the OTLP export path (traces/metrics/logs → the
-// otel-collector). Both fields are defaulted (never validate:required) so the
+// otel-collector). Every field is defaulted (never validate:required) so the
 // service boots without telemetry env set; init is non-fatal (D-179 Wave-8).
 type TelemetryConfig struct {
+	// Enabled gates the whole OTLP bootstrap. Default true so every mesh
+	// instance keeps exporting; set false on hosts with no reachable
+	// collector (the bare Firecracker fleet host), where an unreachable
+	// endpoint otherwise produces a periodic "failed to upload metrics"
+	// DNS-failure loop.
+	Enabled      bool   `mapstructure:"enabled"`
 	ServiceName  string `mapstructure:"service_name"`
 	OTLPEndpoint string `mapstructure:"otlp_endpoint"`
 }
@@ -524,6 +530,7 @@ func Load() (*Config, error) {
 
 			// Telemetry (OTLP export → otel-collector, D-179 Wave-8). Defaulted,
 			// never required — telemetry init is non-fatal.
+			"telemetry.enabled":       true,
 			"telemetry.service_name":  "runtime-service",
 			"telemetry.otlp_endpoint": "otel-collector:4317",
 
@@ -681,6 +688,7 @@ func Load() (*Config, error) {
 			{"fleet.activator_endpoint", "APP_FLEET_ACTIVATOR_ENDPOINT"},
 
 			// Telemetry (OTLP export)
+			{"telemetry.enabled", "APP_TELEMETRY_ENABLED"},
 			{"telemetry.service_name", "APP_TELEMETRY_SERVICE_NAME"},
 			{"telemetry.otlp_endpoint", "APP_TELEMETRY_OTLP_ENDPOINT"},
 
