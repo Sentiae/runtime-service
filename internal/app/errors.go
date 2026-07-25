@@ -16,7 +16,6 @@ import (
 
 	pkerrors "github.com/sentiae/platform-kit/errors"
 	"github.com/sentiae/platform-kit/secret"
-	"github.com/sentiae/runtime-service/internal/domain"
 
 	"google.golang.org/grpc/codes"
 )
@@ -35,10 +34,17 @@ import (
 // consuming service's boundary is the established house pattern:
 // delivery-service does exactly this for platform-kit/tenantdb's RLS sentinels.
 //
-// The runtime-local fleet domain errors deliberately stay in fleetError's
-// hand-map: they predate this registry and their curated, non-leaky messages
-// are load-bearing. fleetError consults this registry only for what it does not
-// hand-map, so these mappings have ONE source of truth.
+// The division of labour, and it is deliberate (§32 deviation, recorded in the
+// service CLAUDE.md): the REGISTRY owns errors whose meaning is defined
+// ELSEWHERE — platform-kit library sentinels that would otherwise collapse to
+// Internal — while fleetError's HAND-MAP owns the errors this service defines,
+// whose curated non-leaky messages are load-bearing (pkerrors.ToGRPC's default
+// echoes raw err.Error(), which would put DB and Vault text on the wire).
+// fleetError consults this registry only in its default branch, i.e. only for what
+// it does not hand-map, so every mapping has ONE source of truth — and registering
+// a sentinel that fleetError already hand-maps would be provably DEAD code (the
+// switch case always matches first) while looking like an enforced control. Do not
+// add the fleet domain sentinels here.
 func RegisterErrors() {
 	// I28 tenancy denial. A caller asking for another org's secret is refused
 	// structurally, before any Vault call. It is an AUTHORIZATION failure and
@@ -68,12 +74,4 @@ func RegisterErrors() {
 	// ErrSecurityGateUnavailable (503 + FailedPrecondition).
 	pkerrors.Register(secret.ErrVaultUnavailable, http.StatusServiceUnavailable, codes.FailedPrecondition)
 	pkerrors.Register(secret.ErrNoHandedToken, http.StatusServiceUnavailable, codes.FailedPrecondition)
-
-	// The fleet-app tenancy guard (#two-orgs-same-claim-key-share-one-database). A
-	// provision without an owner org is a CALLER-INPUT fault, not a host fault: the
-	// app row is the tenancy boundary for fleet_apps (no RLS there) and an org-less
-	// row is unscoped, so it is refused before anything is written. fleetError
-	// hand-maps it to the same codes.InvalidArgument with a caller-facing message;
-	// this registration covers the paths that translate through the registry.
-	pkerrors.Register(domain.ErrFleetAppOwnerOrgRequired, http.StatusBadRequest, codes.InvalidArgument)
 }

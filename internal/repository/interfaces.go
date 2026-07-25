@@ -188,7 +188,13 @@ type FleetAppRepository interface {
 	// (CP4.5 §9 #5). An empty systemID matches NOTHING: '' means "no network
 	// membership", and returning every unscoped app for it would make the resolver
 	// compile rules between strangers.
-	ListBySystemEnv(ctx context.Context, systemID, env string) ([]domain.FleetApp, error)
+	//
+	// ownerOrg is part of the membership key, not a convenience filter: system_id is
+	// an opaque VARCHAR the fleet never dereferences and no producer proves unique,
+	// so an org-blind query makes two orgs that happen to carry the same system_id
+	// network PEERS of each other. An empty ownerOrg likewise matches NOTHING — two
+	// unscoped rows are not each other's tenant.
+	ListBySystemEnv(ctx context.Context, systemID, env, ownerOrg string) ([]domain.FleetApp, error)
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 

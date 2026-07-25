@@ -67,13 +67,18 @@ func (r *fleetAppRepository) List(ctx context.Context) ([]domain.FleetApp, error
 // ListBySystemEnv returns the members of one P21 fleet network. An empty
 // systemID returns NOTHING: an empty scope key means "no network membership", so
 // matching it would hand the resolver every unscoped app on the host as a peer.
-func (r *fleetAppRepository) ListBySystemEnv(ctx context.Context, systemID, env string) ([]domain.FleetApp, error) {
-	if systemID == "" {
+//
+// An empty ownerOrg returns NOTHING for the same reason: fleet_apps has no RLS,
+// owner_org still defaults to the empty string at the column level, and every
+// legacy unscoped
+// row would otherwise resolve as every other tenant's peer.
+func (r *fleetAppRepository) ListBySystemEnv(ctx context.Context, systemID, env, ownerOrg string) ([]domain.FleetApp, error) {
+	if systemID == "" || ownerOrg == "" {
 		return nil, nil
 	}
 	var apps []domain.FleetApp
 	if err := r.db.WithContext(ctx).
-		Where("system_id = ? AND env = ?", systemID, env).
+		Where("system_id = ? AND env = ? AND owner_org = ?", systemID, env, ownerOrg).
 		Find(&apps).Error; err != nil {
 		return nil, err
 	}

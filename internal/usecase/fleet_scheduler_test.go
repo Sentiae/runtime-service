@@ -268,6 +268,6 @@ func TestFleetScheduler_SelectHost(t *testing.T) {
 
 // ListBySystemEnv satisfies FleetAppRepository. This fake predates P21 network
 // membership and models none, so it matches nothing.
-func (f *fakeAppRepo) ListBySystemEnv(context.Context, string, string) ([]domain.FleetApp, error) {
+func (f *fakeAppRepo) ListBySystemEnv(context.Context, string, string, string) ([]domain.FleetApp, error) {
 	return nil, nil
 }

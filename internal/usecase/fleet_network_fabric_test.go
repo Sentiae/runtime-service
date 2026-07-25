@@ -140,13 +140,17 @@ func (r *fakeNetAppRepo) FindByComponentEnv(_ context.Context, componentID, env,
 	return nil, domain.ErrFleetAppNotFound
 }
 func (r *fakeNetAppRepo) List(context.Context) ([]domain.FleetApp, error) { return r.apps, nil }
-func (r *fakeNetAppRepo) ListBySystemEnv(_ context.Context, systemID, env string) ([]domain.FleetApp, error) {
-	if systemID == "" {
+
+// ListBySystemEnv mirrors the Postgres repo exactly, owner_org included: a fake
+// that ignored the org would keep every peer-resolution test green while the
+// cross-tenant reachability defect survived in the real query.
+func (r *fakeNetAppRepo) ListBySystemEnv(_ context.Context, systemID, env, ownerOrg string) ([]domain.FleetApp, error) {
+	if systemID == "" || ownerOrg == "" {
 		return nil, nil
 	}
 	var out []domain.FleetApp
 	for i := range r.apps {
-		if r.apps[i].SystemID == systemID && r.apps[i].Env == env {
+		if r.apps[i].SystemID == systemID && r.apps[i].Env == env && r.apps[i].OwnerOrg == ownerOrg {
 			out = append(out, r.apps[i])
 		}
 	}
@@ -230,12 +234,18 @@ func newFabricHarness() *fabricHarness {
 	return h
 }
 
-// addApp registers a component in a system with N resident replicas at the given
-// guest IPs.
+// addApp registers a component owned by testOrg in a system with N resident
+// replicas at the given guest IPs.
 func (h *fabricHarness) addApp(componentID, systemID, env string, guestIPs ...string) uuid.UUID {
+	return h.addAppForOrg(componentID, systemID, env, testOrg, guestIPs...)
+}
+
+// addAppForOrg is addApp with an explicit owning org — the peer set is scoped by
+// org, so tests that cross tenants must be able to say which one owns the app.
+func (h *fabricHarness) addAppForOrg(componentID, systemID, env, ownerOrg string, guestIPs ...string) uuid.UUID {
 	id := uuid.New()
 	h.apps.apps = append(h.apps.apps, domain.FleetApp{
-		ID: id, ComponentID: componentID, SystemID: systemID, Env: env,
+		ID: id, ComponentID: componentID, SystemID: systemID, Env: env, OwnerOrg: ownerOrg,
 	})
 	for _, ip := range guestIPs {
 		h.replicas.byApp[id] = append(h.replicas.byApp[id], domain.Replica{
@@ -530,6 +540,41 @@ func TestApplyPolicies_TwoSystemsGetDisjointChains(t *testing.T) {
 	if len(h.enforcer.synced[sHandle]) != 1 || len(h.enforcer.synced[tHandle]) != 1 {
 		t.Fatalf("want one rule per system, got S=%d T=%d",
 			len(h.enforcer.synced[sHandle]), len(h.enforcer.synced[tHandle]))
+	}
+}
+
+// TestApplyPolicies_ForeignOrgAppWithTheSameSystemIDIsNotAPeer is the regression
+// for #two-orgs-same-system-id-are-network-peers: system_id is an opaque string no
+// producer proves unique per org, so if the member lookup omits the org, org B's
+// workload becomes a reachable peer inside org A's chain. Same system_id, same env,
+// DIFFERENT owner_org ⇒ not a peer, no rule, and the report says advisory rather
+// than claiming enforcement.
+func TestApplyPolicies_ForeignOrgAppWithTheSameSystemIDIsNotAPeer(t *testing.T) {
+	const foreignOrg = "22222222-2222-2222-2222-222222222222"
+	h := newFabricHarness()
+	handle := h.ensure(t, "shared-key", "prod", testOrg)
+	h.addAppForOrg("api", "shared-key", "prod", testOrg, "10.201.0.6")
+	// Org B's workload, colliding on the whole membership key except the org.
+	h.addAppForOrg("db", "shared-key", "prod", foreignOrg, "10.201.0.10")
+
+	out, err := h.fabric.ApplyPolicies(context.Background(), ApplyPoliciesInput{
+		Handle:   handle,
+		Policies: []PolicySpecInput{{FromComponentID: "api", ToComponentID: "db", Protocol: "tcp", Port: 5432}},
+	})
+	if err != nil {
+		t.Fatalf("ApplyPolicies: %v", err)
+	}
+	for _, r := range h.enforcer.synced[handle] {
+		if r.SrcIP == "10.201.0.10" || r.DstIP == "10.201.0.10" {
+			t.Fatalf("org %s's chain reaches org %s's replica: %+v", testOrg, foreignOrg, r)
+		}
+	}
+	if got := len(h.enforcer.synced[handle]); got != 0 {
+		t.Fatalf("%d rules installed, want 0 — a foreign org's app is not a resolvable endpoint", got)
+	}
+	if out.Aggregate != EnforcementAdvisory {
+		t.Fatalf("aggregate = %q, want %q — the unresolvable endpoint must be reported, not silently enforced",
+			out.Aggregate, EnforcementAdvisory)
 	}
 }
 

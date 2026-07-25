@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -134,10 +136,63 @@ func (uc *FleetOrchestrator) SetRegistryTokenStore(ts *FleetRegistryTokenStore) 
 	uc.registryTokenStore = ts
 }
 
+// dnsLabelMaxLen is the maximum length of a single DNS label in octets
+// (RFC 1035 §2.3.4: "labels 63 octets or less"). A longer label is not merely
+// ugly — it is INVALID: resolvers reject it and ACME/CertMagic refuses to issue a
+// certificate for it, so the app would be unreachable over TLS.
+const dnsLabelMaxLen = 63
+
+// hostLabelHashLen is how many hex chars of the full label's sha256 are appended
+// when a label has to be truncated. 8 hex chars = 32 bits of discrimination, so
+// two DIFFERENT over-long labels sharing a truncated prefix still produce
+// different hosts.
+const hostLabelHashLen = 8
+
 // hostForApp derives the platform-issued hostname for an app:
-// <sanitize(componentID)>-<env>.<ingressDomain>.
+// <sanitize(componentID)>-<sanitize(env)>.<ingressDomain>, with the first label
+// held inside the DNS limit.
+//
+// It MUST be a pure function of the app row: ensureRoute re-derives the host when
+// an app has no route, and migration 0015 deliberately DELETES resource routes so
+// they are recreated from the current component id. Anything time- or
+// random-dependent here would produce a second, different host on every call.
+//
+// ⚠ sanitizeSlug is lossy — "a/b", "a-b", "a_b" and "a.b" all collapse to "a-b" —
+// so two distinct component ids can still derive one host. That is pre-existing
+// and, since dc08424 put the owning org inside a resource's component id, it is
+// confined to a SINGLE org. It also now fails closed legibly rather than as a bare
+// 500: the unique index on fleet_routes.host_pattern (migration 0006) surfaces as
+// domain.ErrIngressHostTaken. Not fixed here.
 func (uc *FleetOrchestrator) hostForApp(app *domain.FleetApp) string {
-	return sanitizeSlug(app.ComponentID) + "-" + sanitizeSlug(app.Env) + "." + uc.ingressDomain
+	return dnsLabel(sanitizeSlug(app.ComponentID)+"-"+sanitizeSlug(app.Env)) + "." + uc.ingressDomain
+}
+
+// dnsLabel returns label unchanged when it fits in a DNS label, and otherwise a
+// deterministic ≤63-octet stand-in: a truncated prefix plus "-" plus the first
+// hostLabelHashLen hex chars of sha256(label) — the hash taken over the FULL
+// pre-truncation label, so ids that differ only past the cut still differ here.
+//
+// Why any of this is needed: the first label is
+// sanitizeSlug(component_id)-sanitizeSlug(env), and component_id is unvalidated
+// free text. A dedicated resource's id is "resource/<org-uuid>/<claim_key>", whose
+// slug is 8+36+1+len(claim) octets before the env is even appended — so a plain
+// claim key like "postgres-main" with env "prod" overflows 63 and yields a host no
+// resolver accepts and no CA will certify. Truncating keeps such a claim WORKING;
+// refusing the provision would turn a legitimate claim key into a hard failure.
+//
+// The arithmetic, explicitly: keep = 63 − 1 ('-' separator) − 8 (hash) = 54 octets
+// of prefix, so the result is at most 54 + 1 + 8 = 63. Trailing '-' is trimmed off
+// the prefix before joining because a label may not begin or end with '-' and the
+// cut can land mid-separator (that only shortens the result — still ≤63). len() is
+// octets, which equals characters here: sanitizeSlug emits only [a-z0-9-] ASCII.
+func dnsLabel(label string) string {
+	if len(label) <= dnsLabelMaxLen {
+		return label
+	}
+	sum := sha256.Sum256([]byte(label))
+	suffix := hex.EncodeToString(sum[:])[:hostLabelHashLen]
+	prefix := strings.TrimRight(label[:dnsLabelMaxLen-1-hostLabelHashLen], "-")
+	return prefix + "-" + suffix
 }
 
 // sanitizeSlug lowercases and reduces a label to DNS-safe [a-z0-9-], collapsing
@@ -192,6 +247,12 @@ func (uc *FleetOrchestrator) ensureRoute(ctx context.Context, app *domain.FleetA
 		UpdatedAt:   now,
 	}
 	if err := uc.routes.Create(ctx, route); err != nil {
+		// The derived host IS the diagnosis, and the caller only gets a code plus a
+		// fixed message (fleetError never echoes error text), so it goes to the
+		// operator log here. Load-bearing for the host-taken case: without it a
+		// conflict is a permanently retrying provision with nothing to look at.
+		logger.FromContext(ctx).Error("fleet ingress route create failed",
+			"app_id", app.ID, "host", route.HostPattern, "err", err)
 		return fmt.Errorf("create route: %w", err)
 	}
 	return nil

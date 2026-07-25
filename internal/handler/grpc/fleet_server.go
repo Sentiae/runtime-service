@@ -345,8 +345,24 @@ func fleetError(err error) error {
 		return status.Error(codes.InvalidArgument, "idempotency_key requires an owner org")
 	case errors.Is(err, domain.ErrSecretResolverUnavailable):
 		return status.Error(codes.FailedPrecondition, "secret resolver unavailable on this host")
+	// The fleet-app tenancy guard (#two-orgs-same-claim-key-share-one-database). A
+	// provision without an owner org is a CALLER-INPUT fault, not a host fault: the
+	// app row is the tenancy boundary for fleet_apps (there is no RLS on that table)
+	// and an org-less row is unscoped, so it is refused before anything is written.
+	// This hand-map is the ONLY mapping for the sentinel — see the note on
+	// registryOrInternal for why a registry entry would be dead code.
 	case errors.Is(err, domain.ErrFleetAppOwnerOrgRequired):
 		return status.Error(codes.InvalidArgument, "a resident fleet app requires an owner org")
+	// AlreadyExists, not FailedPrecondition: the thing that already exists is the
+	// resource this call tried to create — the ingress host — which is the textbook
+	// AlreadyExists case, and it correctly reads as "retrying with the same name
+	// cannot succeed". FailedPrecondition would read as "fix system state, then
+	// retry", which is wrong: the app row is already committed, so a retry re-fails
+	// on the same route insert forever. The message names the fix (a different
+	// component id). The conflicting host is NOT echoed — it is deterministic from
+	// the caller's own component id + env, and ensureRoute logs it for the operator.
+	case errors.Is(err, domain.ErrIngressHostTaken):
+		return status.Error(codes.AlreadyExists, "the ingress host derived from this component id is already routed to another fleet app — a component id must be globally unique across the fleet")
 	case errors.Is(err, domain.ErrSecretOwnerOrgMissing):
 		return status.Error(codes.InvalidArgument, "secret refs require an owner org")
 	case errors.Is(err, domain.ErrImageRefIncomplete):

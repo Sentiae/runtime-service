@@ -366,7 +366,16 @@ func (uc *FleetNetworkFabric) resolve(
 	n *domain.FleetNetwork,
 	ps []domain.FleetNetworkPolicy,
 ) ([]ResolvedRule, []PolicyEnforcementReport, error) {
-	apps, err := uc.apps.ListBySystemEnv(ctx, n.SystemID, n.Env)
+	// The peer set is scoped by the org that OWNS the network row being resolved,
+	// read from that persisted row — never from the ambient tenant context. system_id
+	// is an opaque key no producer proves unique per org, so the org is what makes
+	// two apps peers; taking it from ctx would let a system context (which carries no
+	// tenant) or a forged org header widen the peer set to another tenant's workloads,
+	// which is the whole failure mode. n.OwnerOrg is anchored at EnsureNetwork (a
+	// second org cannot adopt an existing scope), so it is the app's own org for every
+	// legitimately-provisioned member; an app carrying this system_id under a
+	// DIFFERENT org is exactly what must not resolve, and now does not.
+	apps, err := uc.apps.ListBySystemEnv(ctx, n.SystemID, n.Env, n.OwnerOrg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list system apps: %w", err)
 	}

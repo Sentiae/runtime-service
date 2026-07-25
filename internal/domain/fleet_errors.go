@@ -22,6 +22,14 @@ var (
 	ErrPlacementNotFound = errors.New("fleet placement not found")
 	// ErrRouteNotFound is returned when no route matches an id.
 	ErrRouteNotFound = errors.New("fleet route not found")
+	// ErrIngressHostTaken is returned when an app's DERIVED ingress host is already
+	// routed to a different app (the unique index on fleet_routes.host_pattern,
+	// migrations/0006). The host is a pure function of (component_id, env), so a
+	// component id must be globally unique across the fleet — two apps cannot share
+	// one. Untranslated this was a bare Internal AND a permanent wedge: the
+	// fleet_apps row is committed before the route insert, so every retry re-found
+	// the app and re-failed on the same insert with no diagnosable cause.
+	ErrIngressHostTaken = errors.New("ingress host already routed to another fleet app")
 	// ErrVolumeNotFound is returned when no volume matches an id.
 	ErrVolumeNotFound = errors.New("fleet volume not found")
 	// ErrInvalidHostHealth is returned when a heartbeat reports a health value

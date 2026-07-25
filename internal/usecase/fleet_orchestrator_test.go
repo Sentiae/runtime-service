@@ -2,10 +2,14 @@ package usecase
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -196,6 +200,18 @@ func newOrchRouteRepo() *orchRouteRepo {
 func (f *orchRouteRepo) Create(_ context.Context, r *domain.Route) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Enforce host uniqueness the way the real unique index does (migrations/0006),
+	// and fail with the same translated sentinel the real repository returns. A fake
+	// that accepted duplicate hosts could not fail for the right reason: two orgs
+	// colliding on one derived host would look like success here and break only in
+	// production.
+	for _, routes := range f.store {
+		for i := range routes {
+			if routes[i].HostPattern == r.HostPattern {
+				return fmt.Errorf("%w: %s", domain.ErrIngressHostTaken, r.HostPattern)
+			}
+		}
+	}
 	f.store[r.AppID] = append(f.store[r.AppID], *r)
 	return nil
 }
@@ -846,7 +862,7 @@ func TestOrchestrator_ProvisionThenScaleThenDecommission(t *testing.T) {
 
 // ListBySystemEnv satisfies FleetAppRepository. This fake predates P21 network
 // membership and models none, so it matches nothing.
-func (f *orchAppRepo) ListBySystemEnv(context.Context, string, string) ([]domain.FleetApp, error) {
+func (f *orchAppRepo) ListBySystemEnv(context.Context, string, string, string) ([]domain.FleetApp, error) {
 	return nil, nil
 }
 
