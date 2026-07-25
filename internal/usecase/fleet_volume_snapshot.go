@@ -145,7 +145,20 @@ func NewFleetVolumeSnapshotter(
 // is not evidence a recovery point EXISTS. Every caller whose guarantee depends
 // on one existing must check the length itself: the SnapshotResource RPC does,
 // and so does the snapshot-first DecommissionDedicated.
+//
+// Every outcome is RECORDED on the resource before it is returned (see
+// recordSnapshotOutcome). The return value and the error are untouched by that:
+// what the caller sees is exactly what the snapshot did, and the recording only
+// makes a failed recovery point visible to an operator instead of legible solely
+// from a returned error the caller may swallow.
 func (s *FleetVolumeSnapshotter) SnapshotAppVolumes(ctx context.Context, resourceID, appID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error) {
+	points, err := s.snapshotAppVolumes(ctx, resourceID, appID)
+	s.recordSnapshotOutcome(ctx, resourceID, len(points), err)
+	return points, err
+}
+
+// snapshotAppVolumes is the snapshot itself, unobserved.
+func (s *FleetVolumeSnapshotter) snapshotAppVolumes(ctx context.Context, resourceID, appID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error) {
 	vols, err := s.volumes.ListByApp(ctx, appID)
 	if err != nil {
 		return nil, fmt.Errorf("list volumes: %w", err)
@@ -159,6 +172,83 @@ func (s *FleetVolumeSnapshotter) SnapshotAppVolumes(ctx context.Context, resourc
 		points = append(points, rp)
 	}
 	return points, nil
+}
+
+// recordSnapshotOutcome makes the outcome of a snapshot over a DURABLE resource
+// visible without changing what the snapshot returns.
+//
+// A failed snapshot means one thing: the resource has no NEW recovery point, so
+// its protection has stopped. That is the single most consequential thing that can
+// quietly go wrong here — a database is the one thing a customer cannot rebuild —
+// and until now it produced no error-level signal and left no mark on the
+// resource, so a resource failing for a week read like one snapshotted an hour
+// ago. It is therefore logged at Error (with the resource id, claim key, owner org
+// and the underlying cause) and counted on the row, where the status path turns it
+// into a condition token.
+//
+// Best-effort by construction: a recording that fails is logged and swallowed. The
+// snapshot's own verdict is already decided and must not be altered by the
+// bookkeeping about it.
+//
+// captured is the number of recovery points the call produced. Zero WITH no error
+// (an app carrying no volumes) is deliberately neither a failure nor a success
+// here: nothing broke, and nothing was protected either, so the streak is left
+// exactly as it was rather than being cleared by a call that captured nothing.
+func (s *FleetVolumeSnapshotter) recordSnapshotOutcome(ctx context.Context, resourceID uuid.UUID, captured int, cause error) {
+	if s.recovery == nil {
+		return
+	}
+	res, lerr := s.recovery.GetResourceByHandle(ctx, resourceID)
+	if lerr != nil {
+		if cause != nil {
+			// Still loud: the failure matters even when the claim behind it cannot be
+			// read (an on-demand snapshot of a handle that no longer resolves).
+			logger.FromContext(ctx).Error("fleet snapshot: FAILED, and the resource it protects could not be loaded to record it on",
+				"resource_id", resourceID, "err", cause, "load_err", lerr)
+		}
+		return
+	}
+	// Only a durable tier has data whose protection can stop. The shared tier holds
+	// no volumes of its own (its snapshots are the shared engine's problem), so
+	// counting a failure there would put a condition on a resource this path does
+	// not protect.
+	if res.Tier != resourceTierDedicated {
+		return
+	}
+
+	if cause != nil {
+		logger.FromContext(ctx).Error("fleet snapshot: FAILED for a durable resource — it has NO new recovery point, so its protection has stopped",
+			"resource_id", res.ID, "claim_key", res.ClaimKey, "owner_org", res.OwnerOrg, "env", res.Env,
+			"app_id", res.AppID, "consecutive_failures", res.ConsecutiveSnapshotFailures+1,
+			"last_snapshot_success_at", timeOrNever(res.LastSnapshotSuccessAt), "err", cause)
+		if rerr := s.recovery.RecordSnapshotFailure(ctx, res.ID, time.Now().UTC(), cause.Error()); rerr != nil {
+			logger.FromContext(ctx).Error("fleet snapshot: the failure above could not be recorded on the resource, so its status will still read as protected",
+				"resource_id", res.ID, "err", rerr)
+		}
+		return
+	}
+	if captured == 0 {
+		return
+	}
+	if rerr := s.recovery.RecordSnapshotSuccess(ctx, res.ID, time.Now().UTC()); rerr != nil {
+		logger.FromContext(ctx).Warn("fleet snapshot: record snapshot success", "resource_id", res.ID, "err", rerr)
+		return
+	}
+	if res.ConsecutiveSnapshotFailures > 0 {
+		// The recovery is as worth seeing as the outage: it is what closes the alert.
+		logger.FromContext(ctx).Info("fleet snapshot: protection RESUMED for a durable resource after consecutive failures",
+			"resource_id", res.ID, "claim_key", res.ClaimKey, "owner_org", res.OwnerOrg,
+			"cleared_consecutive_failures", res.ConsecutiveSnapshotFailures)
+	}
+}
+
+// timeOrNever renders a nullable timestamp for a log line ("never" reads as the
+// fact it is: this resource has no recorded recovery point at all).
+func timeOrNever(t *time.Time) string {
+	if t == nil {
+		return "never"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // snapshotVolume snapshots one volume. Attached: quiesce the guest (syncfs +

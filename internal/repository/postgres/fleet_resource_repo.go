@@ -120,6 +120,51 @@ func (r *fleetResourceRepository) SetResourceLastError(ctx context.Context, id u
 	return nil
 }
 
+// RecordSnapshotFailure increments the consecutive-failure count IN the UPDATE
+// (gorm.Expr, not a read-modify-write) so two snapshots failing concurrently both
+// count — a read-modify-write would silently collapse them into one and make a
+// sustained outage look milder than it is.
+func (r *fleetResourceRepository) RecordSnapshotFailure(ctx context.Context, id uuid.UUID, at time.Time, cause string) error {
+	res := r.db.WithContext(ctx).
+		Model(&domain.FleetResource{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"consecutive_snapshot_failures": gorm.Expr("consecutive_snapshot_failures + 1"),
+			"last_snapshot_failure_at":      at,
+			"last_snapshot_error":           cause,
+			"updated_at":                    at,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return domain.ErrResourceNotFound
+	}
+	return nil
+}
+
+// RecordSnapshotSuccess clears the failure streak. last_snapshot_error is cleared
+// with it: the stored text describes a streak that is over, and leaving it would
+// make a protected resource read as a failing one.
+func (r *fleetResourceRepository) RecordSnapshotSuccess(ctx context.Context, id uuid.UUID, at time.Time) error {
+	res := r.db.WithContext(ctx).
+		Model(&domain.FleetResource{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"consecutive_snapshot_failures": 0,
+			"last_snapshot_error":           "",
+			"last_snapshot_success_at":      at,
+			"updated_at":                    at,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return domain.ErrResourceNotFound
+	}
+	return nil
+}
+
 func (r *fleetResourceRepository) ListResourcesByPhase(ctx context.Context, phase domain.FleetResourcePhase) ([]domain.FleetResource, error) {
 	var resources []domain.FleetResource
 	err := r.db.WithContext(ctx).

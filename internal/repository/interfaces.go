@@ -286,6 +286,18 @@ type FleetResourceRepository interface {
 	// SetResourceLastError records (or, with an empty string, clears) the terminal
 	// reason of the last failed lifecycle operation.
 	SetResourceLastError(ctx context.Context, id uuid.UUID, msg string) error
+	// RecordSnapshotFailure records that a snapshot of this resource FAILED:
+	// consecutive_snapshot_failures is incremented (atomically, in the UPDATE — two
+	// concurrent failures must both count) and the failure time + cause are
+	// stamped. It never touches phase or last_error: a failed recovery point is a
+	// protection fact, not a lifecycle transition.
+	RecordSnapshotFailure(ctx context.Context, id uuid.UUID, at time.Time, cause string) error
+	// RecordSnapshotSuccess records that a snapshot CAPTURED a recovery point:
+	// consecutive_snapshot_failures resets to 0 and last_snapshot_success_at is
+	// stamped. Only a snapshot that produced a recovery point may call it — a
+	// successful CALL over an app with no volumes captured nothing and resumed no
+	// protection.
+	RecordSnapshotSuccess(ctx context.Context, id uuid.UUID, at time.Time) error
 	// ListResourcesByPhase returns every non-tombstoned resource currently in a
 	// phase. The boot-time restore sweep uses it to find restores interrupted by
 	// a restart.

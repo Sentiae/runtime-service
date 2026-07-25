@@ -93,6 +93,12 @@ func (f *fakeResourceRepo) CompareAndSwapPhase(context.Context, uuid.UUID, []dom
 	return true, nil
 }
 func (f *fakeResourceRepo) SetResourceLastError(context.Context, uuid.UUID, string) error { return nil }
+func (f *fakeResourceRepo) RecordSnapshotFailure(context.Context, uuid.UUID, time.Time, string) error {
+	return nil
+}
+func (f *fakeResourceRepo) RecordSnapshotSuccess(context.Context, uuid.UUID, time.Time) error {
+	return nil
+}
 func (f *fakeResourceRepo) ListResourcesByPhase(context.Context, domain.FleetResourcePhase) ([]domain.FleetResource, error) {
 	return nil, nil
 }

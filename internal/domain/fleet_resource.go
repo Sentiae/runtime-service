@@ -83,6 +83,24 @@ type FleetResource struct {
 	// ends in phase 'ready' after a ROLLED-BACK restore is distinguishable from
 	// one whose restore succeeded — both are 'ready', only last_error differs.
 	LastError string `json:"last_error" gorm:"column:last_error;type:text;not null;default:''"`
+	// ConsecutiveSnapshotFailures counts snapshot attempts that have failed IN A
+	// ROW since the last one that actually captured a recovery point. The count —
+	// not a boolean — is the whole point: a single failed snapshot is a blip worth
+	// a log line, while a resource whose count has been climbing for a week has no
+	// recent recovery point at all, and the two must not look alike. Reset to 0 by
+	// a snapshot that captures something.
+	ConsecutiveSnapshotFailures int `json:"consecutive_snapshot_failures" gorm:"column:consecutive_snapshot_failures;not null;default:0"`
+	// LastSnapshotFailureAt / LastSnapshotError describe the most recent failed
+	// snapshot. LastSnapshotError is operator-facing detail (it holds the
+	// underlying cause), so it is NOT what the tenant-visible status reports — the
+	// status carries a stable condition token instead.
+	LastSnapshotFailureAt *time.Time `json:"last_snapshot_failure_at,omitempty" gorm:"column:last_snapshot_failure_at"`
+	LastSnapshotError     string     `json:"last_snapshot_error" gorm:"column:last_snapshot_error;type:text;not null;default:''"`
+	// LastSnapshotSuccessAt is when this resource last got a recovery point. Nil
+	// means it has never had one recorded here. Together with the count above it is
+	// what makes "protection stopped N days ago" answerable — an alert keys on the
+	// AGE of this timestamp, not on the failure that happens to be freshest.
+	LastSnapshotSuccessAt *time.Time `json:"last_snapshot_success_at,omitempty" gorm:"column:last_snapshot_success_at"`
 	// ExpiresAt is the reclamation deadline for a TTL'd resource; nil never
 	// expires.
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`

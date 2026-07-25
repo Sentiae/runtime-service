@@ -40,6 +40,7 @@ import (
 	"github.com/sentiae/runtime-service/internal/infrastructure/firecracker/vmcomm"
 	"github.com/sentiae/runtime-service/internal/infrastructure/foundry"
 	"github.com/sentiae/runtime-service/internal/infrastructure/gitservice"
+	"github.com/sentiae/runtime-service/internal/infrastructure/hostcapacity"
 	"github.com/sentiae/runtime-service/internal/infrastructure/messaging"
 	"github.com/sentiae/runtime-service/internal/infrastructure/netfabric"
 	"github.com/sentiae/runtime-service/internal/infrastructure/objectstore"
@@ -228,6 +229,13 @@ type Container struct {
 	// root (#fleet-image-staging-dirs-no-gc). Wired wherever a work root is
 	// configured — BOTH boot paths stage under it, on every executor.
 	FleetStagingSweeper *usecase.FleetStagingSweeper
+
+	// Report-only two-directional audit of the volume + recovery-point ledger
+	// against physical reality (row-without-file, file-without-row,
+	// recovery-point-without-object). Wired everywhere, but scoped to the volumes
+	// pinned to THIS host, so it is a no-op until self-registration hands it a
+	// host identity. It never deletes, moves or repairs anything.
+	FleetLedgerReconciler *usecase.FleetLedgerReconciler
 
 	// runtime-fleet P3.4 — the Vault client backing the per-tenant secret
 	// resolver on the fleet host. Non-nil only when the firecracker executor is
@@ -457,10 +465,7 @@ func (c *Container) initFleet(cfg *config.Config) {
 	// CP4 rt#9 — persistent-volume backing-file backend + manager. Real backend on
 	// the firecracker host (mkfs.ext4 backing files); fail-loud otherwise so a
 	// volume is never silently faked on a host without KVM.
-	volumeDir := cfg.Fleet.VolumeDir
-	if volumeDir == "" {
-		volumeDir = filepath.Join(cfg.Firecracker.SnapshotPath, "volumes")
-	}
+	volumeDir := fleetVolumeDir(cfg)
 	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
 		c.VolumeBackend = volumebackend.NewBackingStore()
 		log.Printf("Fleet volume backend: backing files under %s", volumeDir)
@@ -469,6 +474,21 @@ func (c *Container) initFleet(cfg *config.Config) {
 		log.Println("Fleet volume backend: fail-loud (firecracker executor not selected)")
 	}
 	c.FleetVolumeManager = usecase.NewFleetVolumeManager(c.VolumeRepo, c.VolumeBackend, volumeDir)
+
+	// Report-only ledger↔reality audit over the SAME volume root. Deliberately not
+	// gated on the executor: it reads, so there is nothing to fake, and a host that
+	// once ran as a fleet host still carries the files whose rows are wrong. It is
+	// scoped to this host's volumes by SetHostScope (below, after
+	// self-registration) and does nothing without that identity. The object store
+	// may be nil — the recovery-point direction then reports itself unaudited
+	// rather than calling every backup missing.
+	c.FleetLedgerReconciler = usecase.NewFleetLedgerReconciler(
+		c.VolumeRepo,
+		c.FleetResourceRepo,
+		c.FleetAppRepo,
+		c.snapshotArtifactStore,
+		volumeDir,
+	)
 
 	// CP4.5 §9#5 — P21 fleet network fabric. The enforcer is the SINGLE WRITER of
 	// the fleet's FORWARD program (see the netfabric package doc): it installs the
@@ -644,6 +664,13 @@ func (c *Container) initFleet(cfg *config.Config) {
 	// a restore live on another host is never stamped by this instance.
 	if c.ResourceRestorer != nil && c.fleetSelf != nil && c.FleetVolumeManager != nil {
 		c.ResourceRestorer.SetHostScope(c.fleetSelf.ID, c.FleetVolumeManager)
+	}
+
+	// Same scoping for the report-only ledger audit: it may only judge the volumes
+	// pinned HERE. Off a fleet host it stays scope-less and reports nothing — a
+	// file that is not on this filesystem proves nothing by being absent from it.
+	if c.FleetLedgerReconciler != nil && c.fleetSelf != nil {
+		c.FleetLedgerReconciler.SetHostScope(c.fleetSelf.ID)
 	}
 }
 
@@ -850,19 +877,59 @@ func activeReplicas(repo repository.ReplicaRepository) ([]domain.Replica, error)
 	return append(resident, booting...), nil
 }
 
+// fleetVolumeDir resolves the host root under which per-volume backing files are
+// materialized. Shared by the volume manager and the capacity measurement so the
+// disk that is ADVERTISED is the disk the volumes are actually written to.
+func fleetVolumeDir(cfg *config.Config) string {
+	if cfg.Fleet.VolumeDir != "" {
+		return cfg.Fleet.VolumeDir
+	}
+	return filepath.Join(cfg.Firecracker.SnapshotPath, "volumes")
+}
+
 // registerSelfHost registers this runtime-service instance as a fleet host and
 // records the self-host + heartbeat cadence for the background loop. A failure
 // is logged but never crashes the process — fleet self-registration is not on
 // the boot critical path.
+//
+// The advertised capacity is MEASURED off this machine, never asserted by config.
+// It used to be neither: disk came from a fixed 51200MB default (on a host with
+// 40GB, ~22GB of it free) and cpu/memory came from Firecracker.Max{VCPU,MemMB},
+// which are the PER-MICROVM ceiling — the same two values the per-VM bin-packer
+// reads as one VM's maximum. Advertising a per-VM ceiling as the host total is a
+// coincidence when it is close and an over-advertisement when it is not, and the
+// scheduler places customer databases on it. Config now only NARROWS the
+// measurement (see domain.ResolveHostCapacity).
 func (c *Container) registerSelfHost(cfg *config.Config) {
-	vcpu := cfg.Firecracker.MaxVCPU
-	memMB := int64(cfg.Firecracker.MaxMemMB)
-	if vcpu <= 0 {
-		vcpu = 8
+	volumeDir := fleetVolumeDir(cfg)
+	measured, merr := hostcapacity.Measure(volumeDir)
+	if merr != nil {
+		// Fail closed: a host that cannot measure itself advertises nothing. It stays
+		// out of the placement candidate set instead of joining it with invented
+		// numbers, and the process keeps running (self-registration never was on the
+		// boot critical path).
+		log.Printf("ERROR: fleet self-registration REFUSED — this host cannot measure its own capacity (volume dir %s), so it will not advertise any: %v", volumeDir, merr)
+		return
 	}
-	if memMB <= 0 {
-		memMB = 8192
+	capacity, cerr := domain.ResolveHostCapacity(measured, domain.HostCapacityOverride{
+		VCPU:          cfg.Fleet.HostVCPU,
+		MemMB:         cfg.Fleet.HostMemMB,
+		DiskMB:        cfg.Fleet.HostDiskMB,
+		DiskReserveMB: cfg.Fleet.HostDiskReserveMB,
+	})
+	if cerr != nil {
+		log.Printf("ERROR: fleet self-registration REFUSED — configured capacity is not honest about this host (measured vcpu=%d mem=%dMB disk_total=%dMB disk_free=%dMB on %s; configured vcpu=%d mem=%dMB disk=%dMB reserve=%dMB): %v",
+			measured.VCPU, measured.MemTotalMB, measured.DiskTotalMB, measured.DiskAvailableMB, volumeDir,
+			cfg.Fleet.HostVCPU, cfg.Fleet.HostMemMB, cfg.Fleet.HostDiskMB, cfg.Fleet.HostDiskReserveMB, cerr)
+		return
 	}
+	// Log the measurement NEXT TO the override and the result, once, so the
+	// advertised number is observable rather than inferred from a config file that
+	// may not even set the keys.
+	log.Printf("Fleet host capacity: measured vcpu=%d mem=%dMB disk_total=%dMB disk_free=%dMB (fs of %s) | configured vcpu=%d mem=%dMB disk=%dMB reserve=%dMB | advertising vcpu=%d mem=%dMB disk=%dMB",
+		measured.VCPU, measured.MemTotalMB, measured.DiskTotalMB, measured.DiskAvailableMB, volumeDir,
+		cfg.Fleet.HostVCPU, cfg.Fleet.HostMemMB, cfg.Fleet.HostDiskMB, cfg.Fleet.HostDiskReserveMB,
+		capacity.VCPU, capacity.MemMB, capacity.DiskMB)
 
 	// A stable host id keeps restarts on the same registry row. An explicit
 	// APP_FLEET_HOST_ID wins; otherwise derive a UUIDv5 from the advertise host.
@@ -883,9 +950,9 @@ func (c *Container) registerSelfHost(cfg *config.Config) {
 	self := domain.Host{
 		ID:             hostID,
 		Region:         cfg.Fleet.Region,
-		CapacityVCPU:   vcpu,
-		CapacityMemMB:  memMB,
-		CapacityDiskMB: cfg.Fleet.HostDiskMB,
+		CapacityVCPU:   capacity.VCPU,
+		CapacityMemMB:  capacity.MemMB,
+		CapacityDiskMB: capacity.DiskMB,
 		Endpoint:       endpoint,
 	}
 
@@ -900,7 +967,7 @@ func (c *Container) registerSelfHost(cfg *config.Config) {
 		c.fleetHeartbeatEvery = 10 * time.Second
 	}
 	log.Printf("Fleet self-registered: host_id=%s region=%s capacity=%dvcpu/%dMB/%dMB endpoint=%s",
-		registered.ID, registered.Region, vcpu, memMB, cfg.Fleet.HostDiskMB, endpoint)
+		registered.ID, registered.Region, capacity.VCPU, capacity.MemMB, capacity.DiskMB, endpoint)
 }
 
 // initDatabase initializes the database connection
@@ -1689,6 +1756,7 @@ func (c *Container) StartBackgroundControllers(ctx context.Context) {
 	// recovery is a re-issued RestoreResource, never an auto-resume.
 	c.sweepInterruptedRestores(ctx)
 	c.startStagingSweeper(ctx)
+	c.startLedgerReconciler(ctx)
 	c.startFleetReconciler(ctx)
 	// CP4.5 §9#3 (D-183) — shared-tier TTL reaper. Nil until the shared engine is
 	// wired (NEEDS-DECISION on shared-engine admin credentials); the loop is
@@ -1763,6 +1831,69 @@ func (c *Container) startStagingSweeper(ctx context.Context) {
 		}
 	}()
 }
+
+// startLedgerReconciler runs the report-only ledger↔reality audit: once at
+// startup, then every ledgerReconcileEvery. It is the only thing that would ever
+// notice that a fleet_volumes row advertises customer data with no bytes behind
+// it, or that a counted recovery point has no object in the store.
+//
+// REPORT-ONLY — it deletes, moves and repairs nothing (see the use case doc), so
+// running it on a ticker cannot itself destroy anything. Divergences land as
+// Error-level log lines carrying the identity needed to act; acting is a human
+// decision.
+//
+// In its own goroutine (ctx-aware + panic-recovering) because the pass stats
+// every backing file and does an object-store HEAD per recovery point, and
+// startup must not block on either.
+func (c *Container) startLedgerReconciler(ctx context.Context) {
+	if c.FleetLedgerReconciler == nil {
+		return
+	}
+	rec := c.FleetLedgerReconciler
+	pass := func() {
+		rep, err := rec.Reconcile(ctx)
+		if err != nil {
+			log.Printf("[FLEET-LEDGER] reconcile pass failed (nothing reported): %v", err)
+			return
+		}
+		if rep.Divergences() > 0 {
+			log.Printf("[FLEET-LEDGER] %d LEDGER DIVERGENCE(S): %d row-without-file, %d file-without-row, %d recovery-point-without-object (checked %d volume(s), %d file(s), %d recovery point(s); %d undetermined) — report-only, nothing was changed",
+				rep.Divergences(), rep.RowsWithoutFile, rep.FilesWithoutRow, rep.RecoveryPointsWithoutObject,
+				rep.VolumesChecked, rep.FilesChecked, rep.RecoveryPointsChecked, rep.Undetermined)
+			return
+		}
+		if rep.Undetermined > 0 {
+			log.Printf("[FLEET-LEDGER] no divergence found, but %d entr(ies) were undetermined (checked %d volume(s), %d file(s), %d recovery point(s))",
+				rep.Undetermined, rep.VolumesChecked, rep.FilesChecked, rep.RecoveryPointsChecked)
+		}
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[FLEET-LEDGER] reconcile loop panicked: %v", r)
+			}
+		}()
+		pass()
+		ticker := time.NewTicker(ledgerReconcileEvery)
+		defer ticker.Stop()
+		log.Printf("[FLEET-LEDGER] report-only ledger reconcile started (interval=%s)", ledgerReconcileEvery)
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("[FLEET-LEDGER] ledger reconcile stopped (context cancelled)")
+				return
+			case <-ticker.C:
+				pass()
+			}
+		}
+	}()
+}
+
+// ledgerReconcileEvery is the report-only ledger↔reality audit interval. Slow on
+// purpose: a divergence here is permanent (it never heals on its own), while the
+// pass costs an object-store HEAD per recovery point, so there is nothing to buy
+// by running it often.
+const ledgerReconcileEvery = 6 * time.Hour
 
 // stagingSweepEvery is the orphaned-staging-directory GC interval. Hourly: the
 // boot path reclaims its own failures immediately, so this loop only has to

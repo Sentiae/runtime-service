@@ -76,8 +76,19 @@ type FleetConfig struct {
 	HostID string `mapstructure:"host_id"`
 	// Region is the placement region label reported to the registry.
 	Region string `mapstructure:"region"`
-	// HostDiskMB is the advertised disk capacity for image rootfs staging.
+	// HostVCPU, HostMemMB and HostDiskMB are OVERRIDES of the capacity this host
+	// measures at boot (see internal/infrastructure/hostcapacity), not the source
+	// of it. Zero (the default) advertises the measurement. A value ABOVE the
+	// measurement refuses registration — these keys exist to hold part of the
+	// machine BACK from the fleet, never to claim resources it does not have.
+	HostVCPU  int   `mapstructure:"host_vcpu"`
+	HostMemMB int64 `mapstructure:"host_mem_mb"`
+	// HostDiskMB caps advertised disk against the FREE space on the volume
+	// directory's filesystem.
 	HostDiskMB int64 `mapstructure:"host_disk_mb"`
+	// HostDiskReserveMB is headroom subtracted from the advertised disk so the
+	// fleet cannot pack a host to 100% of its filesystem.
+	HostDiskReserveMB int64 `mapstructure:"host_disk_reserve_mb"`
 	// HeartbeatInterval is how often the self-host heartbeats the registry.
 	HeartbeatInterval time.Duration `mapstructure:"heartbeat_interval"`
 	// SecretSelfTest gates the host->guest vsock self-test (Phase 3.3): when set,
@@ -516,9 +527,22 @@ func Load() (*Config, error) {
 			"imageboot.advertise_host": "10.0.10.244",
 
 			// Fleet self-registration + heartbeat (runtime-fleet CP4 §9#4).
-			"fleet.host_id":               "",
-			"fleet.region":                "homelab",
-			"fleet.host_disk_mb":          51200,
+			"fleet.host_id": "",
+			"fleet.region":  "homelab",
+			// 0 ⇒ advertise the MEASURED capacity. A non-zero value is a deliberate
+			// reservation and may only ever be LOWER than what the host measures; the
+			// old 51200 default was a fixed 50GB assertion on a 40GB machine.
+			"fleet.host_vcpu":    0,
+			"fleet.host_mem_mb":  0,
+			"fleet.host_disk_mb": 0,
+			// 4GB of headroom. A fleet host that reaches a 100%-full filesystem takes
+			// its customer databases down with it (Postgres cannot write WAL, and a
+			// full disk is the one condition it cannot recover from on its own), while
+			// the host's own churn — journald, staged image layers under
+			// imageboot.work_dir, ext4 materialization slack — is measured in
+			// hundreds of MB. 4GB covers that churn with room to spare and costs one
+			// volume class at most.
+			"fleet.host_disk_reserve_mb":  4096,
 			"fleet.heartbeat_interval":    "10s",
 			"fleet.secret_selftest":       false,
 			"fleet.volume_dir":            "",
@@ -677,7 +701,10 @@ func Load() (*Config, error) {
 			// Fleet self-registration + heartbeat (runtime-fleet CP4)
 			{"fleet.host_id", "APP_FLEET_HOST_ID"},
 			{"fleet.region", "APP_FLEET_REGION"},
+			{"fleet.host_vcpu", "APP_FLEET_HOST_VCPU"},
+			{"fleet.host_mem_mb", "APP_FLEET_HOST_MEM_MB"},
 			{"fleet.host_disk_mb", "APP_FLEET_HOST_DISK_MB"},
+			{"fleet.host_disk_reserve_mb", "APP_FLEET_HOST_DISK_RESERVE_MB"},
 			{"fleet.heartbeat_interval", "APP_FLEET_HEARTBEAT_INTERVAL"},
 			{"fleet.secret_selftest", "APP_FLEET_SECRET_SELFTEST"},
 			{"fleet.volume_dir", "APP_FLEET_VOLUME_DIR"},

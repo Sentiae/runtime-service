@@ -47,6 +47,20 @@ var (
 	// ErrInvalidHostHealth is returned when a heartbeat reports a health value
 	// the fleet does not recognize (see HostHealth.IsValid).
 	ErrInvalidHostHealth = errors.New("invalid fleet host health")
+	// ErrHostCapacityUnmeasured is returned when a host cannot read its own
+	// physical capacity (cpu/memory/disk). Registration is refused rather than
+	// falling back to a code default: an unmeasured host that advertises a
+	// plausible-looking number is how the fleet came to believe a 40GB machine had
+	// 50GB, and the scheduler places customer databases on that belief.
+	ErrHostCapacityUnmeasured = errors.New("fleet host capacity could not be measured")
+	// ErrHostCapacityOverAdvertised is returned when a CONFIGURED capacity exceeds
+	// the measured one. Under-advertising is a legitimate reservation;
+	// over-advertising is a claim on resources the machine does not have, and for
+	// disk it is the claim that makes a host accept a volume it cannot materialize.
+	ErrHostCapacityOverAdvertised = errors.New("configured fleet host capacity exceeds measured capacity")
+	// ErrHostDiskReserveInvalid is returned when the disk headroom reserve leaves
+	// no advertisable disk at all, or is negative (which would ADD capacity).
+	ErrHostDiskReserveInvalid = errors.New("invalid fleet host disk reserve")
 	// ErrNoSchedulableHost is returned when the scheduler finds no live host
 	// that satisfies a placement request's resource + constraint filters.
 	ErrNoSchedulableHost = errors.New("no schedulable host")

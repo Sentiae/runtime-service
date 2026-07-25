@@ -31,6 +31,9 @@ type fakeResourceRepo struct {
 	findCalls         int
 	saveDuplicate     bool
 	casErr            error
+	// snapshotHealthErr fails the snapshot-health recording so the caller's
+	// swallow-and-log path is reachable.
+	snapshotHealthErr error
 }
 
 func newFakeResourceRepo() *fakeResourceRepo {
@@ -148,6 +151,42 @@ func (f *fakeResourceRepo) SetResourceLastError(_ context.Context, id uuid.UUID,
 		return domain.ErrResourceNotFound
 	}
 	r.LastError = msg
+	return nil
+}
+
+// RecordSnapshotFailure mirrors the postgres UPDATE: an atomic increment plus the
+// failure stamp, touching neither phase nor last_error.
+func (f *fakeResourceRepo) RecordSnapshotFailure(_ context.Context, id uuid.UUID, at time.Time, cause string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.snapshotHealthErr != nil {
+		return f.snapshotHealthErr
+	}
+	r, ok := f.byID[id]
+	if !ok {
+		return domain.ErrResourceNotFound
+	}
+	r.ConsecutiveSnapshotFailures++
+	stamp := at
+	r.LastSnapshotFailureAt = &stamp
+	r.LastSnapshotError = cause
+	return nil
+}
+
+func (f *fakeResourceRepo) RecordSnapshotSuccess(_ context.Context, id uuid.UUID, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.snapshotHealthErr != nil {
+		return f.snapshotHealthErr
+	}
+	r, ok := f.byID[id]
+	if !ok {
+		return domain.ErrResourceNotFound
+	}
+	r.ConsecutiveSnapshotFailures = 0
+	r.LastSnapshotError = ""
+	stamp := at
+	r.LastSnapshotSuccessAt = &stamp
 	return nil
 }
 

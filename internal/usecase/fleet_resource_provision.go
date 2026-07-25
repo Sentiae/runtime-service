@@ -160,6 +160,14 @@ const (
 	// connection is rejected (#p19-restore-false-green-health). The refusal detail
 	// — SQLSTATE and message — is operator-facing and goes to the log, never here.
 	conditionEngineNotAdmitting = "engine-not-admitting"
+	// conditionSnapshotFailing — this resource's snapshots are FAILING: the most
+	// recent attempt produced no recovery point, and the failure streak has not been
+	// broken since. The engine may be perfectly healthy; what has stopped is its
+	// PROTECTION, and a resource that cannot be recovered must not read as if
+	// nothing were wrong. The count, the last failure time and the operator-facing
+	// cause live on the row (fleet_resources.consecutive_snapshot_failures /
+	// last_snapshot_error) — this token only says that the condition holds.
+	conditionSnapshotFailing = "snapshot-failing"
 )
 
 // healthCondition classifies a failed health probe into a condition token. The
@@ -422,6 +430,18 @@ func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uui
 		if ep := residentEndpointOf(reps); ep != "" {
 			status.Endpoint = ep
 		}
+	}
+
+	// A resource whose snapshots are failing is impaired even when its engine is
+	// serving perfectly, so the condition is reported regardless of the health block
+	// above. A tombstone is exempt: a torn-down resource's streak is history.
+	//
+	// The reported PHASE is deliberately left alone. Callers gate on phase (a
+	// provision polls it for `ready`), and a failing snapshot must not block
+	// anything that succeeds today — so the visibility lands on the condition, which
+	// is what an operator and the portal read.
+	if res.ConsecutiveSnapshotFailures > 0 && res.Phase != domain.FleetResourcePhaseDecommissioned {
+		status.Conditions = append(status.Conditions, conditionSnapshotFailing)
 	}
 
 	if rps, rerr := uc.resources.ListRecoveryPoints(ctx, res.ID); rerr != nil {
