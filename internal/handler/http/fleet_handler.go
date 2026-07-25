@@ -2,6 +2,7 @@ package http
 
 import (
 	"crypto/subtle"
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -19,19 +20,41 @@ import (
 // pool may be nil (warm pool disabled): the routes are still registered, and
 // GET /fleet reports {enabled:false} rather than 500ing. The mutating routes
 // 503 when the pool is absent.
+//
+// Authorization fails closed in both directions: the handler refuses to build
+// without a configured service token (boot error, see ErrNoFleetControlToken),
+// and a request presenting no/empty/wrong token is denied at request time. This
+// surface is mounted OUTSIDE the /api/v1 JWT group, on an HTTP port that binds
+// all interfaces on the fleet host, and includes DELETE /fleet/clones/{id} — the
+// token is the only thing between a LAN caller and clone-kill.
 type FleetHandler struct {
 	pool *firecracker.WarmPool
 	// serviceToken is the shared service-to-service token guarding the /fleet
-	// control surface. Empty ⇒ in-cluster traffic is trusted (dev parity).
+	// control surface. Never empty on a constructed handler.
 	serviceToken string
 }
 
+// ErrNoFleetControlToken reports that the /fleet control surface was asked to
+// mount without a service token. It is a boot error, not a request error: the
+// routes live outside the JWT group and include clone-kill, so mounting them
+// with no credential would publish an unauthenticated destructive endpoint —
+// and denying at request time only would leave a surface that looks healthy
+// while being silently unusable.
+var ErrNoFleetControlToken = errors.New("fleet control surface refused: APP_GRPC_SERVICE_API_KEY is unset — /fleet is mounted outside the JWT group and includes DELETE /fleet/clones/{id}, so it must not run without its service token")
+
 // NewFleetHandler builds the handler. Pass the live *WarmPool, or nil when the
 // warm pool is disabled (the handler then reports the fleet as disabled). The
-// serviceToken guards the /fleet routes: when empty, in-cluster traffic is
-// trusted (dev parity); when set, callers must present a matching x-api-key.
-func NewFleetHandler(pool *firecracker.WarmPool, serviceToken string) *FleetHandler {
-	return &FleetHandler{pool: pool, serviceToken: serviceToken}
+// serviceToken guards the /fleet routes: callers must present a matching
+// x-api-key. An empty serviceToken is ErrNoFleetControlToken — the caller (DI)
+// must refuse to boot rather than mount an unauthenticated control surface.
+// Mirrors NewCustomerAgentCertHandler / MustPermissionChecker: the
+// misconfiguration surfaces at boot, not as a mystery 401 on a healthy-looking
+// route.
+func NewFleetHandler(pool *firecracker.WarmPool, serviceToken string) (*FleetHandler, error) {
+	if serviceToken == "" {
+		return nil, ErrNoFleetControlToken
+	}
+	return &FleetHandler{pool: pool, serviceToken: serviceToken}, nil
 }
 
 // RegisterRoutes mounts the fleet routes on the router, gated by the shared
@@ -48,18 +71,24 @@ func (h *FleetHandler) RegisterRoutes(r chi.Router) {
 
 // requireServiceToken guards the /fleet control surface with the shared
 // service-to-service token. The sole caller is deployment-service's Fleet RPC,
-// which presents the token as the x-api-key header. An empty configured token
-// trusts in-cluster traffic (dev parity, matching the internal_auth idiom used
-// across services); a non-empty token requires a constant-time match.
+// which presents the token as the x-api-key header. Absence of a configured
+// credential is NOT permission: an empty token denies every request (it can
+// only happen on a handler built around the constructor's boot refusal), and a
+// configured token requires a constant-time match — a timing oracle here is a
+// path to clone-kill on every host.
+//
+// The denial is deliberately uniform: the same 401 whether the token is
+// absent, empty, or wrong, so a caller cannot learn whether /fleet has a
+// credential configured.
 func (h *FleetHandler) requireServiceToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if h.serviceToken == "" {
-			next.ServeHTTP(w, r)
+			RespondUnauthorized(w, "unauthorized: a valid service token is required")
 			return
 		}
 		presented := r.Header.Get("x-api-key")
 		if subtle.ConstantTimeCompare([]byte(presented), []byte(h.serviceToken)) != 1 {
-			RespondUnauthorized(w, "invalid service token")
+			RespondUnauthorized(w, "unauthorized: a valid service token is required")
 			return
 		}
 		next.ServeHTTP(w, r)

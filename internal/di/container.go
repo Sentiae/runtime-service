@@ -1472,7 +1472,18 @@ func (c *Container) initHandlers() {
 	// Warm-VM fleet visibility + control. c.WarmPool may be nil (warm pool
 	// disabled); NewFleetHandler accepts nil and reports the fleet as disabled,
 	// so we register the routes unconditionally.
-	c.HTTPServer.SetFleetHandler(httphandler.NewFleetHandler(c.WarmPool, c.Config.Server.GRPC.ServiceAPIKey))
+	//
+	// Fail-closed at BOOT, like the customer-agent enrolment endpoint above and
+	// the §B1 permission checker below: /fleet is mounted outside the JWT group
+	// on an HTTP port that binds all interfaces on the fleet host, and it
+	// includes DELETE /fleet/clones/{id}. Without a service token the surface
+	// would either be open (the old behaviour) or silently 401 everything while
+	// looking healthy — both are worse than refusing to start.
+	fleetHandler, fleetErr := httphandler.NewFleetHandler(c.WarmPool, c.Config.Server.GRPC.ServiceAPIKey)
+	if fleetErr != nil {
+		log.Fatalf("runtime-service: %v", fleetErr)
+	}
+	c.HTTPServer.SetFleetHandler(fleetHandler)
 
 	// rt#11 — scale-to-zero wake endpoint (/_activate). Mounted only when the
 	// activator is wired (firecracker host); the setter no-ops on a nil handler.
@@ -1487,9 +1498,17 @@ func (c *Container) initHandlers() {
 	caKey := os.Getenv("AGENT_CA_KEY_PATH")
 	if caCert != "" && caKey != "" {
 		tokenSource := func() string { return os.Getenv("AGENT_ENROLMENT_TOKEN") }
-		c.HTTPServer.SetCustomerAgentCertHandler(
-			httphandler.NewCustomerAgentCertHandler(caCert, caKey, tokenSource),
-		)
+		// Fail-closed at BOOT, like the §B1 permission checker below: the
+		// route is mounted outside the JWT group and signs CSRs with the
+		// agent CA, so enabling it without AGENT_ENROLMENT_TOKEN would
+		// publish an anonymous identity-issuing endpoint. Refusing at
+		// request time only is not enough — the endpoint would look
+		// healthy while being a hole (or, once fixed, silently unusable).
+		agentCertHandler, agentCertErr := httphandler.NewCustomerAgentCertHandler(caCert, caKey, tokenSource)
+		if agentCertErr != nil {
+			log.Fatalf("runtime-service: %v", agentCertErr)
+		}
+		c.HTTPServer.SetCustomerAgentCertHandler(agentCertHandler)
 		log.Printf("[agent-enrolment] endpoint enabled (ca_cert=%s)", caCert)
 	}
 

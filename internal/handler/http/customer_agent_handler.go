@@ -12,11 +12,19 @@
 // operators can rotate the key without restarting runtime-service.
 // The endpoint fails-closed with 503 when either AGENT_CA_CERT_PATH or
 // AGENT_CA_KEY_PATH is unset — enrolment never silently no-ops.
+//
+// Authorization fails closed in both directions: the route refuses to
+// mount at all without a configured enrolment token (boot error, see
+// ErrNoEnrolmentToken), and a request presenting no/empty/wrong token is
+// denied at request time. This route is mounted OUTSIDE the JWT-protected
+// group, so its bearer token is the only thing standing between an
+// anonymous caller and a certificate signed by the agent CA.
 package http
 
 import (
 	"crypto"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -39,12 +47,28 @@ type CustomerAgentCertHandler struct {
 	tokenSource func() string // returns the currently valid enrolment bearer token
 }
 
+// ErrNoEnrolmentToken reports that the enrolment endpoint was asked to
+// mount without a usable enrolment token. It is a boot error, not a
+// request error: this endpoint issues certificates from the agent CA,
+// so mounting it with no credential would hand a signed identity to any
+// unauthenticated caller (it lives outside the JWT-protected group).
+var ErrNoEnrolmentToken = errors.New("customer-agent enrolment endpoint refused: AGENT_ENROLMENT_TOKEN is unset — this endpoint signs CSRs with the agent CA and is mounted outside the JWT group, so it must not run without its bearer token; set the token or unset AGENT_CA_CERT_PATH/AGENT_CA_KEY_PATH to leave enrolment disabled")
+
 // NewCustomerAgentCertHandler constructs the handler. An empty
 // caCertPath / caKeyPath leaves the endpoint in 503-fail-closed mode
 // so bootstrap flows surface a clear error instead of silently
 // signing with an unset CA.
-func NewCustomerAgentCertHandler(caCertPath, caKeyPath string, tokenSource func() string) *CustomerAgentCertHandler {
-	return &CustomerAgentCertHandler{caCertPath: caCertPath, caKeyPath: caKeyPath, tokenSource: tokenSource}
+//
+// A nil tokenSource, or one that yields an empty token at construction,
+// is ErrNoEnrolmentToken — the caller (DI) must refuse to boot rather
+// than mount an unauthenticated signing endpoint. Mirrors
+// MustPermissionChecker: the misconfiguration surfaces at boot, not as
+// a mystery 401 on a route that looks healthy.
+func NewCustomerAgentCertHandler(caCertPath, caKeyPath string, tokenSource func() string) (*CustomerAgentCertHandler, error) {
+	if tokenSource == nil || tokenSource() == "" {
+		return nil, ErrNoEnrolmentToken
+	}
+	return &CustomerAgentCertHandler{caCertPath: caCertPath, caKeyPath: caKeyPath, tokenSource: tokenSource}, nil
 }
 
 // RegisterRoutes mounts the enrolment endpoint at its canonical path.
@@ -67,7 +91,10 @@ type signCSRResponse struct {
 // pre-sign the CSR out-of-band.
 func (h *CustomerAgentCertHandler) SignCSR(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		// Deliberately uniform: the same message whether the token is
+		// absent, empty, or wrong. A caller must not learn from the
+		// response whether enrolment has a credential configured.
+		http.Error(w, "unauthorized: a valid enrolment bearer token is required", http.StatusUnauthorized)
 		return
 	}
 	if h.caCertPath == "" || h.caKeyPath == "" {
@@ -160,21 +187,29 @@ func (h *CustomerAgentCertHandler) SignCSR(w http.ResponseWriter, r *http.Reques
 }
 
 // authorize validates the Authorization header against the configured
-// bearer token source. Empty expected token disables the check — for
-// dev mode only; production deployments MUST wire a real token source.
+// bearer token source. Absence of a credential is NOT permission: a nil
+// source, or a source that has since been rotated to empty, denies every
+// request. The token is read per-request so operators can rotate it
+// without a restart, which means the boot-time check in the constructor
+// cannot be the only gate.
+//
+// The comparison is constant-time — this endpoint signs certificates
+// with the agent CA, so a timing oracle on the token is a path to a
+// forged identity.
 func (h *CustomerAgentCertHandler) authorize(r *http.Request) bool {
 	if h.tokenSource == nil {
-		return true
+		return false
 	}
 	expected := h.tokenSource()
 	if expected == "" {
-		return true
+		return false
 	}
 	got := r.Header.Get("Authorization")
 	if !strings.HasPrefix(got, "Bearer ") {
 		return false
 	}
-	return strings.TrimPrefix(got, "Bearer ") == expected
+	presented := strings.TrimPrefix(got, "Bearer ")
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) == 1
 }
 
 // parsePrivateKey accepts both PKCS8 and PKCS1 blocks. Returns a
