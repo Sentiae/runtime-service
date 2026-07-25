@@ -148,6 +148,19 @@ func vmUID(base, index int) int {
 // single warm template VM (only one runs at a time, like its fixed tap name).
 const ephUIDOffset = 4096
 
+// ephSlotFloor is the first slot the in-memory ephemeral allocator may hand out.
+//
+// Why it is not simply ephUIDOffset+1: TWO independent allocators write into one
+// uid space. The warm pool's clone-index allocator (warm_pool.go, 1..maxCloneIndex)
+// hands clone n the uid slot ephUIDOffset+n, and it knows nothing about the
+// ephemeral slot map — so the [ephUIDOffset+1, ephUIDOffset+maxCloneIndex] window
+// is carved out here and the ephemeral allocator starts above it. If the two
+// ranges ever overlapped, a cold-exec VM and a live warm clone would run as the
+// SAME uid/gid — the exact cross-tenant identity reuse the jail exists to prevent
+// — and it would fail silently, because nothing at runtime compares the two
+// allocators. TestUIDRangesAreDisjoint is the proof that they stay apart.
+const ephSlotFloor = ephUIDOffset + maxCloneIndex + 1
+
 // allocEphSlot reserves an ephemeral uid slot. The slot doubles as the jail id,
 // so it must be unique across live VMs; it is returned to the range by
 // freeEphSlot on teardown. Exhaustion refuses the boot rather than wrapping —
@@ -159,19 +172,20 @@ func (p *Provider) allocEphSlot() (int, error) {
 	if p.ephSlots == nil {
 		p.ephSlots = make(map[int]bool)
 	}
-	for slot := ephUIDOffset + 1; slot < p.cfg.VMUIDSpan; slot++ {
+	for slot := ephSlotFloor; slot < p.cfg.VMUIDSpan; slot++ {
 		if !p.ephSlots[slot] {
 			p.ephSlots[slot] = true
 			return slot, nil
 		}
 	}
-	return 0, fmt.Errorf("ephemeral vm uid slots exhausted (range [%d,%d))", ephUIDOffset+1, p.cfg.VMUIDSpan)
+	return 0, fmt.Errorf("ephemeral vm uid slots exhausted (range [%d,%d))", ephSlotFloor, p.cfg.VMUIDSpan)
 }
 
-// freeEphSlot returns a slot to the range. Slots at or below the offset are not
-// allocator-owned (the reserved warm-template slot, or a non-ephemeral id).
+// freeEphSlot returns a slot to the range. Slots below the floor are not
+// allocator-owned (an image-boot index, the reserved warm-template slot, or a
+// warm-clone slot owned by the pool's index allocator).
 func (p *Provider) freeEphSlot(slot int) {
-	if slot <= ephUIDOffset {
+	if slot < ephSlotFloor {
 		return
 	}
 	p.ephMu.Lock()
@@ -188,8 +202,10 @@ func ephSlotFromSocketPath(chrootBase, socketPath string) (int, bool) {
 	if dir == "" {
 		return 0, false
 	}
+	// Warm jail ids are non-numeric ("warm", "cloneN"), so Atoi already rejects
+	// them; the floor check additionally keeps image-boot indices out.
 	slot, err := strconv.Atoi(filepath.Base(dir))
-	if err != nil || slot <= ephUIDOffset {
+	if err != nil || slot < ephSlotFloor {
 		return 0, false
 	}
 	return slot, true

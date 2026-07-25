@@ -68,22 +68,29 @@ func linkWarmRootfs(j *vmJail, rootfsPath string) (string, error) {
 	return chrootPath, nil
 }
 
-// warmUID is the uid AND gid the warm template and every warm clone run as —
-// ONE shared identity for the whole warm path (D-185d, owner-ruled), drawn from
-// the slot reserved at the bottom of the ephemeral range.
-//
-// Why shared rather than per-VM: the clones' rootfs is a single shared ext4
-// file (the CoW in this path is on memory only — mem_backend File is an mmap;
-// the drive is not copied). It is served READ-ONLY to every VM (see
-// warmRootfsDriveBody), which is what makes one shared inode safe. A per-clone
-// uid would have to chown that one shared inode per clone, which is a fight no
-// clone wins. Handing clones distinct uids is a separate change — it needs its
-// own non-colliding uid sub-range — and is deliberately NOT done here.
-// What the shared uid DOES buy is the point of the ruling: an escaping warm VMM
-// lands as an unprivileged user, not as host root next to every tenant's data
-// volume.
-func (m *WarmManager) warmUID() int {
+// templateUID is the uid AND gid the single warm TEMPLATE VM runs as, drawn from
+// the fixed slot reserved at the bottom of the ephemeral range (only one template
+// runs at a time, like its fixed tap name).
+func (m *WarmManager) templateUID() int {
 	return vmUID(m.p.cfg.VMUIDBase, ephUIDOffset)
+}
+
+// cloneUID is the PRIVATE uid AND gid warm clone n runs as. Each clone gets its
+// own identity, restoring the jail's base invariant (newVMJail: "the per-VM
+// identity is a private (uid, gid) pair"), which D-185d had waived while the warm
+// rootfs was still chowned per clone. Nothing is shared writable between clones
+// any more: the rootfs and the .state/.mem pair are hard-linked in root-owned and
+// served READ-ONLY, guest memory is a private mmap (mem_backend File), and
+// netns/tap/chroot/socket are already per-clone — so a private uid now costs
+// nothing and an escaping clone VMM can no longer touch a sibling clone's chroot.
+//
+// The slot is ephUIDOffset+n, inside the window ephSlotFloor carves out of the
+// ephemeral allocator's range. n comes from the warm pool's index allocator
+// (1..maxCloneIndex), which is a DIFFERENT allocator from the ephemeral slot map,
+// so the carve-out in jail.go is the only thing keeping a clone from being handed
+// a live cold-exec VM's uid. Do not widen maxCloneIndex without moving the floor.
+func (m *WarmManager) cloneUID(n int) int {
+	return vmUID(m.p.cfg.VMUIDBase, ephUIDOffset+n)
 }
 
 // WarmVM is a resident template VM running the guest-agent. The host POSTs code
@@ -153,7 +160,7 @@ func NewWarmManager(p *Provider) *WarmManager {
 // the agent until it is serving. The returned WarmVM is the snapshot template.
 func (m *WarmManager) BootWarm(ctx context.Context, language domain.Language) (*WarmVM, error) {
 	vmID := uuid.New()
-	uid := m.warmUID()
+	uid := m.templateUID()
 
 	rootfsPath := m.warmRootfsForLanguage(language)
 	if _, err := os.Stat(rootfsPath); err != nil {
@@ -383,11 +390,11 @@ func (m *WarmManager) CreateTemplateSnapshot(ctx context.Context, warm *WarmVM) 
 // host-side DNAT so the clone's agent is reachable at 10.200.N.2:8000. N must be
 // unique per concurrent clone (1..254) and is allocated by the caller/pool.
 func (m *WarmManager) CloneFromSnapshot(ctx context.Context, snap *TemplateSnapshot, n int) (*Clone, error) {
-	if n < 1 || n > 254 {
-		return nil, fmt.Errorf("clone index out of range (want 1..254): %d", n)
+	if n < 1 || n > maxCloneIndex {
+		return nil, fmt.Errorf("clone index out of range (want 1..%d): %d", maxCloneIndex, n)
 	}
 	d := cloneNaming(n)
-	uid := m.warmUID()
+	uid := m.cloneUID(n)
 
 	// Namespace + veth + in-ns tap + in-ns NAT, in the proven order.
 	if err := runCloneNetworkSetup(d, uid, uid); err != nil {
