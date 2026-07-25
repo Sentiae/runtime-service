@@ -31,6 +31,12 @@ type FleetOrchestrator struct {
 	scheduler *FleetScheduler
 	runtime   *FleetReplicaRuntime
 
+	// resources is the P19 claim ledger, consulted for ONE question:
+	// does a live durable resource back this app? DecommissionApp refuses when
+	// one does. Constructor-injected rather than a Set* option because a nil
+	// ledger cannot mean "guard off" — see refuseIfResourceBacked.
+	resources repository.FleetResourceRepository
+
 	// volumes drives the persistent-volume lifecycle (rt#9). Nil on a build with
 	// no volume support wired — the orchestrator then behaves statelessly.
 	volumes *FleetVolumeManager
@@ -96,8 +102,16 @@ func NewFleetOrchestrator(
 	replicas repository.ReplicaRepository,
 	scheduler *FleetScheduler,
 	runtime *FleetReplicaRuntime,
+	resources repository.FleetResourceRepository,
 ) *FleetOrchestrator {
-	return &FleetOrchestrator{apps: apps, replicas: replicas, scheduler: scheduler, runtime: runtime, clock: time.Now}
+	return &FleetOrchestrator{
+		apps:      apps,
+		replicas:  replicas,
+		scheduler: scheduler,
+		runtime:   runtime,
+		resources: resources,
+		clock:     time.Now,
+	}
 }
 
 // SetVolumeManager wires the persistent-volume manager (rt#9). Optional: a nil
@@ -1012,6 +1026,36 @@ func (uc *FleetOrchestrator) HealthApp(ctx context.Context, appID uuid.UUID) (Fl
 	return out, true, nil
 }
 
+// refuseIfResourceBacked refuses an app-level teardown of an app that a LIVE
+// durable resource claim still backs (domain.ErrAppBacksDurableResource).
+//
+// This closes a data-loss path, not a bookkeeping one: DecommissionApp deletes
+// the ext4 BACKING FILES (DeleteAppVolumes) and then the app row, while
+// fleet_resources.app_id carries no FK and nothing looked backwards — so a
+// dedicated Postgres could be destroyed, with no recovery point, through a verb
+// that never knew a resource owned it. The snapshot-first guarantee lives on the
+// resource seam (DecommissionDedicated), which is therefore the only way in.
+//
+// It fails CLOSED on every uncertainty — an unwired ledger and an unreadable one
+// both refuse — because "I could not check" must never mean "no claim exists".
+// The legitimate resource teardown passes because DecommissionDedicated stamps
+// decommissioned_at BEFORE calling down, which takes the claim out of "live";
+// there is deliberately no caller-supplied bypass.
+func (uc *FleetOrchestrator) refuseIfResourceBacked(ctx context.Context, appID uuid.UUID) error {
+	if uc.resources == nil {
+		return fmt.Errorf("%w: no resource claim ledger is wired, so app %s cannot be shown to be free of one", domain.ErrAppBacksDurableResource, appID)
+	}
+	res, err := uc.resources.FindLiveResourceByApp(ctx, appID)
+	if err != nil {
+		if errors.Is(err, domain.ErrResourceNotFound) {
+			return nil // the ordinary case: an app nothing claims
+		}
+		return fmt.Errorf("look up durable resource claim of app %s: %w", appID, err)
+	}
+	return fmt.Errorf("%w: app %s backs %s/%s resource %s (phase %s) — decommission the RESOURCE (DecommissionResource), which snapshots first",
+		domain.ErrAppBacksDurableResource, appID, res.Class, res.Tier, res.ID, res.Phase)
+}
+
 // DecommissionApp scales the app to zero (draining all replicas) and deletes
 // the app row. The bool reports whether appID is a known app.
 func (uc *FleetOrchestrator) DecommissionApp(ctx context.Context, appID uuid.UUID) (bool, error) {
@@ -1021,6 +1065,12 @@ func (uc *FleetOrchestrator) DecommissionApp(ctx context.Context, appID uuid.UUI
 			return false, nil
 		}
 		return false, fmt.Errorf("load app: %w", err)
+	}
+
+	// BEFORE anything destructive — before the drain, before the backing files,
+	// before the row. A guard that refuses after the file is unlinked is worthless.
+	if err := uc.refuseIfResourceBacked(ctx, app.ID); err != nil {
+		return true, err
 	}
 
 	app.DesiredReplicas = 0

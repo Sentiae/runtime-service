@@ -89,6 +89,24 @@ func (f *fakeResourceRepo) FindResource(_ context.Context, owner uuid.UUID, clai
 	return nil, domain.ErrResourceNotFound
 }
 
+// FindLiveResourceByApp mirrors the postgres predicate: app_id matches AND the
+// claim is neither stamped decommissioned_at nor phased decommissioned.
+func (f *fakeResourceRepo) FindLiveResourceByApp(_ context.Context, appID uuid.UUID) (*domain.FleetResource, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, r := range f.byID {
+		if r.AppID == nil || *r.AppID != appID {
+			continue
+		}
+		if r.DecommissionedAt != nil || r.Phase == domain.FleetResourcePhaseDecommissioned {
+			continue
+		}
+		cp := *r
+		return &cp, nil
+	}
+	return nil, domain.ErrResourceNotFound
+}
+
 func (f *fakeResourceRepo) UpdateResourcePhase(_ context.Context, id uuid.UUID, phase domain.FleetResourcePhase) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

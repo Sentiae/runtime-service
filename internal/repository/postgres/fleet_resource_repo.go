@@ -53,6 +53,28 @@ func (r *fleetResourceRepository) FindResource(ctx context.Context, ownerOrg uui
 	return &resource, nil
 }
 
+// FindLiveResourceByApp resolves the live claim backed by appID (the
+// fleet_resources_app_id_idx lookup). "Live" is decommissioned_at IS NULL AND
+// phase <> 'decommissioned': BOTH, because the timestamp is stamped when a
+// teardown starts and the phase only when it finishes, so either one alone
+// would still call an in-flight teardown live and deadlock the resource's own
+// path. Newest first purely for determinism — the (owner_org, claim_key, env)
+// unique index means at most one live claim per app in practice.
+func (r *fleetResourceRepository) FindLiveResourceByApp(ctx context.Context, appID uuid.UUID) (*domain.FleetResource, error) {
+	var resource domain.FleetResource
+	err := r.db.WithContext(ctx).
+		Where("app_id = ? AND decommissioned_at IS NULL AND phase <> ?", appID, domain.FleetResourcePhaseDecommissioned).
+		Order("created_at DESC").
+		First(&resource).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, domain.ErrResourceNotFound
+		}
+		return nil, err
+	}
+	return &resource, nil
+}
+
 func (r *fleetResourceRepository) UpdateResourcePhase(ctx context.Context, id uuid.UUID, phase domain.FleetResourcePhase) error {
 	res := r.db.WithContext(ctx).
 		Model(&domain.FleetResource{}).

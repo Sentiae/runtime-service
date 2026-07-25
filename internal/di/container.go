@@ -567,6 +567,9 @@ func (c *Container) initFleet(cfg *config.Config) {
 			c.ReplicaRepo,
 			c.FleetScheduler,
 			c.FleetReplicaRuntimeUC,
+			// The P19 claim ledger: DecommissionApp refuses to tear down an app a
+			// live durable resource backs (data loss with no recovery point).
+			c.FleetResourceRepo,
 		)
 		// rt#9 — persistent-volume lifecycle (ensure/affinity/attach/degrade).
 		c.FleetOrchestratorUC.SetVolumeManager(c.FleetVolumeManager)

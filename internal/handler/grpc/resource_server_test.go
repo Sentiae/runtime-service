@@ -112,6 +112,19 @@ func (f *fakeResourceRepo) MarkRecoveryPointRestoredInPlace(context.Context, uui
 	return nil
 }
 
+// FindLiveResourceByApp resolves the seeded claim when it backs appID and is
+// neither stamped nor phased decommissioned — the postgres predicate.
+func (f *fakeResourceRepo) FindLiveResourceByApp(_ context.Context, appID uuid.UUID) (*domain.FleetResource, error) {
+	if f.res == nil || f.res.AppID == nil || *f.res.AppID != appID {
+		return nil, domain.ErrResourceNotFound
+	}
+	if f.res.DecommissionedAt != nil || f.res.Phase == domain.FleetResourcePhaseDecommissioned {
+		return nil, domain.ErrResourceNotFound
+	}
+	cp := *f.res
+	return &cp, nil
+}
+
 var _ repository.FleetResourceRepository = (*fakeResourceRepo)(nil)
 
 // ─────────────────────────────────────────────────────────────────────

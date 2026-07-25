@@ -103,6 +103,72 @@ func (b *recordingBackend) Delete(_ context.Context, backingPath string) error {
 	return nil
 }
 
+// modeBackend records the ensure MODE per volume so the intent EnsureAppVolumes
+// declares can be asserted at the call site. It fabricates the same path shape
+// the real backend uses.
+type modeBackend struct {
+	modes    []VolumeEnsureMode
+	failWith error
+}
+
+func (b *modeBackend) Ensure(_ context.Context, in VolumeEnsureInput) (VolumeEnsureOutput, error) {
+	b.modes = append(b.modes, in.Mode)
+	if b.failWith != nil {
+		return VolumeEnsureOutput{}, b.failWith
+	}
+	return VolumeEnsureOutput{BackingPath: in.Dir + "/" + in.VolumeID.String() + ".ext4"}, nil
+}
+func (b *modeBackend) Delete(context.Context, string) error { return nil }
+
+// TestEnsureAppVolumes_DeclaresIntentPerCallSite is the ledger half of the
+// data-loss fix: the backend cannot see fleet_volumes, so the manager must say
+// which of the two meanings an absent backing file has. A volume the ledger
+// already records is ADOPT (its file is customer data — refuse if gone); a
+// volume the ledger has never seen is CREATE (nothing can be lost).
+func TestEnsureAppVolumes_DeclaresIntentPerCallSite(t *testing.T) {
+	appID := uuid.New()
+	tests := []struct {
+		name     string
+		seeded   *domain.Volume
+		wantMode VolumeEnsureMode
+	}{
+		{"no ledger row for (app, mount) → first provision creates", nil, VolumeEnsureCreate},
+		{"ledger already records the volume → attach may only adopt", volWithBacking(appID, "/vol/x.ext4"), VolumeEnsureAdopt},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newVolRepoFake()
+			if tt.seeded != nil {
+				repo = newVolRepoFake(tt.seeded)
+			}
+			backend := &modeBackend{}
+			m := NewFleetVolumeManager(repo, backend, "/vol")
+
+			if _, err := m.EnsureAppVolumes(context.Background(), appID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}}); err != nil {
+				t.Fatalf("EnsureAppVolumes: %v", err)
+			}
+			if len(backend.modes) != 1 || backend.modes[0] != tt.wantMode {
+				t.Fatalf("ensure modes = %v, want [%s]", backend.modes, tt.wantMode)
+			}
+		})
+	}
+}
+
+// TestEnsureAppVolumes_MissingBackingFileRefusesProvision proves the refusal is
+// carried, not swallowed: a provision whose recorded volume has no file on the
+// host must fail with the sentinel the boundary reads, never continue to boot a
+// replica over an empty disk.
+func TestEnsureAppVolumes_MissingBackingFileRefusesProvision(t *testing.T) {
+	appID := uuid.New()
+	repo := newVolRepoFake(volWithBacking(appID, "/vol/x.ext4"))
+	m := NewFleetVolumeManager(repo, &modeBackend{failWith: domain.ErrVolumeBackingFileMissing}, "/vol")
+
+	_, err := m.EnsureAppVolumes(context.Background(), appID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}})
+	if !errors.Is(err, domain.ErrVolumeBackingFileMissing) {
+		t.Fatalf("got %v, want ErrVolumeBackingFileMissing", err)
+	}
+}
+
 func volWithBacking(appID uuid.UUID, backing string) *domain.Volume {
 	return &domain.Volume{
 		ID:          uuid.New(),
@@ -137,7 +203,7 @@ func TestDeleteAppVolumes_DeletesBackingFilesAndRows(t *testing.T) {
 func TestDeleteAppVolumes_SkipsEmptyBackingPath(t *testing.T) {
 	appID := uuid.New()
 	repo := newVolRepoFake(
-		volWithBacking(appID, ""),           // never materialized — no backend call
+		volWithBacking(appID, ""), // never materialized — no backend call
 		volWithBacking(appID, "/vol/c.ext4"),
 	)
 	backend := &recordingBackend{}

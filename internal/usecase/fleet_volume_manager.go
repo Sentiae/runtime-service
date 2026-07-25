@@ -28,11 +28,37 @@ type VolumeBackend interface {
 	Delete(ctx context.Context, backingPath string) error
 }
 
-// VolumeEnsureInput is the wire-agnostic backing-file request.
+// VolumeEnsureMode declares what an ensure MEANS, because the backend cannot
+// infer it and must never guess.
+//
+// ⚠ This is a data-loss control. The backend sees a directory and a path, never
+// the ledger, so "the file is absent" is ambiguous to it: on a first provision
+// that means "make it", and on an attach it means "the data this ledger row
+// promises is GONE". Inferring create-if-absent from the filesystem alone turned
+// the second case into the first — a lost fleet host minted a brand-new empty
+// filesystem for every surviving fleet_volumes row and reported the deploy
+// healthy, i.e. total data loss presented as success. The caller holds the
+// ledger, so the caller declares the intent and the backend only obeys.
+type VolumeEnsureMode string
+
+const (
+	// VolumeEnsureCreate is a FIRST provision: the ledger has no volume for this
+	// (app, mount), so there is no data to lose and the backing file is made.
+	VolumeEnsureCreate VolumeEnsureMode = "create"
+	// VolumeEnsureAdopt is an attach/reboot/re-provision of a volume the ledger
+	// already records: the file must already exist and is returned untouched. A
+	// missing file is a hard failure (ErrVolumeBackingFileMissing), never a
+	// reason to format a fresh one.
+	VolumeEnsureAdopt VolumeEnsureMode = "adopt"
+)
+
+// VolumeEnsureInput is the wire-agnostic backing-file request. Mode is required:
+// there is no safe default (see VolumeEnsureMode).
 type VolumeEnsureInput struct {
 	VolumeID uuid.UUID
 	SizeMB   int64
 	Dir      string
+	Mode     VolumeEnsureMode
 }
 
 // VolumeEnsureOutput is the backing-file result.
@@ -105,9 +131,12 @@ func (m *FleetVolumeManager) EnsureAppVolumes(ctx context.Context, appID uuid.UU
 		now := time.Now().UTC()
 
 		if vol := byMount[mount]; vol != nil {
-			// Idempotent: re-ensure the backing file (no-op if it already exists)
-			// and record any change to the backing path.
-			out, berr := m.backend.Ensure(ctx, VolumeEnsureInput{VolumeID: vol.ID, SizeMB: vol.SizeMB, Dir: m.dir})
+			// ADOPT — the ledger already carries this volume, and a row only ever
+			// exists because a materialize once succeeded. So the file is the
+			// customer's data: re-attach it, and if it is not on this host REFUSE.
+			// Creating here would hand a re-provision (or a reboot after the host
+			// lost its disk) a brand-new empty filesystem under the same row.
+			out, berr := m.backend.Ensure(ctx, VolumeEnsureInput{VolumeID: vol.ID, SizeMB: vol.SizeMB, Dir: m.dir, Mode: VolumeEnsureAdopt})
 			if berr != nil {
 				return nil, fmt.Errorf("ensure backing file: %w", berr)
 			}
@@ -126,7 +155,12 @@ func (m *FleetVolumeManager) EnsureAppVolumes(ctx context.Context, appID uuid.UU
 		if id == uuid.Nil {
 			id = uuid.New()
 		}
-		out, berr := m.backend.Ensure(ctx, VolumeEnsureInput{VolumeID: id, SizeMB: spec.SizeMB, Dir: m.dir})
+		// CREATE — no ledger row for this (app, mount), so this is the volume's
+		// first materialization and there is no data that could be destroyed. The
+		// spec's id is NOT evidence of a prior volume: the ledger is keyed by
+		// (app, mount) and the wire id is caller-supplied (an unparseable one is
+		// replaced with a fresh uuid at the boundary).
+		out, berr := m.backend.Ensure(ctx, VolumeEnsureInput{VolumeID: id, SizeMB: spec.SizeMB, Dir: m.dir, Mode: VolumeEnsureCreate})
 		if berr != nil {
 			return nil, fmt.Errorf("ensure backing file: %w", berr)
 		}

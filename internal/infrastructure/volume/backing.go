@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/sentiae/platform-kit/logger"
+	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
 
@@ -44,12 +46,29 @@ var _ usecase.VolumeBackend = (*BackingStore)(nil)
 // NewBackingStore constructs a BackingStore.
 func NewBackingStore() *BackingStore { return &BackingStore{} }
 
-// Ensure returns the backing file for a volume, creating it if absent. It is
-// idempotent: an existing <Dir>/<volumeID>.ext4 is returned unchanged so a
-// re-provision or reboot re-attaches the same data.
-func (b *BackingStore) Ensure(_ context.Context, in usecase.VolumeEnsureInput) (usecase.VolumeEnsureOutput, error) {
+// Ensure returns the backing file for a volume. An existing <Dir>/<volumeID>.ext4
+// is ALWAYS returned unchanged (never re-formatted) so a re-provision or reboot
+// re-attaches the same data; what an ABSENT file means is decided by in.Mode and
+// never inferred here.
+//
+// ⚠ The mode is the data-loss control, and it is required. This backend is handed
+// a path and cannot see the ledger, so it cannot tell a first provision (nothing
+// to lose) from an attach whose data has vanished (everything to lose) — and the
+// two demand opposite answers. It used to answer "create" to both, which meant a
+// fleet host that lost its disk while the control-plane DB survived would mint a
+// fresh empty filesystem for every surviving volume row and report success. The
+// use case owns the ledger and therefore owns the decision (VolumeEnsureMode);
+// deciding it here from the filesystem would put a ledger question in the one
+// layer that cannot answer it.
+func (b *BackingStore) Ensure(ctx context.Context, in usecase.VolumeEnsureInput) (usecase.VolumeEnsureOutput, error) {
 	if in.Dir == "" {
 		return usecase.VolumeEnsureOutput{}, fmt.Errorf("volume dir is required")
+	}
+	// No default: an unset mode is a wiring bug, and the only two ways to guess
+	// are "create" (which is the data-loss path this control exists to close) and
+	// "adopt" (which would silently break first provisions). Refuse instead.
+	if in.Mode != usecase.VolumeEnsureCreate && in.Mode != usecase.VolumeEnsureAdopt {
+		return usecase.VolumeEnsureOutput{}, fmt.Errorf("volume ensure mode is required (create|adopt), got %q", in.Mode)
 	}
 	if err := os.MkdirAll(in.Dir, 0o750); err != nil {
 		return usecase.VolumeEnsureOutput{}, fmt.Errorf("create volume dir: %w", err)
@@ -57,11 +76,21 @@ func (b *BackingStore) Ensure(_ context.Context, in usecase.VolumeEnsureInput) (
 	path := filepath.Join(in.Dir, in.VolumeID.String()+".ext4")
 
 	if _, err := os.Stat(path); err == nil {
-		// Backing file already materialized — idempotent, never re-format (that
-		// would destroy the persisted data).
+		// Backing file already materialized — idempotent under BOTH modes, and
+		// never re-formatted (that would destroy the persisted data).
 		return usecase.VolumeEnsureOutput{BackingPath: path}, nil
 	} else if !os.IsNotExist(err) {
 		return usecase.VolumeEnsureOutput{}, fmt.Errorf("stat backing file: %w", err)
+	}
+
+	if in.Mode == usecase.VolumeEnsureAdopt {
+		// The ledger says this volume exists; the host says its data does not. The
+		// only honest move is to fail — loudly, because a silent refusal leaves an
+		// operator staring at a failed deploy with no clue that a DISK is gone.
+		logger.FromContext(ctx).Error(
+			"fleet volume: backing file missing on attach — the ledger records this volume but its data is NOT on this host; refusing to create an empty replacement",
+			"volume_id", in.VolumeID, "backing_path", path, "volume_dir", in.Dir)
+		return usecase.VolumeEnsureOutput{}, fmt.Errorf("%w: %s", domain.ErrVolumeBackingFileMissing, path)
 	}
 
 	sizeMB := in.SizeMB

@@ -289,15 +289,19 @@ type orchHarness struct {
 	orch     *FleetOrchestrator
 	apps     *orchAppRepo
 	replicas *orchReplicaRepo
+	// resources is the P19 claim ledger the app-seam guard reads. Empty by
+	// default: an ordinary component deploy is claimed by nothing.
+	resources *fakeResourceRepo
 }
 
 func newOrchHarness(hosts []domain.Host, apps ...*domain.FleetApp) orchHarness {
 	appRepo := newOrchAppRepo(apps...)
 	repRepo := newOrchReplicaRepo()
+	resRepo := newFakeResourceRepo()
 	sched := NewFleetScheduler(orchHostLister{hosts: hosts}, repRepo, appRepo, time.Minute)
 	runtime := NewFleetReplicaRuntime(fakeMaterializer{rootfs: "/work/r.ext4"}, &orchBooter{}, repRepo, appRepo, "/tmp/imgwork", "10.0.0.9")
-	orch := NewFleetOrchestrator(appRepo, repRepo, sched, runtime)
-	return orchHarness{orch: orch, apps: appRepo, replicas: repRepo}
+	orch := NewFleetOrchestrator(appRepo, repRepo, sched, runtime, resRepo)
+	return orchHarness{orch: orch, apps: appRepo, replicas: repRepo, resources: resRepo}
 }
 
 func oneLiveHost() []domain.Host {

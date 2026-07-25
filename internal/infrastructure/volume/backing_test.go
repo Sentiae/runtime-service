@@ -1,10 +1,17 @@
 package volume
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/google/uuid"
+	"github.com/sentiae/runtime-service/internal/domain"
+	"github.com/sentiae/runtime-service/internal/usecase"
 )
 
 // write creates a file with a byte of content so its existence is unambiguous.
@@ -26,6 +33,144 @@ func exists(t *testing.T, path string) bool {
 	}
 	return false
 }
+
+// TestEnsureModeDecidesWhatAnAbsentFileMeans is the data-loss regression. An
+// absent backing file is not one condition but two, and the backend cannot tell
+// them apart from the filesystem: on a FIRST provision it means "make it", on an
+// ATTACH it means the customer's data is gone. Inferring create-if-absent made
+// the second silently become the first — a fleet host that lost its disk while
+// the control-plane DB survived would mint a fresh empty filesystem for every
+// surviving volume row and report the deploy healthy.
+//
+// The adopt-with-no-file row is the whole bug: it must REFUSE and leave the
+// directory untouched. Revert the mode guard in Ensure and that row fails by
+// finding a file that was created behind the ledger's back.
+func TestEnsureModeDecidesWhatAnAbsentFileMeans(t *testing.T) {
+	// A byte pattern that no mkfs.ext4 output could coincidentally reproduce, so
+	// "adopted unchanged" is proven by the CONTENT, not merely by the file's
+	// existence — a re-format would leave a superblock here instead.
+	sentinel := []byte("SENTIAE-VOLUME-DATA-DO-NOT-REFORMAT")
+
+	tests := []struct {
+		name string
+		mode usecase.VolumeEnsureMode
+		// filePresent seeds the backing file with the sentinel pattern first.
+		filePresent bool
+		wantErr     error
+		// wantFile is whether a backing file must exist when Ensure returns.
+		wantFile bool
+		// wantPreserved asserts the sentinel content survived (adoption), and
+		// implies no mkfs was run over it.
+		wantPreserved bool
+		// needsMkfs marks the row that actually formats a filesystem.
+		needsMkfs bool
+	}{
+		{
+			name:      "first provision, no file, create intent → materialized",
+			mode:      usecase.VolumeEnsureCreate,
+			wantFile:  true,
+			needsMkfs: true,
+		},
+		{
+			name:          "attach intent, file present → adopted unchanged, never re-formatted",
+			mode:          usecase.VolumeEnsureAdopt,
+			filePresent:   true,
+			wantFile:      true,
+			wantPreserved: true,
+		},
+		{
+			name:      "attach intent, file MISSING → refuses and creates nothing",
+			mode:      usecase.VolumeEnsureAdopt,
+			wantErr:   domain.ErrVolumeBackingFileMissing,
+			wantFile:  false,
+			needsMkfs: false,
+		},
+		{
+			name:          "create intent, file present → still adopted, never re-formatted",
+			mode:          usecase.VolumeEnsureCreate,
+			filePresent:   true,
+			wantFile:      true,
+			wantPreserved: true,
+		},
+		{
+			name:     "unset mode → refused, and nothing is created",
+			mode:     "",
+			wantErr:  errUnsetModeMarker,
+			wantFile: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.needsMkfs {
+				if _, err := exec.LookPath("mkfs.ext4"); err != nil {
+					t.Skip("mkfs.ext4 not on PATH (non-Linux dev host) — this row formats a real filesystem")
+				}
+			}
+			dir := t.TempDir()
+			id := uuid.New()
+			path := filepath.Join(dir, id.String()+".ext4")
+			if tt.filePresent {
+				if err := os.WriteFile(path, sentinel, 0o600); err != nil {
+					t.Fatalf("seed backing file: %v", err)
+				}
+			}
+
+			out, err := NewBackingStore().Ensure(context.Background(), usecase.VolumeEnsureInput{
+				VolumeID: id, SizeMB: 32, Dir: dir, Mode: tt.mode,
+			})
+
+			switch {
+			// t.Errorf, not Fatal: the refusal rows must ALSO reach the
+			// "created nothing" assertions below — that a fresh filesystem was
+			// minted is the louder half of the failure.
+			case tt.wantErr == errUnsetModeMarker:
+				if err == nil {
+					t.Errorf("an unset mode must be refused, got out=%+v", out)
+				}
+			case tt.wantErr != nil:
+				if !errors.Is(err, tt.wantErr) {
+					t.Errorf("got err %v, want %v", err, tt.wantErr)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("Ensure: %v", err)
+				}
+				if out.BackingPath != path {
+					t.Fatalf("BackingPath = %q, want %q", out.BackingPath, path)
+				}
+			}
+
+			if got := exists(t, path); got != tt.wantFile {
+				t.Fatalf("backing file present = %v, want %v (%s)", got, tt.wantFile, path)
+			}
+			// The refusal must not litter the directory with anything else either.
+			if !tt.wantFile {
+				entries, rerr := os.ReadDir(dir)
+				if rerr != nil {
+					t.Fatalf("read dir: %v", rerr)
+				}
+				if len(entries) != 0 {
+					t.Fatalf("a refusal must create nothing, found %d entries", len(entries))
+				}
+			}
+			if tt.wantPreserved {
+				got, rerr := os.ReadFile(path)
+				if rerr != nil {
+					t.Fatalf("read backing file: %v", rerr)
+				}
+				if !bytes.Equal(got, sentinel) {
+					t.Fatalf("backing file content was rewritten (mkfs ran over live data): got %d bytes, want the %d-byte sentinel", len(got), len(sentinel))
+				}
+			}
+		})
+	}
+}
+
+// errUnsetModeMarker is a table-only marker: an unset mode is refused with a
+// plain wiring error (like the empty-dir check beside it), not a domain
+// sentinel, so the row asserts "refused + created nothing" rather than identity.
+var errUnsetModeMarker = errors.New("unset mode")
 
 // TestDeleteReclaimsFailedRestoreSiblings is the
 // #decommission-leaves-failed-restore-sibling regression: deleting a volume must

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -202,11 +203,13 @@ var (
 
 // newFleetServerWithApp wires a FleetServer whose provision use case knows one
 // resident app (owned by ownerOrg) via a real orchestrator over fakes. Unknown
-// handles fall through to the (empty) workload repo → not-found.
-func newFleetServerWithApp(appID, ownerOrg uuid.UUID) *FleetServer {
+// handles fall through to the (empty) workload repo → not-found. claim is the
+// P19 resource ledger the app-seam guard reads; a nil-res fake means the app is
+// claimed by nothing (the ordinary component deploy).
+func newFleetServerWithApp(appID, ownerOrg uuid.UUID, claim *fakeResourceRepo) *FleetServer {
 	prov := usecase.NewFleetProvision(context.Background(), fakeWorkloadRepo{}, nil, nil, "", "")
 	app := &domain.FleetApp{ID: appID, OwnerOrg: ownerOrg.String()}
-	orch := usecase.NewFleetOrchestrator(&fakeAppRepo{app: app}, fakeReplicaRepo{}, nil, nil)
+	orch := usecase.NewFleetOrchestrator(&fakeAppRepo{app: app}, fakeReplicaRepo{}, nil, nil, claim)
 	prov.SetOrchestrator(orch)
 	return &FleetServer{provision: prov}
 }
@@ -267,7 +270,7 @@ func TestFleetHandleOps_OrgGate(t *testing.T) {
 	for _, rpc := range rpcs {
 		for _, tc := range cases {
 			t.Run(rpc.name+"/"+tc.name, func(t *testing.T) {
-				s := newFleetServerWithApp(appID, ownerOrg)
+				s := newFleetServerWithApp(appID, ownerOrg, &fakeResourceRepo{})
 				err := rpc.invoke(s, ctxWithOrg(tc.callerOrg), tc.handle)
 				if code := status.Code(err); code != tc.wantCode {
 					t.Fatalf("%s(%s): want %s, got %s (%v)", rpc.name, tc.name, tc.wantCode, code, err)
@@ -285,11 +288,59 @@ func TestFleetHandleOps_ShadowForeignOrg_DoesNotDeny(t *testing.T) {
 	appID := uuid.New()
 	ownerOrg := uuid.New()
 	foreignOrg := uuid.New()
-	s := newFleetServerWithApp(appID, ownerOrg)
+	s := newFleetServerWithApp(appID, ownerOrg, &fakeResourceRepo{})
 
 	_, err := s.Health(ctxWithOrg(foreignOrg), &runtimev1.FleetHealthRequest{Handle: appID.String()})
 	if code := status.Code(err); code == codes.PermissionDenied || code == codes.Unauthenticated {
 		t.Fatalf("shadow mode must not deny a foreign org, got %s (%v)", code, err)
+	}
+}
+
+// TestFleetDecommission_AppBacksDurableResource_FailedPrecondition drives the
+// real orchestrator guard through the RPC: an app a live P19 claim backs must
+// come back FailedPrecondition naming the resource verb, never OK and never a
+// raw Internal (which is what an unmapped sentinel would produce).
+func TestFleetDecommission_AppBacksDurableResource_FailedPrecondition(t *testing.T) {
+	appID := uuid.New()
+	ownerOrg := uuid.New()
+
+	live := &domain.FleetResource{
+		ID: uuid.New(), Class: "postgres", Tier: "dedicated",
+		Phase: domain.FleetResourcePhaseReady, AppID: &appID,
+	}
+	tombstoned := *live
+	tombstoned.Phase = domain.FleetResourcePhaseDecommissioned
+	at := time.Now().UTC()
+	tombstoned.DecommissionedAt = &at
+
+	tests := []struct {
+		name     string
+		claim    *domain.FleetResource
+		wantCode codes.Code
+	}{
+		{"live claim refuses", live, codes.FailedPrecondition},
+		{"tombstoned claim proceeds", &tombstoned, codes.OK},
+		{"no claim proceeds", nil, codes.OK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newFleetServerWithApp(appID, ownerOrg, &fakeResourceRepo{res: tt.claim})
+			_, err := s.Decommission(ctxWithOrg(ownerOrg), &runtimev1.FleetDecommissionRequest{Handle: appID.String()})
+			if code := status.Code(err); code != tt.wantCode {
+				t.Fatalf("Decommission: code = %s, want %s (%v)", code, tt.wantCode, err)
+			}
+			if tt.wantCode != codes.FailedPrecondition {
+				return
+			}
+			msg := status.Convert(err).Message()
+			if !strings.Contains(msg, "DecommissionResource") {
+				t.Fatalf("message %q does not name the verb that works", msg)
+			}
+			// The hand-map never echoes the wrapped chain (ToGRPC's default would).
+			if strings.Contains(msg, live.ID.String()) {
+				t.Fatalf("message %q leaks the internal error chain", msg)
+			}
+		})
 	}
 }
 

@@ -16,6 +16,18 @@ var (
 	// replica runtime resolves under whatever org the row happens to hold. An
 	// org-less row is therefore not a benign default, it is an unscoped row.
 	ErrFleetAppOwnerOrgRequired = errors.New("fleet app requires an owner org")
+	// ErrAppBacksDurableResource is returned when an app-level decommission is
+	// asked to tear down the backing app of a LIVE durable resource claim
+	// (fleet_resources). The app seam knows nothing about resources: it drains the
+	// replicas, DELETES the ext4 backing files (DeleteAppVolumes) and drops the app
+	// row, so a customer's dedicated database would be destroyed — with no
+	// snapshot — through a verb that never consulted the claim. The
+	// snapshot-first guarantee lives on the RESOURCE seam
+	// (DecommissionDedicated), so the resource is the only legitimate way in; this
+	// sentinel sends the caller there. Only a claim that is still live blocks:
+	// a resource already tombstoned (decommissioned_at stamped) is mid- or
+	// post-teardown and its own path is what is calling through.
+	ErrAppBacksDurableResource = errors.New("fleet app backs a durable resource")
 	// ErrReplicaNotFound is returned when no replica matches an id.
 	ErrReplicaNotFound = errors.New("fleet replica not found")
 	// ErrPlacementNotFound is returned when no placement matches a replica.

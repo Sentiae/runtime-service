@@ -575,6 +575,45 @@ func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, r
 			final = &points[0]
 		}
 	}
+	// Mark the teardown INTENT before calling down, because the app seam now
+	// REFUSES to tear down an app a live resource claims
+	// (domain.ErrAppBacksDurableResource) and this is the legitimate way through:
+	// the guard keys on "a live claim", and stamping decommissioned_at is what
+	// makes this claim no longer live. It is stamped here — after the
+	// snapshot-first gate above — so a refused teardown never marks intent.
+	//
+	// decommissioned_at (not the phase) is the marker on purpose. Writing the
+	// `decommissioned` PHASE first would make the idempotency check at the top of
+	// this function short-circuit a RETRY of a teardown that failed on the way
+	// down: the resource would read retired forever while its VM kept running on
+	// the customer's volume. The timestamp says "teardown began", the phase still
+	// says "teardown finished", and a retry re-enters and completes.
+	now := time.Now().UTC()
+	intentStamped := false
+	if res.DecommissionedAt == nil {
+		res.DecommissionedAt = &now
+		res.UpdatedAt = now
+		if err := uc.resources.SaveResource(ctx, res); err != nil {
+			return nil, fmt.Errorf("mark resource teardown intent: %w", err)
+		}
+		intentStamped = true
+	}
+	// unmarkIntent puts a resource whose teardown FAILED back under the app-seam
+	// guard. Without it a resource left mid-teardown is a live database no longer
+	// protected from an app-level decommission — exactly the state this change
+	// exists to prevent. Best-effort: a failed rollback is logged, and the caller
+	// still gets the original teardown error.
+	unmarkIntent := func(cause error) {
+		if !intentStamped {
+			return
+		}
+		res.DecommissionedAt = nil
+		res.UpdatedAt = time.Now().UTC()
+		if serr := uc.resources.SaveResource(ctx, res); serr != nil {
+			logger.FromContext(ctx).Error("fleet decommission: teardown failed AND its intent stamp could not be rolled back — this resource is not protected by the app-seam guard until it is retried",
+				"resource_id", res.ID, "teardown_err", cause, "err", serr)
+		}
+	}
 	if res.AppID != nil {
 		if derr := uc.provisioner.Decommission(ctx, res.AppID.String()); derr != nil {
 			// An app row that is ALREADY GONE is not a teardown failure — there is
@@ -592,6 +631,7 @@ func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, r
 			// purpose: making an unknown handle idempotent success at the P7 seam would
 			// widen that shared contract's semantics for every caller of it.
 			if !errors.Is(derr, domain.ErrWorkloadNotFound) && !errors.Is(derr, domain.ErrFleetAppNotFound) {
+				unmarkIntent(derr)
 				return nil, fmt.Errorf("decommission app: %w", derr)
 			}
 			// Abnormal path — an operator needs to see that this teardown completed
@@ -605,11 +645,13 @@ func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, r
 				"resource_id", res.ID, "missing_app_id", res.AppID, "recovery_point_id", reliedOn, "err", derr)
 		}
 	}
-	now := time.Now().UTC()
 	res.Phase = domain.FleetResourcePhaseDecommissioned
-	res.DecommissionedAt = &now
-	res.UpdatedAt = now
+	res.UpdatedAt = time.Now().UTC()
 	if err := uc.resources.SaveResource(ctx, res); err != nil {
+		// Deliberately NOT rolled back: the backing app is already torn down, so
+		// the intent stamp is now simply true, and there is no live data left for
+		// the app-seam guard to protect. The retry re-enters (the phase, not the
+		// stamp, is what short-circuits it) and re-writes the tombstone.
 		return nil, fmt.Errorf("tombstone resource: %w", err)
 	}
 	return final, nil

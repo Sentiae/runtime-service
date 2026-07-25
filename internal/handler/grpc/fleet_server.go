@@ -361,6 +361,12 @@ func fleetError(err error) error {
 	// on the same route insert forever. The message names the fix (a different
 	// component id). The conflicting host is NOT echoed — it is deterministic from
 	// the caller's own component id + env, and ensureRoute logs it for the operator.
+	// FailedPrecondition, not PermissionDenied: the caller is allowed to tear this
+	// down, just not through this verb — the app is the backing store of a durable
+	// resource whose teardown must snapshot first. The message names the verb that
+	// works, because the app-level call can never succeed while the claim is live.
+	case errors.Is(err, domain.ErrAppBacksDurableResource):
+		return status.Error(codes.FailedPrecondition, "this workload is the backing store of a durable resource — decommission the RESOURCE (DecommissionResource), which takes a final snapshot first; tearing the app down directly would destroy its data")
 	case errors.Is(err, domain.ErrIngressHostTaken):
 		return status.Error(codes.AlreadyExists, "the ingress host derived from this component id is already routed to another fleet app — a component id must be globally unique across the fleet")
 	case errors.Is(err, domain.ErrSecretOwnerOrgMissing):
@@ -389,6 +395,13 @@ func fleetError(err error) error {
 		return status.Error(codes.FailedPrecondition, "a volume-bearing app cannot scale beyond one replica")
 	case errors.Is(err, domain.ErrVolumeBackendUnavailable):
 		return status.Error(codes.FailedPrecondition, "volumes require the firecracker host")
+	// A provision that had to ADOPT an existing volume and found no data on the
+	// host. Without this it reached the caller as the curated Internal, which reads
+	// as "a bug, retry" — but no retry can invent the data, and the operator needs
+	// to know a DISK is gone, not that the server misbehaved. The path stays
+	// server-side (in the Error log); these messages are tenant-visible.
+	case errors.Is(err, domain.ErrVolumeBackingFileMissing):
+		return status.Error(codes.FailedPrecondition, "this app's persistent volume is recorded but its backing file is not on the host — refusing to attach an empty replacement; restore from a recovery point")
 	case errors.Is(err, domain.ErrFleetNetworkNotFound):
 		return status.Error(codes.FailedPrecondition, "no active fleet network for this system and env — EnsureNetwork first")
 	case errors.Is(err, domain.ErrNetworkEnforcerUnavailable):

@@ -181,7 +181,7 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	// through to image_workloads (unknown → ErrWorkloadNotFound), which is the
 	// exact production route. Neither the scheduler nor the replica runtime is
 	// reachable on a missing-app decommission, so both are left nil.
-	orch := NewFleetOrchestrator(apps, replicas, nil, nil)
+	orch := NewFleetOrchestrator(apps, replicas, nil, nil, resources)
 	orch.SetVolumeManager(volMgr)
 	prov := NewFleetProvision(ctx, workloads, nil, nil, t.TempDir(), "127.0.0.1")
 	prov.SetOrchestrator(orch)

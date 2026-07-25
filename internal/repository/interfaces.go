@@ -266,6 +266,14 @@ type FleetResourceRepository interface {
 	// an (ownerOrg, claimKey, env) triple — the pair the unique index enforces.
 	// Returns domain.ErrResourceNotFound when no claim matches.
 	FindResource(ctx context.Context, ownerOrg uuid.UUID, claimKey, env string) (*domain.FleetResource, error)
+	// FindLiveResourceByApp resolves the LIVE (non-tombstoned) resource claim
+	// whose backing app is appID — the reverse of the app_id column, which
+	// carries no FK. It is the app seam's guard: a decommission of an app a
+	// durable resource still claims must be refused there and routed through the
+	// resource's own snapshot-first teardown. Returns
+	// domain.ErrResourceNotFound when no live claim points at the app, which is
+	// the ordinary case (every component deploy) and not a fault.
+	FindLiveResourceByApp(ctx context.Context, appID uuid.UUID) (*domain.FleetResource, error)
 	// UpdateResourcePhase advances a resource's lifecycle phase. Returns
 	// domain.ErrResourceNotFound when no resource matches the id.
 	UpdateResourcePhase(ctx context.Context, id uuid.UUID, phase domain.FleetResourcePhase) error
