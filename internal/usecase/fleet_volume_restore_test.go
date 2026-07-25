@@ -571,8 +571,8 @@ func TestRestore_HappyPath(t *testing.T) {
 		t.Fatalf("volume status = %q, want available", st)
 	}
 	rps, _ := h.repo.ListRecoveryPoints(context.Background(), h.res.ID)
-	if len(rps) != 1 || !rps[0].Verified {
-		t.Fatalf("recovery point must be marked verified, got %+v", rps)
+	if len(rps) != 1 || !rps[0].RestoredInPlaceOK {
+		t.Fatalf("recovery point must be marked restored-in-place after a clean restore, got %+v", rps)
 	}
 }
 
@@ -664,8 +664,8 @@ func TestRestore_RollsBackWhenRestoredVolumeWillNotBoot(t *testing.T) {
 		t.Fatalf("volume status = %q, want available", st)
 	}
 	rps, _ := h.repo.ListRecoveryPoints(context.Background(), h.res.ID)
-	if rps[0].Verified {
-		t.Fatal("a recovery point that would not boot must NOT be marked verified")
+	if rps[0].RestoredInPlaceOK {
+		t.Fatal("a recovery point that would not boot must NOT be marked restored-in-place")
 	}
 }
 
@@ -757,8 +757,8 @@ func TestRestore_NotSuccessfulWhenTheEngineRefusesEveryClient(t *testing.T) {
 				t.Fatalf("last_error = %q, must surface why the engine refused clients", res.LastError)
 			}
 			rps, _ := h.repo.ListRecoveryPoints(context.Background(), h.res.ID)
-			if rps[0].Verified {
-				t.Fatal("a recovery point whose engine admits nobody must NOT be marked verified")
+			if rps[0].RestoredInPlaceOK {
+				t.Fatal("a recovery point whose engine admits nobody must NOT be marked restored-in-place")
 			}
 		})
 	}
@@ -784,8 +784,8 @@ func TestRestore_FailsClosedWhenTheEngineCannotBeProbed(t *testing.T) {
 		t.Fatalf("last_error = %q, must say the engine could not be probed", res.LastError)
 	}
 	rps, _ := h.repo.ListRecoveryPoints(context.Background(), h.res.ID)
-	if rps[0].Verified {
-		t.Fatal("an unprobeable restore must NOT mark its recovery point verified")
+	if rps[0].RestoredInPlaceOK {
+		t.Fatal("an unprobeable restore must NOT mark its recovery point restored-in-place")
 	}
 }
 

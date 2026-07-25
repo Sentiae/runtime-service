@@ -158,13 +158,13 @@ func (f *fakeResourceRepo) GetRecoveryPointByRef(_ context.Context, resourceID u
 	return nil, domain.ErrRecoveryPointNotFound
 }
 
-func (f *fakeResourceRepo) MarkRecoveryPointVerified(_ context.Context, id uuid.UUID) error {
+func (f *fakeResourceRepo) MarkRecoveryPointRestoredInPlace(_ context.Context, id uuid.UUID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for resID := range f.recovery {
 		for i := range f.recovery[resID] {
 			if f.recovery[resID][i].ID == id {
-				f.recovery[resID][i].Verified = true
+				f.recovery[resID][i].RestoredInPlaceOK = true
 				return nil
 			}
 		}

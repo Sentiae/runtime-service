@@ -410,15 +410,15 @@ func (uc *FleetVolumeRestorer) run(ctx context.Context, resourceID, appID uuid.U
 	// Step 9 — the restore is only real once the engine serves from it.
 	healthErr := uc.waitHealthy(ctx, appID)
 	if healthErr == nil {
-		// ⚠ OVERCLAIM, knowingly retained. The P19 port doc defines `Verified` as
-		// "a restore-VERIFICATION DRILL has passed" — restore this point into a
-		// throwaway target and assert the data. What is actually proven here is
-		// weaker: these bytes booted an engine that admits clients (which is now
-		// genuinely more than a TCP dial, but still says nothing about the CONTENT
-		// of the database). Until a drill exists, `Verified` on this path means
-		// "restored in place and came back serving". The drill lands right here.
-		if verr := uc.resources.MarkRecoveryPointVerified(ctx, rp.ID); verr != nil {
-			log.Warn("fleet restore: mark recovery point verified", "recovery_point_id", rp.ID, "err", verr)
+		// What is proven here is exactly: these bytes were restored IN PLACE, an
+		// engine booted on them, and it admitted a client. That is what the flag is
+		// now NAMED after (RestoredInPlaceOK), so nothing downstream can read it as
+		// a drill result. `Verified` in the P19 port doc means a G1
+		// restore-VERIFICATION DRILL — restore into a throwaway target and assert
+		// the CONTENT — which does not exist yet; it lands right here when it does,
+		// as a SECOND fact, not by widening this one.
+		if verr := uc.resources.MarkRecoveryPointRestoredInPlace(ctx, rp.ID); verr != nil {
+			log.Warn("fleet restore: mark recovery point restored-in-place", "recovery_point_id", rp.ID, "err", verr)
 		}
 		if rerr := os.Remove(pre); rerr != nil && !os.IsNotExist(rerr) {
 			log.Warn("fleet restore: remove pre-restore volume", "path", pre, "err", rerr)

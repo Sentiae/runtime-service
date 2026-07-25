@@ -389,6 +389,14 @@ func fleetError(err error) error {
 		return status.Error(codes.NotFound, "fleet host not found")
 	case errors.Is(err, domain.ErrInvalidHostHealth):
 		return status.Error(codes.InvalidArgument, "invalid host health (want healthy|degraded|unhealthy|unknown)")
+	// The pause guard. A refusal is a permanent property of the VM class, never a
+	// transient fault, so it must not reach a caller as Internal (which reads as
+	// "retry") — firecracker vsock does not survive Pause/Resume, so no retry can
+	// make pausing a data VM safe.
+	case errors.Is(err, domain.ErrPauseUnsafeForResidentVM):
+		return status.Error(codes.FailedPrecondition, "refused: this VM carries data and the component asked to hold it pauses its VMs — firecracker vsock does not survive Pause/Resume")
+	case errors.Is(err, domain.ErrVMClassUndeclared):
+		return status.Error(codes.FailedPrecondition, "refused: a VM handed to a pausing component must declare its class (pausable|resident)")
 	default:
 		return registryOrInternal(err)
 	}

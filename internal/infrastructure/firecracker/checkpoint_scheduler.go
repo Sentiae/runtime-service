@@ -78,8 +78,12 @@ type SnapshotFiles struct {
 
 // VMRegistration describes a VM the scheduler is watching.
 type VMRegistration struct {
-	VMID                      uuid.UUID
-	SocketPath                string
+	VMID       uuid.UUID
+	SocketPath string
+	// Class is MANDATORY: this scheduler pauses every VM it holds, and a resident
+	// (data-bearing) VM must never be paused (see VMClass). An unset Class is
+	// refused, so registration cannot fail open.
+	Class                     VMClass
 	CheckpointIntervalMinutes int // 0 → DefaultCheckpointIntervalMinutes
 	MaxCheckpointsPerVM       int // 0 → DefaultMaxCheckpointsPerVM
 }
@@ -95,11 +99,11 @@ type CheckpointScheduler struct {
 }
 
 type vmState struct {
-	reg        VMRegistration
-	cancel     context.CancelFunc
-	done       chan struct{}
-	mu         sync.Mutex
-	snapshots  []SnapshotRecord
+	reg       VMRegistration
+	cancel    context.CancelFunc
+	done      chan struct{}
+	mu        sync.Mutex
+	snapshots []SnapshotRecord
 }
 
 // NewCheckpointScheduler constructs the scheduler. backend must be
@@ -118,21 +122,32 @@ func NewCheckpointScheduler(backend SnapshotBackend, logger *log.Logger) *Checkp
 // Register starts the per-VM checkpoint goroutine. Idempotent: a
 // second call for the same VMID is a no-op. Calls after Close are
 // rejected silently.
-func (s *CheckpointScheduler) Register(ctx context.Context, reg VMRegistration) {
+//
+// It REFUSES — loudly, with domain.ErrPauseUnsafeForResidentVM — any resident
+// (data-bearing) VM, and any VM whose class was not declared. This scheduler's
+// whole cycle is pause → snapshot → resume, and a paused Firecracker VM never
+// gets its vsock back (see VMClass), so registering a database VM here would
+// destroy its control channel on the first tick. The guard lives at THIS seam
+// rather than at the call site because the call site is the one thing a future
+// caller replaces.
+func (s *CheckpointScheduler) Register(ctx context.Context, reg VMRegistration) error {
 	if s == nil || s.backend == nil {
-		return
+		return nil
+	}
+	if err := checkPausable("the firecracker checkpoint scheduler", reg.Class); err != nil {
+		return err
 	}
 	if reg.VMID == uuid.Nil || reg.SocketPath == "" {
-		return
+		return nil
 	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	if _, exists := s.tracked[reg.VMID]; exists {
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	normalized := reg
 	if normalized.CheckpointIntervalMinutes <= 0 {
@@ -148,6 +163,7 @@ func (s *CheckpointScheduler) Register(ctx context.Context, reg VMRegistration) 
 	s.mu.Unlock()
 
 	go s.run(childCtx, state)
+	return nil
 }
 
 // Deregister stops the goroutine for a VM and waits for it to exit.

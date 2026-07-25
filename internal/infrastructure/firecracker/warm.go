@@ -104,6 +104,12 @@ type WarmVM struct {
 	TapName    string
 	Language   domain.Language
 
+	// Class is MANDATORY: the warm path PAUSES this VM to snapshot it
+	// (CreateTemplateSnapshot), and a resident/data VM must never be paused (see
+	// VMClass). BootWarm sets it; a WarmVM built any other way is refused by the
+	// snapshot call, so the warm path cannot be handed a database VM.
+	Class VMClass
+
 	// jail is the template's chroot. Teardown removes it, and the snapshot is
 	// written inside it (the jailed VMM resolves the snapshot paths after its
 	// chroot), so it has to travel with the VM.
@@ -267,7 +273,10 @@ func (m *WarmManager) BootWarm(ctx context.Context, language domain.Language) (*
 		GuestIP:    warmGuestIP,
 		TapName:    tapName,
 		Language:   language,
-		jail:       j,
+		// A warm template VM exists to be paused and snapshotted; it holds no
+		// customer data and its vsock is disposable.
+		Class: VMClassPausable,
+		jail:  j,
 	}, nil
 }
 
@@ -343,6 +352,14 @@ func (m *WarmManager) DestroyWarm(warm *WarmVM) error {
 func (m *WarmManager) CreateTemplateSnapshot(ctx context.Context, warm *WarmVM) (*TemplateSnapshot, error) {
 	if warm == nil || warm.jail == nil {
 		return nil, fmt.Errorf("create template snapshot: warm VM has no jail")
+	}
+	// This call PAUSES the VM (PATCH /vm {"state":"Paused"}) and a paused
+	// firecracker VM never gets its vsock back, so a resident/data VM must be
+	// refused here rather than merely never passed in. The warm manager has no
+	// Register seam — BootWarm is the only constructor — so the guard sits on the
+	// pausing call itself, which is the narrowest place nothing can bypass.
+	if err := checkPausable("the warm template snapshotter", warm.Class); err != nil {
+		return nil, fmt.Errorf("create template snapshot: %w", err)
 	}
 	snapshotDir := m.p.cfg.SnapshotPath
 	if err := os.MkdirAll(snapshotDir, 0750); err != nil {

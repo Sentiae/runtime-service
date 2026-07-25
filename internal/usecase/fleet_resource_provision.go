@@ -113,8 +113,10 @@ type RecoveryPointInfo struct {
 	ObjectKey string
 	Kind      string
 	SizeBytes int64
-	Verified  bool
-	CreatedAt time.Time
+	// RestoredInPlaceOK mirrors the domain field: this point was restored in
+	// place and the engine came back admitting clients. NOT a verification drill.
+	RestoredInPlaceOK bool
+	CreatedAt         time.Time
 }
 
 // ResourceStatus is the live status of a resource claim. Conditions carries the
@@ -378,12 +380,12 @@ func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uui
 	} else if len(rps) > 0 {
 		rp := rps[0] // newest first
 		status.LastRecoveryPoint = &RecoveryPointInfo{
-			ID:        rp.ID.String(),
-			ObjectKey: rp.ObjectKey,
-			Kind:      rp.Kind,
-			SizeBytes: rp.SizeBytes,
-			Verified:  rp.Verified,
-			CreatedAt: rp.CreatedAt,
+			ID:                rp.ID.String(),
+			ObjectKey:         rp.ObjectKey,
+			Kind:              rp.Kind,
+			SizeBytes:         rp.SizeBytes,
+			RestoredInPlaceOK: rp.RestoredInPlaceOK,
+			CreatedAt:         rp.CreatedAt,
 		}
 	}
 	return status, nil

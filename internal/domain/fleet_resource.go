@@ -110,9 +110,24 @@ type FleetResourceRecoveryPoint struct {
 	// Checksum is the lowercase hex sha256 of the uploaded blob, computed while
 	// streaming the upload. Empty on legacy rows written before D-184: those can
 	// only be size-verified on restore, and the restorer says so explicitly.
-	Checksum  string    `json:"checksum" gorm:"column:checksum;type:text;not null;default:''"`
-	Verified  bool      `json:"verified" gorm:"not null;default:false"`
-	CreatedAt time.Time `json:"created_at" gorm:"not null;default:now();index:idx_fleet_resource_recovery_points_resource,priority:2"`
+	Checksum string `json:"checksum" gorm:"column:checksum;type:text;not null;default:''"`
+	// RestoredInPlaceOK records the ONE fact this system can currently prove about
+	// a recovery point: it was restored IN PLACE over the resource's own volume,
+	// the engine booted on those bytes, and it admitted a client. It says NOTHING
+	// about the CONTENT of the restored database.
+	//
+	// It is deliberately NOT called `verified`. The P19 port doc reserves
+	// "verified" for a G1 restore-verification DRILL (restore into a throwaway
+	// target and assert the data), which does not exist yet — so `Verified` stays
+	// unused here and the drill has a true place to land later. Anything shown to
+	// a customer as a "verified backup" must come from the drill, never from this.
+	//
+	// The COLUMN is still `verified` (created by migration 0012): renaming it would
+	// be a migration whose down is lossy, and the column name is not what anyone
+	// reads meaning off. The name that lies is the one in the code and the API, and
+	// that is the one this fixes.
+	RestoredInPlaceOK bool      `json:"restored_in_place_ok" gorm:"column:verified;not null;default:false"`
+	CreatedAt         time.Time `json:"created_at" gorm:"not null;default:now();index:idx_fleet_resource_recovery_points_resource,priority:2"`
 }
 
 // TableName specifies the GORM table name.

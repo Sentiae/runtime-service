@@ -234,8 +234,10 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 		Kind:       "snapshot",
 		SizeBytes:  up.LogicalBytes,
 		Checksum:   up.Checksum,
-		Verified:   false,
-		CreatedAt:  now,
+		// A fresh snapshot has never been restored from, so nothing about it is
+		// proven beyond its checksum.
+		RestoredInPlaceOK: false,
+		CreatedAt:         now,
 	}
 	if err := s.recovery.SaveRecoveryPoint(ctx, &rp); err != nil {
 		return zero, fmt.Errorf("save recovery point: %w", err)

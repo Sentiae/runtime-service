@@ -212,10 +212,11 @@ func (s *ResourceServer) GetResourceStatus(ctx context.Context, req *runtimev1.G
 	}
 	if st.LastRecoveryPoint != nil {
 		resp.LastRecoveryPoint = &runtimev1.RecoveryPointProto{
-			Ref:      st.LastRecoveryPoint.ObjectKey,
-			Kind:     st.LastRecoveryPoint.Kind,
-			At:       timestamppb.New(st.LastRecoveryPoint.CreatedAt),
-			Verified: st.LastRecoveryPoint.Verified,
+			Ref:  st.LastRecoveryPoint.ObjectKey,
+			Kind: st.LastRecoveryPoint.Kind,
+			At:   timestamppb.New(st.LastRecoveryPoint.CreatedAt),
+			// wire name `verified` is frozen; the VALUE is RestoredInPlaceOK, never a drill result.
+			Verified: st.LastRecoveryPoint.RestoredInPlaceOK,
 		}
 	}
 	return resp, nil
@@ -245,10 +246,11 @@ func (s *ResourceServer) SnapshotResource(ctx context.Context, req *runtimev1.Sn
 	rp := points[0]
 	return &runtimev1.SnapshotResourceResponse{
 		RecoveryPoint: &runtimev1.RecoveryPointProto{
-			Ref:      rp.ObjectKey,
-			Kind:     rp.Kind,
-			At:       timestamppb.New(rp.CreatedAt),
-			Verified: rp.Verified,
+			Ref:  rp.ObjectKey,
+			Kind: rp.Kind,
+			At:   timestamppb.New(rp.CreatedAt),
+			// wire name `verified` is frozen; the VALUE is RestoredInPlaceOK, never a drill result.
+			Verified: rp.RestoredInPlaceOK,
 		},
 	}, nil
 }
@@ -267,10 +269,11 @@ func (s *ResourceServer) ListResourceRecoveryPoints(ctx context.Context, req *ru
 	out := make([]*runtimev1.RecoveryPointProto, 0, len(rps))
 	for i := range rps {
 		out = append(out, &runtimev1.RecoveryPointProto{
-			Ref:      rps[i].ObjectKey,
-			Kind:     rps[i].Kind,
-			At:       timestamppb.New(rps[i].CreatedAt),
-			Verified: rps[i].Verified,
+			Ref:  rps[i].ObjectKey,
+			Kind: rps[i].Kind,
+			At:   timestamppb.New(rps[i].CreatedAt),
+			// wire name `verified` is frozen; the VALUE is RestoredInPlaceOK, never a drill result.
+			Verified: rps[i].RestoredInPlaceOK,
 		})
 	}
 	return &runtimev1.ListResourceRecoveryPointsResponse{RecoveryPoints: out}, nil
@@ -297,10 +300,11 @@ func (s *ResourceServer) DecommissionResource(ctx context.Context, req *runtimev
 	resp := &runtimev1.DecommissionResourceResponse{}
 	if rp != nil {
 		resp.FinalRecoveryPoint = &runtimev1.RecoveryPointProto{
-			Ref:      rp.ObjectKey,
-			Kind:     rp.Kind,
-			At:       timestamppb.New(rp.CreatedAt),
-			Verified: rp.Verified,
+			Ref:  rp.ObjectKey,
+			Kind: rp.Kind,
+			At:   timestamppb.New(rp.CreatedAt),
+			// wire name `verified` is frozen; the VALUE is RestoredInPlaceOK, never a drill result.
+			Verified: rp.RestoredInPlaceOK,
 		}
 	}
 	return resp, nil

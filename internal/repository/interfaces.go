@@ -285,9 +285,11 @@ type FleetResourceRepository interface {
 	// object key from another org's resource is not restorable. Returns
 	// domain.ErrRecoveryPointNotFound when none matches.
 	GetRecoveryPointByRef(ctx context.Context, resourceID uuid.UUID, objectKey string) (*domain.FleetResourceRecoveryPoint, error)
-	// MarkRecoveryPointVerified flags a recovery point as proven restorable — set
-	// only after a restore from it booted healthy.
-	MarkRecoveryPointVerified(ctx context.Context, id uuid.UUID) error
+	// MarkRecoveryPointRestoredInPlace records that a restore FROM this recovery
+	// point, over the resource's own volume, booted an engine that admitted a
+	// client. It is not a verification drill and must never be reported as one
+	// (see domain.FleetResourceRecoveryPoint.RestoredInPlaceOK).
+	MarkRecoveryPointRestoredInPlace(ctx context.Context, id uuid.UUID) error
 }
 
 // VolumeRepository persists volumes for fleet apps.

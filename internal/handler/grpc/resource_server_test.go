@@ -102,7 +102,9 @@ func (f *fakeResourceRepo) GetRecoveryPointByRef(_ context.Context, resourceID u
 	}
 	return nil, domain.ErrRecoveryPointNotFound
 }
-func (f *fakeResourceRepo) MarkRecoveryPointVerified(context.Context, uuid.UUID) error { return nil }
+func (f *fakeResourceRepo) MarkRecoveryPointRestoredInPlace(context.Context, uuid.UUID) error {
+	return nil
+}
 
 var _ repository.FleetResourceRepository = (*fakeResourceRepo)(nil)
 

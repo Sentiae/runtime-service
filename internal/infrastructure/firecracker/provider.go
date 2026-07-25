@@ -573,10 +573,16 @@ func (p *Provider) bootCold(ctx context.Context, bootCfg usecase.VMBootConfig) (
 	// CS-2 G2.8 — register with the per-VM checkpoint scheduler. Nil
 	// scheduler leaves the legacy (no auto-snapshot) behaviour intact.
 	if p.checkpointScheduler != nil {
-		p.checkpointScheduler.Register(context.Background(), VMRegistration{
+		// Run boots the single-shot exec VM: it carries no customer data and is
+		// discarded after the run, so it is the pausable class. A resident/data VM
+		// is refused by the scheduler itself (see VMClass).
+		if err := p.checkpointScheduler.Register(context.Background(), VMRegistration{
 			VMID:       bootCfg.VMID,
 			SocketPath: socketPath,
-		})
+			Class:      VMClassPausable,
+		}); err != nil {
+			log.Printf("[FC-CHECKPOINT] VM %s not registered: %v", bootCfg.VMID, err)
+		}
 	}
 
 	return &usecase.VMBootResult{

@@ -70,14 +70,24 @@ func silentLogger() *log.Logger {
 	return log.New(&bytes.Buffer{}, "", 0)
 }
 
+// mustRegister registers a VM the scheduler is allowed to pause and fails the
+// test if the pause guard refuses it.
+func mustRegister(t *testing.T, sched *CheckpointScheduler, reg VMRegistration) {
+	t.Helper()
+	if err := sched.Register(context.Background(), reg); err != nil {
+		t.Fatalf("Register(%s): %v", reg.Class, err)
+	}
+}
+
 func TestCheckpointScheduler_RegisterDeregister(t *testing.T) {
 	backend := newFakeBackend()
 	sched := NewCheckpointScheduler(backend, silentLogger())
 
 	vmID := uuid.New()
-	sched.Register(context.Background(), VMRegistration{
+	mustRegister(t, sched, VMRegistration{
 		VMID:                      vmID,
 		SocketPath:                "/tmp/sock",
+		Class:                     VMClassPausable,
 		CheckpointIntervalMinutes: 1,
 		MaxCheckpointsPerVM:       5,
 	})
@@ -97,9 +107,9 @@ func TestCheckpointScheduler_RegisterIdempotent(t *testing.T) {
 	defer sched.Close()
 
 	vmID := uuid.New()
-	reg := VMRegistration{VMID: vmID, SocketPath: "/tmp/sock", CheckpointIntervalMinutes: 1}
-	sched.Register(context.Background(), reg)
-	sched.Register(context.Background(), reg)
+	reg := VMRegistration{VMID: vmID, SocketPath: "/tmp/sock", Class: VMClassPausable, CheckpointIntervalMinutes: 1}
+	mustRegister(t, sched, reg)
+	mustRegister(t, sched, reg)
 	if sched.Tracking() != 1 {
 		t.Errorf("duplicate register should be idempotent, got %d", sched.Tracking())
 	}
@@ -117,6 +127,7 @@ func TestCheckpointScheduler_ProducesSnapshotsAndPrunes(t *testing.T) {
 		reg: VMRegistration{
 			VMID:                      vmID,
 			SocketPath:                "/tmp/sock",
+			Class:                     VMClassPausable,
 			CheckpointIntervalMinutes: 15,
 			MaxCheckpointsPerVM:       3,
 		},
@@ -159,7 +170,7 @@ func TestCheckpointScheduler_DefaultsApplied(t *testing.T) {
 	defer sched.Close()
 
 	vmID := uuid.New()
-	sched.Register(context.Background(), VMRegistration{VMID: vmID, SocketPath: "/tmp/sock"})
+	mustRegister(t, sched, VMRegistration{VMID: vmID, SocketPath: "/tmp/sock", Class: VMClassPausable})
 	sched.mu.Lock()
 	state := sched.tracked[vmID]
 	sched.mu.Unlock()
@@ -180,9 +191,9 @@ func TestCheckpointScheduler_RejectsInvalidRegistration(t *testing.T) {
 	defer sched.Close()
 
 	// Nil UUID
-	sched.Register(context.Background(), VMRegistration{SocketPath: "/tmp/sock"})
+	mustRegister(t, sched, VMRegistration{SocketPath: "/tmp/sock", Class: VMClassPausable})
 	// Empty socket
-	sched.Register(context.Background(), VMRegistration{VMID: uuid.New()})
+	mustRegister(t, sched, VMRegistration{VMID: uuid.New(), Class: VMClassPausable})
 	if sched.Tracking() != 0 {
 		t.Errorf("invalid registrations should be rejected, got %d", sched.Tracking())
 	}
@@ -193,8 +204,9 @@ func TestCheckpointScheduler_CloseStopsAll(t *testing.T) {
 	sched := NewCheckpointScheduler(backend, silentLogger())
 
 	for i := 0; i < 3; i++ {
-		sched.Register(context.Background(), VMRegistration{
+		mustRegister(t, sched, VMRegistration{
 			VMID: uuid.New(), SocketPath: "/tmp/s",
+			Class:                     VMClassPausable,
 			CheckpointIntervalMinutes: 60,
 		})
 	}
@@ -212,7 +224,7 @@ func TestCheckpointScheduler_CloseStopsAll(t *testing.T) {
 		t.Errorf("Close should clear tracked; got %d", sched.Tracking())
 	}
 	// Register after close → no-op.
-	sched.Register(context.Background(), VMRegistration{VMID: uuid.New(), SocketPath: "/tmp/x"})
+	mustRegister(t, sched, VMRegistration{VMID: uuid.New(), SocketPath: "/tmp/x", Class: VMClassPausable})
 	if sched.Tracking() != 0 {
 		t.Errorf("Register after Close should be a no-op; got %d", sched.Tracking())
 	}

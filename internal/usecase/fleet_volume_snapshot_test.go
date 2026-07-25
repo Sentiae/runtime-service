@@ -388,7 +388,7 @@ func TestSnapshot_AttachedQuiesceUploadThawOrder(t *testing.T) {
 	}
 	// Recovery point recorded.
 	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
-	if len(rps) != 1 || rps[0].Kind != "snapshot" || rps[0].Verified {
+	if len(rps) != 1 || rps[0].Kind != "snapshot" || rps[0].RestoredInPlaceOK {
 		t.Errorf("recovery point = %+v", rps)
 	}
 	if rps[0].SizeBytes != int64(len(volumeBytes)) {
@@ -426,14 +426,33 @@ func TestSnapshot_HeartbeatHoldsTheFreezeForALongUpload(t *testing.T) {
 		t.Fatalf("freezes = %d, want exactly the initial quiesce — a heartbeat must never re-FREEZE (EBUSY)", got)
 	}
 	events := h.rec.all()
-	if !sameOrder(events[:3], []string{"syncfs", "freeze", "upload"}) {
-		t.Fatalf("events = %v, want it to start syncfs,freeze,upload", events)
+	// The heartbeat runs CONCURRENTLY with the upload, so renews legitimately
+	// interleave — asserting an exact prefix of syncfs,freeze,upload is a race
+	// against how fast the first renew fires, not a statement about correctness.
+	// Assert the invariant instead: quiesce first, upload strictly inside the
+	// freeze window, renews spanning it.
+	if !sameOrder(events[:2], []string{"syncfs", "freeze"}) {
+		t.Fatalf("events = %v, want it to start syncfs,freeze", events)
+	}
+	uploadAt := -1
+	for i, e := range events {
+		if e == "upload" {
+			if uploadAt != -1 {
+				t.Fatalf("events = %v, want exactly one upload", events)
+			}
+			uploadAt = i
+		}
+	}
+	if uploadAt < 2 {
+		t.Fatalf("events = %v, want the upload after the quiesce", events)
 	}
 	if events[len(events)-1] != "thaw" {
 		t.Fatalf("events = %v, want the thaw last — the freeze must outlive the upload", events)
 	}
-	// Everything between the upload and the thaw is a heartbeat renew.
-	for _, e := range events[3 : len(events)-1] {
+	// Everything between the upload and the thaw is a heartbeat renew. Indexed
+	// from the upload's ACTUAL position, not a hardcoded one — a renew may fire
+	// before the upload records, and that is the heartbeat working, not a fault.
+	for _, e := range events[uploadAt+1 : len(events)-1] {
 		if e != "renew" {
 			t.Fatalf("events = %v, want only renew heartbeats between the upload and the thaw", events)
 		}

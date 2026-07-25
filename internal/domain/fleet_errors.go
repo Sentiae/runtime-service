@@ -45,4 +45,16 @@ var (
 	// rt#11) does not observe a healthy resident replica within its budget. It maps
 	// to a retryable 503 so the caller retries rather than the request being dropped.
 	ErrActivationTimeout = errors.New("fleet activation timed out")
+	// ErrPauseUnsafeForResidentVM is returned when a resident (data-bearing) VM is
+	// handed to a component that can PAUSE it. Firecracker v1.16.0's vsock does not
+	// survive Pause/Resume (#fc-vsock-dies-on-pause-resume, proven live): after one
+	// pause the guest control channel is dead for the VM's whole lifetime, which
+	// takes quiesced snapshots, clean shutdown and park with it — i.e. every
+	// durability guarantee a database VM exists to provide.
+	ErrPauseUnsafeForResidentVM = errors.New("resident VM may not be registered with a component that pauses it")
+	// ErrVMClassUndeclared is returned when a VM is handed to a pausing component
+	// without declaring its class. The declaration is MANDATORY on purpose: an
+	// undeclared VM is refused, so a future caller cannot wire a resident VM into a
+	// pause path by simply not setting a flag.
+	ErrVMClassUndeclared = errors.New("VM class must be declared before registering with a component that pauses it")
 )

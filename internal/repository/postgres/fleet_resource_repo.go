@@ -151,7 +151,11 @@ func (r *fleetResourceRepository) GetRecoveryPointByRef(ctx context.Context, res
 	return &rp, nil
 }
 
-func (r *fleetResourceRepository) MarkRecoveryPointVerified(ctx context.Context, id uuid.UUID) error {
+// MarkRecoveryPointRestoredInPlace sets the `verified` COLUMN, which records
+// RestoredInPlaceOK — an in-place restore that came back serving, not a
+// verification drill. The column keeps its 0012 name on purpose (see
+// domain.FleetResourceRecoveryPoint.RestoredInPlaceOK).
+func (r *fleetResourceRepository) MarkRecoveryPointRestoredInPlace(ctx context.Context, id uuid.UUID) error {
 	res := r.db.WithContext(ctx).
 		Model(&domain.FleetResourceRecoveryPoint{}).
 		Where("id = ?", id).

@@ -24,13 +24,24 @@ const (
 
 // RecoveryPointProto is one snapshot/backup entry in a resource's recovery
 // catalog. `ref` is the object-store key (a reference, never a value); `at` is
-// when it was taken; `verified` reports whether a restore-test proved it sound.
+// when it was taken.
 type RecoveryPointProto struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ref           string                 `protobuf:"bytes,1,opt,name=ref,proto3" json:"ref,omitempty"`
-	Kind          string                 `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"`
-	At            *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=at,proto3" json:"at,omitempty"`
-	Verified      bool                   `protobuf:"varint,4,opt,name=verified,proto3" json:"verified,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Ref   string                 `protobuf:"bytes,1,opt,name=ref,proto3" json:"ref,omitempty"`
+	Kind  string                 `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"`
+	At    *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=at,proto3" json:"at,omitempty"`
+	// verified means EXACTLY: this recovery point was restored IN PLACE over the
+	// resource's own volume, the engine booted on those bytes, and it admitted a
+	// client. It says NOTHING about the CONTENT of the restored database, and it
+	// is NOT the result of a restore-verification drill (restore into a throwaway
+	// target and assert the data) — no such drill exists yet.
+	//
+	// Do NOT surface this to a customer as a "verified backup" badge. The field
+	// NAME is frozen (field numbers/names are not reusable, §14) and the server
+	// populates it from FleetResourceRecoveryPoint.RestoredInPlaceOK, which is
+	// what it has always actually meant. When the drill lands it gets its OWN
+	// field; this one is never widened.
+	Verified      bool `protobuf:"varint,4,opt,name=verified,proto3" json:"verified,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
