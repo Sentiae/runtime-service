@@ -50,6 +50,23 @@ func (uc *FleetHostRegistry) RegisterHost(ctx context.Context, host domain.Host)
 		existing.CapacityVCPU = host.CapacityVCPU
 		existing.CapacityMemMB = host.CapacityMemMB
 		existing.CapacityDiskMB = host.CapacityDiskMB
+		// Allocatable is heartbeat-owned accounting, so a re-register must not
+		// overwrite it — but it can never legitimately EXCEED the capacity we
+		// just refreshed. Clamping is what keeps a shrinking measurement honest:
+		// this host was seeded at 51200MB disk / 2048MB mem from a hardcoded
+		// config default, and once capacity became measured (17542/7941) the
+		// un-clamped allocatable kept advertising the old numbers indefinitely,
+		// because only Create ever seeded it. Reported capacity that outlives
+		// the measurement is the same class of lie as never measuring at all.
+		if existing.AllocatableVCPU > existing.CapacityVCPU {
+			existing.AllocatableVCPU = existing.CapacityVCPU
+		}
+		if existing.AllocatableMemMB > existing.CapacityMemMB {
+			existing.AllocatableMemMB = existing.CapacityMemMB
+		}
+		if existing.AllocatableDiskMB > existing.CapacityDiskMB {
+			existing.AllocatableDiskMB = existing.CapacityDiskMB
+		}
 		existing.Endpoint = host.Endpoint
 		existing.Health = domain.HostHealthHealthy
 		existing.Status = domain.HostStatusActive
