@@ -708,6 +708,47 @@ func TestSnapshot_ThawsWhenTheBackingFileCannotBeRead(t *testing.T) {
 	}
 }
 
+// A backing file that is not on the host is a LEGIBLE condition, not an internal
+// fault: it must carry ErrVolumeBackingFileMissing all the way out so the gRPC
+// boundary can say why the teardown was refused instead of returning a bare
+// Internal (#resource-final-snapshot-failure-is-a-bare-500). Both branches are
+// pinned — attached and unattached reach os.Open by different routes.
+func TestSnapshot_MissingBackingFileIsLegible(t *testing.T) {
+	tests := []struct {
+		name     string
+		attached bool
+	}{
+		{name: "attached volume", attached: true},
+		{name: "unattached volume", attached: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newSnapshotHarness(t)
+			appID, resID, volID, replicaID, _ := h.attachedVolume(t)
+			if !tt.attached {
+				h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: appID, BackingPath: h.backing}}
+				_ = replicaID
+			}
+			if err := os.Remove(h.backing); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
+			if !errors.Is(err, domain.ErrVolumeBackingFileMissing) {
+				t.Fatalf("got %v, want ErrVolumeBackingFileMissing", err)
+			}
+			// The refusal must stay a refusal: nothing stored, nothing recorded.
+			if len(h.store.puts) != 0 {
+				t.Errorf("nothing must be uploaded when the backing file is missing")
+			}
+			rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
+			if len(rps) != 0 {
+				t.Errorf("no recovery point may be invented: got %d", len(rps))
+			}
+		})
+	}
+}
+
 func TestSnapshot_NoRowOnUploadFailure(t *testing.T) {
 	h := newSnapshotHarness(t)
 	appID, resID, volID, _, _ := h.attachedVolume(t)

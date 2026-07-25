@@ -87,4 +87,11 @@ var (
 	// that: it proves transport integrity, not source consistency, so a torn
 	// snapshot verifies clean forever.
 	ErrSnapshotNotQuiescible = errors.New("fleet resource volume snapshot refused: guest could not be quiesced")
+	// ErrVolumeBackingFileMissing is returned when a volume's backing file is not
+	// on the host, so there is nothing to snapshot. It is the terminal shape of a
+	// resource whose data is already gone: the refusal is correct (a durable
+	// resource must not be torn down without a recovery point), but without this
+	// sentinel it reached the caller as a bare Internal, indistinguishable from a
+	// panic (#resource-final-snapshot-failure-is-a-bare-500).
+	ErrVolumeBackingFileMissing = errors.New("fleet resource volume backing file is missing")
 )

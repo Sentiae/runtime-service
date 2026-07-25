@@ -1,7 +1,13 @@
 package grpc
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -358,6 +364,73 @@ func TestDecommissionResource_ReportsFinalRecoveryPoint(t *testing.T) {
 			}
 			if !got.GetAt().AsTime().Equal(takenAt) {
 				t.Fatalf("taken at = %v, want %v", got.GetAt().AsTime(), takenAt)
+			}
+		})
+	}
+}
+
+// A failed final snapshot must be LEGIBLE on the wire. The refusal is correct and
+// unchanged; what changes is that the caller learns why instead of getting a bare
+// Internal that looks like a crash (#resource-final-snapshot-failure-is-a-bare-500).
+// The unknown-error row keeps the unmapped bucket honest: this removes ONE case
+// from it, not the bucket.
+func TestDecommissionResource_ErrorMapping(t *testing.T) {
+	resID := uuid.New()
+
+	tests := []struct {
+		name        string
+		err         error
+		wantCode    codes.Code
+		wantMsg     string
+		wantUnmappedLog bool
+	}{
+		{
+			name:     "missing backing file names the condition without leaking the path",
+			err:      fmt.Errorf("final snapshot: upload snapshot: %w: /var/lib/fleet/volumes/abc.ext4: %w", domain.ErrVolumeBackingFileMissing, os.ErrNotExist),
+			wantCode: codes.FailedPrecondition,
+			wantMsg:  "the volume's backing file is missing, so a final snapshot cannot be taken",
+		},
+		{
+			// The sibling refusal path is untouched.
+			name:     "zero recovery points still refuses with its own message",
+			err:      fmt.Errorf("%w: resource %s produced NO recovery point", domain.ErrResourceFinalSnapshotRequired, resID),
+			wantCode: codes.FailedPrecondition,
+			wantMsg:  "a durable resource requires a final snapshot to decommission",
+		},
+		{
+			name:           "a genuinely unmapped error is still Internal and still logged",
+			err:            errors.New("some brand new fleet failure"),
+			wantCode:       codes.Internal,
+			wantUnmappedLog: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logbuf bytes.Buffer
+			log.SetOutput(&logbuf)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+			repo := &fakeResourceRepo{res: &domain.FleetResource{ID: resID, Tier: resourceTierDedicated}}
+			s := NewResourceServer(&fakeDedicatedProvisioner{err: tt.err}, &fakeSharedProvisioner{}, nil, nil, repo)
+
+			_, err := s.DecommissionResource(context.Background(), &runtimev1.DecommissionResourceRequest{
+				Handle: resID.String(), FinalSnapshot: true,
+			})
+			st, _ := status.FromError(err)
+			if st.Code() != tt.wantCode {
+				t.Fatalf("code = %s, want %s (%v)", st.Code(), tt.wantCode, err)
+			}
+			if tt.wantMsg != "" && st.Message() != tt.wantMsg {
+				t.Fatalf("message = %q, want %q", st.Message(), tt.wantMsg)
+			}
+			// Tenant-visible messages must not carry the host path or the OS text.
+			if strings.Contains(st.Message(), "/var/lib") || strings.Contains(st.Message(), "no such file") {
+				t.Errorf("curated message leaks host detail: %q", st.Message())
+			}
+			logged := strings.Contains(logbuf.String(), "resource op failed (unmapped)")
+			if logged != tt.wantUnmappedLog {
+				t.Errorf("unmapped log fired = %v, want %v (log: %q)", logged, tt.wantUnmappedLog, logbuf.String())
 			}
 		})
 	}

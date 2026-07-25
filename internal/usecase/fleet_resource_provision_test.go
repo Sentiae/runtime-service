@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -914,6 +915,45 @@ func TestDecommissionDedicated_SnapshotFailureAborts(t *testing.T) {
 	row, _ := repo.GetResourceByHandle(context.Background(), rid)
 	if row.Phase == domain.FleetResourcePhaseDecommissioned {
 		t.Errorf("row must not be tombstoned when snapshot fails")
+	}
+}
+
+// A resource whose backing file is gone is REFUSED — unchanged — but the refusal
+// now carries a sentinel the boundary can read, instead of an opaque error that
+// reached the caller as a bare Internal
+// (#resource-final-snapshot-failure-is-a-bare-500). This drives the REAL
+// snapshotter (not the fake) because the translation happens at the os.Open site:
+// a fake would prove only that the fake returns what it was told to.
+func TestDecommissionDedicated_MissingBackingFileIsLegible(t *testing.T) {
+	h := newSnapshotHarness(t)
+	appID, _, _, _, _ := h.attachedVolume(t)
+	if err := os.Remove(h.backing); err != nil {
+		t.Fatal(err)
+	}
+
+	rid := uuid.New()
+	h.recovery.seed(&domain.FleetResource{ID: rid, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady, AppID: &appID})
+	prov := &fakeFleetProvisioner{}
+	uc := NewFleetResourceProvisioner(prov, h.recovery, h.replicas, h.s, testEngine())
+
+	final, err := uc.DecommissionDedicated(context.Background(), rid, true)
+	if !errors.Is(err, domain.ErrVolumeBackingFileMissing) {
+		t.Fatalf("got %v, want ErrVolumeBackingFileMissing", err)
+	}
+	if final != nil {
+		t.Errorf("no recovery point may be reported: %+v", final)
+	}
+	// The refusal itself is the point: nothing torn down, nothing recorded.
+	if len(prov.decommissioned) != 0 {
+		t.Errorf("app must not be torn down: %v", prov.decommissioned)
+	}
+	row, _ := h.recovery.GetResourceByHandle(context.Background(), rid)
+	if row.Phase == domain.FleetResourcePhaseDecommissioned || row.DecommissionedAt != nil {
+		t.Errorf("resource must not be tombstoned: phase=%q at=%v", row.Phase, row.DecommissionedAt)
+	}
+	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), rid)
+	if len(rps) != 0 {
+		t.Errorf("no recovery point may be invented: got %d", len(rps))
 	}
 }
 

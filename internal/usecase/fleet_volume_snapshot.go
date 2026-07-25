@@ -366,6 +366,15 @@ func (s *FleetVolumeSnapshotter) uploadUnderFreeze(ctx context.Context, replica 
 func (s *FleetVolumeSnapshotter) uploadBackingFile(ctx context.Context, src, objectKey string) (snapshotUpload, error) {
 	f, err := os.Open(src)
 	if err != nil {
+		// Translate "the file is not there" HERE, at the only site that knows it is
+		// a filesystem fact. An absent backing file is a legible, actionable
+		// condition (the volume's data is gone, so no snapshot can be taken), not an
+		// internal fault — and the boundary must be able to say so with errors.Is
+		// rather than by string-matching an OS message
+		// (#resource-final-snapshot-failure-is-a-bare-500).
+		if errors.Is(err, os.ErrNotExist) {
+			return snapshotUpload{}, fmt.Errorf("%w: %s: %w", domain.ErrVolumeBackingFileMissing, src, err)
+		}
 		return snapshotUpload{}, fmt.Errorf("open backing file %s to snapshot: %w", src, err)
 	}
 	// Sole owner of the descriptor: uploadSnapshotStreamHashed joins its compressor

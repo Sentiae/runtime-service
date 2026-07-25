@@ -401,6 +401,13 @@ func resourceError(err error) error {
 		return status.Error(codes.FailedPrecondition, "in-place restore requires exactly one materialized volume")
 	case errors.Is(err, domain.ErrRestoreStoreUnavailable):
 		return status.Error(codes.Unavailable, "restore artifact store not configured on this host")
+	case errors.Is(err, domain.ErrVolumeBackingFileMissing):
+		// The refusal is correct — a durable resource whose data cannot be
+		// snapshotted must not be torn down — but it used to reach the caller as a
+		// bare Internal. Name the CONDITION and nothing else: the raw path and the
+		// OS error stay server-side (these messages are tenant-visible, which is why
+		// this service curates them by hand instead of registering them).
+		return status.Error(codes.FailedPrecondition, "the volume's backing file is missing, so a final snapshot cannot be taken")
 	default:
 		// Log the real error server-side before curating a leak-free code for the
 		// caller — an unmapped failure (e.g. a fleet-side Pause/boot/volume error)
