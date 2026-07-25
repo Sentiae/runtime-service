@@ -3,3 +3,4 @@
 /guest-agent
 /bin/
 .build/
+/image-init
