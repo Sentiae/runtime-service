@@ -90,6 +90,7 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 		ResourcesVCPU:   2,
 		ResourcesMemMB:  1024,
 		RestartPolicy:   domain.RestartPolicyAlways,
+		SecretRefs:      []string{"secret/data/pg#password"}, // fleet_apps.secret_refs is NOT NULL
 		LastActiveAt:    now,
 		CreatedAt:       now,
 		UpdatedAt:       now,

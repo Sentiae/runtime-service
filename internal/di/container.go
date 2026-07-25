@@ -789,7 +789,8 @@ func (c *Container) initNetworkFabric(cfg *config.Config) {
 // AutoCreate:false → decrypt fails closed, I29). It returns nil (never crashes)
 // when Vault is unconfigured or unreachable at boot: a secret-less app still
 // boots, and a secret-bearing app then fails closed at resolve time. The built
-// VaultClient is retained on the container so Close stops its lease renewer.
+// VaultClient is retained on the container so Close stops its lease renewer, and
+// the resolver rides that same primary client's transport (see below).
 func (c *Container) buildSecretResolver() secret.Resolver {
 	if os.Getenv("VAULT_ADDR") == "" || os.Getenv("VAULT_AUTH_MODE") == "" {
 		log.Println("Fleet secret resolver: VAULT_ADDR/VAULT_AUTH_MODE unset — resident secret_refs will fail closed")
@@ -818,7 +819,16 @@ func (c *Container) buildSecretResolver() secret.Resolver {
 		vaulttoken.New(vc.Raw()),
 		0, // default renewal cadence (30m; self-adjusts to the token's granted TTL)
 	)
-	return secret.NewHandedTokenEnvelopeResolver("secret", "transit-tenants")
+	// The resolver rides the PRIMARY client (vc) for address + transport only: its
+	// per-call Clone leaves CloneToken false, so no token comes with it and the
+	// handed per-deployment token still governs every read (the host stays a
+	// bearer, never a minter — D-089 above). What the transport buys is CA
+	// rotation: in svid mode vc's TLS verifies against the live X509Source on every
+	// handshake, whereas building a client from vault.DefaultConfig() snapshots
+	// VAULT_CACERT into an *x509.CertPool once at process start — and this resolver
+	// outlives the process's boot, so that snapshot went stale on every daily SPIRE
+	// CA rotation and no data-VM could boot until a restart.
+	return secret.NewHandedTokenEnvelopeResolverWithClient(vc.Raw(), "secret", "transit-tenants")
 }
 
 // activeReplicas returns replicas currently holding a /30 index + host port
@@ -1893,6 +1903,9 @@ func (c *Container) Close() error {
 	}
 
 	// runtime-fleet P3.4 — stop the Vault client's background lease renewer.
+	// ⚠ Must stay AFTER the provision/restore waits above: the secret resolver now
+	// shares this client's transport, so closing it also kills the X509Source that
+	// verifies in-flight secret resolves — not only the lease renewer.
 	if c.vaultClient != nil {
 		_ = c.vaultClient.Close()
 	}
