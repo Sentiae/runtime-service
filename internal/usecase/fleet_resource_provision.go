@@ -68,6 +68,16 @@ type FleetResourceProvisioner struct {
 	replicas    repository.ReplicaRepository
 	snapshotter VolumeSnapshotter
 	engine      DedicatedEngineConfig
+
+	// pgReady decides whether the provisioned engine ADMITS clients, over and
+	// above the app health probe's process-alive + TCP-dial (see engineAdmits). A
+	// field rather than a direct call so tests drive both verdicts without a live
+	// engine; production is always probePostgresReady. The dedicated tier is
+	// postgres only (see ProvisionDedicated's class gate), so the engine-specific
+	// probe is exact here in a way it would not be on the general replica health
+	// path. Same seam shape as FleetVolumeRestorer.pgReady on purpose — the two
+	// readiness gates must never drift.
+	pgReady func(ctx context.Context, host string, port int) error
 }
 
 // NewFleetResourceProvisioner constructs the use case.
@@ -84,6 +94,7 @@ func NewFleetResourceProvisioner(
 		replicas:    replicas,
 		snapshotter: snapshotter,
 		engine:      engine,
+		pgReady:     probePostgresReady,
 	}
 }
 
@@ -143,6 +154,12 @@ const (
 	// conditionHealthUnavailable — the health of the backing app could not be
 	// read at all (a store or transport fault). It says nothing about the data.
 	conditionHealthUnavailable = "health-unavailable"
+	// conditionEngineNotAdmitting — the backing VM is alive and listening, but the
+	// engine refuses (or cannot be proven to accept) a client connection. This is
+	// the false-green case: process-alive + TCP-dial pass while every customer
+	// connection is rejected (#p19-restore-false-green-health). The refusal detail
+	// — SQLSTATE and message — is operator-facing and goes to the log, never here.
+	conditionEngineNotAdmitting = "engine-not-admitting"
 )
 
 // healthCondition classifies a failed health probe into a condition token. The
@@ -355,22 +372,46 @@ func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uui
 			logger.FromContext(ctx).Warn("fleet resource: health probe failed, reporting it as a condition",
 				"resource_id", res.ID, "app_id", res.AppID, "err", herr)
 		}
+		// One replica listing answers both questions below — whether the engine
+		// admits a client, and what the private endpoint is — so it is read once
+		// here rather than by each of them.
+		reps, reperr := uc.replicas.ListByApp(ctx, *res.AppID)
+		if reperr != nil {
+			logger.FromContext(ctx).Warn("fleet resource: list replicas", "resource_id", res.ID, "app_id", res.AppID, "err", reperr)
+		}
 		// D-184 — a restore owns the phase while it runs. Auto-advancing to ready
 		// here would race the restore's own verification window: the OLD engine can
 		// still be healthy the instant before the restore drains it, and the
 		// restored one is not proven until the restore says so.
 		if herr == nil && h.Healthy && res.Phase != domain.FleetResourcePhaseRestoring {
-			status.Phase = string(domain.FleetResourcePhaseReady)
-			// Keep the durable row honest: advance provisioning → ready once observed.
-			if res.Phase != domain.FleetResourcePhaseReady {
-				if uerr := uc.resources.UpdateResourcePhase(ctx, res.ID, domain.FleetResourcePhaseReady); uerr != nil {
-					logger.FromContext(ctx).Warn("fleet resource: persist ready phase", "resource_id", res.ID, "err", uerr)
+			// Probed only here, never above: admission is a live network round trip,
+			// and its verdict is unused unless the app is already healthy and not
+			// mid-restore. Reading it eagerly would put a dial on the path of every
+			// status read of an app that is already known to be down.
+			aerr := uc.engineAdmits(ctx, *res.AppID, reps, reperr)
+			if aerr == nil {
+				status.Phase = string(domain.FleetResourcePhaseReady)
+				// Keep the durable row honest: advance provisioning → ready once observed.
+				if res.Phase != domain.FleetResourcePhaseReady {
+					if uerr := uc.resources.UpdateResourcePhase(ctx, res.ID, domain.FleetResourcePhaseReady); uerr != nil {
+						logger.FromContext(ctx).Warn("fleet resource: persist ready phase", "resource_id", res.ID, "err", uerr)
+					}
 				}
+			} else {
+				// Alive but refusing clients: the resource EXISTS and is impaired, which
+				// is exactly what degraded means. Reported, never persisted — a stored
+				// ready is left alone here. What a demotion should mean durably (and
+				// what would then reconcile it back) is a separate decision; until it is
+				// made, this call only tells the truth about the observation it just
+				// took, and never rewrites the row on a probe that could itself be the
+				// thing that is wrong.
+				status.Phase = string(domain.FleetResourcePhaseDegraded)
+				status.Conditions = append(status.Conditions, conditionEngineNotAdmitting)
+				logger.FromContext(ctx).Warn("fleet resource: backing app is healthy but the engine does not admit clients",
+					"resource_id", res.ID, "app_id", res.AppID, "err", aerr)
 			}
 		}
-		if ep, eerr := uc.residentEndpoint(ctx, *res.AppID); eerr != nil {
-			logger.FromContext(ctx).Warn("fleet resource: resolve endpoint", "resource_id", res.ID, "err", eerr)
-		} else if ep != "" {
+		if ep := residentEndpointOf(reps); ep != "" {
 			status.Endpoint = ep
 		}
 	}
@@ -391,19 +432,59 @@ func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uui
 	return status, nil
 }
 
-// residentEndpoint returns the private "guest-ip:5432" of the app's resident
-// replica (same scheme as fleet_replica_runtime), or "" when none is resident.
-func (uc *FleetResourceProvisioner) residentEndpoint(ctx context.Context, appID uuid.UUID) (string, error) {
-	replicas, err := uc.replicas.ListByApp(ctx, appID)
-	if err != nil {
-		return "", err
+// engineAdmits checks that every resident replica of the app lets a client
+// through pg_hba to authentication, using the credential-free probe. It takes
+// the already-read replica listing (and the error that produced it) so StatusOf
+// reads the store once.
+//
+// This is READINESS, and it is deliberately NOT folded into the app health probe
+// that drives it (FleetReplicaRuntime.RefreshHealth stays process-alive + TCP
+// dial). That probe is LIVENESS: the reconciler restarts what it calls unhealthy,
+// so teaching it about pg_hba would turn a broken-but-alive engine into a restart
+// crashloop that destroys the very state an operator needs to repair. Liveness
+// decides whether to restart; readiness decides what the customer is told.
+//
+// Fail-closed throughout, matching FleetVolumeRestorer.engineAdmits: no probe
+// wired, a repository error, a replica listed as resident with no guest address,
+// and an app with no resident replica at all are ALL failures, because each of
+// them means the engine cannot be PROVEN usable — and an unprovable engine must
+// never be reported as ready over customer data.
+func (uc *FleetResourceProvisioner) engineAdmits(ctx context.Context, appID uuid.UUID, reps []domain.Replica, listErr error) error {
+	if uc.pgReady == nil {
+		return fmt.Errorf("no readiness probe is wired, so the engine of app %s cannot be confirmed usable", appID)
 	}
+	if listErr != nil {
+		return fmt.Errorf("list replicas of app %s: %w", appID, listErr)
+	}
+	probed := 0
+	for i := range reps {
+		r := &reps[i]
+		if r.State != domain.ReplicaStateResident {
+			continue
+		}
+		if r.GuestIP == "" || r.Port <= 0 {
+			return fmt.Errorf("replica %s is resident but carries no guest address to probe", r.ID)
+		}
+		if perr := uc.pgReady(ctx, r.GuestIP, r.Port); perr != nil {
+			return fmt.Errorf("replica %s: %w", r.ID, perr)
+		}
+		probed++
+	}
+	if probed == 0 {
+		return fmt.Errorf("app %s has no resident replica to probe", appID)
+	}
+	return nil
+}
+
+// residentEndpointOf returns the private "guest-ip:5432" of the first resident
+// replica (same scheme as fleet_replica_runtime), or "" when none is resident.
+func residentEndpointOf(replicas []domain.Replica) string {
 	for i := range replicas {
 		if replicas[i].State == domain.ReplicaStateResident && replicas[i].GuestIP != "" {
-			return fmt.Sprintf("%s:%d", replicas[i].GuestIP, residentPGPort), nil
+			return fmt.Sprintf("%s:%d", replicas[i].GuestIP, residentPGPort)
 		}
 	}
-	return "", nil
+	return ""
 }
 
 // DecommissionDedicated tears down a dedicated resource. A durable tier is torn

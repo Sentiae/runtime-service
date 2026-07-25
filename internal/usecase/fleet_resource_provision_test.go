@@ -263,6 +263,9 @@ func (f *fakeSnapshotter) SnapshotAppVolumes(_ context.Context, resourceID, appI
 type fakeResourceReplicaRepo struct {
 	byApp map[uuid.UUID][]domain.Replica
 	byID  map[uuid.UUID]*domain.Replica
+	// listErr makes ListByApp fail, which a readiness gate must treat as "cannot
+	// be proven usable" rather than as "nothing to probe".
+	listErr error
 }
 
 func newFakeResourceReplicaRepo() *fakeResourceReplicaRepo {
@@ -286,6 +289,9 @@ func (f *fakeResourceReplicaRepo) FindByID(_ context.Context, id uuid.UUID) (*do
 	return nil, domain.ErrReplicaNotFound
 }
 func (f *fakeResourceReplicaRepo) ListByApp(_ context.Context, appID uuid.UUID) ([]domain.Replica, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return f.byApp[appID], nil
 }
 func (f *fakeResourceReplicaRepo) ListByHost(context.Context, uuid.UUID) ([]domain.Replica, error) {
@@ -581,9 +587,10 @@ func TestStatusOf_HealthyBecomesReady(t *testing.T) {
 	prov := &fakeFleetProvisioner{healthOut: FleetHealthOutput{Healthy: true}}
 	appID := uuid.New()
 	replicas := newFakeResourceReplicaRepo()
-	guestReplica := domain.Replica{ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident, GuestIP: "10.0.0.9"}
+	guestReplica := domain.Replica{ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident, GuestIP: "10.0.0.9", Port: residentPGPort}
 	replicas.byApp[appID] = []domain.Replica{guestReplica}
 	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine())
+	uc.pgReady = func(context.Context, string, int) error { return nil }
 
 	rid := uuid.New()
 	repo.seed(&domain.FleetResource{
@@ -620,6 +627,7 @@ func TestStatusOf_DoesNotAdvanceWhileRestoring(t *testing.T) {
 	appID := uuid.New()
 	replicas := newFakeResourceReplicaRepo()
 	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine())
+	uc.pgReady = func(context.Context, string, int) error { return nil }
 
 	rid := uuid.New()
 	repo.seed(&domain.FleetResource{
@@ -699,6 +707,136 @@ func TestStatusOf_UnreadableHealthIsAConditionNotAnError(t *testing.T) {
 			stored, _ := repo.GetResourceByHandle(context.Background(), rid)
 			if stored.Phase != domain.FleetResourcePhaseProvisioning {
 				t.Errorf("stored phase = %q, want it untouched", stored.Phase)
+			}
+		})
+	}
+}
+
+// #p19-restore-false-green-health — process-alive + a TCP dial is NOT readiness.
+// A Postgres whose pg_hba.conf came back torn passes both while refusing every
+// client, so `ready` (reported AND persisted) additionally requires a resident
+// replica to ADMIT a connection. Every way of NOT being able to prove that is a
+// refusal, because the alternative is a false green over customer data.
+func TestStatusOf_ReadyRequiresTheEngineToAdmitClients(t *testing.T) {
+	admits := func(context.Context, string, int) error { return nil }
+	refuses := func(context.Context, string, int) error {
+		return errors.New(`postgres at 10.0.0.9:5432 refused the connection before authentication: FATAL: SQLSTATE 28000: no pg_hba.conf entry for host "10.0.0.1"`)
+	}
+	appID := uuid.New()
+	resident := []domain.Replica{{
+		ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident,
+		GuestIP: "10.0.0.9", Port: residentPGPort,
+	}}
+	addressless := []domain.Replica{{
+		ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident,
+	}}
+	paused := []domain.Replica{{
+		ID: uuid.New(), AppID: appID, State: domain.ReplicaStatePaused,
+		GuestIP: "10.0.0.9", Port: residentPGPort,
+	}}
+
+	tests := []struct {
+		name           string
+		stored         domain.FleetResourcePhase
+		replicas       []domain.Replica
+		listErr        error
+		probe          func(context.Context, string, int) error
+		noProbe        bool
+		wantPhase      domain.FleetResourcePhase
+		wantConditions []string
+		wantStored     domain.FleetResourcePhase
+	}{
+		{
+			name: "engine admits: promoted and persisted", stored: domain.FleetResourcePhaseProvisioning,
+			replicas: resident, probe: admits,
+			wantPhase: domain.FleetResourcePhaseReady, wantStored: domain.FleetResourcePhaseReady,
+		},
+		{
+			name: "engine refuses: degraded and ready is never persisted", stored: domain.FleetResourcePhaseProvisioning,
+			replicas: resident, probe: refuses,
+			wantPhase: domain.FleetResourcePhaseDegraded, wantConditions: []string{conditionEngineNotAdmitting},
+			wantStored: domain.FleetResourcePhaseProvisioning,
+		},
+		{
+			name: "already ready and now refusing: reported degraded, phase NOT demoted", stored: domain.FleetResourcePhaseReady,
+			replicas: resident, probe: refuses,
+			wantPhase: domain.FleetResourcePhaseDegraded, wantConditions: []string{conditionEngineNotAdmitting},
+			wantStored: domain.FleetResourcePhaseReady,
+		},
+		{
+			name: "no probe wired: cannot be proven, so not promoted", stored: domain.FleetResourcePhaseProvisioning,
+			replicas: resident, noProbe: true,
+			wantPhase: domain.FleetResourcePhaseDegraded, wantConditions: []string{conditionEngineNotAdmitting},
+			wantStored: domain.FleetResourcePhaseProvisioning,
+		},
+		{
+			name: "no resident replica to probe: not promoted", stored: domain.FleetResourcePhaseProvisioning,
+			replicas: paused, probe: admits,
+			wantPhase: domain.FleetResourcePhaseDegraded, wantConditions: []string{conditionEngineNotAdmitting},
+			wantStored: domain.FleetResourcePhaseProvisioning,
+		},
+		{
+			name: "resident replica with no guest address: not promoted", stored: domain.FleetResourcePhaseProvisioning,
+			replicas: addressless, probe: admits,
+			wantPhase: domain.FleetResourcePhaseDegraded, wantConditions: []string{conditionEngineNotAdmitting},
+			wantStored: domain.FleetResourcePhaseProvisioning,
+		},
+		{
+			name: "replica listing fails: not promoted", stored: domain.FleetResourcePhaseProvisioning,
+			replicas: resident, listErr: errors.New("fake: replica store down"), probe: admits,
+			wantPhase: domain.FleetResourcePhaseDegraded, wantConditions: []string{conditionEngineNotAdmitting},
+			wantStored: domain.FleetResourcePhaseProvisioning,
+		},
+		{
+			// D-184 — a restore owns the phase while it runs; the probe verdict, either
+			// way, must not touch it.
+			name: "restoring: untouched regardless of the probe", stored: domain.FleetResourcePhaseRestoring,
+			replicas: resident, probe: refuses,
+			wantPhase: domain.FleetResourcePhaseRestoring, wantStored: domain.FleetResourcePhaseRestoring,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newFakeResourceRepo()
+			prov := &fakeFleetProvisioner{healthOut: FleetHealthOutput{Healthy: true}}
+			replicas := newFakeResourceReplicaRepo()
+			replicas.byApp[appID] = tt.replicas
+			replicas.listErr = tt.listErr
+			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine())
+			if tt.noProbe {
+				uc.pgReady = nil
+			} else {
+				uc.pgReady = tt.probe
+			}
+
+			rid := uuid.New()
+			repo.seed(&domain.FleetResource{
+				ID: rid, OwnerOrg: uuid.New(), ClaimKey: "c", Env: "prod",
+				Tier: "dedicated", Phase: tt.stored, AppID: &appID,
+			})
+
+			st, err := uc.StatusOf(context.Background(), rid)
+			if err != nil {
+				t.Fatalf("status: %v", err)
+			}
+			if st.Phase != string(tt.wantPhase) {
+				t.Errorf("reported phase = %q, want %q", st.Phase, tt.wantPhase)
+			}
+			if len(st.Conditions) != len(tt.wantConditions) {
+				t.Fatalf("conditions = %v, want %v", st.Conditions, tt.wantConditions)
+			}
+			for i, want := range tt.wantConditions {
+				if st.Conditions[i] != want {
+					t.Errorf("condition[%d] = %q, want %q", i, st.Conditions[i], want)
+				}
+			}
+			stored, gerr := repo.GetResourceByHandle(context.Background(), rid)
+			if gerr != nil {
+				t.Fatalf("reload resource: %v", gerr)
+			}
+			if stored.Phase != tt.wantStored {
+				t.Errorf("stored phase = %q, want %q", stored.Phase, tt.wantStored)
 			}
 		})
 	}
