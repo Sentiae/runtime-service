@@ -948,14 +948,18 @@ func TestProvisionApp_SameComponentEnvDifferentOrgs_GetsSeparateApps(t *testing.
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// The ingress-wired sibling of the test above. The org-separation test runs with
-// uc.routes nil, so ensureRoute returns early and the ROUTE path — where the
-// derived host is the shared key — is never exercised, while production wires
-// ingress unconditionally (internal/di/container.go). Two orgs claiming the same
-// resource claim key must get two distinct hosts and two route rows.
+// The ingress-wired sibling of the test above (the org-separation test runs with
+// uc.routes nil, while production wires ingress unconditionally —
+// internal/di/container.go). A data-resource claim must get NO ingress route at
+// all: Postgres is reached at L4, and a route would publish a hostname + gateway
+// certificate for a customer's database, with <guest-ip>:5432 as the HTTP upstream
+// (where the engine rejects the HTTP bytes) — and that hostname is the very key the
+// unauthenticated wake path resolves apps by. The org-namespacing of the derived
+// host is still asserted, since it is what keeps two orgs' claims apart everywhere
+// that host is used.
 // ─────────────────────────────────────────────────────────────────────
 
-func TestProvisionApp_SameResourceClaimDifferentOrgs_GetsSeparateIngressHosts(t *testing.T) {
+func TestProvisionApp_ResourceClaim_GetsNoIngressRoute(t *testing.T) {
 	origAlive := processAlive
 	processAlive = func(int) bool { return true }
 	defer func() { processAlive = origAlive }()
@@ -964,10 +968,10 @@ func TestProvisionApp_SameResourceClaimDifferentOrgs_GetsSeparateIngressHosts(t 
 	routes := newOrchRouteRepo()
 	h.orch.SetIngress(routes, "fleet.sentiae.local", &fakeIngressSyncer{})
 
-	// The component id comes from the REAL dedicatedDescriptor, so this test also
-	// guards the org-namespacing that produces it. "postgres-main" is the plausible
-	// claim key whose derived label overflows 63 octets once the 36-char org uuid is
-	// inside the id — so the truncation path is exercised end to end too.
+	// The descriptor comes from the REAL dedicatedDescriptor, so this test cannot
+	// drift from what P19 actually provisions. "postgres-main" is the plausible claim
+	// key whose derived label overflows 63 octets once the 36-char org uuid is inside
+	// the id — so the truncation path is exercised end to end too.
 	resources := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, testEngine())
 	provision := func(org string) (uuid.UUID, string) {
 		t.Helper()
@@ -975,11 +979,8 @@ func TestProvisionApp_SameResourceClaimDifferentOrgs_GetsSeparateIngressHosts(t 
 		claim.OwnerOrg = org
 		claim.ClaimKey = "postgres-main"
 		desc := resources.dedicatedDescriptor(claim)
-		handle, url, err := h.orch.ProvisionApp(context.Background(), FleetProvisionInput{
-			ComponentID: desc.ComponentID, Env: desc.Env, OwnerOrg: desc.OwnerOrg,
-			Registry: desc.Registry, Repository: desc.Repository, Digest: desc.Digest,
-			VCPU: 2, MemoryMB: 1024, Port: desc.Port,
-		})
+		desc.VCPU, desc.MemoryMB = 2, 1024
+		handle, url, err := h.orch.ProvisionApp(context.Background(), desc)
 		if err != nil {
 			t.Fatalf("ProvisionApp(%s): %v", org, err)
 		}
@@ -993,36 +994,107 @@ func TestProvisionApp_SameResourceClaimDifferentOrgs_GetsSeparateIngressHosts(t 
 	appA, urlA := provision(orgA)
 	appB, urlB := provision(orgB)
 
-	if urlA == urlB {
-		t.Fatalf("both orgs got ingress url %q — one org's traffic reaches the other's database", urlA)
+	// No route row for either claim.
+	for _, c := range []struct {
+		org   string
+		appID uuid.UUID
+	}{{orgA, appA}, {orgB, appB}} {
+		rs, err := routes.ListByApp(context.Background(), c.appID)
+		if err != nil {
+			t.Fatalf("list routes %s: %v", c.org, err)
+		}
+		if len(rs) != 0 {
+			t.Fatalf("%s: routes = %+v, want none — a database must not be published on the HTTP edge", c.org, rs)
+		}
+	}
+	// And no https URL is claimed for a host nothing serves. The caller reads the
+	// resource's endpoint from the replica state (residentEndpointOf), never here.
+	for _, u := range []string{urlA, urlB} {
+		if strings.HasPrefix(u, "https://") {
+			t.Fatalf("ProvisionApp url = %q, want no HTTP-edge url for a data resource", u)
+		}
 	}
 
-	rsA, err := routes.ListByApp(context.Background(), appA)
+	// The derived host stays org-namespaced (the cross-tenant guard) and DNS-valid,
+	// even though no route publishes it.
+	appRowA, err := h.apps.FindByID(context.Background(), appA)
 	if err != nil {
-		t.Fatalf("list routes A: %v", err)
+		t.Fatalf("load app A: %v", err)
 	}
-	rsB, err := routes.ListByApp(context.Background(), appB)
+	appRowB, err := h.apps.FindByID(context.Background(), appB)
 	if err != nil {
-		t.Fatalf("list routes B: %v", err)
+		t.Fatalf("load app B: %v", err)
 	}
-	if len(rsA) != 1 || len(rsB) != 1 {
-		t.Fatalf("routes = %d / %d, want 1 each", len(rsA), len(rsB))
+	hostA, hostB := h.orch.hostForApp(appRowA), h.orch.hostForApp(appRowB)
+	if hostA == hostB {
+		t.Fatalf("both orgs derive host %q — the cross-tenant defect", hostA)
 	}
-	if rsA[0].HostPattern == rsB[0].HostPattern {
-		t.Fatalf("both orgs routed host %q — the cross-tenant defect", rsA[0].HostPattern)
-	}
-	// Each url is the app's own route host, and each host is a valid DNS name.
-	for _, c := range []struct {
-		org, url string
-		route    domain.Route
-	}{{orgA, urlA, rsA[0]}, {orgB, urlB, rsB[0]}} {
-		if c.url != "https://"+c.route.HostPattern {
-			t.Fatalf("%s: url = %q, want https://%s", c.org, c.url, c.route.HostPattern)
-		}
-		label := strings.SplitN(c.route.HostPattern, ".", 2)[0]
+	for _, host := range []string{hostA, hostB} {
+		label := strings.SplitN(host, ".", 2)[0]
 		if len(label) > dnsLabelMaxLen {
-			t.Fatalf("%s: first label %q is %d octets, over the %d-octet DNS limit", c.org, label, len(label), dnsLabelMaxLen)
+			t.Fatalf("first label %q is %d octets, over the %d-octet DNS limit", label, len(label), dnsLabelMaxLen)
 		}
+	}
+}
+
+// A route is created for an ordinary HTTP workload and withheld from a
+// data-resource one, on each signal independently (declared resource class, and
+// the reserved in-guest data-engine port).
+func TestProvisionApp_IngressRouteOnlyForHTTPServedWorkloads(t *testing.T) {
+	origAlive := processAlive
+	processAlive = func(int) bool { return true }
+	defer func() { processAlive = origAlive }()
+
+	tests := []struct {
+		name      string
+		mutate    func(*FleetProvisionInput)
+		wantRoute bool
+	}{
+		{"ordinary http workload", func(*FleetProvisionInput) {}, true},
+		{"declared resource class", func(in *FleetProvisionInput) { in.ResourceClass = resourceClassPostgres }, false},
+		{"reserved data-engine port", func(in *FleetProvisionInput) { in.Port = residentPGPort }, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newOrchHarness(oneLiveHost())
+			routes := newOrchRouteRepo()
+			h.orch.SetIngress(routes, "fleet.sentiae.local", &fakeIngressSyncer{})
+
+			in := FleetProvisionInput{
+				ComponentID: "urlshortener", Env: "prod", OwnerOrg: orgA,
+				Registry: "reg", Repository: "org/app", Digest: "sha256:abc",
+				VCPU: 2, MemoryMB: 1024, Port: 8080,
+			}
+			tt.mutate(&in)
+
+			handle, url, err := h.orch.ProvisionApp(context.Background(), in)
+			if err != nil {
+				t.Fatalf("ProvisionApp: %v", err)
+			}
+			appID, perr := uuid.Parse(handle)
+			if perr != nil {
+				t.Fatalf("handle is not a uuid: %v", perr)
+			}
+			rs, err := routes.ListByApp(context.Background(), appID)
+			if err != nil {
+				t.Fatalf("list routes: %v", err)
+			}
+			if tt.wantRoute {
+				if len(rs) != 1 {
+					t.Fatalf("routes = %+v, want exactly one", rs)
+				}
+				if url != "https://"+rs[0].HostPattern {
+					t.Fatalf("url = %q, want https://%s", url, rs[0].HostPattern)
+				}
+				return
+			}
+			if len(rs) != 0 {
+				t.Fatalf("routes = %+v, want none", rs)
+			}
+			if strings.HasPrefix(url, "https://") {
+				t.Fatalf("url = %q, want no HTTP-edge url", url)
+			}
+		})
 	}
 }
 

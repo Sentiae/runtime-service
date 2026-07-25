@@ -86,6 +86,17 @@ var (
 	// rt#11) does not observe a healthy resident replica within its budget. It maps
 	// to a retryable 503 so the caller retries rather than the request being dropped.
 	ErrActivationTimeout = errors.New("fleet activation timed out")
+	// ErrAnonymousWakeRefused is returned when the scale-to-zero activator (rt#11)
+	// is asked to wake an app it cannot PROVE is a plain scale-to-zero HTTP
+	// workload. The wake path is reached without authentication — its only caller
+	// is the co-located gateway, and the app is selected by a caller-supplied
+	// hostname — so it may only ever boot the ONE class of workload for which
+	// "a request arrived" is the whole authority needed. Everything else
+	// (a data-engine app above all: booting one is a durability-relevant
+	// transition over customer data) belongs behind an authenticated seam. The
+	// refusal is PERMANENT, not retryable: the caller must be told no, not told
+	// to try again.
+	ErrAnonymousWakeRefused = errors.New("anonymous wake refused: app is not a plain scale-to-zero HTTP workload")
 	// ErrPauseUnsafeForResidentVM is returned when a resident (data-bearing) VM is
 	// handed to a component that can PAUSE it. Firecracker v1.16.0's vsock does not
 	// survive Pause/Resume (#fc-vsock-dies-on-pause-resume, proven live): after one

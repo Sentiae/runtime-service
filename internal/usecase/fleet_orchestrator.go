@@ -237,6 +237,27 @@ func stripScheme(endpoint string) string {
 	return endpoint
 }
 
+// httpServedWorkload reports whether this descriptor describes a workload the
+// fleet's HTTP edge can actually serve — the only kind that may be given an
+// ingress route.
+//
+// A dedicated data engine is not one. Giving it a route published a
+// platform-issued hostname for a customer's database, made the internal CA issue a
+// certificate for it, and handed the gateway a reverse-proxy upstream of
+// <guest-ip>:5432 — where Postgres rejects the HTTP bytes, so nothing ever worked
+// through it. It was pure attack surface, and that same hostname was the key the
+// unauthenticated wake path looked apps up by. Postgres is reached at L4 (db-gate),
+// never through the HTTP edge.
+//
+// Two independent signals, because either alone could be forgotten by a future
+// caller: the descriptor's declared resource class, and the reserved in-guest
+// data-engine port. Both fail toward "no route", which is the safe direction — an
+// app without a route still runs and is still reachable on its private endpoint,
+// while an unwanted route is a published hostname nobody asked for.
+func httpServedWorkload(in FleetProvisionInput) bool {
+	return in.ResourceClass == "" && in.Port != residentPGPort
+}
+
 // ensureRoute makes sure the app has exactly one ingress route (idempotent): if
 // none exists it creates the platform-host route at path "/". No-op when the
 // route repo is not wired.
@@ -469,9 +490,17 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 	}
 
 	// rt#8 — ensure the app's ingress route exists before the first placement so
-	// the next reconcile tick's SyncIngress publishes it. Idempotent.
-	if err := uc.ensureRoute(ctx, app); err != nil {
-		return "", "", err
+	// the next reconcile tick's SyncIngress publishes it. Idempotent. A data-resource
+	// app gets NO route (httpServedWorkload): the HTTP edge cannot serve it.
+	httpServed := httpServedWorkload(in)
+	if httpServed {
+		if err := uc.ensureRoute(ctx, app); err != nil {
+			return "", "", err
+		}
+	} else if uc.routes != nil {
+		logger.FromContext(ctx).Info("fleet ingress: no HTTP route for a data-resource app (reached at L4, never through the HTTP edge)",
+			"app_id", app.ID, "component_id", app.ComponentID, "env", app.Env,
+			"resource_class", in.ResourceClass, "port", in.Port)
 	}
 
 	if err := uc.ReconcileApp(ctx, app.ID); err != nil {
@@ -479,9 +508,10 @@ func (uc *FleetOrchestrator) ProvisionApp(ctx context.Context, in FleetProvision
 	}
 
 	// rt#8 — when ingress is wired the public URL is the stable Caddy-served host
-	// (https), independent of which replica is resident. Non-ingress builds fall
+	// (https), independent of which replica is resident. Non-ingress builds — and an
+	// app that has no ingress route because the HTTP edge cannot serve it — fall
 	// back to a resident replica's private endpoint (preserves the pre-rt#8 path).
-	if uc.routes != nil {
+	if uc.routes != nil && httpServed {
 		return app.ID.String(), "https://" + uc.hostForApp(app), nil
 	}
 

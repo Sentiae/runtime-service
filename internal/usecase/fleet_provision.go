@@ -259,6 +259,19 @@ type FleetProvisionInput struct {
 	// when pulling the image, else falls back to the shared service key (back-compat).
 	// It is NEVER written to the fleet_apps row, rootfs, runtime.json, or any log.
 	RegistryPullToken string
+	// ResourceClass names the P19 data-resource class this app IS (today only
+	// "postgres") when the descriptor comes from the resource control plane
+	// (fleet_resource_provision.go dedicatedDescriptor). Empty means an ordinary
+	// application workload.
+	//
+	// It is INTERNAL by construction: no proto field feeds it, so the P7 descriptor
+	// delivery sends can neither set nor clear it. It exists because a data engine
+	// must not be given an HTTP ingress route — Postgres speaks a different protocol
+	// on the wire, so the route would only publish a public hostname, a gateway
+	// certificate and a wake key for a customer's database that could never serve a
+	// single request through it. It is not persisted: it is consulted at provision,
+	// which is the only moment a route is created.
+	ResourceClass string
 }
 
 // FleetProvisionOutput is the provision result.

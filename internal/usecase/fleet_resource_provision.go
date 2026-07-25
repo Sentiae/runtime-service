@@ -302,6 +302,9 @@ func (uc *FleetResourceProvisioner) dedicatedDescriptor(in ProvisionDedicatedInp
 		Digest:        uc.engine.Digest,
 		Port:          residentPGPort,
 		WorkloadClass: string(domain.ImageWorkloadClassResident),
+		// Declares this app as a data resource, which is what keeps it off the HTTP
+		// edge (no ingress route — Postgres is reached at L4, never through Caddy).
+		ResourceClass: resourceClassPostgres,
 		SecretRefs:    in.SecretRefs,
 		VaultToken:    in.VaultToken,
 		SystemID:      in.SystemID,
