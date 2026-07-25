@@ -80,13 +80,17 @@ func main() {
 	}
 
 	// rt#9 — mount the persistent data volume (2nd virtio-blk /dev/vdb) at the
-	// descriptor's mount path before the workload starts. Best-effort: a failure
-	// is logged to the console (like the pseudo-FS mounts) and the workload still
-	// runs — its data would then be ephemeral rather than crashing the boot.
+	// descriptor's mount path before the workload starts. Fail-closed: an empty
+	// mount path still means "this workload has no volume" and is a no-op, but a
+	// path that is present and does NOT mount refuses to start the workload. A
+	// workload that was promised durable storage and silently gets the rootfs
+	// instead (discarded on the next boot) is worse than a boot failure: the boot
+	// failure is visible to the host and the operator, whereas the data loss is
+	// not — it surfaces only after the customer's writes are already gone.
 	if spec.DataMountPath != "" {
 		_ = os.MkdirAll(spec.DataMountPath, 0o755)
 		if err := syscall.Mount("/dev/vdb", spec.DataMountPath, "ext4", 0, ""); err != nil {
-			fmt.Fprintf(os.Stderr, "image-init: mount data volume /dev/vdb at %s: %v\n", spec.DataMountPath, err)
+			failDataMount(fmt.Sprintf("mount data volume /dev/vdb at %s: %v", spec.DataMountPath, err))
 		}
 	}
 
@@ -340,6 +344,23 @@ func applyEnv(cmd *exec.Cmd, spec *runtimeSpec) {
 	if spec.WorkDir != "" {
 		cmd.Dir = spec.WorkDir
 	}
+}
+
+// failDataMount records a fail-closed data-volume error and powers off. It does
+// not return (syncAndPowerOff halts the VM). The message goes to the console as
+// well as /sentiae/out so it is legible both to an operator watching the serial
+// log and to the host retrieving the output after the VM is gone; both must read
+// as a deliberate refusal rather than a crash.
+func failDataMount(msg string) {
+	full := "image-init: " + msg + "\n" +
+		"image-init: workload NOT started — its persistent data volume did not mount, " +
+		"so anything it wrote would have landed on the ephemeral rootfs and been lost at the next boot. " +
+		"This is a deliberate refusal to run, not a crash.\n"
+	fmt.Fprint(os.Stderr, full)
+	_ = os.MkdirAll(outDir, 0o755)
+	_ = os.WriteFile(filepath.Join(outDir, "stderr.txt"), []byte(full), 0o644)
+	_ = os.WriteFile(filepath.Join(outDir, "exit_code.txt"), []byte(fmt.Sprintf("%d", exConfig)), 0o644)
+	syncAndPowerOff()
 }
 
 // syncAndPowerOff flushes disk buffers and halts the VM. RESTART maps to a
