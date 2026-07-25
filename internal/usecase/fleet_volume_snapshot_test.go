@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,7 +28,7 @@ import (
 
 // recorder collects the snapshotter's externally visible steps in order. It is
 // mutex-guarded because the dead-man heartbeat records from its own goroutine
-// while the copy records from the caller's.
+// while the upload records from the caller's.
 type recorder struct {
 	mu     sync.Mutex
 	events []string
@@ -56,8 +57,8 @@ func (r *recorder) count(event string) int {
 }
 
 // fakeGuestControl records every control op in order and can fail any of them.
-// Ordering is the point: a snapshot whose freeze lands AFTER the copy is exactly
-// the torn-snapshot defect this slice closes.
+// Ordering is the point: a snapshot whose freeze lands AFTER the upload is
+// exactly the torn-snapshot defect this slice closes.
 type fakeGuestControl struct {
 	rec *recorder
 
@@ -65,7 +66,7 @@ type fakeGuestControl struct {
 	syncErr   error
 	freezeErr error
 	// renewErr fails the dead-man heartbeat that holds the freeze open while the
-	// copy runs, never the initial quiesce.
+	// upload runs, never the initial quiesce.
 	renewErr error
 	thawErr  error
 	// thawBlocks makes Thaw hang until its context ends, modelling the real
@@ -138,6 +139,14 @@ type fakeArtifactStore struct {
 	puts      []string
 	putErr    error
 	shortRead bool
+	// readDelay slows every read of the incoming stream. The upload now runs
+	// INSIDE the freeze, so a slow store is how the tests make the frozen window
+	// long enough for the dead-man heartbeat to be observable.
+	readDelay time.Duration
+	// onPut runs when the store is handed the stream, before it consumes any of
+	// it — the hook a test uses to interfere mid-upload (e.g. cancel the caller's
+	// context) now that there is no staging copy to interfere with instead.
+	onPut func()
 	// bodies keeps the bytes AS STORED, so tests can assert the transfer size,
 	// the checksum, and feed a stored blob straight back into the restore path.
 	bodies map[string][]byte
@@ -146,28 +155,56 @@ type fakeArtifactStore struct {
 func (f *fakeArtifactStore) Put(digest string, r io.Reader) error {
 	f.rec.add("upload")
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.putErr != nil {
-		return f.putErr
+	putErr, short, delay, hook := f.putErr, f.shortRead, f.readDelay, f.onPut
+	f.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+	if putErr != nil {
+		return putErr
 	}
 	var body []byte
-	if f.shortRead {
+	if short {
 		// Consume only the first byte — models a store that did not take the whole
 		// blob, which must NOT yield a checksum of the full file.
 		_, _ = io.CopyN(io.Discard, r, 1)
 	} else {
 		var buf bytes.Buffer
-		if _, err := io.Copy(&buf, r); err != nil {
+		if _, err := io.Copy(&buf, &slowReader{r: r, delay: delay}); err != nil {
 			return err
 		}
 		body = buf.Bytes()
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.bodies == nil {
 		f.bodies = map[string][]byte{}
 	}
 	f.bodies[digest] = body
 	f.puts = append(f.puts, digest)
 	return nil
+}
+
+// slowReader paces a read loop so a test can hold the upload — and therefore the
+// freeze — open for a controlled span.
+type slowReader struct {
+	r     io.Reader
+	delay time.Duration
+}
+
+func (s *slowReader) Read(p []byte) (int, error) {
+	if s.delay > 0 {
+		time.Sleep(s.delay)
+	}
+	return s.r.Read(p)
+}
+
+// putCount reports how many uploads the store COMPLETED.
+func (f *fakeArtifactStore) putCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.puts)
 }
 
 func (f *fakeArtifactStore) stored(digest string) []byte {
@@ -216,9 +253,17 @@ type snapHarness struct {
 	vols     *fakeVolumeRepo
 	recovery *fakeResourceRepo
 	replicas *fakeResourceReplicaRepo
+	// backing is the volume's real on-disk file. It IS the upload source now — no
+	// staging copy stands between it and the store — so a test that wants
+	// particular snapshot bytes writes them here.
+	backing string
 }
 
-// newSnapshotHarness builds a snapshotter with fakes and a recording copyFile.
+// volumeBytes is the backing-file content the snapshot tests expect to see land
+// in the store.
+const volumeBytes = "ext4-bytes"
+
+// newSnapshotHarness builds a snapshotter with fakes behind it.
 func newSnapshotHarness(t *testing.T) *snapHarness {
 	t.Helper()
 	rec := &recorder{}
@@ -231,10 +276,6 @@ func newSnapshotHarness(t *testing.T) *snapHarness {
 		replicas: newFakeResourceReplicaRepo(),
 	}
 	h.s = NewFleetVolumeSnapshotter(h.guest, h.store, h.vols, h.replicas, h.recovery)
-	h.s.copyFile = func(_ context.Context, _, dst string) error {
-		rec.add("copy")
-		return os.WriteFile(dst, []byte("ext4-bytes"), 0o600)
-	}
 	// Keep the thaw retry loop reachable without burning the real 10s deadline,
 	// and park the heartbeat far out so only the tests that exercise it see one.
 	h.s.thawDeadline = 60 * time.Millisecond
@@ -245,18 +286,61 @@ func newSnapshotHarness(t *testing.T) *snapHarness {
 }
 
 // attachedVolume seeds one app with a single backing file attached to a replica
-// and returns the ids the tests assert on.
+// and returns the ids the tests assert on. dir is a REAL directory: the tests
+// assert on what the snapshot does and does not create next to the volume.
 func (h *snapHarness) attachedVolume(t *testing.T) (appID, resID, volID, replicaID uuid.UUID, dir string) {
 	t.Helper()
 	dir = t.TempDir()
-	backing := filepath.Join(dir, "vol.ext4")
-	if err := os.WriteFile(backing, []byte("data"), 0o600); err != nil {
+	h.backing = filepath.Join(dir, "vol.ext4")
+	if err := os.WriteFile(h.backing, []byte(volumeBytes), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	appID, resID, volID, replicaID = uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	h.replicas.byID[replicaID] = &domain.Replica{ID: replicaID, SocketPath: "/tmp/x.sock"}
-	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: appID, BackingPath: backing, AttachedReplica: &replicaID}}
+	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: appID, BackingPath: h.backing, AttachedReplica: &replicaID}}
 	return appID, resID, volID, replicaID, dir
+}
+
+// writeBacking replaces the volume's content.
+func (h *snapHarness) writeBacking(t *testing.T, b []byte) {
+	t.Helper()
+	if err := os.WriteFile(h.backing, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// bigBacking fills the volume with n bytes of INCOMPRESSIBLE data so the upload
+// is a genuine multi-write stream: that is what lets a test observe (and
+// interrupt) an upload while it is in flight.
+func (h *snapHarness) bigBacking(t *testing.T, n int) {
+	t.Helper()
+	buf := make([]byte, n)
+	r := rand.New(rand.NewSource(1))
+	if _, err := r.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	h.writeBacking(t, buf)
+}
+
+// assertNoLocalStaging is the whole point of the change: the snapshot must not
+// materialize a second copy of the volume next to it. A host with less free space
+// than the volume's size could not snapshot — and, since a durable resource
+// refuses decommission without a final snapshot, could not free the space by
+// deleting the resource either.
+func assertNoLocalStaging(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read volume dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".snap.tmp") {
+			t.Fatalf("snapshot staged a local copy %q — the upload must stream the backing file itself", e.Name())
+		}
+	}
+	if len(entries) != 1 {
+		t.Fatalf("volume dir holds %d entries, want only the backing file: %v", len(entries), entries)
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -264,16 +348,17 @@ func (h *snapHarness) attachedVolume(t *testing.T) (appID, resID, volID, replica
 // ─────────────────────────────────────────────────────────────────────
 
 // The ORDER is the contract, not the presence of the calls: the guest has to be
-// flushed and frozen BEFORE the copy, and the thaw issued only after it. A test
-// that merely counted the calls would still pass on the torn-snapshot behaviour
-// this closes.
+// flushed and frozen BEFORE the volume is read, and the thaw issued only AFTER
+// the upload — the freeze is what makes streaming the live backing file safe, so
+// it must cover the whole transfer. A test that merely counted the calls would
+// still pass on the torn-snapshot behaviour this closes.
 //
 // It also pins the ABSENCE of a VMM pause/resume. Firecracker v1.16.0's vsock
 // device does not survive Pause/Resume — the guest control channel is dead for
 // the rest of the VM's life after the first pause — so reintroducing the pause
 // (which looks like an obvious safety measure) breaks every subsequent snapshot
 // of that VM. This is the assertion that catches it.
-func TestSnapshot_AttachedQuiesceCopyThawOrder(t *testing.T) {
+func TestSnapshot_AttachedQuiesceUploadThawOrder(t *testing.T) {
 	h := newSnapshotHarness(t)
 	appID, resID, volID, _, dir := h.attachedVolume(t)
 
@@ -282,7 +367,7 @@ func TestSnapshot_AttachedQuiesceCopyThawOrder(t *testing.T) {
 		t.Fatalf("snapshot: %v", err)
 	}
 	events := h.rec.all()
-	want := []string{"syncfs", "freeze", "copy", "thaw", "upload"}
+	want := []string{"syncfs", "freeze", "upload", "thaw"}
 	if !sameOrder(events, want) {
 		t.Fatalf("order = %v, want %v", events, want)
 	}
@@ -306,83 +391,75 @@ func TestSnapshot_AttachedQuiesceCopyThawOrder(t *testing.T) {
 	if len(rps) != 1 || rps[0].Kind != "snapshot" || rps[0].Verified {
 		t.Errorf("recovery point = %+v", rps)
 	}
-	if rps[0].SizeBytes != int64(len("ext4-bytes")) {
-		t.Errorf("size = %d, want %d", rps[0].SizeBytes, len("ext4-bytes"))
+	if rps[0].SizeBytes != int64(len(volumeBytes)) {
+		t.Errorf("size = %d, want %d", rps[0].SizeBytes, len(volumeBytes))
 	}
 	// SnapshotRef written on the volume.
 	if got := h.vols.updated[volID].SnapshotRef; got != wantKey {
 		t.Errorf("volume SnapshotRef = %q, want %q", got, wantKey)
 	}
-	// Temp file cleaned up.
-	entries, _ := os.ReadDir(dir)
-	if len(entries) != 1 {
-		t.Errorf("temp file not cleaned: %d entries", len(entries))
-	}
+	// The upload streamed the backing file: nothing was staged beside it.
+	assertNoLocalStaging(t, dir)
 }
 
 // With the vCPUs running, the dead-man the guest armed at Freeze keeps counting
-// and would auto-thaw mid-copy on any volume big enough to take longer than the
-// window. The copy therefore RENEWs it on an interval; a copy that outlives the
-// interval must show those renews — and they must be renews, not repeat freezes:
-// FIFREEZE on an already-frozen filesystem returns EBUSY and re-arms nothing, so
-// a heartbeat built on Freeze fails exactly when it is load-bearing.
-func TestSnapshot_HeartbeatHoldsTheFreezeForALongCopy(t *testing.T) {
+// and would auto-thaw mid-transfer on any volume big enough to take longer than
+// the window — and the transfer is now the UPLOAD, which is the slow part. The
+// upload therefore RENEWs it on an interval; an upload that outlives the interval
+// must show those renews — and they must be renews, not repeat freezes: FIFREEZE
+// on an already-frozen filesystem returns EBUSY and re-arms nothing, so a
+// heartbeat built on Freeze fails exactly when it is load-bearing.
+func TestSnapshot_HeartbeatHoldsTheFreezeForALongUpload(t *testing.T) {
 	h := newSnapshotHarness(t)
-	appID, resID, _, _, _ := h.attachedVolume(t)
-	h.s.freezeHeartbeat = 10 * time.Millisecond
-	h.s.copyFile = func(ctx context.Context, _, dst string) error {
-		h.rec.add("copy")
-		select {
-		case <-time.After(80 * time.Millisecond):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		return os.WriteFile(dst, []byte("ext4-bytes"), 0o600)
-	}
+	appID, resID, _, _, dir := h.attachedVolume(t)
+	h.bigBacking(t, 512<<10)
+	h.s.freezeHeartbeat = 5 * time.Millisecond
+	h.store.readDelay = 10 * time.Millisecond
 
 	if _, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 	if got := h.guest.renewCount(); got < 2 {
-		t.Fatalf("renews = %d, want at least 2 heartbeats across the copy", got)
+		t.Fatalf("renews = %d, want at least 2 heartbeats across the upload", got)
 	}
 	if got := h.guest.freezeCount(); got != 1 {
 		t.Fatalf("freezes = %d, want exactly the initial quiesce — a heartbeat must never re-FREEZE (EBUSY)", got)
 	}
 	events := h.rec.all()
-	if !sameOrder(events[:3], []string{"syncfs", "freeze", "copy"}) {
-		t.Fatalf("events = %v, want it to start syncfs,freeze,copy", events)
+	if !sameOrder(events[:3], []string{"syncfs", "freeze", "upload"}) {
+		t.Fatalf("events = %v, want it to start syncfs,freeze,upload", events)
 	}
-	if !sameOrder(events[len(events)-2:], []string{"thaw", "upload"}) {
-		t.Fatalf("events = %v, want it to end thaw,upload", events)
+	if events[len(events)-1] != "thaw" {
+		t.Fatalf("events = %v, want the thaw last — the freeze must outlive the upload", events)
 	}
-	// Everything between the copy and the thaw is a heartbeat renew.
-	for _, e := range events[3 : len(events)-2] {
+	// Everything between the upload and the thaw is a heartbeat renew.
+	for _, e := range events[3 : len(events)-1] {
 		if e != "renew" {
-			t.Fatalf("events = %v, want only renew heartbeats between copy and thaw", events)
+			t.Fatalf("events = %v, want only renew heartbeats between the upload and the thaw", events)
 		}
 	}
+	assertNoLocalStaging(t, dir)
 }
 
 // A renew that fails means either the dead-man may fire at any moment or the
-// freeze is already gone, so the copy cannot be trusted: it is aborted and the
+// freeze is already gone, so the upload cannot be trusted: it is aborted and the
 // snapshot fails with no recovery point. "Continue and hope" would mint exactly
 // the torn recovery point this path exists to prevent. The guest's refusal when
 // no dead-man is armed (the freeze was lost) is the sharpest instance of it.
-func TestSnapshot_FailedHeartbeatAbortsTheSnapshot(t *testing.T) {
+//
+// The freeze now covers the whole upload, so this is the assertion that the
+// upload itself is interruptible: the source reads are context-bound, so a dead
+// heartbeat stops a transfer already in flight instead of letting it finish
+// against a filesystem that may have thawed underneath it.
+func TestSnapshot_FailedHeartbeatAbortsTheSnapshotMidUpload(t *testing.T) {
 	h := newSnapshotHarness(t)
-	appID, resID, volID, _, _ := h.attachedVolume(t)
+	appID, resID, volID, _, dir := h.attachedVolume(t)
+	// Big + slow: the upload is guaranteed to still be running when the first
+	// heartbeat fails.
+	h.bigBacking(t, 512<<10)
+	h.store.readDelay = 5 * time.Millisecond
 	h.s.freezeHeartbeat = 5 * time.Millisecond
 	h.guest.renewErr = errors.New("guest refused RENEW: guest control: no dead-man armed — the freeze is gone")
-	copyAborted := make(chan struct{})
-	h.s.copyFile = func(ctx context.Context, _, _ string) error {
-		h.rec.add("copy")
-		// Never completes on its own: the only way out is the heartbeat aborting it,
-		// which is the behaviour under test.
-		<-ctx.Done()
-		close(copyAborted)
-		return ctx.Err()
-	}
 
 	_, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
 	if err == nil {
@@ -391,14 +468,13 @@ func TestSnapshot_FailedHeartbeatAbortsTheSnapshot(t *testing.T) {
 	if !strings.Contains(err.Error(), "re-arm guest dead-man") {
 		t.Errorf("err = %v, want it to name the failed dead-man re-arm", err)
 	}
-	select {
-	case <-copyAborted:
-	default:
-		t.Error("the in-flight copy must be aborted, not left to finish")
+	if h.rec.count("upload") == 0 {
+		t.Fatal("the upload must have started — otherwise this proves nothing about aborting one in flight")
 	}
-	if len(h.store.puts) != 0 {
-		t.Errorf("uploads = %d, want 0", len(h.store.puts))
+	if got := h.store.putCount(); got != 0 {
+		t.Errorf("completed uploads = %d, want 0 — the in-flight upload must be aborted, not left to finish", got)
 	}
+	assertNoLocalStaging(t, dir)
 	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
 	if len(rps) != 0 {
 		t.Errorf("recovery points = %d, want 0 — a copy that may have raced the dead-man is not a recovery point", len(rps))
@@ -406,7 +482,7 @@ func TestSnapshot_FailedHeartbeatAbortsTheSnapshot(t *testing.T) {
 	if _, ok := h.vols.updated[volID]; ok {
 		t.Error("SnapshotRef must not be written when the heartbeat failed")
 	}
-	// The guest is still released: the freeze must not outlive the failed copy.
+	// The guest is still released: the freeze must not outlive the failed upload.
 	if h.guest.thawCount() == 0 {
 		t.Error("the guest must still be thawed after a heartbeat failure")
 	}
@@ -485,9 +561,9 @@ func TestSnapshot_RefusesWhenTheGuestCannotBeQuiesced(t *testing.T) {
 			if h.guest.thawCount() < tt.wantThawedGE {
 				t.Errorf("thaws = %d, want >= %d", h.guest.thawCount(), tt.wantThawedGE)
 			}
-			// Nothing is copied, uploaded or recorded.
-			if h.rec.count("copy") != 0 {
-				t.Errorf("copies = %d, want 0", h.rec.count("copy"))
+			// The volume is never read, uploaded or recorded.
+			if h.rec.count("upload") != 0 {
+				t.Errorf("upload attempts = %d, want 0", h.rec.count("upload"))
 			}
 			if len(h.store.puts) != 0 {
 				t.Errorf("uploads = %d, want 0", len(h.store.puts))
@@ -503,8 +579,9 @@ func TestSnapshot_RefusesWhenTheGuestCannotBeQuiesced(t *testing.T) {
 	}
 }
 
-// The copy is already consistent once the freeze held, so a thaw that will not
-// take must not fail the snapshot — and must NOT kill the replica either: the
+// The bytes are already in the store once the upload finished under the freeze,
+// so a thaw that will not take must not fail the snapshot — and must NOT kill
+// the replica either: the
 // guest's own dead-man auto-thaw releases the filesystem within its window,
 // while a kill would trade that bounded stall for a full database restart.
 func TestSnapshot_ThawFailureKeepsTheSnapshotAndDoesNotKillTheReplica(t *testing.T) {
@@ -530,18 +607,15 @@ func TestSnapshot_ThawFailureKeepsTheSnapshotAndDoesNotKillTheReplica(t *testing
 		t.Errorf("thaw attempts = %d, want the retries to have run (>=2)", h.guest.thawCount())
 	}
 	// The replica survives: the snapshotter has no kill path at all any more, so
-	// the recorded steps are exactly quiesce/copy/thaw/upload and the replica row
-	// is untouched.
+	// the recorded steps are exactly quiesce/upload/thaw-retries and the replica
+	// row is untouched.
 	events := h.rec.all()
-	if !sameOrder(events[:3], []string{"syncfs", "freeze", "copy"}) {
-		t.Fatalf("events = %v, want it to start syncfs,freeze,copy", events)
+	if !sameOrder(events[:3], []string{"syncfs", "freeze", "upload"}) {
+		t.Fatalf("events = %v, want it to start syncfs,freeze,upload", events)
 	}
-	if events[len(events)-1] != "upload" {
-		t.Fatalf("events = %v, want it to end with the upload", events)
-	}
-	for _, e := range events[3 : len(events)-1] {
+	for _, e := range events[3:] {
 		if e != "thaw" {
-			t.Fatalf("events = %v: only thaw retries may run between the copy and the upload (no replica kill)", events)
+			t.Fatalf("events = %v: only thaw retries may run after the upload (no replica kill)", events)
 		}
 	}
 	if _, err := h.replicas.FindByID(context.Background(), replicaID); err != nil {
@@ -589,27 +663,29 @@ func TestSnapshot_ThawRetriesReallyRetry(t *testing.T) {
 	}
 }
 
-func TestSnapshot_ThawsOnCopyFailure(t *testing.T) {
+// A source the host cannot even open fails the snapshot — but not before the
+// guest is released. The freeze is taken before the file is touched, so every
+// exit from the capture, including this earliest one, still thaws.
+func TestSnapshot_ThawsWhenTheBackingFileCannotBeRead(t *testing.T) {
 	h := newSnapshotHarness(t)
 	appID, resID, _, _, _ := h.attachedVolume(t)
-	h.s.copyFile = func(context.Context, string, string) error {
-		h.rec.add("copy")
-		return errors.New("disk full")
+	if err := os.Remove(h.backing); err != nil {
+		t.Fatal(err)
 	}
 
 	_, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
 	if err == nil {
-		t.Fatal("expected copy failure")
+		t.Fatal("expected the unreadable backing file to fail the snapshot")
 	}
 	if h.guest.thawCount() != 1 {
-		t.Errorf("guest must be thawed even on copy failure (thaws=%d)", h.guest.thawCount())
+		t.Errorf("guest must be thawed even when the source cannot be read (thaws=%d)", h.guest.thawCount())
 	}
 	if len(h.store.puts) != 0 {
-		t.Errorf("nothing must be uploaded on copy failure")
+		t.Errorf("nothing must be uploaded when the source cannot be read")
 	}
 	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
 	if len(rps) != 0 {
-		t.Errorf("no recovery point on copy failure")
+		t.Errorf("no recovery point when the source cannot be read")
 	}
 }
 
@@ -638,20 +714,20 @@ func TestSnapshot_UnattachedVolumeNoQuiesce(t *testing.T) {
 	h := newSnapshotHarness(t)
 
 	dir := t.TempDir()
-	backing := filepath.Join(dir, "vol.ext4")
-	_ = os.WriteFile(backing, []byte("data"), 0o600)
+	h.backing = filepath.Join(dir, "vol.ext4")
+	h.writeBacking(t, []byte(volumeBytes))
 	appID := uuid.New()
 	resID := uuid.New()
 	volID := uuid.New()
-	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: appID, BackingPath: backing}} // AttachedReplica nil
+	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: appID, BackingPath: h.backing}} // AttachedReplica nil
 
 	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 	// There is no guest to talk to when nothing is attached.
-	if events := h.rec.all(); !sameOrder(events, []string{"copy", "upload"}) {
-		t.Errorf("events = %v, want copy,upload", events)
+	if events := h.rec.all(); !sameOrder(events, []string{"upload"}) {
+		t.Errorf("events = %v, want just the upload", events)
 	}
 	if len(h.store.puts) != 1 || len(points) != 1 {
 		t.Errorf("unattached volume must still snapshot")
@@ -659,6 +735,15 @@ func TestSnapshot_UnattachedVolumeNoQuiesce(t *testing.T) {
 	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
 	if len(rps) != 1 {
 		t.Errorf("recovery point missing for unattached volume")
+	}
+	// Detached streams too: no VM is writing the file, so a staging copy would
+	// protect against nothing while still demanding the headroom that deadlocks
+	// decommission. The consistency of this branch is bounded by how clean the
+	// last engine STOP was (#resident-stop-is-vmm-kill) — staging never changed
+	// that either way.
+	assertNoLocalStaging(t, dir)
+	if got := gunzip(t, h.store.stored(points[0].ObjectKey)); got != volumeBytes {
+		t.Errorf("stored blob decompresses to %q, want the backing file itself", got)
 	}
 }
 
@@ -696,11 +781,11 @@ func TestSnapshot_RecordsChecksumOfUploadedBytes(t *testing.T) {
 	if want := hex.EncodeToString(sum[:]); rps[0].Checksum != want {
 		t.Fatalf("checksum = %q, want the sha256 of the STORED bytes %q", rps[0].Checksum, want)
 	}
-	if got := gunzip(t, body); got != "ext4-bytes" { // what the harness copyFile writes
+	if got := gunzip(t, body); got != volumeBytes { // the backing file, streamed as-is
 		t.Fatalf("stored blob decompresses to %q, want the volume bytes", got)
 	}
-	if rps[0].SizeBytes != int64(len("ext4-bytes")) {
-		t.Fatalf("size_bytes = %d, want the LOGICAL volume size %d", rps[0].SizeBytes, len("ext4-bytes"))
+	if rps[0].SizeBytes != int64(len(volumeBytes)) {
+		t.Fatalf("size_bytes = %d, want the LOGICAL volume size %d", rps[0].SizeBytes, len(volumeBytes))
 	}
 }
 
@@ -717,15 +802,11 @@ func TestSnapshot_SparseVolumeStoresFarLessThanItsNominalSize(t *testing.T) {
 	)
 	h := newSnapshotHarness(t)
 	appID, resID, _, _, _ := h.attachedVolume(t)
-	// A REAL sparse copy: a small write, then Truncate out to the nominal size.
+	// A REAL sparse volume: a small write, then Truncate out to the nominal size.
 	// Everything past the write is a hole that reads back as zeros.
-	h.s.copyFile = func(_ context.Context, _, dst string) error {
-		h.rec.add("copy")
-		payload := bytes.Repeat([]byte{0xAB}, realData)
-		if err := os.WriteFile(dst, payload, 0o600); err != nil {
-			return err
-		}
-		return os.Truncate(dst, nominal)
+	h.writeBacking(t, bytes.Repeat([]byte{0xAB}, realData))
+	if err := os.Truncate(h.backing, nominal); err != nil {
+		t.Fatal(err)
 	}
 
 	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
@@ -850,10 +931,11 @@ func TestUploadSnapshotFileHashed_TruncationGuard(t *testing.T) {
 	}
 }
 
-// A cancelled or failed snapshot unlinks its temp copy, so any descriptor still
-// open on it pins the disk until the process dies — measured live as ~28GB of
-// held-open deleted files after repeated cancels. Every abort path must leave
-// zero descriptors behind.
+// Every abort path must leave zero descriptors behind. The snapshot now holds an
+// open descriptor on the LIVE backing file for the whole upload, so a leak here
+// pins a customer volume's inode (and, when the volume is later deleted, its disk
+// until the process dies — measured live as ~28GB of held-open deleted files
+// after repeated cancels).
 //
 // The proxy is the fd NUMBER a fresh open gets: on Unix the kernel hands out the
 // lowest free descriptor, so leaked descriptors push it up. It proves "no
@@ -862,31 +944,30 @@ func TestUploadSnapshotFileHashed_TruncationGuard(t *testing.T) {
 func TestSnapshot_AbortedSnapshotLeavesNoOpenDescriptor(t *testing.T) {
 	aborts := []struct {
 		name  string
-		setup func(h *snapHarness) context.Context
+		setup func(t *testing.T, h *snapHarness) context.Context
 	}{
 		{
-			name: "context cancelled mid-copy",
-			setup: func(h *snapHarness) context.Context {
+			name: "context cancelled mid-upload",
+			setup: func(t *testing.T, h *snapHarness) context.Context {
 				ctx, cancel := context.WithCancel(context.Background())
-				h.s.copyFile = func(_ context.Context, _, dst string) error {
-					// A killed `cp` leaves a partial file behind, like the real one does.
-					_ = os.WriteFile(dst, []byte("half-a-vol"), 0o600)
-					cancel()
-					return context.Canceled
-				}
+				// Big enough that the store is handed the stream long before the
+				// compressor has read the file out: cancelling from the store's own
+				// hook therefore lands in the MIDDLE of the transfer.
+				h.bigBacking(t, 512<<10)
+				h.store.onPut = cancel
 				return ctx
 			},
 		},
 		{
 			name: "upload fails",
-			setup: func(h *snapHarness) context.Context {
+			setup: func(_ *testing.T, h *snapHarness) context.Context {
 				h.store.putErr = errors.New("s3 down")
 				return context.Background()
 			},
 		},
 		{
 			name: "store stops reading mid-upload",
-			setup: func(h *snapHarness) context.Context {
+			setup: func(_ *testing.T, h *snapHarness) context.Context {
 				h.store.shortRead = true
 				return context.Background()
 			},
@@ -901,16 +982,13 @@ func TestSnapshot_AbortedSnapshotLeavesNoOpenDescriptor(t *testing.T) {
 		for _, ab := range aborts {
 			h := newSnapshotHarness(t)
 			appID, resID, _, _, dir := h.attachedVolume(t)
-			ctx := ab.setup(h)
+			ctx := ab.setup(t, h)
 			if _, err := h.s.SnapshotAppVolumes(ctx, resID, appID); err == nil {
 				t.Fatalf("%s: expected the snapshot to abort", ab.name)
 			}
-			// The temp copy is unlinked on every abort — that is exactly why a
-			// surviving descriptor would hold the disk hostage.
-			entries, _ := os.ReadDir(dir)
-			if len(entries) != 1 {
-				t.Fatalf("%s: temp copy not cleaned up: %d entries", ab.name, len(entries))
-			}
+			// An aborted snapshot leaves nothing behind either — least of all a
+			// half-written copy of the volume.
+			assertNoLocalStaging(t, dir)
 		}
 	}
 

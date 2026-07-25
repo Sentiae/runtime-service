@@ -126,14 +126,27 @@ func uploadSnapshotFileHashed(ctx context.Context, store ArtifactStore, key, pat
 	if err != nil {
 		return zero, fmt.Errorf("open %s: %w", path, err)
 	}
-	// This function is the SOLE owner of f. The compressor goroutine below only
-	// borrows it and is always joined before this returns, so exactly one Close
-	// runs on every exit — success, error, context cancellation and panic. A
-	// descriptor left open here is not just a leak: the temp file it points at is
-	// unlinked on the way out, so its disk is not reclaimed until the process
-	// dies (measured live: ~28GB of held-open deleted files after repeated
-	// cancels).
+	// This function is the SOLE owner of the descriptor it opened. The compressor
+	// goroutine inside uploadSnapshotStreamHashed only borrows it and is always
+	// joined before that call returns, so exactly one Close runs on every exit —
+	// success, error, context cancellation and panic. A descriptor left open here
+	// is not just a leak: a temp file it points at may be unlinked on the way out,
+	// so its disk is not reclaimed until the process dies (measured live: ~28GB of
+	// held-open deleted files after repeated cancels).
 	defer f.Close()
+	return uploadSnapshotStreamHashed(ctx, store, key, path, f)
+}
+
+// uploadSnapshotStreamHashed is uploadSnapshotFileHashed over a descriptor the
+// CALLER owns and keeps open. It exists because the fleet volume snapshotter
+// streams a live volume's backing file DIRECTLY into the store (no local staging
+// copy) and wants the same single descriptor it just fsync'd — see
+// FleetVolumeSnapshotter.uploadBackingFile.
+//
+// It never closes f: the caller does, after this returns and after the
+// compressor goroutine has been joined.
+func uploadSnapshotStreamHashed(ctx context.Context, store ArtifactStore, key, path string, f *os.File) (snapshotUpload, error) {
+	var zero snapshotUpload
 	st, err := f.Stat()
 	if err != nil {
 		return zero, fmt.Errorf("stat %s: %w", path, err)
@@ -163,8 +176,8 @@ func uploadSnapshotFileHashed(ctx context.Context, store ArtifactStore, key, pat
 		compressErr = gzipStream(emitted, source)
 	}()
 	// Unpark and JOIN the compressor on EVERY exit — including a panic inside the
-	// store's Put. It borrows f, so the deferred Close above (registered first,
-	// therefore running last) must not fire while it is still reading. Closing
+	// store's Put. It borrows f, so the owner's Close (registered before this call,
+	// therefore running after it) must not fire while it is still reading. Closing
 	// the read end is what unparks a compressor blocked writing into the pipe.
 	// Both operations are idempotent, so the explicit join below is free.
 	defer func() {

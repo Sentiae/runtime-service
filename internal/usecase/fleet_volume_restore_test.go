@@ -1184,20 +1184,9 @@ func TestRestore_RoundTripFromSnapshotPreservesHolesAndBytes(t *testing.T) {
 
 	h := newSnapshotHarness(t)
 	appID, resID, _, _, _ := h.attachedVolume(t)
-	h.s.copyFile = func(_ context.Context, _, dst string) error {
-		f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		if _, err := f.WriteAt(image[:head], 0); err != nil {
-			return err
-		}
-		if _, err := f.WriteAt(image[nominal-tail:], nominal-tail); err != nil {
-			return err
-		}
-		return f.Truncate(nominal)
-	}
+	// The volume itself is sparse: the snapshot streams THIS file (there is no
+	// staging copy any more), so the holes are read straight off it.
+	writeSparseImage(t, h.backing, image, head, tail)
 
 	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
 	if err != nil {
@@ -1230,6 +1219,28 @@ func TestRestore_RoundTripFromSnapshotPreservesHolesAndBytes(t *testing.T) {
 	}
 	if alloc := allocatedBytes(t, dst); alloc >= nominal/2 {
 		t.Fatalf("staged file allocates %d bytes of a %d-byte image — the holes were materialized", alloc, int64(nominal))
+	}
+}
+
+// writeSparseImage materializes image at path as a genuinely sparse file: head
+// bytes written at the front, tail bytes written at the very end, and a hole in
+// between (Truncate out to the full length).
+func writeSparseImage(t *testing.T, path string, image []byte, head, tail int) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+	nominal := int64(len(image))
+	if _, err := f.WriteAt(image[:head], 0); err != nil {
+		t.Fatalf("write head: %v", err)
+	}
+	if _, err := f.WriteAt(image[len(image)-tail:], nominal-int64(tail)); err != nil {
+		t.Fatalf("write tail: %v", err)
+	}
+	if err := f.Truncate(nominal); err != nil {
+		t.Fatalf("truncate: %v", err)
 	}
 }
 
