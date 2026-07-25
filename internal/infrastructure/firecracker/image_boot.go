@@ -383,12 +383,8 @@ func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath st
 		j.remove()
 		return nil, "", fmt.Errorf("configure boot source: %w", err)
 	}
-	if err := b.p.apiPut(ctx, client, "/drives/rootfs", map[string]any{
-		"drive_id":       "rootfs",
-		"path_on_host":   rootfsChrootPath,
-		"is_root_device": true,
-		"is_read_only":   false,
-	}); err != nil {
+	if err := b.p.apiPut(ctx, client, "/drives/rootfs",
+		driveConfigBody("rootfs", rootfsChrootPath, true, false)); err != nil {
 		b.killVM(cmd, socketPath)
 		j.remove()
 		return nil, "", fmt.Errorf("configure rootfs: %w", err)
@@ -396,18 +392,11 @@ func (b *ImageBooter) startVM(ctx context.Context, vmID uuid.UUID, rootfsPath st
 	// rt#9 — attach the persistent data volume as a 2nd virtio-blk device. The
 	// guest sees it as /dev/vdb and mounts it at the runtime.json data_mount_path.
 	if dataDiskPath != "" {
-		if err := b.p.apiPut(ctx, client, "/drives/data", map[string]any{
-			"drive_id":       "data",
-			"path_on_host":   dataChrootPath,
-			"is_root_device": false,
-			"is_read_only":   false,
-			// SentiaeDB Phase-0 P0 (D-184, #p19-firecracker-cache-type-fsync):
-			// the persistent data volume MUST use Writeback so the guest's fsync
-			// is honored down to the host. Firecracker's default (Unsafe) drops
-			// flushes at the host boundary — every Postgres fsync becomes a no-op
-			// and a host crash loses committed data. Writeback is the durable mode.
-			"cache_type": "Writeback",
-		}); err != nil {
+		// SentiaeDB Phase-0 P0 (D-184, #p19-firecracker-cache-type-fsync): the
+		// persistent data volume MUST honor the guest's fsync down to the host.
+		// driveConfigBody settles that for every drive, including this one.
+		if err := b.p.apiPut(ctx, client, "/drives/data",
+			driveConfigBody("data", dataChrootPath, false, false)); err != nil {
 			b.killVM(cmd, socketPath)
 			j.remove()
 			return nil, "", fmt.Errorf("configure data drive: %w", err)

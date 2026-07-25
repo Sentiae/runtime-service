@@ -71,8 +71,10 @@ type TelemetryConfig struct {
 // fleet host + its heartbeat loop (runtime-fleet CP4 §9#4). Only active when the
 // firecracker executor is selected (a compose instance cannot boot images).
 type FleetConfig struct {
-	// HostID pins this host's fleet id. Empty ⇒ a stable UUIDv5 is derived from
-	// the advertise host so restarts re-register the same row.
+	// HostID is this host's fleet identity, minted at host BIRTH and pinned in the
+	// host's env file. It is REQUIRED on a firecracker host and must be a valid
+	// uuid: an empty or unparseable value refuses boot (it is never derived — see
+	// di.resolveFleetHostID).
 	HostID string `mapstructure:"host_id"`
 	// Region is the placement region label reported to the registry.
 	Region string `mapstructure:"region"`

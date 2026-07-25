@@ -67,6 +67,9 @@ func TestWarmRootfsDriveBody(t *testing.T) {
 		"path_on_host":   "/var/lib/firecracker/rootfs/python-warm.ext4",
 		"is_root_device": true,
 		"is_read_only":   true,
+		// Every drive this platform configures carries Writeback (gate condition
+		// A2) — see driveConfigBody.
+		"cache_type": "Writeback",
 	}
 	if !reflect.DeepEqual(body, want) {
 		t.Fatalf("warmRootfsDriveBody:\n got %#v\nwant %#v", body, want)

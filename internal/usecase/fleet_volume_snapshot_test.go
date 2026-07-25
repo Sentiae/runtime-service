@@ -1081,3 +1081,78 @@ func probeFD(t *testing.T) uintptr {
 	}
 	return fd
 }
+
+// Every recovery point must record HOW it was made consistent — it is
+// unbackfillable (nothing about a blob in the store reveals whether the
+// filesystem it was read from was frozen) and PITR needs it to know which anchors
+// are valid.
+//
+// The attached path holds the guest freeze for the WHOLE upload, so what it
+// produces is a crash-free filesystem image: guest_frozen.
+func TestSnapshot_AttachedCaptureStampsGuestFrozen(t *testing.T) {
+	h := newSnapshotHarness(t)
+	appID, resID, _, _, _ := h.attachedVolume(t)
+
+	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if got := points[0].Consistency; got != domain.RecoveryPointGuestFrozen {
+		t.Errorf("returned consistency = %q, want %q", got, domain.RecoveryPointGuestFrozen)
+	}
+	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
+	if got := rps[0].Consistency; got != domain.RecoveryPointGuestFrozen {
+		t.Errorf("recorded consistency = %q, want %q", got, domain.RecoveryPointGuestFrozen)
+	}
+}
+
+// The detached path has no freeze AND cannot prove the writer stopped cleanly (a
+// resident stop is a VMM kill, #resident-stop-is-vmm-kill), so it is
+// detached_unclean — a crashed filesystem image, not a PITR anchor. Stamping
+// detached_clean here would be the optimistic label the class exists to prevent.
+func TestSnapshot_DetachedCaptureStampsDetachedUnclean(t *testing.T) {
+	h := newSnapshotHarness(t)
+
+	dir := t.TempDir()
+	h.backing = filepath.Join(dir, "vol.ext4")
+	h.writeBacking(t, []byte(volumeBytes))
+	appID, resID, volID := uuid.New(), uuid.New(), uuid.New()
+	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: appID, BackingPath: h.backing}} // AttachedReplica nil
+
+	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if got := points[0].Consistency; got != domain.RecoveryPointDetachedUnclean {
+		t.Errorf("returned consistency = %q, want %q", got, domain.RecoveryPointDetachedUnclean)
+	}
+	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
+	if got := rps[0].Consistency; got != domain.RecoveryPointDetachedUnclean {
+		t.Errorf("recorded consistency = %q, want %q", got, domain.RecoveryPointDetachedUnclean)
+	}
+	if got := rps[0].Consistency; got == domain.RecoveryPointGuestFrozen {
+		t.Errorf("a capture with no freeze must never be stamped %q", got)
+	}
+}
+
+// A capture that ABORTS must leave no row at all — so there is never a recovery
+// point stamped with a class its bytes do not have. The freeze lapsing mid-upload
+// (a failed dead-man renew) is exactly the case that would otherwise mint a torn
+// artifact labelled guest_frozen.
+func TestSnapshot_AbortedFreezeLeavesNoStampedRecoveryPoint(t *testing.T) {
+	h := newSnapshotHarness(t)
+	appID, resID, _, _, _ := h.attachedVolume(t)
+	h.bigBacking(t, 4<<20)
+	h.s.freezeHeartbeat = time.Millisecond
+	h.guest.mu.Lock()
+	h.guest.renewErr = errors.New("dead-man re-arm refused")
+	h.guest.mu.Unlock()
+
+	if _, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID); err == nil {
+		t.Fatal("a lapsed freeze must fail the snapshot")
+	}
+	rps, _ := h.recovery.ListRecoveryPoints(context.Background(), resID)
+	if len(rps) != 0 {
+		t.Fatalf("aborted capture recorded %d recovery point(s): %+v", len(rps), rps)
+	}
+}

@@ -115,6 +115,53 @@ func (FleetResource) TableName() string {
 	return "fleet_resources"
 }
 
+// RecoveryPointConsistency names HOW a recovery point's artifact was made
+// consistent. It is NOT a quality score and NOT a status — it is the physics of
+// the capture, and it is the only thing that answers whether a given artifact is
+// a valid anchor for point-in-time recovery.
+//
+// It must be stamped AT CAPTURE and can never be backfilled: nothing about a
+// blob sitting in the artifact store reveals whether the filesystem it was read
+// from was frozen at the time. A recovery point written without this is
+// permanently ambiguous, which is why the column exists before any real customer
+// data does.
+type RecoveryPointConsistency string
+
+const (
+	// RecoveryPointGuestFrozen — the GUEST filesystem was flushed and frozen for
+	// the ENTIRE capture (and the freeze's dead-man was held open throughout, with
+	// a lapsed renew aborting the capture rather than producing an artifact). The
+	// bytes are therefore a crash-free filesystem image: a valid PITR base.
+	RecoveryPointGuestFrozen RecoveryPointConsistency = "guest_frozen"
+	// RecoveryPointDetachedClean — no VM was attached and the engine that wrote
+	// the volume had been STOPPED CLEANLY before the capture. Equivalent in
+	// practice to a clean shutdown copy.
+	//
+	// ⚠ Nothing stamps this today, deliberately: a resident stop is a VMM kill
+	// (#resident-stop-is-vmm-kill), so this platform cannot currently prove a
+	// clean stop. The value exists so the fix has a true class to stamp, not so a
+	// detached copy can be optimistically labelled.
+	RecoveryPointDetachedClean RecoveryPointConsistency = "detached_clean"
+	// RecoveryPointDetachedUnclean — captured with no freeze from a volume whose
+	// writer was not proven to have stopped cleanly. Restoring it is restoring a
+	// crashed filesystem: recoverable by engine crash recovery in the common case,
+	// NOT a guarantee, and not a PITR anchor.
+	RecoveryPointDetachedUnclean RecoveryPointConsistency = "detached_unclean"
+	// RecoveryPointUnknown — the row predates this column (migration 0019 default).
+	// It must be treated as the WEAKEST class, never as "probably fine".
+	RecoveryPointUnknown RecoveryPointConsistency = "unknown"
+)
+
+// IsValid reports whether the class is one the fleet recognizes.
+func (c RecoveryPointConsistency) IsValid() bool {
+	switch c {
+	case RecoveryPointGuestFrozen, RecoveryPointDetachedClean,
+		RecoveryPointDetachedUnclean, RecoveryPointUnknown:
+		return true
+	}
+	return false
+}
+
 // FleetResourceRecoveryPoint is one snapshot/backup entry in a resource's
 // recovery catalog. It intentionally SURVIVES a resource tombstone (no cascade
 // delete) so a decommissioned resource can still be restored from.
@@ -125,6 +172,15 @@ type FleetResourceRecoveryPoint struct {
 	ObjectKey  string     `json:"object_key" gorm:"column:object_key;type:text;not null"`
 	Kind       string     `json:"kind" gorm:"type:text;not null"`
 	SizeBytes  int64      `json:"size_bytes" gorm:"column:size_bytes"`
+	// Consistency records HOW this artifact was made consistent — see
+	// RecoveryPointConsistency. `kind` says what the artifact IS; this says what it
+	// GUARANTEES, and PITR needs the second one to know which anchors are valid.
+	//
+	// ⚠ The GORM tag must match migration 0019 EXACTLY (column `consistency`, TEXT,
+	// NOT NULL, DEFAULT 'unknown'): the fleet host runs AutoMigrate, so any
+	// divergence here is a schema change the migration never authored (the D-187
+	// lesson).
+	Consistency RecoveryPointConsistency `json:"consistency" gorm:"column:consistency;type:text;not null;default:'unknown'"`
 	// Checksum is the lowercase hex sha256 of the uploaded blob, computed while
 	// streaming the upload. Empty on legacy rows written before D-184: those can
 	// only be size-verified on restore, and the restorer says so explicitly.

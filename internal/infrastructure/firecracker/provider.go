@@ -800,12 +800,7 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 
 	// Rootfs drive (the modified copy). Apply per-drive rate limiter
 	// when caller specified DiskBandwidthMBps / DiskIOPS (§9.1.5).
-	rootfsDrive := map[string]any{
-		"drive_id":       "rootfs",
-		"path_on_host":   jv.rootfsPath,
-		"is_root_device": true,
-		"is_read_only":   false,
-	}
+	rootfsDrive := driveConfigBody("rootfs", jv.rootfsPath, true, false)
 	if rl := driveRateLimiter(execBootCfg.DiskBandwidthMBps, execBootCfg.DiskIOPS); rl != nil {
 		rootfsDrive["rate_limiter"] = rl
 	}
@@ -1209,12 +1204,7 @@ func (p *Provider) configureVMWithPolicy(ctx context.Context, socketPath, chroot
 		return fmt.Errorf("configure boot source: %w", err)
 	}
 
-	rootfsDrive := map[string]any{
-		"drive_id":       "rootfs",
-		"path_on_host":   rootfsPath,
-		"is_root_device": true,
-		"is_read_only":   false,
-	}
+	rootfsDrive := driveConfigBody("rootfs", rootfsPath, true, false)
 	if rl := driveRateLimiter(cfg.DiskBandwidthMBps, cfg.DiskIOPS); rl != nil {
 		rootfsDrive["rate_limiter"] = rl
 	}
@@ -1280,12 +1270,7 @@ func (p *Provider) configureVM(ctx context.Context, socketPath, kernelPath, root
 	}
 
 	// 3. Attach rootfs drive
-	rootfsDrive := map[string]any{
-		"drive_id":       "rootfs",
-		"path_on_host":   rootfsPath,
-		"is_root_device": true,
-		"is_read_only":   false,
-	}
+	rootfsDrive := driveConfigBody("rootfs", rootfsPath, true, false)
 	if rl := driveRateLimiter(cfg.DiskBandwidthMBps, cfg.DiskIOPS); rl != nil {
 		rootfsDrive["rate_limiter"] = rl
 	}

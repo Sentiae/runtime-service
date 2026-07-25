@@ -457,7 +457,7 @@ func TestWarmPool_ReadyN_FillsBuffer_AndTakeServesRequest(t *testing.T) {
 	}
 
 	// Simulate RunCode's always-destroy on the taken clone.
-	if err := mgr.DestroyClone(ctx, clone); err != nil {
+	if err := mgr.DestroyClone(context.Background(), clone); err != nil {
 		t.Fatalf("DestroyClone: %v", err)
 	}
 	p.freeIndex(n)
@@ -604,7 +604,7 @@ func TestWarmPool_BufferEmpty_FallsBackToOnDemand(t *testing.T) {
 	}
 	// The on-demand clone came from the blocking manager's on-demand path
 	// (which does NOT block — only replenisher clones block).
-	mgr.DestroyClone(ctx, clone)
+	mgr.DestroyClone(context.Background(), clone) //nolint:errcheck // teardown of a clone the assertions above are already done with
 	p.freeIndex(n)
 }
 

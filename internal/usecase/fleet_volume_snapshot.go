@@ -269,6 +269,11 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 	objectKey := fmt.Sprintf("volumes/%s/%s.ext4", vol.ID, snapshotID)
 
 	var up snapshotUpload
+	// The consistency CLASS this capture will be stamped with, decided by the
+	// branch that actually produces the bytes (never asserted up front). Every
+	// return below this point either aborts with no row or carries a class that is
+	// TRUE of the path it came from.
+	var consistency domain.RecoveryPointConsistency
 	if vol.AttachedReplica != nil {
 		replica, err := s.replicas.FindByID(ctx, *vol.AttachedReplica)
 		if err != nil {
@@ -292,6 +297,12 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 			// catalog row.
 			return zero, fmt.Errorf("upload snapshot: %w", upErr)
 		}
+		// guest_frozen is earned, not assumed: the freeze covered the WHOLE upload
+		// and uploadUnderFreeze fails the capture when the dead-man renew lapses (a
+		// mid-flight auto-thaw aborts the upload and returns the heartbeat error
+		// above), so reaching here means no unfrozen byte was read. If that abort
+		// ever became best-effort, this stamp would become a lie.
+		consistency = domain.RecoveryPointGuestFrozen
 	} else {
 		// No attached replica: nothing is writing the file, so there is no guest to
 		// quiesce and nothing a staging copy could protect against — streaming is
@@ -305,6 +316,12 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 		if upErr != nil {
 			return zero, fmt.Errorf("upload snapshot: %w", upErr)
 		}
+		// detached_UNCLEAN, not detached_clean: this path cannot prove the writer
+		// stopped cleanly, because a resident stop is a VMM kill
+		// (#resident-stop-is-vmm-kill). Stamping the clean class here would label
+		// a crashed-filesystem image as a PITR anchor. It becomes detached_clean
+		// only when a clean stop is provable, never before.
+		consistency = domain.RecoveryPointDetachedUnclean
 	}
 	// Both sizes, because they diverge: the recovery point records the LOGICAL
 	// size (what a restore materializes) while the transfer only pays for the
@@ -324,6 +341,8 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 		Kind:       "snapshot",
 		SizeBytes:  up.LogicalBytes,
 		Checksum:   up.Checksum,
+		// What this artifact GUARANTEES, decided by the branch that produced it.
+		Consistency: consistency,
 		// A fresh snapshot has never been restored from, so nothing about it is
 		// proven beyond its checksum.
 		RestoredInPlaceOK: false,

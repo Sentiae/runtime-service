@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -335,7 +336,9 @@ func NewContainer(cfg *config.Config) (*Container, error) {
 	// SetupRoutes. The fleet's one back-edge into handlers — the FleetOrchestration
 	// gRPC registration, which needs the GRPCServer that initHandlers builds — is
 	// relocated to the end of initHandlers to break the init cycle.
-	c.initFleet(cfg)
+	if err := c.initFleet(cfg); err != nil {
+		return nil, fmt.Errorf("failed to initialize fleet: %w", err)
+	}
 
 	// Declare + prove the service's fail-closed security posture (D-179 Wave-8)
 	// before any handler serves. A failed assertion refuses boot.
@@ -403,7 +406,7 @@ func (c *Container) initPosture() error {
 // when the firecracker executor is selected and a live FCProvider exists;
 // otherwise the fail-loud booter rejects every call so image boot is never
 // silently faked on a host without KVM.
-func (c *Container) initFleet(cfg *config.Config) {
+func (c *Container) initFleet(cfg *config.Config) error {
 	client := oci.NewClient(oci.Config{
 		Host:     cfg.Registry.Host,
 		Password: cfg.Registry.ServiceKey,
@@ -651,8 +654,13 @@ func (c *Container) initFleet(cfg *config.Config) {
 
 	c.initResourceControlPlane(cfg)
 
+	// Self-registration is firecracker-only, and so is the fatal host-identity
+	// check inside it: a container-executor instance (the compose deployment) never
+	// reaches this branch and has no fleet identity to mint.
 	if cfg.App.ExecutorType == "firecracker" {
-		c.registerSelfHost(cfg)
+		if err := c.registerSelfHost(cfg); err != nil {
+			return err
+		}
 	} else {
 		log.Println("Fleet self-registration skipped (executor is not firecracker)")
 	}
@@ -672,6 +680,7 @@ func (c *Container) initFleet(cfg *config.Config) {
 	if c.FleetLedgerReconciler != nil && c.fleetSelf != nil {
 		c.FleetLedgerReconciler.SetHostScope(c.fleetSelf.ID)
 	}
+	return nil
 }
 
 // initResourceControlPlane wires the P19 durable resource control plane (CP4.5
@@ -887,10 +896,45 @@ func fleetVolumeDir(cfg *config.Config) string {
 	return filepath.Join(cfg.Firecracker.SnapshotPath, "volumes")
 }
 
+// resolveFleetHostID resolves this host's fleet identity from configuration. It
+// is REQUIRED and it is never derived.
+//
+// A derived id used to be the fallback (UUIDv5 over the advertise host). That is
+// a routable-address-derived identity, and it is wrong in the one direction that
+// costs data: a host that gets a new IP mints a SECOND identity, re-registers as
+// a fresh empty host, and every resource whose volumes live on its disks is now
+// pinned to a host id nothing answers for — while the scheduler happily places
+// new customer databases on the "new" host. The reverse is just as bad: two hosts
+// briefly sharing an advertise address collide onto ONE registry row.
+//
+// Host identity therefore has to be minted at host BIRTH and pinned in the host's
+// env file (config-as-code, §34), which makes an empty or unparseable value a
+// fatal MISCONFIGURATION rather than something to paper over. There is no
+// fallback branch to guard, because a fallback is how the permissive branch
+// survives.
+func resolveFleetHostID(raw string) (uuid.UUID, error) {
+	if strings.TrimSpace(raw) == "" {
+		return uuid.Nil, fmt.Errorf("APP_FLEET_HOST_ID is not set: a fleet host's identity must be minted at host birth and pinned in its env file, never derived from a routable address (a re-IP'd host would mint a second identity and orphan every volume pinned to the first)")
+	}
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("APP_FLEET_HOST_ID %q is not a valid uuid: %w", raw, err)
+	}
+	if id == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("APP_FLEET_HOST_ID is the nil uuid: a fleet host's identity must be a real, minted uuid")
+	}
+	return id, nil
+}
+
 // registerSelfHost registers this runtime-service instance as a fleet host and
-// records the self-host + heartbeat cadence for the background loop. A failure
-// is logged but never crashes the process — fleet self-registration is not on
-// the boot critical path.
+// records the self-host + heartbeat cadence for the background loop.
+//
+// It returns an error ONLY for a fatal misconfiguration (an absent/invalid
+// APP_FLEET_HOST_ID): that refuses boot, because a fleet host with no minted
+// identity must not run at all. Every other failure — a host that cannot measure
+// itself, a registry that is unreachable — is logged and swallowed as before:
+// self-registration is not on the boot critical path, and the host simply stays
+// out of the placement candidate set.
 //
 // The advertised capacity is MEASURED off this machine, never asserted by config.
 // It used to be neither: disk came from a fixed 51200MB default (on a host with
@@ -900,7 +944,16 @@ func fleetVolumeDir(cfg *config.Config) string {
 // coincidence when it is close and an over-advertisement when it is not, and the
 // scheduler places customer databases on it. Config now only NARROWS the
 // measurement (see domain.ResolveHostCapacity).
-func (c *Container) registerSelfHost(cfg *config.Config) {
+func (c *Container) registerSelfHost(cfg *config.Config) error {
+	// Identity FIRST: it is the one fatal condition here, and it is a pure config
+	// fact. Resolving it after the capacity measurement would let a host that
+	// cannot measure itself return early and never notice it has no identity
+	// either — the misconfiguration would surface only on some later boot.
+	hostID, err := resolveFleetHostID(cfg.Fleet.HostID)
+	if err != nil {
+		return fmt.Errorf("fleet host identity: %w", err)
+	}
+
 	volumeDir := fleetVolumeDir(cfg)
 	measured, merr := hostcapacity.Measure(volumeDir)
 	if merr != nil {
@@ -909,7 +962,7 @@ func (c *Container) registerSelfHost(cfg *config.Config) {
 		// numbers, and the process keeps running (self-registration never was on the
 		// boot critical path).
 		log.Printf("ERROR: fleet self-registration REFUSED — this host cannot measure its own capacity (volume dir %s), so it will not advertise any: %v", volumeDir, merr)
-		return
+		return nil
 	}
 	capacity, cerr := domain.ResolveHostCapacity(measured, domain.HostCapacityOverride{
 		VCPU:          cfg.Fleet.HostVCPU,
@@ -921,7 +974,7 @@ func (c *Container) registerSelfHost(cfg *config.Config) {
 		log.Printf("ERROR: fleet self-registration REFUSED — configured capacity is not honest about this host (measured vcpu=%d mem=%dMB disk_total=%dMB disk_free=%dMB on %s; configured vcpu=%d mem=%dMB disk=%dMB reserve=%dMB): %v",
 			measured.VCPU, measured.MemTotalMB, measured.DiskTotalMB, measured.DiskAvailableMB, volumeDir,
 			cfg.Fleet.HostVCPU, cfg.Fleet.HostMemMB, cfg.Fleet.HostDiskMB, cfg.Fleet.HostDiskReserveMB, cerr)
-		return
+		return nil
 	}
 	// Log the measurement NEXT TO the override and the result, once, so the
 	// advertised number is observable rather than inferred from a config file that
@@ -930,21 +983,6 @@ func (c *Container) registerSelfHost(cfg *config.Config) {
 		measured.VCPU, measured.MemTotalMB, measured.DiskTotalMB, measured.DiskAvailableMB, volumeDir,
 		cfg.Fleet.HostVCPU, cfg.Fleet.HostMemMB, cfg.Fleet.HostDiskMB, cfg.Fleet.HostDiskReserveMB,
 		capacity.VCPU, capacity.MemMB, capacity.DiskMB)
-
-	// A stable host id keeps restarts on the same registry row. An explicit
-	// APP_FLEET_HOST_ID wins; otherwise derive a UUIDv5 from the advertise host.
-	var hostID uuid.UUID
-	if cfg.Fleet.HostID != "" {
-		parsed, err := uuid.Parse(cfg.Fleet.HostID)
-		if err != nil {
-			log.Printf("Warning: APP_FLEET_HOST_ID %q is not a valid uuid, deriving one instead: %v", cfg.Fleet.HostID, err)
-		} else {
-			hostID = parsed
-		}
-	}
-	if hostID == uuid.Nil {
-		hostID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("sentiae-fleet-host:"+cfg.ImageBoot.AdvertiseHost))
-	}
 
 	endpoint := fmt.Sprintf("%s:%s", cfg.ImageBoot.AdvertiseHost, cfg.Server.GRPC.Port)
 	self := domain.Host{
@@ -956,10 +994,10 @@ func (c *Container) registerSelfHost(cfg *config.Config) {
 		Endpoint:       endpoint,
 	}
 
-	registered, err := c.FleetHostRegistry.RegisterHost(context.Background(), self)
-	if err != nil {
-		log.Printf("Warning: fleet self-registration failed (continuing without it): %v", err)
-		return
+	registered, rerr := c.FleetHostRegistry.RegisterHost(context.Background(), self)
+	if rerr != nil {
+		log.Printf("Warning: fleet self-registration failed (continuing without it): %v", rerr)
+		return nil
 	}
 	c.fleetSelf = &registered
 	c.fleetHeartbeatEvery = cfg.Fleet.HeartbeatInterval
@@ -968,6 +1006,7 @@ func (c *Container) registerSelfHost(cfg *config.Config) {
 	}
 	log.Printf("Fleet self-registered: host_id=%s region=%s capacity=%dvcpu/%dMB/%dMB endpoint=%s",
 		registered.ID, registered.Region, capacity.VCPU, capacity.MemMB, capacity.DiskMB, endpoint)
+	return nil
 }
 
 // initDatabase initializes the database connection

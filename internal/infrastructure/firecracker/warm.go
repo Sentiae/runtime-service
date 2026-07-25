@@ -620,12 +620,7 @@ func warmBootSourceBody(kernelPath string) map[string]any {
 // `ro,noload`). The warm image must be cleanly unmounted / e2fsck-clean on the
 // host before it is served this way.
 func warmRootfsDriveBody(rootfsPath string) map[string]any {
-	return map[string]any{
-		"drive_id":       "rootfs",
-		"path_on_host":   rootfsPath,
-		"is_root_device": true,
-		"is_read_only":   true,
-	}
+	return driveConfigBody("rootfs", rootfsPath, true, true)
 }
 
 // warmNetIfaceBody is the /network-interfaces/eth0 body binding eth0 to the host TAP.
