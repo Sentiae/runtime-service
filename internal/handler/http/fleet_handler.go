@@ -96,7 +96,7 @@ func (h *FleetHandler) KillClone(w http.ResponseWriter, r *http.Request) {
 		RespondBadRequest(w, "Invalid clone id", nil)
 		return
 	}
-	killed, err := h.pool.KillClone(id)
+	killed, err := h.pool.KillClone(r.Context(), id)
 	if err != nil {
 		// The clone WAS removed from the buffer; only its host teardown failed.
 		RespondInternalError(w, "Failed to destroy clone: "+err.Error())

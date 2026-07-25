@@ -27,12 +27,12 @@ package firecracker
 import (
 	"context"
 	"fmt"
-	"log"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 )
 
 // Defaults for the scheduler. These match the §9.3 spec.
@@ -91,7 +91,6 @@ type VMRegistration struct {
 // CheckpointScheduler runs one goroutine per registered VM.
 type CheckpointScheduler struct {
 	backend SnapshotBackend
-	log     *log.Logger
 
 	mu      sync.Mutex
 	tracked map[uuid.UUID]*vmState
@@ -107,14 +106,11 @@ type vmState struct {
 }
 
 // NewCheckpointScheduler constructs the scheduler. backend must be
-// non-nil; logger defaults to the std logger when nil.
-func NewCheckpointScheduler(backend SnapshotBackend, logger *log.Logger) *CheckpointScheduler {
-	if logger == nil {
-		logger = log.Default()
-	}
+// non-nil. Logging is ctx-first via platform-kit (each per-VM goroutine
+// carries the registering caller's context), so no logger is injected.
+func NewCheckpointScheduler(backend SnapshotBackend) *CheckpointScheduler {
 	return &CheckpointScheduler{
 		backend: backend,
-		log:     logger,
 		tracked: make(map[uuid.UUID]*vmState),
 	}
 }
@@ -236,16 +232,18 @@ func (s *CheckpointScheduler) run(ctx context.Context, state *vmState) {
 	interval := time.Duration(state.reg.CheckpointIntervalMinutes) * time.Minute
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	s.log.Printf("[FC-CHECKPOINT] VM %s registered (interval=%s, max=%d)",
-		state.reg.VMID, interval, state.reg.MaxCheckpointsPerVM)
+	logger.FromContext(ctx).Info("checkpoint-scheduler: VM registered",
+		"vm_id", state.reg.VMID, "interval", interval.String(),
+		"max_checkpoints", state.reg.MaxCheckpointsPerVM)
 	for {
 		select {
 		case <-ctx.Done():
-			s.log.Printf("[FC-CHECKPOINT] VM %s deregistered", state.reg.VMID)
+			logger.FromContext(ctx).Info("checkpoint-scheduler: VM deregistered", "vm_id", state.reg.VMID)
 			return
 		case <-t.C:
 			if err := s.checkpointOnce(ctx, state); err != nil {
-				s.log.Printf("[FC-CHECKPOINT] VM %s tick: %v", state.reg.VMID, err)
+				logger.FromContext(ctx).Error("checkpoint-scheduler: checkpoint tick failed",
+					"vm_id", state.reg.VMID, "err", err)
 			}
 		}
 	}
@@ -260,7 +258,8 @@ func (s *CheckpointScheduler) checkpointOnce(ctx context.Context, state *vmState
 	}
 	defer func() {
 		if err := s.backend.Resume(ctx, state.reg.SocketPath); err != nil {
-			s.log.Printf("[FC-CHECKPOINT] resume VM %s failed: %v", state.reg.VMID, err)
+			logger.FromContext(ctx).Error("checkpoint-scheduler: resume VM failed",
+				"vm_id", state.reg.VMID, "socket_path", state.reg.SocketPath, "err", err)
 		}
 	}()
 
@@ -292,11 +291,13 @@ func (s *CheckpointScheduler) checkpointOnce(ctx context.Context, state *vmState
 
 	for _, rec := range toPrune {
 		if err := s.backend.DeleteSnapshotFiles(rec.MemoryFilePath, rec.StateFilePath); err != nil {
-			s.log.Printf("[FC-CHECKPOINT] prune %s failed: %v", rec.ID, err)
+			logger.FromContext(ctx).Warn("checkpoint-scheduler: prune snapshot failed",
+				"vm_id", state.reg.VMID, "snapshot_id", rec.ID, "err", err)
 		}
 	}
-	s.log.Printf("[FC-CHECKPOINT] VM %s → snapshot %s (%d bytes, kept=%d pruned=%d)",
-		state.reg.VMID, snapshotID, files.SizeBytes, state.reg.MaxCheckpointsPerVM, len(toPrune))
+	logger.FromContext(ctx).Info("checkpoint-scheduler: snapshot created",
+		"vm_id", state.reg.VMID, "snapshot_id", snapshotID, "size_bytes", files.SizeBytes,
+		"max_checkpoints", state.reg.MaxCheckpointsPerVM, "pruned", len(toPrune))
 	return nil
 }
 

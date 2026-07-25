@@ -1,9 +1,7 @@
 package firecracker
 
 import (
-	"bytes"
 	"context"
-	"log"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -66,10 +64,6 @@ func (f *fakeSnapshotBackend) DeleteSnapshotFiles(memPath, statePath string) err
 
 // --- tests ----------------------------------------------------------
 
-func silentLogger() *log.Logger {
-	return log.New(&bytes.Buffer{}, "", 0)
-}
-
 // mustRegister registers a VM the scheduler is allowed to pause and fails the
 // test if the pause guard refuses it.
 func mustRegister(t *testing.T, sched *CheckpointScheduler, reg VMRegistration) {
@@ -81,7 +75,7 @@ func mustRegister(t *testing.T, sched *CheckpointScheduler, reg VMRegistration) 
 
 func TestCheckpointScheduler_RegisterDeregister(t *testing.T) {
 	backend := newFakeBackend()
-	sched := NewCheckpointScheduler(backend, silentLogger())
+	sched := NewCheckpointScheduler(backend)
 
 	vmID := uuid.New()
 	mustRegister(t, sched, VMRegistration{
@@ -103,7 +97,7 @@ func TestCheckpointScheduler_RegisterDeregister(t *testing.T) {
 
 func TestCheckpointScheduler_RegisterIdempotent(t *testing.T) {
 	backend := newFakeBackend()
-	sched := NewCheckpointScheduler(backend, silentLogger())
+	sched := NewCheckpointScheduler(backend)
 	defer sched.Close()
 
 	vmID := uuid.New()
@@ -119,7 +113,6 @@ func TestCheckpointScheduler_ProducesSnapshotsAndPrunes(t *testing.T) {
 	backend := newFakeBackend()
 	sched := &CheckpointScheduler{
 		backend: backend,
-		log:     silentLogger(),
 		tracked: make(map[uuid.UUID]*vmState),
 	}
 	vmID := uuid.New()
@@ -166,7 +159,7 @@ func TestCheckpointScheduler_ProducesSnapshotsAndPrunes(t *testing.T) {
 
 func TestCheckpointScheduler_DefaultsApplied(t *testing.T) {
 	backend := newFakeBackend()
-	sched := NewCheckpointScheduler(backend, silentLogger())
+	sched := NewCheckpointScheduler(backend)
 	defer sched.Close()
 
 	vmID := uuid.New()
@@ -187,7 +180,7 @@ func TestCheckpointScheduler_DefaultsApplied(t *testing.T) {
 
 func TestCheckpointScheduler_RejectsInvalidRegistration(t *testing.T) {
 	backend := newFakeBackend()
-	sched := NewCheckpointScheduler(backend, silentLogger())
+	sched := NewCheckpointScheduler(backend)
 	defer sched.Close()
 
 	// Nil UUID
@@ -201,7 +194,7 @@ func TestCheckpointScheduler_RejectsInvalidRegistration(t *testing.T) {
 
 func TestCheckpointScheduler_CloseStopsAll(t *testing.T) {
 	backend := newFakeBackend()
-	sched := NewCheckpointScheduler(backend, silentLogger())
+	sched := NewCheckpointScheduler(backend)
 
 	for i := 0; i < 3; i++ {
 		mustRegister(t, sched, VMRegistration{

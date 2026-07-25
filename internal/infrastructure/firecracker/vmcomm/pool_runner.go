@@ -31,7 +31,7 @@ func (r *PoolRunner) Run(ctx context.Context, vm *domain.MicroVM, execution *dom
 	}
 
 	// Always return to pool after execution
-	defer r.pool.ReleaseVM(pooledVM.VM.ID)
+	defer r.pool.ReleaseVM(ctx, pooledVM.VM.ID)
 
 	taskID := execution.ID.String()
 
@@ -63,15 +63,15 @@ func (r *PoolRunner) Run(ctx context.Context, vm *domain.MicroVM, execution *dom
 		// and boot a fresh VM.
 		logger.FromContext(ctx).Warn("vmcomm pool-runner: task failed on warm VM, retrying with a fresh VM",
 			"task_id", taskID, "vm_id", pooledVM.VM.ID, "err", err)
-		r.pool.ReleaseVM(pooledVM.VM.ID) // release first so defer doesn't double-release
-		r.pool.removeVM(pooledVM.VM.ID)  // remove from pool entirely
+		r.pool.ReleaseVM(ctx, pooledVM.VM.ID) // release first so defer doesn't double-release
+		r.pool.removeVM(ctx, pooledVM.VM.ID)  // remove from pool entirely
 
 		// Boot a fresh VM and retry
 		freshVM, bootErr := r.pool.bootAndConnect(ctx, execution.Language, execution.Resources)
 		if bootErr != nil {
 			return nil, fmt.Errorf("retry with fresh VM failed: %w", bootErr)
 		}
-		defer r.pool.ReleaseVM(freshVM.VM.ID)
+		defer r.pool.ReleaseVM(ctx, freshVM.VM.ID)
 
 		result, err = freshVM.Client.ExecuteTask(ctx, task, nil)
 		if err != nil {

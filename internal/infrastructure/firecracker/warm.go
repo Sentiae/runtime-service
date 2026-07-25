@@ -3,7 +3,6 @@ package firecracker
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -319,20 +318,22 @@ func (m *WarmManager) configureWarmVM(ctx context.Context, socketPath, kernelPat
 // booted to be snapshotted; the snapshot files outlive it, so after a snapshot
 // the template process can be released. Each step is idempotent and logs-but-
 // continues so a partial teardown still frees as much as possible.
-func (m *WarmManager) DestroyWarm(warm *WarmVM) error {
+func (m *WarmManager) DestroyWarm(ctx context.Context, warm *WarmVM) error {
 	if warm == nil {
 		return nil
 	}
 	if warm.PID > 0 {
 		if proc, err := os.FindProcess(warm.PID); err == nil {
 			if err := proc.Kill(); err != nil {
-				log.Printf("Warning: kill warm VM %s pid %d: %v", warm.ID, warm.PID, err)
+				logger.FromContext(ctx).Warn("warm: kill warm VM failed",
+					"vm_id", warm.ID, "pid", warm.PID, "err", err)
 			}
 		}
 	}
 	if warm.TapName != "" {
 		if out, err := exec.Command("ip", "link", "del", warm.TapName).CombinedOutput(); err != nil {
-			log.Printf("Warning: delete warm tap %s: %s: %v", warm.TapName, string(out), err)
+			logger.FromContext(ctx).Warn("warm: delete warm tap failed",
+				"tap_name", warm.TapName, "output", string(out), "err", err)
 		}
 	}
 	if warm.SocketPath != "" {
@@ -343,7 +344,8 @@ func (m *WarmManager) DestroyWarm(warm *WarmVM) error {
 	if warm.jail != nil {
 		warm.jail.remove()
 	}
-	log.Printf("Warm VM %s destroyed (tap=%s)", warm.ID, warm.TapName)
+	logger.FromContext(ctx).Info("warm: template VM destroyed",
+		"vm_id", warm.ID, "tap_name", warm.TapName)
 	return nil
 }
 
@@ -521,14 +523,15 @@ func (m *WarmManager) CloneFromSnapshot(ctx context.Context, snap *TemplateSnaps
 // DestroyClone tears down a clone: kill the FC pid, delete its netns, delete its
 // host veth. Each step is idempotent and logs-but-continues on failure so a
 // partial teardown still releases as much as possible.
-func (m *WarmManager) DestroyClone(clone *Clone) error {
+func (m *WarmManager) DestroyClone(ctx context.Context, clone *Clone) error {
 	if clone == nil {
 		return nil
 	}
 	if clone.PID > 0 {
 		if proc, err := os.FindProcess(clone.PID); err == nil {
 			if err := proc.Kill(); err != nil {
-				log.Printf("Warning: kill clone %d pid %d: %v", clone.ID, clone.PID, err)
+				logger.FromContext(ctx).Warn("warm: kill clone failed",
+					"clone_id", clone.ID, "pid", clone.PID, "err", err)
 			}
 		}
 	}
@@ -542,15 +545,18 @@ func (m *WarmManager) DestroyClone(clone *Clone) error {
 	}
 	if clone.Namespace != "" {
 		if out, err := exec.Command("ip", "netns", "del", clone.Namespace).CombinedOutput(); err != nil {
-			log.Printf("Warning: delete netns %s: %s: %v", clone.Namespace, string(out), err)
+			logger.FromContext(ctx).Warn("warm: delete clone netns failed",
+				"clone_id", clone.ID, "namespace", clone.Namespace, "output", string(out), "err", err)
 		}
 	}
 	if clone.VethHost != "" {
 		if out, err := exec.Command("ip", "link", "del", clone.VethHost).CombinedOutput(); err != nil {
-			log.Printf("Warning: delete veth %s: %s: %v", clone.VethHost, string(out), err)
+			logger.FromContext(ctx).Warn("warm: delete clone veth failed",
+				"clone_id", clone.ID, "veth_host", clone.VethHost, "output", string(out), "err", err)
 		}
 	}
-	log.Printf("Clone %d destroyed (ns=%s veth=%s)", clone.ID, clone.Namespace, clone.VethHost)
+	logger.FromContext(ctx).Info("warm: clone destroyed",
+		"clone_id", clone.ID, "namespace", clone.Namespace, "veth_host", clone.VethHost)
 	return nil
 }
 

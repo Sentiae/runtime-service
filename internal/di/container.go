@@ -2020,7 +2020,7 @@ func (c *Container) initFirecrackerCheckpointScheduler(cfg *config.Config) {
 		return
 	}
 	backend := &firecracker.ProviderSnapshotBackend{P: c.FCProvider}
-	c.FCCheckpointScheduler = firecracker.NewCheckpointScheduler(backend, nil)
+	c.FCCheckpointScheduler = firecracker.NewCheckpointScheduler(backend)
 	c.FCProvider.SetCheckpointScheduler(c.FCCheckpointScheduler)
 	interval := cfg.Firecracker.CheckpointIntervalMinutes
 	if interval <= 0 {

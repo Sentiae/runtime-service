@@ -27,7 +27,7 @@ func TestCheckpointSchedulerRegisterRefusesUnpausableVMs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			backend := newFakeBackend()
-			sched := NewCheckpointScheduler(backend, silentLogger())
+			sched := NewCheckpointScheduler(backend)
 			defer sched.Close()
 
 			err := sched.Register(context.Background(), VMRegistration{
@@ -48,7 +48,7 @@ func TestCheckpointSchedulerRegisterRefusesUnpausableVMs(t *testing.T) {
 
 func TestCheckpointSchedulerRegisterAcceptsPausableVM(t *testing.T) {
 	backend := newFakeBackend()
-	sched := NewCheckpointScheduler(backend, silentLogger())
+	sched := NewCheckpointScheduler(backend)
 	defer sched.Close()
 
 	if err := sched.Register(context.Background(), VMRegistration{

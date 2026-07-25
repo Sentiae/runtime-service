@@ -5,7 +5,6 @@ package vmcomm
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"syscall"
@@ -48,7 +47,7 @@ type Listener struct {
 
 // NewListener creates a vsock listener bound to the given port.
 // The port should match the guest agent's connection port (AgentPort = 52).
-func NewListener(port uint32) (*Listener, error) {
+func NewListener(ctx context.Context, port uint32) (*Listener, error) {
 	fd, err := syscall.Socket(afVSOCK, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, fmt.Errorf("create vsock socket: %w", err)
@@ -76,7 +75,7 @@ func NewListener(port uint32) (*Listener, error) {
 		return nil, fmt.Errorf("listen vsock: %w", err)
 	}
 
-	log.Printf("vmcomm: listening on vsock port %d", port)
+	logger.FromContext(ctx).Info("vmcomm: listening on vsock", "port", port)
 	return &Listener{
 		fd:      fd,
 		port:    port,

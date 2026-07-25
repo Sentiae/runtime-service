@@ -5,7 +5,6 @@ package vmcomm
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 
@@ -26,14 +25,14 @@ type Listener struct {
 
 // NewListener creates a TCP listener on localhost:<port>.
 // This is the development fallback; production uses vsock (Linux).
-func NewListener(port uint32) (*Listener, error) {
+func NewListener(ctx context.Context, port uint32) (*Listener, error) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("listen tcp %s: %w", addr, err)
 	}
 
-	log.Printf("vmcomm: listening on TCP %s (vsock fallback)", addr)
+	logger.FromContext(ctx).Info("vmcomm: listening on TCP (vsock fallback)", "addr", addr)
 	return &Listener{
 		ln:      ln,
 		port:    port,

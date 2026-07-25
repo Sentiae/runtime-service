@@ -20,9 +20,9 @@ import (
 type warmManager interface {
 	BootWarm(ctx context.Context, language domain.Language) (*WarmVM, error)
 	CreateTemplateSnapshot(ctx context.Context, warm *WarmVM) (*TemplateSnapshot, error)
-	DestroyWarm(warm *WarmVM) error
+	DestroyWarm(ctx context.Context, warm *WarmVM) error
 	CloneFromSnapshot(ctx context.Context, snap *TemplateSnapshot, n int) (*Clone, error)
-	DestroyClone(clone *Clone) error
+	DestroyClone(ctx context.Context, clone *Clone) error
 }
 
 // codeAgent is the narrow slice of AgentClient the pool depends on: POST code to
@@ -157,7 +157,7 @@ func (p *WarmPool) RunCode(ctx context.Context, language domain.Language, code, 
 	// success, agent error, or panic — so no VM/index leaks past one run.
 	defer p.freeIndex(n)
 	defer func() {
-		if derr := p.mgr.DestroyClone(clone); derr != nil {
+		if derr := p.mgr.DestroyClone(ctx, clone); derr != nil {
 			logger.FromContext(ctx).Warn("warm-pool: destroy used clone failed",
 				"clone_id", n, "language", language, "err", derr)
 		}
@@ -296,10 +296,10 @@ func (p *WarmPool) buildTemplateLocal(ctx context.Context, language domain.Langu
 	snap, err := p.mgr.CreateTemplateSnapshot(ctx, warm)
 	if err != nil {
 		// Best-effort teardown of the warm VM we just booted.
-		_ = p.mgr.DestroyWarm(warm)
+		_ = p.mgr.DestroyWarm(ctx, warm)
 		return nil, fmt.Errorf("create template snapshot: %w", err)
 	}
-	if derr := p.mgr.DestroyWarm(warm); derr != nil {
+	if derr := p.mgr.DestroyWarm(ctx, warm); derr != nil {
 		logger.FromContext(ctx).Warn("warm-pool: destroy warm template VM failed",
 			"language", language, "vm_id", warm.ID, "err", derr)
 	}
@@ -562,7 +562,7 @@ func (p *WarmPool) replenishLoop(language domain.Language, snap *TemplateSnapsho
 		select {
 		case ch <- clone:
 		case <-ctx.Done():
-			if derr := p.mgr.DestroyClone(clone); derr != nil {
+			if derr := p.mgr.DestroyClone(ctx, clone); derr != nil {
 				logger.FromContext(ctx).Warn("warm-pool: destroy ready clone on shutdown failed",
 					"language", language, "clone_id", n, "err", derr)
 			}
@@ -593,7 +593,7 @@ func (p *WarmPool) Close() error {
 			for {
 				select {
 				case c := <-ch:
-					if derr := p.mgr.DestroyClone(c); derr != nil {
+					if derr := p.mgr.DestroyClone(p.rootCtx, c); derr != nil {
 						logger.FromContext(p.rootCtx).Warn("warm-pool: destroy buffered clone on close failed",
 							"clone_id", c.ID, "err", derr)
 					}
@@ -763,7 +763,7 @@ func (p *WarmPool) Fleet() FleetSnapshot {
 // pushing the rest back (same order), so the take/replenish paths never observe
 // a torn buffer. DestroyClone (the only host call) runs AFTER the lock is
 // released so a slow teardown doesn't block the pool.
-func (p *WarmPool) KillClone(id int) (bool, error) {
+func (p *WarmPool) KillClone(ctx context.Context, id int) (bool, error) {
 	p.mu.Lock()
 	var victim *Clone
 	for _, ch := range p.ready {
@@ -794,7 +794,7 @@ func (p *WarmPool) KillClone(id int) (bool, error) {
 	}
 
 	// Destroy outside the lock; free the index regardless so it never leaks.
-	derr := p.mgr.DestroyClone(victim)
+	derr := p.mgr.DestroyClone(ctx, victim)
 	p.freeIndex(victim.ID)
 	if derr != nil {
 		return true, fmt.Errorf("destroy clone %d: %w", id, derr)

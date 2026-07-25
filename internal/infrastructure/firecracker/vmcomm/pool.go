@@ -3,7 +3,6 @@ package vmcomm
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
@@ -17,6 +16,9 @@ import (
 // VMs are reused across multiple task executions. Idle VMs are terminated
 // after IdleTimeoutMin to support scale-to-zero.
 type Pool struct {
+	// rootCtx/cancel scope the idle-cleanup goroutine; Close() cancels it.
+	rootCtx        context.Context
+	cancel         context.CancelFunc
 	mu             sync.Mutex
 	vmProvider     usecase.VMProvider
 	listener       *FirecrackerListener
@@ -48,7 +50,10 @@ func NewPool(vmProvider usecase.VMProvider, listener *FirecrackerListener, poolS
 	if len(idleTimeoutMin) > 0 {
 		timeout = idleTimeoutMin[0]
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	p := &Pool{
+		rootCtx:        ctx,
+		cancel:         cancel,
 		vmProvider:     vmProvider,
 		listener:       listener,
 		readyVMs:       make(map[domain.Language][]*PooledVM),
@@ -59,21 +64,32 @@ func NewPool(vmProvider usecase.VMProvider, listener *FirecrackerListener, poolS
 	}
 	// Start idle cleanup goroutine if timeout > 0
 	if timeout > 0 {
-		go p.idleCleanupLoop()
+		go p.idleCleanupLoop(ctx)
 	}
 	return p
 }
 
 // idleCleanupLoop periodically terminates VMs that have been idle too long.
-func (p *Pool) idleCleanupLoop() {
+// It exits when the pool's lifetime context is cancelled (Close).
+func (p *Pool) idleCleanupLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.FromContext(ctx).Error("vmcomm pool: idle cleanup loop panicked", "panic", r)
+		}
+	}()
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		p.cleanupIdleVMs()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.cleanupIdleVMs(ctx)
+		}
 	}
 }
 
-func (p *Pool) cleanupIdleVMs() {
+func (p *Pool) cleanupIdleVMs(ctx context.Context) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -84,7 +100,8 @@ func (p *Pool) cleanupIdleVMs() {
 		for _, vm := range vms {
 			if vm.LastUsedAt.Before(cutoff) {
 				// Terminate idle VM
-				log.Printf("pool: terminating idle VM %s (idle since %s)", vm.VM.ID, vm.LastUsedAt.Format(time.Kitchen))
+				logger.FromContext(ctx).Info("vmcomm pool: terminating idle VM",
+					"vm_id", vm.VM.ID, "last_used_at", vm.LastUsedAt)
 				if vm.Client != nil {
 					_ = vm.Client.Shutdown()
 					_ = vm.Client.Close()
@@ -195,7 +212,7 @@ func (p *Pool) ensureConnected(ctx context.Context, vm *PooledVM) error {
 }
 
 // ReleaseVM returns a VM to the pool for reuse.
-func (p *Pool) ReleaseVM(vmID uuid.UUID) {
+func (p *Pool) ReleaseVM(ctx context.Context, vmID uuid.UUID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -212,7 +229,7 @@ func (p *Pool) ReleaseVM(vmID uuid.UUID) {
 	// Return to ready pool
 	lang := vm.VM.Language
 	p.readyVMs[lang] = append(p.readyVMs[lang], vm)
-	log.Printf("pool: VM %s returned to warm pool (%s)", vmID, lang)
+	logger.FromContext(ctx).Debug("vmcomm pool: VM returned to warm pool", "vm_id", vmID, "language", lang)
 }
 
 // bootAndConnect boots a new VM and establishes vsock connection.
@@ -283,7 +300,7 @@ func (p *Pool) bootAndConnect(ctx context.Context, language domain.Language, res
 }
 
 // removeVM permanently removes a VM from the pool (e.g., broken connection).
-func (p *Pool) removeVM(vmID uuid.UUID) {
+func (p *Pool) removeVM(ctx context.Context, vmID uuid.UUID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.busyVMs, vmID)
@@ -296,11 +313,13 @@ func (p *Pool) removeVM(vmID uuid.UUID) {
 			}
 		}
 	}
-	log.Printf("pool: removed broken VM %s", vmID)
+	logger.FromContext(ctx).Warn("vmcomm pool: removed broken VM", "vm_id", vmID)
 }
 
 // Close terminates all VMs in the pool.
 func (p *Pool) Close() {
+	p.cancel()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

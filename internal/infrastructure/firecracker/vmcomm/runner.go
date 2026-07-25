@@ -3,7 +3,6 @@ package vmcomm
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -103,11 +102,11 @@ func (r *Runner) Run(ctx context.Context, vm *domain.MicroVM, execution *domain.
 }
 
 // ShutdownVM sends a graceful shutdown to the guest agent and cleans up.
-func (r *Runner) ShutdownVM(vmID uuid.UUID) {
+func (r *Runner) ShutdownVM(ctx context.Context, vmID uuid.UUID) {
 	client := r.fcListener.GetClient(vmID)
 	if client != nil {
 		if err := client.Shutdown(); err != nil {
-			log.Printf("vmcomm: shutdown error for VM %s: %v", vmID, err)
+			logger.FromContext(ctx).Warn("vmcomm: guest agent shutdown failed", "vm_id", vmID, "err", err)
 		}
 	}
 	r.fcListener.RemoveClient(vmID)

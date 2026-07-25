@@ -115,7 +115,7 @@ func (f *fakeWarmManager) CreateTemplateSnapshot(ctx context.Context, warm *Warm
 	return &TemplateSnapshot{StatePath: statePath, MemPath: memPath, Language: warm.Language}, nil
 }
 
-func (f *fakeWarmManager) DestroyWarm(warm *WarmVM) error { return nil }
+func (f *fakeWarmManager) DestroyWarm(ctx context.Context, warm *WarmVM) error { return nil }
 
 func (f *fakeWarmManager) CloneFromSnapshot(ctx context.Context, snap *TemplateSnapshot, n int) (*Clone, error) {
 	if f.cloneErr != nil {
@@ -127,7 +127,7 @@ func (f *fakeWarmManager) CloneFromSnapshot(ctx context.Context, snap *TemplateS
 	return &Clone{ID: n, Endpoint: "10.200.1.2:8000"}, nil
 }
 
-func (f *fakeWarmManager) DestroyClone(clone *Clone) error {
+func (f *fakeWarmManager) DestroyClone(ctx context.Context, clone *Clone) error {
 	f.mu.Lock()
 	f.clonesKilled++
 	f.mu.Unlock()
@@ -457,7 +457,7 @@ func TestWarmPool_ReadyN_FillsBuffer_AndTakeServesRequest(t *testing.T) {
 	}
 
 	// Simulate RunCode's always-destroy on the taken clone.
-	if err := mgr.DestroyClone(clone); err != nil {
+	if err := mgr.DestroyClone(ctx, clone); err != nil {
 		t.Fatalf("DestroyClone: %v", err)
 	}
 	p.freeIndex(n)
@@ -604,7 +604,7 @@ func TestWarmPool_BufferEmpty_FallsBackToOnDemand(t *testing.T) {
 	}
 	// The on-demand clone came from the blocking manager's on-demand path
 	// (which does NOT block — only replenisher clones block).
-	mgr.DestroyClone(clone)
+	mgr.DestroyClone(ctx, clone)
 	p.freeIndex(n)
 }
 
@@ -632,7 +632,7 @@ func (b *blockingWarmManager) CreateTemplateSnapshot(ctx context.Context, warm *
 	return &TemplateSnapshot{StatePath: "state", MemPath: "mem", Language: warm.Language}, nil
 }
 
-func (b *blockingWarmManager) DestroyWarm(warm *WarmVM) error { return nil }
+func (b *blockingWarmManager) DestroyWarm(ctx context.Context, warm *WarmVM) error { return nil }
 
 func (b *blockingWarmManager) CloneFromSnapshot(ctx context.Context, snap *TemplateSnapshot, n int) (*Clone, error) {
 	// Untagged ctx (the replenisher) blocks so the ready buffer never fills;
@@ -650,7 +650,7 @@ func (b *blockingWarmManager) CloneFromSnapshot(ctx context.Context, snap *Templ
 	return &Clone{ID: n, Endpoint: "10.200.1.2:8000"}, nil
 }
 
-func (b *blockingWarmManager) DestroyClone(clone *Clone) error {
+func (b *blockingWarmManager) DestroyClone(ctx context.Context, clone *Clone) error {
 	b.mu.Lock()
 	b.clonesKilled++
 	b.mu.Unlock()
@@ -776,7 +776,7 @@ func TestWarmPool_KillClone_RemovesDestroysAndFrees(t *testing.T) {
 	targetID := fleet.Languages[0].ReadyClones[0].ID
 	killedBefore := mgr.clonesKilledCount()
 
-	ok, err := p.KillClone(targetID)
+	ok, err := p.KillClone(context.Background(), targetID)
 	if err != nil {
 		t.Fatalf("KillClone: %v", err)
 	}
@@ -829,7 +829,7 @@ func TestWarmPool_KillClone_UnknownID(t *testing.T) {
 
 	killedBefore := mgr.clonesKilledCount()
 	// 9999 is well outside any buffered clone id.
-	ok, err := p.KillClone(9999)
+	ok, err := p.KillClone(context.Background(), 9999)
 	if err != nil {
 		t.Fatalf("KillClone(unknown): unexpected error %v", err)
 	}
