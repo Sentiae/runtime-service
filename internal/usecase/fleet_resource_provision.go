@@ -472,12 +472,17 @@ func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, r
 			logger.FromContext(ctx).Warn("fleet decommission: final snapshot captured nothing; proceeding on an existing recovery point",
 				"resource_id", res.ID, "prior_recovery_points", len(prior))
 			final = &prior[0]
+		} else {
+			// The dedicated tier is single-volume by construction (dedicatedDescriptor
+			// requests exactly one, and in-place restore refuses anything else), so the
+			// first point IS the resource's final recovery point — the same choice the
+			// SnapshotResource RPC makes.
+			//
+			// This MUST stay in the else. Outside it, the empty-points path above
+			// indexes points[0] and panics, and it silently overwrites the prior
+			// recovery point the fallback just resolved.
+			final = &points[0]
 		}
-		// The dedicated tier is single-volume by construction (dedicatedDescriptor
-		// requests exactly one, and in-place restore refuses anything else), so the
-		// first point IS the resource's final recovery point — the same choice the
-		// SnapshotResource RPC makes.
-		final = &points[0]
 	}
 	if res.AppID != nil {
 		if derr := uc.provisioner.Decommission(ctx, res.AppID.String()); derr != nil {
