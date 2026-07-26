@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -77,12 +78,18 @@ func main() {
 	var shutdownTelemetry otelkit.Shutdown
 	if cfg.Telemetry.Enabled {
 		log.Printf("Telemetry: enabled (OTLP endpoint: %s)", cfg.Telemetry.OTLPEndpoint)
+		// service.instance.id is the DURABLE fleet host id when this process is a
+		// fleet host: its series must be joinable to the placement records that key
+		// on that uuid, and a hostname is not (a re-IP'd or renamed host would fork a
+		// second series that no volume or resource row points at). Empty on a mesh
+		// container, where platform-kit's hostname default is correct.
 		shutdownTelemetry, err = otelkit.Init(otelCtx, otelkit.Config{
 			ServiceName:    cfg.Telemetry.ServiceName,
 			ServiceVersion: Version,
 			Environment:    cfg.App.Environment,
 			Endpoint:       cfg.Telemetry.OTLPEndpoint,
 			Insecure:       true,
+			InstanceID:     strings.TrimSpace(cfg.Fleet.HostID),
 		})
 		if err != nil {
 			log.Printf("Failed to init telemetry (continuing without it): %v", err)
