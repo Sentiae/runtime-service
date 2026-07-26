@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/runtime-service/internal/domain"
 	pb "github.com/sentiae/runtime-service/internal/infrastructure/firecracker/agentpb"
@@ -99,17 +98,6 @@ func (r *Runner) Run(ctx context.Context, vm *domain.MicroVM, execution *domain.
 		MemoryPeakMB: float64(result.MemoryPeakKB) / 1024.0,
 		ExecTimeMS:   result.DurationMS,
 	}, nil
-}
-
-// ShutdownVM sends a graceful shutdown to the guest agent and cleans up.
-func (r *Runner) ShutdownVM(ctx context.Context, vmID uuid.UUID) {
-	client := r.fcListener.GetClient(vmID)
-	if client != nil {
-		if err := client.Shutdown(); err != nil {
-			logger.FromContext(ctx).Warn("vmcomm: guest agent shutdown failed", "vm_id", vmID, "err", err)
-		}
-	}
-	r.fcListener.RemoveClient(vmID)
 }
 
 // Close cleans up all connections.

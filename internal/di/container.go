@@ -113,8 +113,13 @@ type Container struct {
 	ExecutionRunner   usecase.ExecutionRunner
 	EventPublisher    messaging.EventPublisher
 	EventConsumer     *messaging.EventConsumer
-	VsockListener     *vmcomm.Listener
 	VsockRunner       *vmcomm.Runner
+
+	// VsockPool is the vsock warm VM pool behind ExecutionRunner when the
+	// executor is firecracker + vsock. Kept on the container so Close() can
+	// cancel its idle-cleanup loop and terminate its VMs; without this the
+	// loop would outlive shutdown and run to process exit.
+	VsockPool *vmcomm.Pool
 
 	// Posture is runtime's declared security posture (D-179 Wave-8). It carries
 	// the service's one real fail-closed boot control — the gRPC mesh must not be
@@ -1393,8 +1398,8 @@ func (c *Container) initInfrastructure(cfg *config.Config) {
 		if cfg.App.UseVsock {
 			// Vsock agent with warm pool — VMs are reused across tasks
 			fcListener := vmcomm.NewFirecrackerListener()
-			pool := vmcomm.NewPool(c.FCProvider, fcListener, 1)
-			c.ExecutionRunner = vmcomm.NewPoolRunner(pool)
+			c.VsockPool = vmcomm.NewPool(c.FCProvider, fcListener, 1)
+			c.ExecutionRunner = vmcomm.NewPoolRunner(c.VsockPool)
 			log.Println("Firecracker with vsock agent + warm pool execution")
 		} else {
 			// Rootfs-injection — each task gets a fresh disposable VM
@@ -2467,6 +2472,15 @@ func (c *Container) Close() error {
 	// verifies in-flight secret resolves — not only the lease renewer.
 	if c.vaultClient != nil {
 		_ = c.vaultClient.Close()
+	}
+
+	// vsock warm pool — cancel the idle-cleanup loop and shut down each pooled
+	// agent. ⚠ Must stay BEFORE the c.FCPools drain below: its VMs were booted
+	// through c.FCProvider, which hands out clones from c.FCPools[0] (SetPool),
+	// so closing the FCPools first would pull the substrate out from under the
+	// VMs this Close() is trying to terminate gracefully.
+	if c.VsockPool != nil {
+		c.VsockPool.Close()
 	}
 
 	// §9.1 — drain every warm pool before releasing upstream resources
