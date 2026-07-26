@@ -154,6 +154,10 @@ func NewFleetVolumeSnapshotter(
 func (s *FleetVolumeSnapshotter) SnapshotAppVolumes(ctx context.Context, resourceID, appID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error) {
 	points, err := s.snapshotAppVolumes(ctx, resourceID, appID)
 	s.recordSnapshotOutcome(ctx, resourceID, len(points), err)
+	// §22 use case counter. Only ok/error: whether a successful call actually
+	// PROTECTED anything is answered by sentiae_fleet_recovery_point_* (the ledger
+	// is the authority on that), and a second answer here could disagree with it.
+	recordExecution("snapshot_app_volumes", outcomeFor(err))
 	return points, err
 }
 

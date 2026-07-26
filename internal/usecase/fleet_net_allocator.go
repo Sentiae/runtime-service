@@ -75,6 +75,17 @@ func (a *FleetNetAllocator) Ordinal() int { return a.ordinal }
 // allocating a second lease would both burn a slot forever and leave two rows
 // describing one owner.
 func (a *FleetNetAllocator) Acquire(ctx context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) (domain.NetLease, error) {
+	lease, err := a.acquire(ctx, kind, ownerID)
+	if err != nil {
+		// Every refusal is a boot that did not happen, so it is counted at the ONE
+		// seam every return path passes through — a per-branch increment is how a
+		// later branch silently stops being counted.
+		recordLeaseAcquire(leaseOutcomeRefused)
+	}
+	return lease, err
+}
+
+func (a *FleetNetAllocator) acquire(ctx context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) (domain.NetLease, error) {
 	if a.leases == nil {
 		return domain.NetLease{}, fmt.Errorf("%w: no lease store wired", domain.ErrNetPlaneUnreconciled)
 	}
@@ -108,6 +119,7 @@ func (a *FleetNetAllocator) Acquire(ctx context.Context, kind domain.NetLeaseOwn
 				"%w: %s %s already holds net_index %d on host %s, not on this host %s",
 				domain.ErrNetLeaseConflict, kind, ownerID, existing.NetIndex, existing.HostID, a.selfHost)
 		}
+		recordLeaseAcquire(leaseOutcomeAdopted)
 		return *existing, nil
 	}
 
@@ -162,6 +174,7 @@ func (a *FleetNetAllocator) Acquire(ctx context.Context, kind domain.NetLeaseOwn
 
 		aerr := a.leases.Acquire(ctx, &lease)
 		if aerr == nil {
+			recordLeaseAcquire(leaseOutcomeAllocated)
 			return lease, nil
 		}
 		if !errors.Is(aerr, domain.ErrNetLeaseConflict) {
@@ -171,9 +184,11 @@ func (a *FleetNetAllocator) Acquire(ctx context.Context, kind domain.NetLeaseOwn
 		// the SAME owner won the (owner_kind, owner_id) fence, in which case the
 		// lease to use is that one — so re-check the owner before trying a new slot.
 		if held, herr := a.leases.FindByOwner(ctx, kind, ownerID); herr == nil && held.HostID == a.selfHost {
+			recordLeaseAcquire(leaseOutcomeAdopted)
 			return *held, nil
 		}
 		tried[slot] = true
+		recordLeaseAcquire(leaseOutcomeConflictRetry)
 		logger.FromContext(ctx).Warn("fleet net plane: lease conflict, retrying with the next free slot",
 			"host_id", a.selfHost, "slot", slot, "net_index", lease.NetIndex,
 			"owner_kind", kind, "owner_id", ownerID, "attempt", attempt+1, "err", aerr)

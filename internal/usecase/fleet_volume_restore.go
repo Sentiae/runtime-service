@@ -201,6 +201,16 @@ type RestoreResourceOutput struct {
 // for the outcome — phase `ready` with an empty last_error means the restore
 // took, phase `ready` WITH a last_error means it was rolled back.
 func (uc *FleetVolumeRestorer) Restore(ctx context.Context, in RestoreResourceInput) (RestoreResourceOutput, error) {
+	out, err := uc.restore(ctx, in)
+	// §22 counter. It counts ADMISSION only — the restore itself finishes in a
+	// detached goroutine, and its outcome is the resource's phase + last_error, not
+	// this return value. Counting it here as `ok` would otherwise be read as "the
+	// restore worked".
+	recordExecution("restore_resource_admit", outcomeFor(err))
+	return out, err
+}
+
+func (uc *FleetVolumeRestorer) restore(ctx context.Context, in RestoreResourceInput) (RestoreResourceOutput, error) {
 	var zero RestoreResourceOutput
 	res, rp := in.Resource, in.RecoveryPoint
 	if res == nil {

@@ -231,6 +231,15 @@ func healthCondition(err error) string {
 // returns the current status; a different revision is REJECTED (converge/resize
 // is a later slice); a concurrent insert-race returns the winner.
 func (uc *FleetResourceProvisioner) ProvisionDedicated(ctx context.Context, in ProvisionDedicatedInput) (ProvisionDedicatedOutput, error) {
+	out, err := uc.provisionDedicated(ctx, in)
+	// §22 counter at the ONE seam every return path passes through — this use case
+	// has a dozen early returns, and per-branch instrumentation is how a later
+	// branch silently stops being counted.
+	recordExecution("provision_dedicated_resource", outcomeFor(err))
+	return out, err
+}
+
+func (uc *FleetResourceProvisioner) provisionDedicated(ctx context.Context, in ProvisionDedicatedInput) (ProvisionDedicatedOutput, error) {
 	if in.Class != resourceClassPostgres {
 		return ProvisionDedicatedOutput{}, domain.ErrResourceClassUnsupported
 	}
@@ -683,6 +692,12 @@ func residentEndpointOf(replicas []domain.Replica) string {
 // when no final snapshot was asked for (an ephemeral tier) or when the resource
 // was already a tombstone.
 func (uc *FleetResourceProvisioner) DecommissionDedicated(ctx context.Context, resourceID uuid.UUID, finalSnapshot bool) (*domain.FleetResourceRecoveryPoint, error) {
+	rp, err := uc.decommissionDedicated(ctx, resourceID, finalSnapshot)
+	recordExecution("decommission_dedicated_resource", outcomeFor(err))
+	return rp, err
+}
+
+func (uc *FleetResourceProvisioner) decommissionDedicated(ctx context.Context, resourceID uuid.UUID, finalSnapshot bool) (*domain.FleetResourceRecoveryPoint, error) {
 	res, err := uc.resources.GetResourceByHandle(ctx, resourceID)
 	if err != nil {
 		return nil, err

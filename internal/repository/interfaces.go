@@ -289,6 +289,36 @@ type RouteRepository interface {
 	FindByHost(ctx context.Context, host string) (*domain.Route, error)
 }
 
+// ResourceDurability is the per-resource protection projection the durability
+// metric collector reads. It is a QUERY PROJECTION, not an entity: it exists so
+// one indexed aggregate answers "when was each live resource last protected"
+// instead of an N+1 walk over every resource's recovery catalog.
+//
+// ⚠ Both timestamps and the count are reported EXACTLY as the ledger holds them —
+// nil means the fact does not exist and must never be substituted with a zero
+// time. A resource that has never had a recovery point is the state this whole
+// projection exists to make visible, so collapsing it into "age 0" would report
+// the safest possible value for the least safe possible state.
+type ResourceDurability struct {
+	ResourceID uuid.UUID `gorm:"column:resource_id"`
+	OwnerOrg   uuid.UUID `gorm:"column:owner_org"`
+	Phase      string    `gorm:"column:phase"`
+	Class      string    `gorm:"column:class"`
+	Tier       string    `gorm:"column:tier"`
+	// ConsecutiveSnapshotFailures / LastSnapshotSuccessAt mirror the resource's
+	// snapshot-health columns (migration 0018).
+	ConsecutiveSnapshotFailures int        `gorm:"column:consecutive_snapshot_failures"`
+	LastSnapshotSuccessAt       *time.Time `gorm:"column:last_snapshot_success_at"`
+	// LatestRecoveryPointAt is the creation time of this resource's NEWEST recovery
+	// point, or nil when it has none at all. It is read from the recovery-point
+	// catalog rather than from last_snapshot_success_at because the two can
+	// disagree: the catalog is the artifact that would actually be restored.
+	LatestRecoveryPointAt *time.Time `gorm:"column:latest_recovery_point_at"`
+	// RecoveryPointCount is how many recovery points the catalog holds for this
+	// resource. Zero is the alarming case and is reported as zero, not as absence.
+	RecoveryPointCount int `gorm:"column:recovery_point_count"`
+}
+
 // FleetResourceRepository persists P19 resource control-plane claims and their
 // recovery points (CP4.5 §9 #3, D-164/D-183).
 type FleetResourceRepository interface {
@@ -353,6 +383,11 @@ type FleetResourceRepository interface {
 	// object key from another org's resource is not restorable. Returns
 	// domain.ErrRecoveryPointNotFound when none matches.
 	GetRecoveryPointByRef(ctx context.Context, resourceID uuid.UUID, objectKey string) (*domain.FleetResourceRecoveryPoint, error)
+	// ListResourceDurability returns the protection projection (see
+	// ResourceDurability) for every LIVE claim — one row per non-tombstoned
+	// resource, including those with no recovery point at all, which are precisely
+	// the rows the durability gauges have to be able to report on.
+	ListResourceDurability(ctx context.Context) ([]ResourceDurability, error)
 	// MarkRecoveryPointRestoredInPlace records that a restore FROM this recovery
 	// point, over the resource's own volume, booted an engine that admitted a
 	// client. It is not a verification drill and must never be reported as one

@@ -118,6 +118,12 @@ func (f *fakeResourceRepo) MarkRecoveryPointRestoredInPlace(context.Context, uui
 	return nil
 }
 
+// ListResourceDurability is unused by the handler (the metric collector reads it),
+// so the fake satisfies the interface without inventing rows.
+func (f *fakeResourceRepo) ListResourceDurability(context.Context) ([]repository.ResourceDurability, error) {
+	return nil, nil
+}
+
 // FindLiveResourceByApp resolves the seeded claim when it backs appID and is
 // neither stamped nor phased decommissioned — the postgres predicate.
 func (f *fakeResourceRepo) FindLiveResourceByApp(_ context.Context, appID uuid.UUID) (*domain.FleetResource, error) {

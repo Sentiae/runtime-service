@@ -244,6 +244,13 @@ type Container struct {
 	// host identity. It never deletes, moves or repairs anything.
 	FleetLedgerReconciler *usecase.FleetLedgerReconciler
 
+	// The durability metric collector: the timer that keeps the recovery-point,
+	// snapshot-health, addressing-plane and host-attestation gauges true. It is a
+	// TIMER rather than a write-path hook on purpose — a gauge written only when
+	// work succeeds can never report that the work stopped, which is the exact
+	// false-green the durability surface exists to remove. Stopped by Close.
+	FleetDurabilityMetrics *usecase.FleetDurabilityCollector
+
 	// runtime-fleet P3.4 — the Vault client backing the per-tenant secret
 	// resolver on the fleet host. Non-nil only when the firecracker executor is
 	// selected AND VAULT_ADDR/VAULT_AUTH_MODE are set and the client built.
@@ -454,12 +461,19 @@ func (c *Container) initFleet(cfg *config.Config) error {
 		if planeErr != nil {
 			log.Printf("ERROR: fleet microVM addressing plane UNRECONCILED — every boot on this host is REFUSED (teardown, health and ingress still served): %v", planeErr)
 		}
+		// The one boot fact /posture structurally cannot carry (see initNetPlane: a
+		// posture control REFUSES boot, which is a worse posture than "refuse boots,
+		// keep serving teardown"). As a gauge it is watchable without being fatal.
+		usecase.PublishNetPlaneReconciled(planeErr == nil)
 		c.ImageBooter = publishImageBooter(booter, planeErr)
 		c.GuestControl = firecracker.NewGuestControlClient(c.guestControlTokens)
 		log.Println("Image-boot Firecracker booter initialized")
 	} else {
 		c.ImageBooter = usecase.FailLoudImageBooter{}
 		c.GuestControl = gateway.FailLoudGuestControl{}
+		// Not 0: 0 means "customer boots are being refused on a fleet host", which
+		// would be a false alarm on an instance that never boots a microVM at all.
+		usecase.PublishNetPlaneNotApplicable()
 		log.Println("Image-boot booter: fail-loud (firecracker executor not selected)")
 	}
 
@@ -489,6 +503,17 @@ func (c *Container) initFleet(cfg *config.Config) error {
 		c.FleetAppRepo,
 		c.snapshotArtifactStore,
 		volumeDir,
+	)
+
+	// The durability gauges' collector. Deliberately not gated on the executor
+	// either: the ledger it reads is the SHARED control plane, so any instance can
+	// answer "how old is every resource's newest recovery point" — and an instance
+	// that published nothing would leave the whole set absent, which reads as
+	// healthy.
+	c.FleetDurabilityMetrics = usecase.NewFleetDurabilityCollector(
+		c.FleetResourceRepo,
+		c.HostRepo,
+		c.NetLeaseRepo,
 	)
 
 	// CP4.5 §9#5 — P21 fleet network fabric. The enforcer is the SINGLE WRITER of
@@ -1924,6 +1949,14 @@ func (c *Container) StartBackgroundControllers(ctx context.Context) {
 	c.sweepInterruptedRestores(ctx)
 	c.startStagingSweeper(ctx)
 	c.startLedgerReconciler(ctx)
+	// The durability gauges' timer. Started BEFORE the fleet reconciler so the first
+	// values land within a second of boot: an instance that serves traffic while its
+	// durability gauges are still unset is an instance whose alerts have nothing to
+	// evaluate.
+	if c.FleetDurabilityMetrics != nil {
+		c.FleetDurabilityMetrics.Start(ctx)
+		log.Printf("Fleet durability metric collector started (interval=%s)", usecase.DurabilityCollectEvery)
+	}
 	c.startFleetReconciler(ctx)
 	// CP4.5 §9#3 (D-183) — shared-tier TTL reaper. Nil until the shared engine is
 	// wired (NEEDS-DECISION on shared-engine admin credentials); the loop is
@@ -2023,6 +2056,11 @@ func (c *Container) startLedgerReconciler(ctx context.Context) {
 			log.Printf("[FLEET-LEDGER] reconcile pass failed (nothing reported): %v", err)
 			return
 		}
+		// Only a COMPLETED pass publishes. A failed pass proved nothing, and
+		// republishing zeros for it would turn an unreadable oracle into a clean bill
+		// of health — the ledger gauges then keep their previous values, and the
+		// last-success timestamp stops advancing, which is the honest signal.
+		usecase.PublishLedgerReport(rep, time.Now().UTC())
 		if rep.Divergences() > 0 {
 			log.Printf("[FLEET-LEDGER] %d LEDGER DIVERGENCE(S): %d row-without-file, %d file-without-row, %d recovery-point-without-object (checked %d volume(s), %d file(s), %d recovery point(s); %d undetermined) — report-only, nothing was changed",
 				rep.Divergences(), rep.RowsWithoutFile, rep.FilesWithoutRow, rep.RecoveryPointsWithoutObject,
@@ -2215,6 +2253,13 @@ func (c *Container) Close() error {
 	// DB pool closes, so it never dies between the swap and the phase write.
 	if c.ResourceRestorer != nil {
 		c.ResourceRestorer.Wait()
+	}
+
+	// Stop the durability metric collector (waits for the loop) BEFORE the DB pool
+	// closes, so a final pass never queries a closed pool and reports a fabricated
+	// collection error on the way out.
+	if c.FleetDurabilityMetrics != nil {
+		c.FleetDurabilityMetrics.Stop()
 	}
 
 	// CP4.5 §9#3 (D-183) — stop the shared-tier TTL reaper (waits for the loop).

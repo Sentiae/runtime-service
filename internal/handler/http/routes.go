@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	kafka "github.com/sentiae/platform-kit/kafka"
 	"github.com/sentiae/platform-kit/opshttp"
 	"github.com/sentiae/platform-kit/posture"
@@ -105,6 +106,14 @@ func (s *Server) setupRoutes() {
 	// /health above is runtime's own liveness and stays untouched.
 	s.router.Handle("/posture", opshttp.PostureHandler("runtime", s.postureSet))
 	s.router.Handle("/healthz/consumers", kafka.ConsumersHealthzHandler("runtime", s.consumers...))
+
+	// Prometheus scrape surface (§22), matching identity/git/conversation/vigil:
+	// promhttp over the DEFAULT registry, which is the same registry otelkit.Init
+	// bridges into the OTLP push path. Both paths matter here — the bare Firecracker
+	// fleet host runs with APP_TELEMETRY_ENABLED=false (no reachable collector), so
+	// without this route the durability gauges on the host that actually holds
+	// customer data would be unreadable.
+	s.router.Handle("/metrics", promhttp.Handler())
 
 	// §9.4 — customer-agent enrolment endpoint. Lives OUTSIDE the
 	// /api/v1 auth-protected group because the customer-agent has

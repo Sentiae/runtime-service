@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sentiae/platform-kit/secret"
 	"github.com/sentiae/runtime-service/internal/domain"
+	"github.com/sentiae/runtime-service/internal/repository"
 )
 
 // ─────────────────────────────────────────────────────────────────────
@@ -40,6 +41,9 @@ type fakeResourceRepo struct {
 	// snapshotHealthErr fails the snapshot-health recording so the caller's
 	// swallow-and-log path is reachable.
 	snapshotHealthErr error
+	// durabilityErr fails the durability projection so the metric collector's
+	// fail-soft path (keep the previous gauge values, count the error) is reachable.
+	durabilityErr error
 }
 
 func newFakeResourceRepo() *fakeResourceRepo {
@@ -241,6 +245,41 @@ func (f *fakeResourceRepo) MarkRecoveryPointRestoredInPlace(_ context.Context, i
 		}
 	}
 	return domain.ErrRecoveryPointNotFound
+}
+
+// ListResourceDurability mirrors the postgres aggregate: one row per LIVE claim,
+// including claims with no recovery point at all (a LEFT JOIN, so those rows carry
+// a nil latest and a count of 0 rather than being dropped).
+func (f *fakeResourceRepo) ListResourceDurability(context.Context) ([]repository.ResourceDurability, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.durabilityErr != nil {
+		return nil, f.durabilityErr
+	}
+	var out []repository.ResourceDurability
+	for id, r := range f.byID {
+		if r.DecommissionedAt != nil {
+			continue
+		}
+		row := repository.ResourceDurability{
+			ResourceID:                  id,
+			OwnerOrg:                    r.OwnerOrg,
+			Phase:                       string(r.Phase),
+			Class:                       r.Class,
+			Tier:                        r.Tier,
+			ConsecutiveSnapshotFailures: r.ConsecutiveSnapshotFailures,
+			LastSnapshotSuccessAt:       r.LastSnapshotSuccessAt,
+			RecoveryPointCount:          len(f.recovery[id]),
+		}
+		for _, rp := range f.recovery[id] {
+			if row.LatestRecoveryPointAt == nil || rp.CreatedAt.After(*row.LatestRecoveryPointAt) {
+				at := rp.CreatedAt
+				row.LatestRecoveryPointAt = &at
+			}
+		}
+		out = append(out, row)
+	}
+	return out, nil
 }
 
 func (f *fakeResourceRepo) ListExpiredShared(_ context.Context, now time.Time) ([]domain.FleetResource, error) {

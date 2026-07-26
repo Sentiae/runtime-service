@@ -11,6 +11,7 @@ require (
 	github.com/jackc/pgx/v5 v5.7.4
 	github.com/lib/pq v1.12.3
 	github.com/minio/minio-go/v7 v7.1.0
+	github.com/prometheus/client_golang v1.23.2
 	github.com/sentiae/canvas-service v0.0.0-00010101000000-000000000000
 	github.com/sentiae/foundry-service v0.1.0
 	github.com/sentiae/platform-kit v0.3.14
@@ -86,6 +87,7 @@ require (
 	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
+	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/magiconair/properties v1.8.10 // indirect
@@ -112,7 +114,6 @@ require (
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect

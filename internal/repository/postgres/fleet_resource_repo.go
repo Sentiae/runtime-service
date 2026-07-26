@@ -242,6 +242,37 @@ func (r *fleetResourceRepository) GetRecoveryPointByRef(ctx context.Context, res
 	return &rp, nil
 }
 
+// ListResourceDurability aggregates every live claim against its recovery-point
+// catalog in ONE query.
+//
+// A LEFT JOIN, never an inner one: a resource with no recovery point must appear
+// in the result with a NULL latest and a count of 0. An inner join would DROP
+// exactly those rows, and a dropped row becomes a missing metric series, which
+// reads as "nothing to report" — the false-green this projection exists to
+// prevent. GROUP BY r.id is sufficient in Postgres (every selected r column is
+// functionally dependent on the primary key).
+func (r *fleetResourceRepository) ListResourceDurability(ctx context.Context) ([]repository.ResourceDurability, error) {
+	var out []repository.ResourceDurability
+	err := r.db.WithContext(ctx).Raw(`
+		SELECT r.id                            AS resource_id,
+		       r.owner_org                     AS owner_org,
+		       r.phase                         AS phase,
+		       r.class                         AS class,
+		       r.tier                          AS tier,
+		       r.consecutive_snapshot_failures AS consecutive_snapshot_failures,
+		       r.last_snapshot_success_at      AS last_snapshot_success_at,
+		       MAX(rp.created_at)              AS latest_recovery_point_at,
+		       COUNT(rp.id)                    AS recovery_point_count
+		FROM fleet_resources r
+		LEFT JOIN fleet_resource_recovery_points rp ON rp.resource_id = r.id
+		WHERE r.decommissioned_at IS NULL
+		GROUP BY r.id`).Scan(&out).Error
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MarkRecoveryPointRestoredInPlace sets the `verified` COLUMN, which records
 // RestoredInPlaceOK — an in-place restore that came back serving, not a
 // verification drill. The column keeps its 0012 name on purpose (see
