@@ -36,8 +36,10 @@ func NewFleetHostRegistry(repo repository.HostRepository, leases repository.NetL
 // RegisterHost upserts a host by id, then makes sure it has a net ordinal. A new
 // host is created healthy/active with allocatable seeded from capacity;
 // re-registering an existing host refreshes its spec
-// (region/labels/capacity/endpoint) and marks it healthy/active without clobbering
-// the live allocatable accounting a heartbeat maintains.
+// (region/labels/capacity/endpoint) and marks it healthy without clobbering the
+// live allocatable accounting a heartbeat maintains — and, critically, without
+// resurrecting its own schedulability: an operator-set cordoned/draining/
+// decommissioned status SURVIVES re-registration (see below).
 //
 // The ordinal assignment is a REFUSAL point: if the fleet has no free ordinal the
 // registration fails, because admitting a host that would have to share another
@@ -109,8 +111,32 @@ func (uc *FleetHostRegistry) RegisterHost(ctx context.Context, host domain.Host)
 			existing.AllocatableDiskMB = existing.CapacityDiskMB
 		}
 		existing.Endpoint = host.Endpoint
+		// Health is OBSERVED and orthogonal to schedulability: this registration is
+		// itself the evidence that the host's process is up, so refreshing it is
+		// honest.
 		existing.Health = domain.HostHealthHealthy
-		existing.Status = domain.HostStatusActive
+		// Schedulability is OPERATOR-owned, and a re-registration must never widen
+		// it. This used to set active unconditionally, and runtime-service
+		// self-registers on every boot — so a cordoned host silently UN-CORDONED
+		// itself by restarting. Cordon is the precondition of every safe
+		// host-lifecycle operation (drain, re-image), and a cordon that lapses on
+		// restart is worse than no cordon at all: the operator believes work is being
+		// kept off a machine the scheduler is placing on.
+		//
+		// draining is preserved for the same reason plus a stronger one: a drain is an
+		// in-flight operation moving work OFF this host, so resurrecting it mid-drain
+		// would have the scheduler fill the machine that is being emptied — the drain
+		// would never converge. decommissioned is terminal for the same class of
+		// reason. In all three cases only a human can put the host back in the
+		// candidate set, because only a human knows the operation finished.
+		//
+		// The one row this may promote to active is one whose status is not a value
+		// the fleet recognizes (a row written before the column existed, or corrupted
+		// by hand): leaving that unschedulable forever would be an un-fixable host
+		// rather than a preserved decision.
+		if existing.Status == domain.HostStatusActive || !existing.Status.IsValid() {
+			existing.Status = domain.HostStatusActive
+		}
 		existing.LastHeartbeat = &now
 		existing.UpdatedAt = now
 		if err := uc.repo.Update(ctx, existing); err != nil {

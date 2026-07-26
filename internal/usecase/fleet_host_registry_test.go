@@ -146,6 +146,104 @@ func TestRegisterHost_ClampsAllocatableToRefreshedCapacity(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Schedulability survives a restart (#cordon-un-cordons-itself-on-restart)
+// ─────────────────────────────────────────────────────────────────────
+
+// The test that matters here is the PRESERVATION test, not the happy path:
+// runtime-service self-registers on every boot, so a re-registration that set
+// status=active unconditionally meant a cordoned host silently UN-CORDONED itself
+// by restarting — and a cordon that lapses is worse than no cordon, because the
+// operator believes work is being kept off a machine the scheduler is placing on.
+func TestRegisterHost_ReRegistrationNeverWidensSchedulability(t *testing.T) {
+	tests := []struct {
+		name    string
+		seeded  domain.HostStatus
+		want    domain.HostStatus
+		because string
+	}{
+		{
+			name: "cordoned survives a restart", seeded: domain.HostStatusCordoned, want: domain.HostStatusCordoned,
+			because: "only an operator un-cordons; a reboot is not a decision",
+		},
+		{
+			name: "draining survives a restart", seeded: domain.HostStatusDraining, want: domain.HostStatusDraining,
+			because: "a drain is in-flight work moving OFF the host; refilling it means the drain never converges",
+		},
+		{
+			name: "decommissioned survives a restart", seeded: domain.HostStatusDecommissioned, want: domain.HostStatusDecommissioned,
+			because: "retirement is terminal and only a human revives a machine",
+		},
+		{
+			name: "an active host is unaffected", seeded: domain.HostStatusActive, want: domain.HostStatusActive,
+			because: "the ordinary boot of a schedulable host must keep working",
+		},
+		{
+			name: "an unrecognized status is promoted, so a row is never stuck unschedulable", seeded: domain.HostStatus("legacy-nonsense"), want: domain.HostStatusActive,
+			because: "a value the fleet does not recognize is not a preserved operator decision",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hostID := uuid.New()
+			repo := &stubHostRepo{existing: &domain.Host{
+				ID:                hostID,
+				Region:            "homelab",
+				FailureDomain:     "site-a/breaker-a/switch-1",
+				Status:            tt.seeded,
+				Health:            domain.HostHealthUnhealthy,
+				Endpoint:          "10.0.0.1:50061",
+				CapacityVCPU:      2,
+				CapacityMemMB:     2048,
+				CapacityDiskMB:    8000,
+				AllocatableVCPU:   2,
+				AllocatableMemMB:  2048,
+				AllocatableDiskMB: 8000,
+			}}
+
+			payload := attestedHost(hostID)
+			payload.CapacityVCPU = 8
+			payload.CapacityMemMB = 16000
+			payload.CapacityDiskMB = 40000
+			payload.Endpoint = "10.0.0.9:50061"
+
+			got, err := NewFleetHostRegistry(repo, newNetFakeLeaseRepo()).RegisterHost(context.Background(), payload)
+			if err != nil {
+				t.Fatalf("RegisterHost: %v", err)
+			}
+			if repo.updated == nil {
+				t.Fatal("expected the existing host row to be updated")
+			}
+			// Assert on the PERSISTED row: the lapsed cordon lived in the column.
+			if repo.updated.Status != tt.want {
+				t.Errorf("persisted status = %q, want %q (%s)", repo.updated.Status, tt.want, tt.because)
+			}
+			if got.Status != tt.want {
+				t.Errorf("returned status = %q, want %q", got.Status, tt.want)
+			}
+
+			// The rest of a re-registration MUST still happen: preserving the status
+			// must not turn into "a cordoned host stops being maintained". Its
+			// capacity, endpoint, health and heartbeat are all facts about a machine
+			// that is up, and an operator draining it needs them to be current.
+			if repo.updated.CapacityVCPU != 8 || repo.updated.CapacityMemMB != 16000 || repo.updated.CapacityDiskMB != 40000 {
+				t.Errorf("capacity was not refreshed: %dvcpu/%dMB/%dMB",
+					repo.updated.CapacityVCPU, repo.updated.CapacityMemMB, repo.updated.CapacityDiskMB)
+			}
+			if repo.updated.Endpoint != "10.0.0.9:50061" {
+				t.Errorf("endpoint = %q, want the freshly advertised one", repo.updated.Endpoint)
+			}
+			if repo.updated.LastHeartbeat == nil {
+				t.Error("last_heartbeat was not refreshed")
+			}
+			if repo.updated.Health != domain.HostHealthHealthy {
+				t.Errorf("health = %q, want healthy — health is OBSERVED and this registration is the observation", repo.updated.Health)
+			}
+		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // The placement FACTS (SentiaeDB standard-ha slice 0, D-196)
 // ─────────────────────────────────────────────────────────────────────
 
