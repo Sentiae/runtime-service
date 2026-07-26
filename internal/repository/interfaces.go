@@ -319,6 +319,28 @@ type ResourceDurability struct {
 	RecoveryPointCount int `gorm:"column:recovery_point_count"`
 }
 
+// RecoveryPointLocationFacts is one location class's slice of the recovery-point
+// catalog: how many blobs are in it and how old the OLDEST of them is. A QUERY
+// PROJECTION, not an entity.
+//
+// ⚠ It covers EVERY recovery point, including those of decommissioned resources.
+// A tombstoned resource's recovery points deliberately survive it (they are what a
+// restore-after-deletion uses), so a blob that exists in one place is a
+// single-domain blob whether or not the claim above it is still live — filtering
+// them out would hide real, restorable customer data that the loss of one machine
+// would destroy.
+type RecoveryPointLocationFacts struct {
+	// Locations is the class (domain.RecoveryPointLocations).
+	Locations string `gorm:"column:locations"`
+	// Count is how many recovery points are in the class. Reported as zero, never
+	// as an absent row — see ComputeRecoveryPointLocations, which fills in the
+	// classes the query did not return.
+	Count int `gorm:"column:count"`
+	// OldestCreatedAt is the creation time of the oldest recovery point in the
+	// class, or nil when the class is empty.
+	OldestCreatedAt *time.Time `gorm:"column:oldest_created_at"`
+}
+
 // FleetResourceRepository persists P19 resource control-plane claims and their
 // recovery points (CP4.5 §9 #3, D-164/D-183).
 type FleetResourceRepository interface {
@@ -388,6 +410,25 @@ type FleetResourceRepository interface {
 	// resource, including those with no recovery point at all, which are precisely
 	// the rows the durability gauges have to be able to report on.
 	ListResourceDurability(ctx context.Context) ([]ResourceDurability, error)
+	// MarkRecoveryPointInSecondDomain records a CONFIRMED, checksum-verified copy of
+	// a recovery point in a second failure domain (D-192/D-195): it sets locations
+	// to primary_and_second_domain, names the store, stamps the time and clears any
+	// previous failure. Returns domain.ErrRecoveryPointNotFound when no row matches.
+	//
+	// ⚠ One-way by contract. There is deliberately NO method that moves a row back
+	// to primary_only: the second bucket cannot be enumerated (D-199 — LIST is 403)
+	// and its objects cannot be deleted for 30 days (object lock), so nothing this
+	// service can observe would justify retracting the claim.
+	MarkRecoveryPointInSecondDomain(ctx context.Context, id uuid.UUID, store string, at time.Time) error
+	// RecordRecoveryPointMirrorFailure records that the second-domain copy FAILED,
+	// leaving locations untouched (primary_only). It writes only the cause and its
+	// time — a failed mirror is not a failed snapshot, so it must not touch the
+	// resource's snapshot-health columns.
+	RecordRecoveryPointMirrorFailure(ctx context.Context, id uuid.UUID, at time.Time, cause string) error
+	// ListRecoveryPointLocations aggregates the WHOLE recovery-point catalog by
+	// location class (see RecoveryPointLocationFacts). It is the read behind the
+	// two-domain gauges.
+	ListRecoveryPointLocations(ctx context.Context) ([]RecoveryPointLocationFacts, error)
 	// MarkRecoveryPointRestoredInPlace records that a restore FROM this recovery
 	// point, over the resource's own volume, booted an engine that admitted a
 	// client. It is not a verification drill and must never be reported as one

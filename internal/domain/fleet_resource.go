@@ -227,6 +227,54 @@ func (c RecoveryPointConsistency) IsValid() bool {
 	return false
 }
 
+// RecoveryPointLocations names WHERE a recovery point's blob exists — how many
+// FAILURE DOMAINS hold it. It is not a status and not a progress indicator: it is
+// the only answer to "would this recovery point survive the loss of the fleet
+// chassis", and everything that publishes a durability number reads it.
+//
+// It must be stamped AT CAPTURE and can never be backfilled: the second domain's
+// credential grants object read/write but NOT bucket listing (D-199 — LIST returns
+// 403, verified live), so nothing can go and look. A row written without it is
+// permanently ambiguous, which is why migration 0023 lands with the mirroring
+// rather than after it.
+type RecoveryPointLocations string
+
+const (
+	// RecoveryPointLocationsUnknown — the row predates migration 0023. It must be
+	// treated as the WEAKEST class: NOT provably in a second failure domain, and
+	// never counted as if it were.
+	RecoveryPointLocationsUnknown RecoveryPointLocations = "unknown"
+	// RecoveryPointLocationsPrimaryOnly — the blob is in the primary store and
+	// NOWHERE else. Stamped at capture, BEFORE the second copy is attempted, so a
+	// crash between the two can never leave a row claiming a copy that does not
+	// exist. It is also the honest value on a host with no second domain wired at
+	// all.
+	RecoveryPointLocationsPrimaryOnly RecoveryPointLocations = "primary_only"
+	// RecoveryPointLocationsSecondDomain — the second copy was written AND read
+	// back and hashed to the recorded checksum. Only a CONFIRMED, verified copy
+	// earns this: an optimistic stamp would be a durability claim made before the
+	// durability exists.
+	RecoveryPointLocationsSecondDomain RecoveryPointLocations = "primary_and_second_domain"
+)
+
+// IsValid reports whether the class is one the fleet recognizes (the vocabulary
+// migration 0023's CHECK constraint fences).
+func (l RecoveryPointLocations) IsValid() bool {
+	switch l {
+	case RecoveryPointLocationsUnknown, RecoveryPointLocationsPrimaryOnly,
+		RecoveryPointLocationsSecondDomain:
+		return true
+	}
+	return false
+}
+
+// InTwoFailureDomains reports whether this class PROVES the blob exists in two
+// failure domains. Only the confirmed class does — `unknown` deliberately answers
+// false, because "we did not record it" is not evidence of a second copy.
+func (l RecoveryPointLocations) InTwoFailureDomains() bool {
+	return l == RecoveryPointLocationsSecondDomain
+}
+
 // FleetResourceRecoveryPoint is one snapshot/backup entry in a resource's
 // recovery catalog. It intentionally SURVIVES a resource tombstone (no cascade
 // delete) so a decommissioned resource can still be restored from.
@@ -265,7 +313,29 @@ type FleetResourceRecoveryPoint struct {
 	// be a migration whose down is lossy, and the column name is not what anyone
 	// reads meaning off. The name that lies is the one in the code and the API, and
 	// that is the one this fixes.
-	RestoredInPlaceOK bool      `json:"restored_in_place_ok" gorm:"column:verified;not null;default:false"`
+	RestoredInPlaceOK bool `json:"restored_in_place_ok" gorm:"column:verified;not null;default:false"`
+	// Locations records WHERE this blob exists — see RecoveryPointLocations. It is
+	// the fact behind every "failure_domains = 2" claim, and it is a fact rather
+	// than an inference from configuration precisely because a mirror can fail
+	// while the snapshot succeeds.
+	//
+	// ⚠ The GORM tags on all four second-domain fields must match migration 0023
+	// EXACTLY (columns `locations` TEXT NOT NULL DEFAULT 'unknown',
+	// `second_domain_store` TEXT NOT NULL DEFAULT '', `second_domain_at`
+	// TIMESTAMPTZ NULL, `second_domain_error` TEXT NOT NULL DEFAULT ''): the fleet
+	// host runs AutoMigrate, so any divergence here is a schema change the
+	// migration never authored (the D-187 lesson).
+	Locations RecoveryPointLocations `json:"locations" gorm:"column:locations;type:text;not null;default:'unknown'"`
+	// SecondDomainStore names WHICH second domain holds the copy (e.g.
+	// "cloudflare-r2:sentiae-recovery-points"). Empty while none is confirmed.
+	SecondDomainStore string `json:"second_domain_store,omitempty" gorm:"column:second_domain_store;type:text;not null;default:''"`
+	// SecondDomainAt is when the second copy was CONFIRMED — verified, not merely
+	// requested. Nil while there is none.
+	SecondDomainAt *time.Time `json:"second_domain_at,omitempty" gorm:"column:second_domain_at"`
+	// SecondDomainError is the last failed mirror attempt's cause. A failed mirror
+	// is NOT a failed snapshot (a recovery point exists), so it lives here and not
+	// on the resource's snapshot-health columns — see migration 0023.
+	SecondDomainError string    `json:"second_domain_error,omitempty" gorm:"column:second_domain_error;type:text;not null;default:''"`
 	CreatedAt         time.Time `json:"created_at" gorm:"not null;default:now();index:idx_fleet_resource_recovery_points_resource,priority:2"`
 }
 

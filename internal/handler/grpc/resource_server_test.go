@@ -124,6 +124,20 @@ func (f *fakeResourceRepo) ListResourceDurability(context.Context) ([]repository
 	return nil, nil
 }
 
+// The second-failure-domain ledger writes and census are likewise unused by the
+// handler — they belong to the snapshot path and the metric collector.
+func (f *fakeResourceRepo) MarkRecoveryPointInSecondDomain(context.Context, uuid.UUID, string, time.Time) error {
+	return nil
+}
+
+func (f *fakeResourceRepo) RecordRecoveryPointMirrorFailure(context.Context, uuid.UUID, time.Time, string) error {
+	return nil
+}
+
+func (f *fakeResourceRepo) ListRecoveryPointLocations(context.Context) ([]repository.RecoveryPointLocationFacts, error) {
+	return nil, nil
+}
+
 // FindLiveResourceByApp resolves the seeded claim when it backs appID and is
 // neither stamped nor phased decommissioned — the postgres predicate.
 func (f *fakeResourceRepo) FindLiveResourceByApp(_ context.Context, appID uuid.UUID) (*domain.FleetResource, error) {

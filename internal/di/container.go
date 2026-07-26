@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -732,6 +734,13 @@ func (c *Container) initResourceControlPlane(cfg *config.Config) {
 			c.ReplicaRepo,
 			c.FleetResourceRepo,
 		)
+		// D-192/D-195/D-199 — put every recovery point in a SECOND FAILURE DOMAIN.
+		// Nil when no second domain is reachable, which stamps every recovery point
+		// primary_only: the truth, and visible as such on
+		// sentiae_fleet_recovery_points_by_location.
+		if mirror := c.buildSecondDomainMirror(); mirror != nil {
+			c.ResourceSnapshotter.SetSecondDomainMirror(mirror)
+		}
 	} else if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
 		log.Println("Fleet resource snapshotter DISABLED: no snapshot artifact store configured (APP_SNAPSHOT_STORE_ENABLED) — snapshot/restore report unsupported")
 	}
@@ -902,6 +911,133 @@ func (c *Container) buildSecretResolver() secret.Resolver {
 	// outlives the process's boot, so that snapshot went stale on every daily SPIRE
 	// CA rotation and no data-VM could boot until a restart.
 	return secret.NewHandedTokenEnvelopeResolverWithClient(vc.Raw(), "secret", "transit-tenants")
+}
+
+// recoveryPointMirrorVaultPath is the Vault KV path holding the second failure
+// domain's S3 credential (D-199: an R2 token scoped to OBJECT read & write on
+// `sentiae-recovery-points` only). Hard-coded, not configurable: a config name is
+// something that can be typo'd into the branch where no mirror is built and every
+// recovery point silently stays on one machine — the platform's own recurring trap.
+const recoveryPointMirrorVaultPath = "r2/recovery-points"
+
+// buildSecondDomainMirror constructs the second-failure-domain mirror for recovery
+// points (D-192/D-195/D-199).
+//
+// ⚠ WHY THIS EXISTS. Every recovery point used to land only in the MinIO container
+// that runs on the SAME PHYSICAL CHASSIS as the fleet host whose data it protects,
+// so `failure_domains = 1` and every durability promise was arithmetic over one
+// machine. This copies each captured blob into Cloudflare R2 — a different provider,
+// different hardware, with a 30-day object lock over all prefixes that no
+// credential (or bug, or bad drill) can delete through.
+//
+// ⚠ THE CREDENTIAL IS READ FROM VAULT AND NEVER FROM CONFIG. It rides the SAME
+// primary Vault client buildSecretResolver already authenticated as svc/runtime over
+// SPIFFE JWT-SVID (P14's seam), so no new auth path exists and no key material
+// touches the repo, an env file or docker-compose. That client's policy must grant
+// read on <kv-mount>/r2/recovery-points; without it this returns nil and says so.
+//
+// ⚠ NIL IS AN HONEST OUTCOME, NOT A DEGRADED ONE. Every failure below returns nil,
+// which makes the snapshotter stamp recovery points primary_only — true, and counted
+// as such by sentiae_fleet_recovery_points_by_location{locations="primary_only"} and
+// alerted on by the oldest-single-domain age gauge. Refusing to boot instead would
+// take the control plane away from customer VMs that are already running, and the
+// snapshot path is not what protects them from a missing mirror; the ledger being
+// truthful is.
+//
+// ⚠ NOTHING HERE MAY ENUMERATE THE BUCKET. The D-199 token grants object access and
+// not bucket listing (LIST returns 403, verified live), which is why the store is
+// built with SkipBucketProbe. The ledger is the source of truth for what exists off
+// the chassis; the bucket cannot be asked.
+func (c *Container) buildSecondDomainMirror() usecase.SecondDomainMirror {
+	if c.snapshotArtifactStore == nil {
+		return nil
+	}
+	if c.vaultClient == nil {
+		log.Println("[recovery-point-mirror] DISABLED: no Vault client — every recovery point will exist in ONE failure domain (the fleet chassis) and is recorded primary_only")
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	creds, err := c.vaultClient.GetSecrets(ctx, recoveryPointMirrorVaultPath)
+	if err != nil {
+		log.Printf("[recovery-point-mirror] DISABLED: read %s from Vault failed (%v) — every recovery point will exist in ONE failure domain and is recorded primary_only", recoveryPointMirrorVaultPath, err)
+		return nil
+	}
+	// Every field is required. A partially-configured mirror is worse than none: it
+	// would be wired, non-nil, and fail on every single snapshot.
+	bucket := creds["bucket"]
+	endpoint := creds["endpoint"]
+	accessKey := creds["access_key_id"]
+	secretKey := creds["secret_access_key"]
+	region := creds["region"]
+	var missing []string
+	for name, v := range map[string]string{
+		"bucket": bucket, "endpoint": endpoint,
+		"access_key_id": accessKey, "secret_access_key": secretKey, "region": region,
+	} {
+		if v == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		log.Printf("[recovery-point-mirror] DISABLED: %s is missing field(s) %s — every recovery point will exist in ONE failure domain and is recorded primary_only",
+			recoveryPointMirrorVaultPath, strings.Join(missing, ","))
+		return nil
+	}
+
+	host, useSSL, err := s3EndpointHost(endpoint)
+	if err != nil {
+		log.Printf("[recovery-point-mirror] DISABLED: %v — every recovery point will exist in ONE failure domain and is recorded primary_only", err)
+		return nil
+	}
+	secondary, err := objectstore.NewS3ArtifactStore(objectstore.S3Config{
+		Endpoint:  host,
+		Region:    region,
+		Bucket:    bucket,
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+		UseSSL:    useSSL,
+		// The token cannot HeadBucket or CreateBucket, and CreateBucket must never be
+		// attempted: a bucket this code created would not carry the object lock that is
+		// the whole durability control.
+		SkipBucketProbe: true,
+	})
+	if err != nil {
+		log.Printf("[recovery-point-mirror] DISABLED: build the second-domain store failed (%v) — every recovery point will exist in ONE failure domain and is recorded primary_only", err)
+		return nil
+	}
+	// The domain label recorded on every row it protects. Host, not bucket alone: the
+	// question during an incident is which PROVIDER holds the copy.
+	label := "r2:" + bucket
+	mirror, err := usecase.NewArtifactStoreMirror(c.snapshotArtifactStore, secondary, label)
+	if err != nil {
+		log.Printf("[recovery-point-mirror] DISABLED: %v — every recovery point will exist in ONE failure domain and is recorded primary_only", err)
+		return nil
+	}
+	log.Printf("[recovery-point-mirror] ENABLED: recovery points are mirrored to %s (%s) and confirmed by checksum before the ledger claims two failure domains", label, host)
+	return mirror
+}
+
+// s3EndpointHost splits an S3 endpoint into the host:port minio-go wants and
+// whether to use TLS. A bare host (no scheme) is assumed HTTPS — for an
+// off-premises credential, guessing plaintext would put the secret key on the wire.
+func s3EndpointHost(endpoint string) (host string, useSSL bool, err error) {
+	if !strings.Contains(endpoint, "://") {
+		return endpoint, true, nil
+	}
+	u, perr := url.Parse(endpoint)
+	if perr != nil || u.Host == "" {
+		return "", false, fmt.Errorf("second-domain endpoint %q is not a usable URL", endpoint)
+	}
+	switch u.Scheme {
+	case "https":
+		return u.Host, true, nil
+	case "http":
+		return u.Host, false, nil
+	default:
+		return "", false, fmt.Errorf("second-domain endpoint %q has unsupported scheme %q", endpoint, u.Scheme)
+	}
 }
 
 // publishImageBooter decides what the fleet's booter seam becomes given the

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -267,6 +268,95 @@ func (r *fleetResourceRepository) ListResourceDurability(ctx context.Context) ([
 		LEFT JOIN fleet_resource_recovery_points rp ON rp.resource_id = r.id
 		WHERE r.decommissioned_at IS NULL
 		GROUP BY r.id`).Scan(&out).Error
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// MarkRecoveryPointInSecondDomain promotes a row to the two-domain class.
+//
+// ⚠ The predicate is `locations <> 'primary_and_second_domain'` and NOT a bare id
+// match, so the write is idempotent: a re-confirmation of a row that already holds
+// the claim affects no rows and is reported as success, rather than restamping
+// second_domain_at to a later time and thereby claiming the copy is newer than it
+// is. `unknown` is promotable — a legacy row whose blob has now been verified in the
+// second domain genuinely IS in two domains.
+func (r *fleetResourceRepository) MarkRecoveryPointInSecondDomain(ctx context.Context, id uuid.UUID, store string, at time.Time) error {
+	if store == "" {
+		// Migration 0023's CHECK forbids the claim without a named store; refuse here
+		// with a legible error rather than surfacing a constraint violation.
+		return fmt.Errorf("mark recovery point %s in second domain: the store must be named", id)
+	}
+	res := r.db.WithContext(ctx).
+		Model(&domain.FleetResourceRecoveryPoint{}).
+		Where("id = ? AND locations <> ?", id, domain.RecoveryPointLocationsSecondDomain).
+		Updates(map[string]any{
+			"locations":           domain.RecoveryPointLocationsSecondDomain,
+			"second_domain_store": store,
+			"second_domain_at":    at,
+			"second_domain_error": "",
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		// Either the row is gone or it already holds the claim. Distinguish them: a
+		// missing row is a caller bug, an already-claimed row is a no-op success.
+		var count int64
+		if err := r.db.WithContext(ctx).
+			Model(&domain.FleetResourceRecoveryPoint{}).
+			Where("id = ?", id).
+			Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return domain.ErrRecoveryPointNotFound
+		}
+	}
+	return nil
+}
+
+// RecordRecoveryPointMirrorFailure records WHY a second-domain copy failed without
+// touching `locations` — the row keeps saying what is true (one domain) and gains
+// the cause an operator needs. It touches nothing on fleet_resources: a failed
+// mirror is not a failed snapshot.
+func (r *fleetResourceRepository) RecordRecoveryPointMirrorFailure(ctx context.Context, id uuid.UUID, at time.Time, cause string) error {
+	res := r.db.WithContext(ctx).
+		Model(&domain.FleetResourceRecoveryPoint{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"second_domain_error": cause,
+			// The attempt time, so "when did this last fail" is answerable. It is NOT
+			// second_domain_at's success meaning — that column stays NULL, because the
+			// CHECK constraint and every reader treat a non-NULL second_domain_at with a
+			// two-domain class as evidence of a confirmed copy.
+			"second_domain_at": nil,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return domain.ErrRecoveryPointNotFound
+	}
+	return nil
+}
+
+// ListRecoveryPointLocations aggregates the whole catalog by location class in ONE
+// query.
+//
+// No `decommissioned_at IS NULL` filter and no join to fleet_resources, on purpose:
+// a tombstoned resource's recovery points survive it and are still restorable
+// customer data, so excluding them would under-report the blobs that one machine's
+// loss would destroy (see RecoveryPointLocationFacts).
+func (r *fleetResourceRepository) ListRecoveryPointLocations(ctx context.Context) ([]repository.RecoveryPointLocationFacts, error) {
+	var out []repository.RecoveryPointLocationFacts
+	err := r.db.WithContext(ctx).Raw(`
+		SELECT locations        AS locations,
+		       COUNT(*)         AS count,
+		       MIN(created_at)  AS oldest_created_at
+		FROM fleet_resource_recovery_points
+		GROUP BY locations`).Scan(&out).Error
 	if err != nil {
 		return nil, err
 	}

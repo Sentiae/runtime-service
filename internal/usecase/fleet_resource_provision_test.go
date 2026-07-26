@@ -44,6 +44,11 @@ type fakeResourceRepo struct {
 	// durabilityErr fails the durability projection so the metric collector's
 	// fail-soft path (keep the previous gauge values, count the error) is reachable.
 	durabilityErr error
+	// locationsErr fails the failure-domain census the same way.
+	locationsErr error
+	// mirrorLedgerErr fails the second-domain ledger writes, so the snapshotter's
+	// "the copy landed but the ledger does not know it" path is reachable.
+	mirrorLedgerErr error
 }
 
 func newFakeResourceRepo() *fakeResourceRepo {
@@ -231,6 +236,89 @@ func (f *fakeResourceRepo) GetRecoveryPointByRef(_ context.Context, resourceID u
 		}
 	}
 	return nil, domain.ErrRecoveryPointNotFound
+}
+
+// MarkRecoveryPointInSecondDomain mirrors the postgres UPDATE: it promotes the row
+// to the two-domain class, names the store and stamps the time, and clears any
+// recorded failure. Idempotent on a row that already holds the claim.
+func (f *fakeResourceRepo) MarkRecoveryPointInSecondDomain(_ context.Context, id uuid.UUID, store string, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mirrorLedgerErr != nil {
+		return f.mirrorLedgerErr
+	}
+	for resID := range f.recovery {
+		for i := range f.recovery[resID] {
+			rp := &f.recovery[resID][i]
+			if rp.ID != id {
+				continue
+			}
+			if rp.Locations == domain.RecoveryPointLocationsSecondDomain {
+				return nil
+			}
+			stamp := at
+			rp.Locations = domain.RecoveryPointLocationsSecondDomain
+			rp.SecondDomainStore = store
+			rp.SecondDomainAt = &stamp
+			rp.SecondDomainError = ""
+			return nil
+		}
+	}
+	return domain.ErrRecoveryPointNotFound
+}
+
+// RecordRecoveryPointMirrorFailure mirrors the postgres UPDATE: the cause only.
+// `locations` is deliberately untouched — the row keeps saying one domain, which is
+// what is true.
+func (f *fakeResourceRepo) RecordRecoveryPointMirrorFailure(_ context.Context, id uuid.UUID, _ time.Time, cause string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mirrorLedgerErr != nil {
+		return f.mirrorLedgerErr
+	}
+	for resID := range f.recovery {
+		for i := range f.recovery[resID] {
+			rp := &f.recovery[resID][i]
+			if rp.ID != id {
+				continue
+			}
+			rp.SecondDomainError = cause
+			rp.SecondDomainAt = nil
+			return nil
+		}
+	}
+	return domain.ErrRecoveryPointNotFound
+}
+
+// ListRecoveryPointLocations mirrors the postgres aggregate: a census of the WHOLE
+// catalog by location class, including recovery points of decommissioned resources.
+func (f *fakeResourceRepo) ListRecoveryPointLocations(context.Context) ([]repository.RecoveryPointLocationFacts, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.locationsErr != nil {
+		return nil, f.locationsErr
+	}
+	byClass := map[string]*repository.RecoveryPointLocationFacts{}
+	for _, points := range f.recovery {
+		for _, rp := range points {
+			class := string(rp.Locations)
+			row, ok := byClass[class]
+			if !ok {
+				row = &repository.RecoveryPointLocationFacts{Locations: class}
+				byClass[class] = row
+			}
+			row.Count++
+			if row.OldestCreatedAt == nil || rp.CreatedAt.Before(*row.OldestCreatedAt) {
+				at := rp.CreatedAt
+				row.OldestCreatedAt = &at
+			}
+		}
+	}
+	var out []repository.RecoveryPointLocationFacts
+	for _, row := range byClass {
+		out = append(out, *row)
+	}
+	return out, nil
 }
 
 func (f *fakeResourceRepo) MarkRecoveryPointRestoredInPlace(_ context.Context, id uuid.UUID) error {

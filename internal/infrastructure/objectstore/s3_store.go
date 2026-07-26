@@ -39,6 +39,18 @@ type S3Config struct {
 	SecretKey string
 	UseSSL    bool
 	PathStyle bool
+	// SkipBucketProbe suppresses the construction-time BucketExists/MakeBucket
+	// handshake below.
+	//
+	// ⚠ REQUIRED for the D-199 second-failure-domain bucket, and it is a capability
+	// fact rather than a preference: that R2 token is scoped to OBJECT read/write on
+	// `sentiae-recovery-points` only, so bucket-level calls are refused (LIST returns
+	// 403, verified live) and the probe would fail construction for a store that can
+	// perfectly well read and write every object it will ever be asked about.
+	// MakeBucket must NEVER be attempted there either — the bucket's object-lock
+	// policy IS the durability control, and a bucket this code created would not
+	// carry it.
+	SkipBucketProbe bool
 }
 
 // S3ArtifactStore implements usecase.ArtifactStore backed by an
@@ -73,6 +85,14 @@ func NewS3ArtifactStore(cfg S3Config) (*S3ArtifactStore, error) {
 	client, err := minio.New(cfg.Endpoint, opts)
 	if err != nil {
 		return nil, fmt.Errorf("objectstore: minio client: %w", err)
+	}
+
+	if cfg.SkipBucketProbe {
+		// Nothing is verified here, deliberately: the credential cannot verify it (see
+		// SkipBucketProbe). What proves this store works is the first object-level
+		// call, and for the mirror that is a Put immediately followed by a
+		// checksum-verified read-back — a stronger proof than HeadBucket anyway.
+		return &S3ArtifactStore{cfg: cfg, client: client}, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
