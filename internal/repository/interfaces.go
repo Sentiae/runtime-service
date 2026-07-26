@@ -410,6 +410,16 @@ type FleetResourceRepository interface {
 	// resource, including those with no recovery point at all, which are precisely
 	// the rows the durability gauges have to be able to report on.
 	ListResourceDurability(ctx context.Context) ([]ResourceDurability, error)
+	// ListRecoveryPointsToMirror returns the control-plane mirror's backlog (D-200):
+	// recovery points stamped primary_only, OLDEST FIRST, capped at limit.
+	//
+	// ⚠ `unknown` rows are deliberately EXCLUDED. Migration 0023 is unbackfillable —
+	// nothing about a pre-0023 row reveals whether its blob was ever copied
+	// off-chassis, and the second bucket cannot be enumerated to find out (D-199:
+	// LIST is 403) — so those rows are permanently unknown by that migration's own
+	// doctrine. They still count as NOT-two-domains everywhere it matters (the census
+	// and the oldest-single-domain age gauge both fold them in with primary_only).
+	ListRecoveryPointsToMirror(ctx context.Context, limit int) ([]domain.FleetResourceRecoveryPoint, error)
 	// MarkRecoveryPointInSecondDomain records a CONFIRMED, checksum-verified copy of
 	// a recovery point in a second failure domain (D-192/D-195): it sets locations
 	// to primary_and_second_domain, names the store, stamps the time and clears any

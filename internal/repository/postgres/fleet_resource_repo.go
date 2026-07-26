@@ -274,6 +274,29 @@ func (r *fleetResourceRepository) ListResourceDurability(ctx context.Context) ([
 	return out, nil
 }
 
+// ListRecoveryPointsToMirror returns the control-plane mirror's backlog (D-200).
+//
+// OLDEST FIRST, because the alert this drains is an AGE
+// (sentiae_fleet_recovery_point_oldest_single_domain_age_seconds): copying the
+// newest first would leave the worst number untouched while the worker looked busy.
+// The predicate is `locations = 'primary_only'` exactly — see the interface note on
+// why `unknown` is not swept in.
+func (r *fleetResourceRepository) ListRecoveryPointsToMirror(ctx context.Context, limit int) ([]domain.FleetResourceRecoveryPoint, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var out []domain.FleetResourceRecoveryPoint
+	err := r.db.WithContext(ctx).
+		Where("locations = ?", domain.RecoveryPointLocationsPrimaryOnly).
+		Order("created_at ASC").
+		Limit(limit).
+		Find(&out).Error
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MarkRecoveryPointInSecondDomain promotes a row to the two-domain class.
 //
 // ⚠ The predicate is `locations <> 'primary_and_second_domain'` and NOT a bare id

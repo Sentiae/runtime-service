@@ -317,3 +317,79 @@ func TestListRecoveryPointLocationsCensus(t *testing.T) {
 		t.Errorf("oldest primary_only age = %v, want ~100h (the oldest single-domain copy is what the alert keys on)", age)
 	}
 }
+
+// TestListRecoveryPointsToMirrorBacklog proves the control-plane mirror's read
+// (D-200) against a real Postgres: exactly the primary_only rows, OLDEST FIRST, and
+// bounded by the limit.
+//
+// ⚠ The ordering is not cosmetic. The alert this backlog drains is an AGE
+// (sentiae_fleet_recovery_point_oldest_single_domain_age_seconds), so a worker fed
+// newest-first would look busy while the worst number never moved.
+//
+// ⚠ `unknown` must NOT appear. Migration 0023 is unbackfillable and the second bucket
+// cannot be enumerated to reconstruct it (D-199: LIST is 403), so those rows are
+// permanently unknown — and a query that swept them in would attempt a copy for every
+// pre-0023 row on every pass, forever, most of them without a checksum to confirm it
+// against.
+func TestListRecoveryPointsToMirrorBacklog(t *testing.T) {
+	ctx := context.Background()
+	db, m := startLeasePG(t)
+	migrateAll(t, m)
+	repo := postgres.NewFleetResourceRepository(db)
+
+	resID := seedRecoveryPointResource(t, db)
+	now := time.Now().UTC()
+	add := func(key string, loc domain.RecoveryPointLocations, age time.Duration) {
+		t.Helper()
+		rp := &domain.FleetResourceRecoveryPoint{
+			ID: uuid.New(), ResourceID: resID,
+			ObjectKey: key, Kind: "snapshot", SizeBytes: 1, Checksum: "c",
+			Locations: loc, CreatedAt: now.Add(-age),
+		}
+		if loc.InTwoFailureDomains() {
+			at := now.Add(-age)
+			rp.SecondDomainStore = "r2:b"
+			rp.SecondDomainAt = &at
+		}
+		if err := repo.SaveRecoveryPoint(ctx, rp); err != nil {
+			t.Fatalf("save recovery point: %v", err)
+		}
+	}
+	add("volumes/v/oldest.ext4", domain.RecoveryPointLocationsPrimaryOnly, 72*time.Hour)
+	add("volumes/v/middle.ext4", domain.RecoveryPointLocationsPrimaryOnly, 5*time.Hour)
+	add("volumes/v/newest.ext4", domain.RecoveryPointLocationsPrimaryOnly, time.Hour)
+	add("volumes/v/legacy.ext4", domain.RecoveryPointLocationsUnknown, 500*time.Hour)
+	add("volumes/v/done.ext4", domain.RecoveryPointLocationsSecondDomain, 400*time.Hour)
+
+	got, err := repo.ListRecoveryPointsToMirror(ctx, 10)
+	if err != nil {
+		t.Fatalf("list recovery points to mirror: %v", err)
+	}
+	want := []string{"volumes/v/oldest.ext4", "volumes/v/middle.ext4", "volumes/v/newest.ext4"}
+	if len(got) != len(want) {
+		t.Fatalf("backlog size = %d, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i].ObjectKey != want[i] {
+			t.Fatalf("backlog[%d] = %q, want %q (oldest first)", i, got[i].ObjectKey, want[i])
+		}
+	}
+
+	// The limit bounds one pass, and it must keep taking from the OLD end.
+	capped, err := repo.ListRecoveryPointsToMirror(ctx, 2)
+	if err != nil {
+		t.Fatalf("list capped: %v", err)
+	}
+	if len(capped) != 2 || capped[0].ObjectKey != want[0] || capped[1].ObjectKey != want[1] {
+		t.Fatalf("capped backlog = %v, want the two oldest %v", capped, want[:2])
+	}
+
+	// A non-positive limit asks for nothing; it must not degrade into "everything".
+	none, err := repo.ListRecoveryPointsToMirror(ctx, 0)
+	if err != nil {
+		t.Fatalf("list with limit 0: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("limit 0 returned %d rows", len(none))
+	}
+}

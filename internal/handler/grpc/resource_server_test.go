@@ -124,8 +124,13 @@ func (f *fakeResourceRepo) ListResourceDurability(context.Context) ([]repository
 	return nil, nil
 }
 
-// The second-failure-domain ledger writes and census are likewise unused by the
-// handler — they belong to the snapshot path and the metric collector.
+// The second-failure-domain backlog, ledger writes and census are likewise unused
+// by the handler — they belong to the control-plane mirror worker (D-200) and the
+// metric collector.
+func (f *fakeResourceRepo) ListRecoveryPointsToMirror(context.Context, int) ([]domain.FleetResourceRecoveryPoint, error) {
+	return nil, nil
+}
+
 func (f *fakeResourceRepo) MarkRecoveryPointInSecondDomain(context.Context, uuid.UUID, string, time.Time) error {
 	return nil
 }
