@@ -1,0 +1,34 @@
+# squawk lint baseline — runtime-service
+#
+# The migrations listed here are FROZEN: CLAUDE.md §24 forbids editing a
+# past migration, so a squawk finding in one of them cannot be fixed.
+# Linting them retroactively therefore buys nothing and would block every
+# deploy forever. Only migrations added AFTER this baseline are linted by
+# infrastructure/scripts/migration-gate.sh (run on every deploy).
+#
+# Do NOT add a new migration to this file to silence the gate. Fix the SQL.
+# Regenerate only when intentionally re-baselining:
+#   infrastructure/scripts/migration-gate.sh --baseline runtime-service
+0001_fleet_control_plane.up.sql
+0002_replica_runtime_handle.up.sql
+0003_fleet_app_secret_refs.up.sql
+0004_fleet_app_owner_org.up.sql
+0005_volume_attach_handle.up.sql
+0006_fleet_routes_host_unique.up.sql
+0007_fleet_app_activity.up.sql
+0008_drop_fleet_secret_bindings.up.sql
+0009_fleet_networks.up.sql
+0010_fleet_app_system_id.up.sql
+0011_adopt_core_runtime_tables.up.sql
+0012_create_fleet_resources.up.sql
+0013_add_restore_support.up.sql
+0014_fleet_apps_owner_org_unique.up.sql
+0015_namespace_resource_component_ids.up.sql
+0016_drop_fleet_apps_component_env_unique.up.sql
+0017_fleet_volumes_app_mount_unique.up.sql
+0018_fleet_resource_snapshot_health.up.sql
+0019_add_recovery_point_consistency.up.sql
+0020_fleet_net_leases.up.sql
+0021_add_resource_endpoint_identity.up.sql
+0022_standard_ha_irreversibles.up.sql
+0023_recovery_point_second_failure_domain.up.sql
