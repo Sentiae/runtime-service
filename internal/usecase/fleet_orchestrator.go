@@ -733,6 +733,13 @@ const (
 	// absent. An unmounted volume store looks exactly like this and it comes back
 	// on its own, so this is a DEFER, never a data-loss claim.
 	conditionVolumeStoreUnavailable = "volume-store-unavailable"
+	// conditionBackingFileUnmountable — the backing file is present but does not
+	// present a mountable ext4 (no primary superblock, or a superblock describing
+	// a filesystem larger than the file). The guest mount fails closed on exactly
+	// this, so without the gate the replica dies every boot and is re-placed every
+	// tick: present-but-broken churns identically to absent. It is NOT a data-loss
+	// claim — `e2fsck -fy` repairs most of what produces it.
+	conditionBackingFileUnmountable = "backing-file-unmountable"
 )
 
 // conditionLogInterval is how often ONE (app, condition) placement-blocked line
@@ -767,6 +774,7 @@ func (uc *FleetOrchestrator) shouldLogCondition(appID uuid.UUID, condition strin
 func (uc *FleetOrchestrator) clearConditionLogs(appID uuid.UUID) {
 	uc.condLogLast.Delete(appID.String() + "|" + conditionBackingFileMissing)
 	uc.condLogLast.Delete(appID.String() + "|" + conditionVolumeStoreUnavailable)
+	uc.condLogLast.Delete(appID.String() + "|" + conditionBackingFileUnmountable)
 }
 
 // now reads the clock seam, tolerating an orchestrator built without one.
@@ -778,7 +786,14 @@ func (uc *FleetOrchestrator) now() time.Time {
 }
 
 // placeableOnBackingFile reports whether a shortfall replica may be placed for
-// this app on THIS tick, by checking that the data it would attach still exists.
+// this app on THIS tick, by checking that the data it would attach still exists
+// and presents a filesystem that could mount.
+//
+// The mountability half is churn suppression, NOT a data guard: the guest's own
+// mount already fails closed, so the only thing at stake here is whether the
+// host wastes a boot. It therefore fails OPEN on every inconclusive answer (see
+// fleet_volume_ext4_probe.go) — stranding a healthy app on a probe we cannot
+// trust would be far worse than a wasted boot.
 //
 // It answers true for everything it cannot disprove: a stateless app, a volume
 // with no materialized backing path yet, a repository lookup that failed, a stat
@@ -791,7 +806,7 @@ func (uc *FleetOrchestrator) now() time.Time {
 // attaches and the snapshotter copies the backing file locally on the host that
 // holds the app's affinity).
 func (uc *FleetOrchestrator) placeableOnBackingFile(ctx context.Context, appID uuid.UUID) bool {
-	placeable := uc.evalPlaceableOnBackingFile(ctx, appID)
+	placeable, _ := uc.evalPlaceableOnBackingFile(ctx, appID)
 	if placeable {
 		// The condition (if any) has cleared — forget the throttle so a
 		// recurrence logs on its first tick.
@@ -802,9 +817,11 @@ func (uc *FleetOrchestrator) placeableOnBackingFile(ctx context.Context, appID u
 
 // evalPlaceableOnBackingFile is the check itself. It runs on every tick and its
 // answer is the sole input to placement; only the LOGGING it does is throttled.
-func (uc *FleetOrchestrator) evalPlaceableOnBackingFile(ctx context.Context, appID uuid.UUID) bool {
+// The second return is the condition token that blocked placement, empty when
+// placeable, so a caller can surface WHY without re-deriving it.
+func (uc *FleetOrchestrator) evalPlaceableOnBackingFile(ctx context.Context, appID uuid.UUID) (bool, string) {
 	if uc.volumes == nil {
-		return true // no volume support wired: every app is stateless here
+		return true, "" // no volume support wired: every app is stateless here
 	}
 	// The volume-bearing apps this guards are single-volume by construction (a
 	// dedicated resource's descriptor requests exactly one, and in-place restore
@@ -812,17 +829,41 @@ func (uc *FleetOrchestrator) evalPlaceableOnBackingFile(ctx context.Context, app
 	vol, has, err := uc.volumes.PrimaryVolume(ctx, appID)
 	if err != nil {
 		logger.FromContext(ctx).Warn("fleet reconcile: primary volume lookup", "app_id", appID, "err", err)
-		return true
+		return true, ""
 	}
 	if !has || vol.BackingPath == "" {
-		return true
+		return true, ""
 	}
-	if _, serr := os.Stat(vol.BackingPath); serr == nil {
-		return true
+	if st, serr := os.Stat(vol.BackingPath); serr == nil {
+		// The file is there. Second question: could it mount? A present-but-broken
+		// ext4 churns exactly like an absent one, because the guest mount fails
+		// closed on it. Fail OPEN on anything the probe cannot disprove — a probe
+		// error, unknown geometry, an inconclusive superblock — since the guest
+		// refusal, not this gate, is what protects the data.
+		verdict, fsBytes, perr := probeExt4Mountable(vol.BackingPath, st.Size())
+		if perr != nil || verdict == ext4Mountable {
+			if perr != nil {
+				logger.FromContext(ctx).Warn("fleet reconcile: probe backing filesystem (inconclusive, allowing placement)",
+					"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath, "err", perr)
+			}
+			return true, ""
+		}
+		if uc.shouldLogCondition(appID, conditionBackingFileUnmountable) {
+			attrs := []any{
+				"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath,
+				"condition", conditionBackingFileUnmountable, "reason", verdict.reason(),
+			}
+			if verdict == ext4Truncated {
+				attrs = append(attrs, "fs_bytes", fsBytes, "file_bytes", st.Size())
+			}
+			logger.FromContext(ctx).Error("fleet reconcile: backing file is present but presents no mountable ext4 — skipping placement (no replica, no image materialize, no secret resolve). This repeats each tick until the file changes and clears itself on the next tick after repair (`e2fsck -fy <backing_path>`, or restore the resource from a recovery point). This is NOT a claim that the data is gone.",
+				attrs...)
+		}
+		return false, conditionBackingFileUnmountable
 	} else if !os.IsNotExist(serr) {
 		logger.FromContext(ctx).Warn("fleet reconcile: stat backing file",
 			"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath, "err", serr)
-		return true // an unreadable stat is not evidence of absence
+		return true, "" // an unreadable stat is not evidence of absence
 	}
 
 	// The file is absent. WHY it is absent decides what this means, and getting it
@@ -835,14 +876,14 @@ func (uc *FleetOrchestrator) evalPlaceableOnBackingFile(ctx context.Context, app
 				"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath,
 				"condition", conditionVolumeStoreUnavailable, "err", derr)
 		}
-		return false
+		return false, conditionVolumeStoreUnavailable
 	}
 	if uc.shouldLogCondition(appID, conditionBackingFileMissing) {
 		logger.FromContext(ctx).Error("fleet reconcile: backing file is missing from a mounted volume store — skipping placement (no replica, no image materialize, no secret resolve) until the file returns or the resource is restored from a recovery point",
 			"app_id", appID, "volume_id", vol.ID, "backing_path", vol.BackingPath,
 			"condition", conditionBackingFileMissing)
 	}
-	return false
+	return false, conditionBackingFileMissing
 }
 
 // ReconcileAll reconciles every known app. A per-app error is logged, never
@@ -1052,7 +1093,20 @@ func (uc *FleetOrchestrator) HealthApp(ctx context.Context, appID uuid.UUID) (Fl
 	if uc.routes != nil {
 		out.URL = "https://" + uc.hostForApp(app)
 	}
-	out.Message = fmt.Sprintf("healthy=%d pending=%d desired=%d replicas=%d", healthy, pending, app.DesiredReplicas, len(replicas))
+	// An app the reconciler is refusing to place reads as "failed" with zero
+	// replicas and no hint of why, which is the report that sent an operator
+	// hunting the wrong cause. Name the condition in the message; the STATE is
+	// deliberately unchanged — this is a reason string, not a new lifecycle state.
+	//
+	// ⚠ evalPlaceableOnBackingFile, NOT placeableOnBackingFile: the latter clears
+	// the app's condition-log throttle whenever it answers placeable, and Health is
+	// polled far more often than the 10-minute window. Calling it here would keep
+	// resetting the reconciler's throttle and restore the every-tick log flood the
+	// throttle exists to prevent.
+	if placeable, cond := uc.evalPlaceableOnBackingFile(ctx, app.ID); !placeable {
+		out.Message = "placement blocked: " + cond + "; "
+	}
+	out.Message += fmt.Sprintf("healthy=%d pending=%d desired=%d replicas=%d", healthy, pending, app.DesiredReplicas, len(replicas))
 	return out, true, nil
 }
 

@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -444,6 +445,41 @@ func TestReconcileApp(t *testing.T) {
 // newStatefulOrchHarness wires a volume-bearing app whose single volume points
 // at `backing` (which the caller creates or removes at will), through the REAL
 // FleetVolumeManager the reconciler consults in production.
+// writeSyntheticExt4 writes a file that the host superblock probe accepts as a
+// mountable ext4: sizeBytes long, ext4 magic at file offset 1080, 4KiB blocks,
+// and a block count that exactly fills the file. Real mkfs is not available in a
+// unit test and is not what is under test — the probe reads these three fields.
+func writeSyntheticExt4(t *testing.T, path string, sizeBytes int64) {
+	t.Helper()
+	if sizeBytes < 2048 {
+		t.Fatalf("writeSyntheticExt4: sizeBytes=%d cannot hold a superblock", sizeBytes)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			t.Fatal(cerr)
+		}
+	}()
+	if err := f.Truncate(sizeBytes); err != nil {
+		t.Fatal(err)
+	}
+	sb := make([]byte, 1024)
+	binary.LittleEndian.PutUint32(sb[0x04:], uint32(sizeBytes/4096)) // s_blocks_count_lo
+	binary.LittleEndian.PutUint32(sb[0x18:], 2)                      // s_log_block_size → 4KiB
+	binary.LittleEndian.PutUint16(sb[0x38:], 0xEF53)                 // s_magic
+	if _, err := f.WriteAt(sb, 1024); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// syntheticExt4Size is a size large enough to be plausible and small enough to
+// write in every test (its block count is exact, so it also pins the
+// exact-equality arm of the probe).
+const syntheticExt4Size = 4096 * 64
+
 func newStatefulOrchHarness(t *testing.T, backing string) (orchHarness, *domain.FleetApp) {
 	t.Helper()
 	app := testFleetApp(1)
@@ -468,9 +504,7 @@ func TestReconcileApp_BackingFilePrecondition(t *testing.T) {
 			name: "backing file present places normally",
 			setup: func(t *testing.T) string {
 				p := filepath.Join(t.TempDir(), "vol.ext4")
-				if err := os.WriteFile(p, []byte("DATA"), 0o600); err != nil {
-					t.Fatal(err)
-				}
+				writeSyntheticExt4(t, p, syntheticExt4Size)
 				return p
 			},
 			wantPlace: true,
@@ -494,6 +528,60 @@ func TestReconcileApp_BackingFilePrecondition(t *testing.T) {
 				return filepath.Join(t.TempDir(), "not-mounted", "vol.ext4")
 			},
 			wantPlace: false,
+		},
+		{
+			// Present but NOT mountable: the guest mount fails closed on this, so
+			// booting it churns exactly like a missing file. The gate must catch it.
+			name: "backing file present with a zeroed superblock places nothing",
+			setup: func(t *testing.T) string {
+				p := filepath.Join(t.TempDir(), "vol.ext4")
+				writeSyntheticExt4(t, p, syntheticExt4Size)
+				f, err := os.OpenFile(p, os.O_RDWR, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.WriteAt(make([]byte, 1024), 1024); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.Close(); err != nil {
+					t.Fatal(err)
+				}
+				return p
+			},
+			wantPlace: false,
+		},
+		{
+			// The superblock describes twice the bytes the file holds: an interrupted
+			// copy or a truncated restore. Cannot mount, must not be booted.
+			name: "backing file truncated below its own superblock places nothing",
+			setup: func(t *testing.T) string {
+				p := filepath.Join(t.TempDir(), "vol.ext4")
+				writeSyntheticExt4(t, p, syntheticExt4Size)
+				if err := os.Truncate(p, syntheticExt4Size/2); err != nil {
+					t.Fatal(err)
+				}
+				return p
+			},
+			wantPlace: false,
+		},
+		{
+			// ⚠ PINS FAIL-OPEN. The probe cannot read the file at all, which is not
+			// evidence of anything. The guest's own mount is the data guard; this
+			// gate only suppresses churn, so an inconclusive probe MUST still place.
+			name: "unreadable backing file still places (the probe fails open)",
+			setup: func(t *testing.T) string {
+				p := filepath.Join(t.TempDir(), "vol.ext4")
+				writeSyntheticExt4(t, p, syntheticExt4Size)
+				if err := os.Chmod(p, 0o000); err != nil {
+					t.Fatal(err)
+				}
+				if f, err := os.Open(p); err == nil {
+					_ = f.Close()
+					t.Skip("running as a user that can read mode-0000 files (root?); cannot stage an unreadable file")
+				}
+				return p
+			},
+			wantPlace: true,
 		},
 		{
 			// An app with no volume at all is untouched by any of this.
@@ -550,9 +638,7 @@ func TestReconcileApp_BackingFilePreconditionIsNotALatch(t *testing.T) {
 	}
 
 	// The file comes back. The NEXT tick must recover on its own.
-	if err := os.WriteFile(backing, []byte("DATA"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeSyntheticExt4(t, backing, syntheticExt4Size)
 	if err := h.orch.ReconcileApp(context.Background(), app.ID); err != nil {
 		t.Fatalf("recovery tick: %v", err)
 	}
@@ -620,9 +706,7 @@ func TestPlaceableOnBackingFile_ConditionLogThrottle(t *testing.T) {
 				}
 			},
 			heal: func(t *testing.T, backing string) {
-				if err := os.WriteFile(backing, []byte("DATA"), 0o600); err != nil {
-					t.Fatal(err)
-				}
+				writeSyntheticExt4(t, backing, syntheticExt4Size)
 			},
 		},
 		{
@@ -638,9 +722,32 @@ func TestPlaceableOnBackingFile_ConditionLogThrottle(t *testing.T) {
 				if err := os.MkdirAll(filepath.Dir(backing), 0o700); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(backing, []byte("DATA"), 0o600); err != nil {
+				writeSyntheticExt4(t, backing, syntheticExt4Size)
+			},
+		},
+		{
+			// Present-but-unmountable: the file stays exactly where it is and only
+			// its superblock is wiped. Nothing about the path changes, so this arm
+			// also proves the heal needs no operator verb — rewriting a valid
+			// superblock (what `e2fsck -fy` does for real) is enough.
+			name:        "backing file present but unmountable",
+			condition:   conditionBackingFileUnmountable,
+			backingPath: func(root string) string { return filepath.Join(root, "vol.ext4") },
+			breakIt: func(t *testing.T, backing string) {
+				writeSyntheticExt4(t, backing, syntheticExt4Size)
+				f, err := os.OpenFile(backing, os.O_RDWR, 0o600)
+				if err != nil {
 					t.Fatal(err)
 				}
+				if _, err := f.WriteAt(make([]byte, 1024), 1024); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.Close(); err != nil {
+					t.Fatal(err)
+				}
+			},
+			heal: func(t *testing.T, backing string) {
+				writeSyntheticExt4(t, backing, syntheticExt4Size)
 			},
 		},
 	}
@@ -684,6 +791,141 @@ func TestPlaceableOnBackingFile_ConditionLogThrottle(t *testing.T) {
 			tick(false, 3, "recurrence logs immediately")
 		})
 	}
+}
+
+// TestParseExt4Superblock pins the decision table of the pure parser, including
+// every arm that must answer "mountable" because it is INCONCLUSIVE rather than
+// because it is healthy.
+func TestParseExt4Superblock(t *testing.T) {
+	// sb builds a superblock with the given log-block-size and 64-bit block count.
+	sb := func(logBlockSize uint32, blocksLo, blocksHi uint32, magic uint16) []byte {
+		b := make([]byte, 1024)
+		binary.LittleEndian.PutUint32(b[0x04:], blocksLo)
+		binary.LittleEndian.PutUint32(b[0x18:], logBlockSize)
+		binary.LittleEndian.PutUint16(b[0x38:], magic)
+		binary.LittleEndian.PutUint32(b[0x150:], blocksHi)
+		return b
+	}
+
+	tests := []struct {
+		name      string
+		sb        []byte
+		fileBytes int64
+		want      ext4Verdict
+	}{
+		{
+			name:      "healthy 4KiB-block filesystem",
+			sb:        sb(2, 64, 0, 0xEF53),
+			fileBytes: 4096 * 64,
+			want:      ext4Mountable,
+		},
+		{
+			name:      "zeroed magic is no superblock",
+			sb:        sb(2, 64, 0, 0x0000),
+			fileBytes: 4096 * 64,
+			want:      ext4NoSuperblock,
+		},
+		{
+			name:      "file too small to hold a superblock",
+			sb:        sb(2, 64, 0, 0xEF53),
+			fileBytes: 512,
+			want:      ext4NoSuperblock,
+		},
+		{
+			name:      "filesystem larger than its file is truncated",
+			sb:        sb(2, 64, 0, 0xEF53),
+			fileBytes: 4096 * 32,
+			want:      ext4Truncated,
+		},
+		{
+			// The normal case: a filesystem that fills its file exactly must pass.
+			name:      "exact size equality passes",
+			sb:        sb(2, 100, 0, 0xEF53),
+			fileBytes: 4096 * 100,
+			want:      ext4Mountable,
+		},
+		{
+			name:      "zero block count is inconclusive, not a refusal",
+			sb:        sb(2, 0, 0, 0xEF53),
+			fileBytes: 4096 * 64,
+			want:      ext4Mountable,
+		},
+		{
+			name:      "nonsense block size is inconclusive, not a refusal",
+			sb:        sb(9, 1<<30, 0, 0xEF53),
+			fileBytes: 4096 * 64,
+			want:      ext4Mountable,
+		},
+		{
+			// 64bit feature: the high half of the block count must be read, or a
+			// hugely oversized filesystem reads as a small healthy one.
+			name:      "64-bit high block count is honoured",
+			sb:        sb(2, 0, 1, 0xEF53),
+			fileBytes: 4096 * 64,
+			want:      ext4Truncated,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, fsBytes := parseExt4Superblock(tt.sb, tt.fileBytes)
+			if got != tt.want {
+				t.Fatalf("verdict = %v (%s), want %v (%s)", got, got.reason(), tt.want, tt.want.reason())
+			}
+			if got == ext4Truncated && fsBytes <= tt.fileBytes {
+				t.Fatalf("truncated verdict reported fs_bytes=%d, want > file_bytes=%d", fsBytes, tt.fileBytes)
+			}
+		})
+	}
+}
+
+// TestHealthApp_SurfacesPlacementCondition — a blocked app used to report
+// "failed, 0 replicas" with no hint of why, which is the report that sends an
+// operator after the wrong cause.
+func TestHealthApp_SurfacesPlacementCondition(t *testing.T) {
+	t.Run("blocked stateful app names the condition", func(t *testing.T) {
+		backing := filepath.Join(t.TempDir(), "vol.ext4")
+		writeSyntheticExt4(t, backing, syntheticExt4Size)
+		f, err := os.OpenFile(backing, os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteAt(make([]byte, 1024), 1024); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		h, app := newStatefulOrchHarness(t, backing)
+		out, isApp, err := h.orch.HealthApp(context.Background(), app.ID)
+		if err != nil || !isApp {
+			t.Fatalf("HealthApp: isApp=%v err=%v", isApp, err)
+		}
+		if !strings.Contains(out.Message, conditionBackingFileUnmountable) {
+			t.Fatalf("message = %q, want it to name %q", out.Message, conditionBackingFileUnmountable)
+		}
+		if !strings.Contains(out.Message, "desired=1") {
+			t.Fatalf("message = %q, want the replica counts retained", out.Message)
+		}
+		// The state stays the replica set's own verdict: this is a reason string,
+		// not a new lifecycle state.
+		if out.State != "failed" {
+			t.Fatalf("state = %q, want %q (the condition must not invent a state)", out.State, "failed")
+		}
+	})
+
+	t.Run("healthy app message is unchanged", func(t *testing.T) {
+		app := testFleetApp(1)
+		h := newOrchHarness(oneLiveHost(), app)
+		out, isApp, err := h.orch.HealthApp(context.Background(), app.ID)
+		if err != nil || !isApp {
+			t.Fatalf("HealthApp: isApp=%v err=%v", isApp, err)
+		}
+		if out.Message != "healthy=0 pending=0 desired=1 replicas=0" {
+			t.Fatalf("message = %q, want the untouched counts line", out.Message)
+		}
+	})
 }
 
 func TestOrchestrator_UnknownAppReturnsFalse(t *testing.T) {
