@@ -1,8 +1,10 @@
 package http
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -50,7 +52,14 @@ func MustPermissionChecker(real PermissionChecker) (PermissionChecker, bool, err
 		log.Printf("WARNING: runtime-service wired with DevAllowAllPermissionChecker — APP_PERMISSION_ALLOW_ALL=true. Do NOT use this in production.")
 		return DevAllowAllPermissionChecker{}, false, nil
 	}
-	log.Printf("WARNING: runtime-service has no PermissionChecker configured — defaulting to deny-all. Set APP_PERMISSION_ALLOW_ALL=true for dev or wire a real client.")
+	// Not a misconfiguration, and the line should not read like one. runtime-service
+	// deliberately has NO permission-service client: every other surface it serves
+	// is gated by mesh SVID + attested org carriage (the gRPC auth interceptor plus
+	// the per-handler org checks), not by a permission check. The ONLY
+	// permission-gated routes are the hermetic-build mutations, so deny-all costs
+	// exactly those two routes and nothing else — which is the correct fail-closed
+	// answer while nothing calls them.
+	log.Printf("runtime-service: no PermissionChecker wired (by design — this service is gated by mesh SVID + org carriage). The permission-gated hermetic-build mutation routes (POST /hermetic-builds/complete, PUT /hermetic-builds/{id}/artifact) will therefore REFUSE every request; set APP_PERMISSION_ALLOW_ALL=true to allow them in dev.")
 	return denyAllPermissionChecker{}, false, nil
 }
 
@@ -102,6 +111,74 @@ func RequireRuntimePermission(checker PermissionChecker, resourceType, permissio
 			resourceID := chi.URLParam(r, paramName)
 			if resourceID == "" {
 				writePermissionError(w, http.StatusBadRequest, "missing resource id")
+				return
+			}
+			allowed, err := checker.CheckPermission(r.Context(), userID.String(), permission, resourceType, resourceID)
+			if err != nil {
+				writePermissionError(w, http.StatusServiceUnavailable, "permission check failed: "+err.Error())
+				return
+			}
+			if !allowed {
+				writePermissionError(w, http.StatusForbidden, "permission denied")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// maxGatedBodyBytes bounds the body a body-field gate is willing to buffer. The
+// gated routes are small JSON envelopes; a larger body is refused rather than
+// read into memory, and no artifact upload goes through this gate (those carry
+// their id in the URL).
+const maxGatedBodyBytes = 1 << 20
+
+// RequireRuntimePermissionFromBody is the body-carried counterpart of
+// RequireRuntimePermission, for a mutation whose target resource is named in the
+// JSON body rather than the path (e.g. POST /hermetic-builds/complete carries
+// build_id). It buffers the bounded body, reads the field, then RESTORES the body
+// so the handler decodes it normally.
+//
+// It exists because the alternative is a handler that checks its own permission
+// after decoding, which puts the same control in two shapes; keeping every gate
+// in middleware is what makes "is this route gated" answerable by reading the
+// route table.
+func RequireRuntimePermissionFromBody(checker PermissionChecker, resourceType, permission, field string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if checker == nil {
+				writePermissionError(w, http.StatusInternalServerError, "permission checker not configured")
+				return
+			}
+			userID, ok := GetUserIDFromContext(r.Context())
+			if !ok {
+				writePermissionError(w, http.StatusUnauthorized, "authenticated user required")
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, maxGatedBodyBytes+1))
+			if err != nil {
+				writePermissionError(w, http.StatusBadRequest, "unreadable request body")
+				return
+			}
+			if len(body) > maxGatedBodyBytes {
+				writePermissionError(w, http.StatusRequestEntityTooLarge, "request body too large to authorize")
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(body, &fields); err != nil {
+				writePermissionError(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
+			var resourceID string
+			if raw, present := fields[field]; present {
+				// Only a JSON string is accepted: a resource id that is not a string is
+				// not a resource id, and coercing one would authorize a value the
+				// handler will later reject or reinterpret.
+				_ = json.Unmarshal(raw, &resourceID)
+			}
+			if resourceID == "" {
+				writePermissionError(w, http.StatusBadRequest, "missing resource id: "+field+" is required")
 				return
 			}
 			allowed, err := checker.CheckPermission(r.Context(), userID.String(), permission, resourceType, resourceID)

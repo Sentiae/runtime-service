@@ -297,10 +297,9 @@ type MigrationsConfig struct {
 
 // ServicesConfig contains external service endpoints.
 type ServicesConfig struct {
-	Identity   ServiceEndpoint `mapstructure:"identity"`
-	Permission ServiceEndpoint `mapstructure:"permission"`
-	Canvas     ServiceEndpoint `mapstructure:"canvas"`
-	Git        ServiceEndpoint `mapstructure:"git"`
+	Identity ServiceEndpoint `mapstructure:"identity"`
+	Canvas   ServiceEndpoint `mapstructure:"canvas"`
+	Git      ServiceEndpoint `mapstructure:"git"`
 }
 
 // ServiceEndpoint represents an external service configuration.
@@ -468,15 +467,12 @@ func Load() (*Config, error) {
 			"database.postgres.log_level":           "warn",
 
 			// Services defaults
-			"services.identity.enabled":   true,
-			"services.identity.url":       "identity-service:50051",
-			"services.identity.timeout":   "5s",
-			"services.permission.enabled": true,
-			"services.permission.url":     "permission-service:50054",
-			"services.permission.timeout": "5s",
-			"services.canvas.enabled":     true,
-			"services.canvas.url":         "canvas-service:50058",
-			"services.canvas.timeout":     "10s",
+			"services.identity.enabled": true,
+			"services.identity.url":     "identity-service:50051",
+			"services.identity.timeout": "5s",
+			"services.canvas.enabled":   true,
+			"services.canvas.url":       "canvas-service:50058",
+			"services.canvas.timeout":   "10s",
 			// Git service HTTP origin (symbol graph + impact analysis).
 			// Empty URL disables the symbol graph path in
 			// AffectedTestResolver (it falls back to the filename
@@ -656,9 +652,6 @@ func Load() (*Config, error) {
 			{"services.identity.enabled", "APP_SERVICES_IDENTITY_ENABLED"},
 			{"services.identity.url", "APP_SERVICES_IDENTITY_URL"},
 			{"services.identity.timeout", "APP_SERVICES_IDENTITY_TIMEOUT"},
-			{"services.permission.enabled", "APP_SERVICES_PERMISSION_ENABLED"},
-			{"services.permission.url", "APP_SERVICES_PERMISSION_URL"},
-			{"services.permission.timeout", "APP_SERVICES_PERMISSION_TIMEOUT"},
 			{"services.canvas.enabled", "APP_SERVICES_CANVAS_ENABLED"},
 			{"services.canvas.url", "APP_SERVICES_CANVAS_URL"},
 			{"services.canvas.timeout", "APP_SERVICES_CANVAS_TIMEOUT"},

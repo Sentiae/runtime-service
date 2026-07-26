@@ -33,13 +33,37 @@ func NewHermeticBuildHandler(uc *usecase.HermeticBuildUseCase) *HermeticBuildHan
 }
 
 // RegisterRoutes mounts the endpoints under /hermetic-builds.
-func (h *HermeticBuildHandler) RegisterRoutes(r chi.Router) {
+//
+// The two MUTATING routes are mounted INSIDE their gates, and the gates are
+// parameters rather than something the router "seeds" around them. They used to
+// be ungated: the caller put a RequireRuntimePermission middleware on a
+// chi.Group that registered no routes, and then registered these routes on the
+// outer router — so the middleware never ran and a comment described a control
+// that did not exist.
+//
+// pathIDGate must gate a route whose resource id is a URL param named "id";
+// bodyIDGate must gate one whose resource id is a JSON body field. A nil gate is
+// refused rather than skipped: an unwired gate is the fail-open this signature
+// exists to prevent.
+func (h *HermeticBuildHandler) RegisterRoutes(r chi.Router, pathIDGate, bodyIDGate func(http.Handler) http.Handler) {
+	if pathIDGate == nil || bodyIDGate == nil {
+		panic("hermetic build routes require both permission gates: mounting the mutating routes ungated is the bug this signature exists to prevent")
+	}
 	r.Route("/hermetic-builds", func(r chi.Router) {
-		r.Post("/complete", h.Complete)
+		// Reads. They disclose a build's own digests/artifact for an id the caller
+		// already holds, behind the /api/v1 JWT group, and gating them is a separate
+		// question from the mutations (see #hermetic-build-routes-are-ungated, which
+		// scopes itself to the mutation routes).
 		r.Get("/resolve", h.Resolve)
 		r.Get("/{id}/verify", h.Verify)
-		r.Put("/{id}/artifact", h.UploadArtifact)
 		r.Get("/{id}/artifact", h.DownloadArtifact)
+
+		// Mutations. Complete rewrites the build's output digest + artifact ref — the
+		// value the next identical input digest is SHORT-CIRCUITED to, so an
+		// unauthorized write here substitutes an artifact into someone else's build
+		// cache. UploadArtifact writes the bytes themselves.
+		r.With(bodyIDGate).Post("/complete", h.Complete)
+		r.With(pathIDGate).Put("/{id}/artifact", h.UploadArtifact)
 	})
 }
 

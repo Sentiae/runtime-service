@@ -17,12 +17,18 @@ import (
 // we can still exercise the error paths that fire before the usecase
 // is consulted (nil-uc guards, missing params, bad JSON, wrong method).
 
+// openGate is a pass-through gate for the tests below, which exercise the
+// handler's OWN error paths rather than the permission gate. The gate itself is
+// exercised in hermetic_build_gate_test.go — the point of the signature is that
+// a caller cannot forget to pass one.
+func openGate(next http.Handler) http.Handler { return next }
+
 func TestHermeticBuildHandler_UploadArtifact_NoStoreReturns503(t *testing.T) {
 	// UC without a store: upload must respond 503 so callers know the
 	// artifact path isn't configured rather than silently 500.
 	h := NewHermeticBuildHandler(usecase.NewHermeticBuildUseCase(nil))
 	r := chi.NewRouter()
-	h.RegisterRoutes(r)
+	h.RegisterRoutes(r, openGate, openGate)
 
 	req := httptest.NewRequest(http.MethodPut, "/hermetic-builds/00000000-0000-0000-0000-000000000001/artifact", strings.NewReader("blob"))
 	rec := httptest.NewRecorder()
@@ -36,7 +42,7 @@ func TestHermeticBuildHandler_UploadArtifact_NoStoreReturns503(t *testing.T) {
 func TestHermeticBuildHandler_DownloadArtifact_NoStoreReturns503(t *testing.T) {
 	h := NewHermeticBuildHandler(usecase.NewHermeticBuildUseCase(nil))
 	r := chi.NewRouter()
-	h.RegisterRoutes(r)
+	h.RegisterRoutes(r, openGate, openGate)
 
 	req := httptest.NewRequest(http.MethodGet, "/hermetic-builds/00000000-0000-0000-0000-000000000001/artifact?digest=abc", nil)
 	rec := httptest.NewRecorder()
@@ -49,7 +55,7 @@ func TestHermeticBuildHandler_DownloadArtifact_NoStoreReturns503(t *testing.T) {
 func TestHermeticBuildHandler_Complete_InvalidJSON400(t *testing.T) {
 	h := NewHermeticBuildHandler(usecase.NewHermeticBuildUseCase(nil))
 	r := chi.NewRouter()
-	h.RegisterRoutes(r)
+	h.RegisterRoutes(r, openGate, openGate)
 
 	req := httptest.NewRequest(http.MethodPost, "/hermetic-builds/complete",
 		strings.NewReader("{not json"))
@@ -64,7 +70,7 @@ func TestHermeticBuildHandler_Complete_InvalidJSON400(t *testing.T) {
 func TestHermeticBuildHandler_Complete_MissingDigest400(t *testing.T) {
 	h := NewHermeticBuildHandler(usecase.NewHermeticBuildUseCase(nil))
 	r := chi.NewRouter()
-	h.RegisterRoutes(r)
+	h.RegisterRoutes(r, openGate, openGate)
 
 	payload, _ := json.Marshal(map[string]any{
 		"build_id":      "00000000-0000-0000-0000-000000000001",
@@ -83,7 +89,7 @@ func TestHermeticBuildHandler_Complete_MissingDigest400(t *testing.T) {
 func TestHermeticBuildHandler_Resolve_InvalidOrgID400(t *testing.T) {
 	h := NewHermeticBuildHandler(usecase.NewHermeticBuildUseCase(nil))
 	r := chi.NewRouter()
-	h.RegisterRoutes(r)
+	h.RegisterRoutes(r, openGate, openGate)
 
 	req := httptest.NewRequest(http.MethodGet, "/hermetic-builds/resolve?org_id=not-a-uuid&input_digest=abc", nil)
 	rec := httptest.NewRecorder()
@@ -96,7 +102,7 @@ func TestHermeticBuildHandler_Resolve_InvalidOrgID400(t *testing.T) {
 func TestHermeticBuildHandler_Resolve_MissingDigest400(t *testing.T) {
 	h := NewHermeticBuildHandler(usecase.NewHermeticBuildUseCase(nil))
 	r := chi.NewRouter()
-	h.RegisterRoutes(r)
+	h.RegisterRoutes(r, openGate, openGate)
 
 	req := httptest.NewRequest(http.MethodGet, "/hermetic-builds/resolve?org_id=00000000-0000-0000-0000-000000000001", nil)
 	rec := httptest.NewRecorder()
@@ -109,7 +115,7 @@ func TestHermeticBuildHandler_Resolve_MissingDigest400(t *testing.T) {
 func TestHermeticBuildHandler_Verify_InvalidID400(t *testing.T) {
 	h := NewHermeticBuildHandler(usecase.NewHermeticBuildUseCase(nil))
 	r := chi.NewRouter()
-	h.RegisterRoutes(r)
+	h.RegisterRoutes(r, openGate, openGate)
 
 	req := httptest.NewRequest(http.MethodGet, "/hermetic-builds/not-a-uuid/verify", nil)
 	rec := httptest.NewRecorder()

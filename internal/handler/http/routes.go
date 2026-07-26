@@ -176,17 +176,19 @@ func (s *Server) setupRoutes() {
 			s.dslHandler.RegisterRoutes(r)
 		}
 		if s.hermeticBuildHandler != nil {
-			// Hermetic build mutations require write permission on the
-			// pipeline_run resource. Read-only resolution is still
-			// served through the unprotected hermeticBuildHandler
-			// below; the protected group only covers mutating routes.
-			r.Group(func(pr chi.Router) {
-				pr.Use(RequireRuntimePermission(checker, "hermetic_build", "write", "id"))
-				// Intentionally no-op — the handler already owns its
-				// own sub-router below. This group seeds the middleware
-				// for future mutating routes as they migrate in.
-			})
-			s.hermeticBuildHandler.RegisterRoutes(r)
+			// Hermetic-build MUTATIONS require write permission on the build. The
+			// gates are handed to the handler so they wrap the routes themselves —
+			// this used to be a middleware on an empty chi.Group next to routes
+			// registered outside it, i.e. no check at all.
+			//
+			// ⚠ With no PermissionChecker wired (the default — see
+			// MustPermissionChecker) `checker` is deny-all, so these two routes
+			// REFUSE every request. That is the intended fail-closed posture and it
+			// breaks nothing: no caller of /hermetic-builds exists in the fleet.
+			s.hermeticBuildHandler.RegisterRoutes(r,
+				RequireRuntimePermission(checker, "hermetic_build", "write", "id"),
+				RequireRuntimePermissionFromBody(checker, "hermetic_build", "write", "build_id"),
+			)
 		}
 		if s.quarantineHandler != nil {
 			s.quarantineHandler.RegisterRoutes(r)
