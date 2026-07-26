@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -208,16 +209,118 @@ func (s *FleetServer) Scale(ctx context.Context, req *runtimev1.FleetScaleReques
 	return &runtimev1.FleetScaleResponse{}, nil
 }
 
+// svidPath returns the path component of a SPIFFE ID string —
+// spiffe://<trust-domain><path> — and ok=false for anything that is not one. The
+// string is split here rather than parsed with go-spiffe's spiffeid because the
+// caller already holds a peer id the TLS layer validated, and the exact-shape
+// checks that matter (the /fleet-host/ prefix and a real uuid) are done below.
+func svidPath(raw string) (string, bool) {
+	const scheme = "spiffe://"
+	if !strings.HasPrefix(raw, scheme) {
+		return "", false
+	}
+	authorityAndPath := raw[len(scheme):]
+	slash := strings.Index(authorityAndPath, "/")
+	if slash <= 0 {
+		// No path at all (or an empty trust domain): a trust-domain id names no
+		// workload, so it names no host either.
+		return "", false
+	}
+	return authorityAndPath[slash:], true
+}
+
+// hostSVIDPathPrefix is the SPIFFE path prefix of a PER-HOST identity —
+// spiffe://<domain>/fleet-host/<uuid>, minted at host birth (the same
+// server-side action that already issues the SPIRE join token). It is the only
+// thing that answers "which host is calling", because it is the one statement
+// about the caller the caller cannot write.
+const hostSVIDPathPrefix = "/fleet-host/"
+
+// peerHostID derives the calling host's identity from its peer SVID.
+//
+// The identity of a host is a TRANSPORT fact, never a payload fact: the request
+// body used to name the host, and an empty host_id used to mint a fresh
+// uuid.New() — so any mesh caller could re-register (or, before the status fix,
+// un-cordon) any host it liked, and an anonymous caller was HANDED an identity
+// it never proved. A caller that cannot prove who it is gets refused, not named.
+//
+// ⚠ Until per-host SVIDs are minted at birth, no real caller satisfies this and
+// every RPC call is refused. That is not a regression: this RPC already refuses
+// every call (see RegisterHost), the live registration path is in-process
+// (di.registerSelfHost, which never crosses this handler), and refusing is the
+// correct posture for a host whose identity is unknowable.
+//
+// The SVID is read through tenant.FromContext — the same seam every other check
+// in this file uses — which derives Principal.ServiceSVID from the peer
+// certificate the SVID interceptor extracted. It is the identical fact, read
+// where the rest of this handler's identity checks read it.
+func peerHostID(ctx context.Context) (uuid.UUID, error) {
+	p, ok := tenant.FromContext(ctx)
+	if !ok || p.ServiceSVID == "" {
+		return uuid.Nil, status.Error(codes.Unauthenticated,
+			"a fleet host must prove its identity with a peer SVID (spiffe://…"+hostSVIDPathPrefix+"<uuid>); an unidentified caller is refused, never assigned an identity")
+	}
+	path, ok := svidPath(p.ServiceSVID)
+	if !ok {
+		return uuid.Nil, status.Errorf(codes.PermissionDenied, "peer SVID %q is not a valid SPIFFE ID", p.ServiceSVID)
+	}
+	if !strings.HasPrefix(path, hostSVIDPathPrefix) {
+		return uuid.Nil, status.Errorf(codes.PermissionDenied,
+			"peer SVID %q is not a fleet-host identity: only a workload holding a %s<uuid> SVID may act as a host", p.ServiceSVID, hostSVIDPathPrefix)
+	}
+	hostID, perr := uuid.Parse(strings.TrimPrefix(path, hostSVIDPathPrefix))
+	if perr != nil || hostID == uuid.Nil {
+		return uuid.Nil, status.Errorf(codes.PermissionDenied,
+			"peer SVID %q does not carry a valid host uuid", p.ServiceSVID)
+	}
+	return hostID, nil
+}
+
+// requireSelfOrRefuse cross-checks a body-supplied host id against the attested
+// peer identity. A body id is accepted only as a redundant restatement of the
+// SVID; a disagreement is a forgery attempt, not a correction.
+func requireSelfOrRefuse(bodyHostID string, attested uuid.UUID) error {
+	if bodyHostID == "" {
+		return nil
+	}
+	claimed, err := uuid.Parse(bodyHostID)
+	if err != nil {
+		return status.Error(codes.InvalidArgument, "host_id is not a valid uuid")
+	}
+	if claimed != attested {
+		return status.Errorf(codes.PermissionDenied,
+			"host_id %s does not match the attested peer identity %s: a host may only act as itself", claimed, attested)
+	}
+	return nil
+}
+
+// requireAttestedCaller refuses a caller that presented no identity at all: no
+// peer SVID, no verified service token, no user claims. It is deliberately the
+// weakest possible check — it answers "is this someone" and nothing about
+// authorization — so it belongs only on surfaces that carry no tenant data.
+func requireAttestedCaller(ctx context.Context) error {
+	p, ok := tenant.FromContext(ctx)
+	if !ok || (p.ServiceSVID == "" && !p.ServiceAuthed && p.Claims == nil) {
+		return status.Error(codes.Unauthenticated,
+			"the fleet host inventory is not an anonymous read: present a peer SVID, a service token, or a user token")
+	}
+	return nil
+}
+
 // RegisterHost registers (or refreshes) a fleet host in the durable inventory.
 //
-// ⚠ This RPC currently REFUSES every call with ErrHostFailureDomainRequired, and
-// that is deliberate rather than broken: since D-196 a host must state its
-// structured failure domain, and `HostSpec` has no field to carry one — adding it
-// is a frozen-contract (proto) change, which is not this slice's to make. The
-// live path is unaffected: a fleet host self-registers in-process from
-// APP_FLEET_FAILURE_DOMAIN (di.registerFleetSelf), and this RPC has no caller.
-// Refusing is the correct interim posture — admitting a host whose failure domain
-// is unknowable is the fail-open the column exists to close.
+// The host id comes from the peer SVID (see peerHostID) — never from the request
+// body, and never minted for an anonymous caller.
+//
+// ⚠ Beyond identity, this RPC also REFUSES every call with
+// ErrHostFailureDomainRequired, and that is deliberate rather than broken: since
+// D-196 a host must state its structured failure domain, and `HostSpec` has no
+// field to carry one — adding it is a frozen-contract (proto) change, which is
+// not this slice's to make. The live path is unaffected: a fleet host
+// self-registers in-process from APP_FLEET_FAILURE_DOMAIN (di.registerSelfHost),
+// and this RPC has no caller. Refusing is the correct interim posture — admitting
+// a host whose failure domain is unknowable is the fail-open the column exists to
+// close.
 func (s *FleetServer) RegisterHost(ctx context.Context, req *runtimev1.RegisterHostRequest) (*runtimev1.RegisterHostResponse, error) {
 	if s.registry == nil {
 		return nil, status.Error(codes.Unavailable, "fleet host registry not configured")
@@ -226,13 +329,14 @@ func (s *FleetServer) RegisterHost(ctx context.Context, req *runtimev1.RegisterH
 	if spec == nil {
 		return nil, status.Error(codes.InvalidArgument, "host spec is required")
 	}
-	var id uuid.UUID
-	if spec.GetHostId() != "" {
-		parsed, err := uuid.Parse(spec.GetHostId())
-		if err != nil {
-			return nil, status.Error(codes.InvalidArgument, "host_id is not a valid uuid")
-		}
-		id = parsed
+	// Identity BEFORE any spec validation: a caller that cannot prove which host it
+	// is has nothing to say about capacity or placement facts either.
+	id, err := peerHostID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireSelfOrRefuse(spec.GetHostId(), id); err != nil {
+		return nil, err
 	}
 	host, err := s.registry.RegisterHost(ctx, domain.Host{
 		ID:             id,
@@ -250,13 +354,23 @@ func (s *FleetServer) RegisterHost(ctx context.Context, req *runtimev1.RegisterH
 }
 
 // Heartbeat refreshes a host's liveness and allocatable capacity.
+//
+// Identity comes from the peer SVID for the same reason as RegisterHost, and here
+// it also guards a WRITE to another host's row: a heartbeat sets liveness and
+// allocatable capacity, so a forged host_id could keep a dead host in the
+// placement candidate set, or make a live one advertise capacity it does not have.
+// The live self-heartbeat loop calls the use case in-process (di.startFleetHeartbeat)
+// and does not pass through this handler.
 func (s *FleetServer) Heartbeat(ctx context.Context, req *runtimev1.HeartbeatRequest) (*runtimev1.HeartbeatResponse, error) {
 	if s.registry == nil {
 		return nil, status.Error(codes.Unavailable, "fleet host registry not configured")
 	}
-	id, err := uuid.Parse(req.GetHostId())
+	id, err := peerHostID(ctx)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "host_id is not a valid uuid")
+		return nil, err
+	}
+	if err := requireSelfOrRefuse(req.GetHostId(), id); err != nil {
+		return nil, err
 	}
 	if err := s.registry.Heartbeat(ctx, id,
 		int(req.GetAllocatableVcpu()),
@@ -270,9 +384,21 @@ func (s *FleetServer) Heartbeat(ctx context.Context, req *runtimev1.HeartbeatReq
 }
 
 // ListHosts returns the full fleet host inventory.
+//
+// GATED, not declared: this is an operator/control-plane read surface and it
+// carries no tenant identifier and no customer data (host ids, regions, failure
+// domains, capacity, endpoints, health) — so any ATTESTED mesh caller may read it.
+// What it must not be is anonymous: the inventory is a map of every machine
+// holding customer state, with the gRPC endpoint of each, which is reconnaissance
+// worth refusing. The requirement is enforced here rather than left to the auth
+// interceptor's config (AcceptAPIKey / RequirePeerSVID), because a config-driven
+// gate is exactly how a control comes to exist only on paper.
 func (s *FleetServer) ListHosts(ctx context.Context, _ *runtimev1.ListHostsRequest) (*runtimev1.ListHostsResponse, error) {
 	if s.registry == nil {
 		return nil, status.Error(codes.Unavailable, "fleet host registry not configured")
+	}
+	if err := requireAttestedCaller(ctx); err != nil {
+		return nil, err
 	}
 	hosts, err := s.registry.ListHosts(ctx)
 	if err != nil {
