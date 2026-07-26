@@ -419,7 +419,7 @@ func TestProvisionDedicated_Validation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := newFakeResourceRepo()
 			prov := &fakeFleetProvisioner{}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
+			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
 			in := validDedicatedInput()
 			tt.mutate(&in)
 			_, err := uc.ProvisionDedicated(context.Background(), in)
@@ -436,7 +436,7 @@ func TestProvisionDedicated_Validation(t *testing.T) {
 func TestProvisionDedicated_EngineUnconfigured(t *testing.T) {
 	repo := newFakeResourceRepo()
 	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, DedicatedEngineConfig{ConnBudget: 100}, testEndpointNaming())
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, DedicatedEngineConfig{ConnBudget: 100}, testEndpointNaming(), nil, 0)
 	_, err := uc.ProvisionDedicated(context.Background(), validDedicatedInput())
 	if !errors.Is(err, domain.ErrImageRefIncomplete) {
 		t.Fatalf("got %v, want ErrImageRefIncomplete", err)
@@ -447,7 +447,7 @@ func TestProvisionDedicated_HappyPath(t *testing.T) {
 	repo := newFakeResourceRepo()
 	appHandle := uuid.New()
 	prov := &fakeFleetProvisioner{provisionOut: FleetProvisionOutput{Handle: appHandle.String()}}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	in := validDedicatedInput()
 	out, err := uc.ProvisionDedicated(context.Background(), in)
@@ -580,7 +580,7 @@ func TestProvisionDedicated_IdempotentSameRevision(t *testing.T) {
 				healthErr:    tt.healthErr,
 				provisionOut: FleetProvisionOutput{Handle: appID.String()},
 			}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
+			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
 
 			in := validDedicatedInput()
 			in.Revision = tt.revision
@@ -641,7 +641,7 @@ func TestProvisionDedicated_DuplicateRaceReturnsWinner(t *testing.T) {
 	repo.findNotFoundFirst = true // pre-check sees no claim
 	repo.saveDuplicate = true     // SaveResource collides with the winner
 	prov := &fakeFleetProvisioner{provisionOut: FleetProvisionOutput{Handle: uuid.New().String()}}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	in := validDedicatedInput()
 	owner := uuid.MustParse(in.OwnerOrg)
@@ -667,7 +667,7 @@ func TestStatusOf_HealthyBecomesReady(t *testing.T) {
 	replicas := newFakeResourceReplicaRepo()
 	guestReplica := domain.Replica{ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident, GuestIP: "10.0.0.9", Port: residentPGPort}
 	replicas.byApp[appID] = []domain.Replica{guestReplica}
-	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
+	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
 	uc.pgReady = func(context.Context, string, int) error { return nil }
 
 	rid := uuid.New()
@@ -704,7 +704,7 @@ func TestStatusOf_DoesNotAdvanceWhileRestoring(t *testing.T) {
 	prov := &fakeFleetProvisioner{healthOut: FleetHealthOutput{Healthy: true}}
 	appID := uuid.New()
 	replicas := newFakeResourceReplicaRepo()
-	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
+	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
 	uc.pgReady = func(context.Context, string, int) error { return nil }
 
 	rid := uuid.New()
@@ -758,7 +758,7 @@ func TestStatusOf_UnreadableHealthIsAConditionNotAnError(t *testing.T) {
 			prov := &fakeFleetProvisioner{healthErr: tt.healthErr}
 			appID := uuid.New()
 			replicas := newFakeResourceReplicaRepo()
-			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
+			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
 
 			rid := uuid.New()
 			repo.seed(&domain.FleetResource{
@@ -881,7 +881,7 @@ func TestStatusOf_ReadyRequiresTheEngineToAdmitClients(t *testing.T) {
 			replicas := newFakeResourceReplicaRepo()
 			replicas.byApp[appID] = tt.replicas
 			replicas.listErr = tt.listErr
-			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
+			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
 			if tt.noProbe {
 				uc.pgReady = nil
 			} else {
@@ -924,7 +924,7 @@ func TestDecommissionDedicated_RejectsNoFinalSnapshot(t *testing.T) {
 	repo := newFakeResourceRepo()
 	snap := &fakeSnapshotter{}
 	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming())
+	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
 
 	rid := uuid.New()
 	appID := uuid.New()
@@ -943,7 +943,7 @@ func TestDecommissionDedicated_SnapshotFirstThenTombstone(t *testing.T) {
 	repo := newFakeResourceRepo()
 	snap := &fakeSnapshotter{}
 	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming())
+	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
 
 	rid := uuid.New()
 	appID := uuid.New()
@@ -977,7 +977,7 @@ func TestDecommissionDedicated_SnapshotFailureAborts(t *testing.T) {
 	repo := newFakeResourceRepo()
 	snap := &fakeSnapshotter{err: errors.New("upload failed")}
 	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming())
+	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
 
 	rid := uuid.New()
 	appID := uuid.New()
@@ -1011,7 +1011,7 @@ func TestDecommissionDedicated_MissingBackingFileIsLegible(t *testing.T) {
 	rid := uuid.New()
 	h.recovery.seed(&domain.FleetResource{ID: rid, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady, AppID: &appID})
 	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, h.recovery, h.replicas, h.s, testEngine(), testEndpointNaming())
+	uc := NewFleetResourceProvisioner(prov, h.recovery, h.replicas, h.s, testEngine(), testEndpointNaming(), nil, 0)
 
 	final, err := uc.DecommissionDedicated(context.Background(), rid, true)
 	if !errors.Is(err, domain.ErrVolumeBackingFileMissing) {
@@ -1060,7 +1060,7 @@ func TestDecommissionDedicated_RefusesWhenNoRecoveryPointWasCreated(t *testing.T
 			repo := newFakeResourceRepo()
 			snap := &fakeSnapshotter{noVolumes: tt.noVolumes}
 			prov := &fakeFleetProvisioner{}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming())
+			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
 
 			rid := uuid.New()
 			appID := uuid.New()
@@ -1150,7 +1150,7 @@ func TestDecommissionDedicated_MissingBackingFileFallsBackToTheCatalog(t *testin
 			repo := newFakeResourceRepo()
 			snap := &fakeSnapshotter{err: tt.snapErr}
 			prov := &fakeFleetProvisioner{}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming())
+			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
 
 			rid := uuid.New()
 			appID := uuid.New()
@@ -1283,7 +1283,7 @@ func TestDecommissionDedicated_VanishedBackingAppStillRetires(t *testing.T) {
 			repo := newFakeResourceRepo()
 			snap := &fakeSnapshotter{noVolumes: tt.noVolumes}
 			prov := &fakeFleetProvisioner{decommissionErr: tt.decommissionErr}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming())
+			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
 
 			rid := uuid.New()
 			appID := uuid.New()
@@ -1354,7 +1354,7 @@ func TestDecommissionDedicated_VanishedBackingAppIsIdempotent(t *testing.T) {
 	repo := newFakeResourceRepo()
 	snap := &fakeSnapshotter{noVolumes: true}
 	prov := &fakeFleetProvisioner{decommissionErr: domain.ErrWorkloadNotFound}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming())
+	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
 
 	rid := uuid.New()
 	appID := uuid.New()
@@ -1474,7 +1474,7 @@ func newResourceRecoveryHarness(t *testing.T) resourceRecoveryHarness {
 		orch:     h,
 		store:    store,
 		repo:     repo,
-		resource: NewFleetResourceProvisioner(orchProvisioner{h.orch}, repo, h.replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming()),
+		resource: NewFleetResourceProvisioner(orchProvisioner{h.orch}, repo, h.replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0),
 	}
 }
 
@@ -1656,7 +1656,7 @@ func TestProvisionDedicated_HealthyReProvisionDoesNotChurn(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────
 
 func TestDedicatedDescriptor_ComponentIDIsOrgNamespaced(t *testing.T) {
-	uc := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming())
+	uc := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	in := validDedicatedInput()
 	got := uc.dedicatedDescriptor(in).ComponentID

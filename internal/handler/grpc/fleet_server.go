@@ -209,6 +209,15 @@ func (s *FleetServer) Scale(ctx context.Context, req *runtimev1.FleetScaleReques
 }
 
 // RegisterHost registers (or refreshes) a fleet host in the durable inventory.
+//
+// ⚠ This RPC currently REFUSES every call with ErrHostFailureDomainRequired, and
+// that is deliberate rather than broken: since D-196 a host must state its
+// structured failure domain, and `HostSpec` has no field to carry one — adding it
+// is a frozen-contract (proto) change, which is not this slice's to make. The
+// live path is unaffected: a fleet host self-registers in-process from
+// APP_FLEET_FAILURE_DOMAIN (di.registerFleetSelf), and this RPC has no caller.
+// Refusing is the correct interim posture — admitting a host whose failure domain
+// is unknowable is the fail-open the column exists to close.
 func (s *FleetServer) RegisterHost(ctx context.Context, req *runtimev1.RegisterHostRequest) (*runtimev1.RegisterHostResponse, error) {
 	if s.registry == nil {
 		return nil, status.Error(codes.Unavailable, "fleet host registry not configured")
@@ -444,6 +453,34 @@ func fleetError(err error) error {
 		return status.Error(codes.NotFound, "fleet host not found")
 	case errors.Is(err, domain.ErrInvalidHostHealth):
 		return status.Error(codes.InvalidArgument, "invalid host health (want healthy|degraded|unhealthy|unknown)")
+	// SentiaeDB standard-ha — the host placement FACTS (D-196). InvalidArgument,
+	// because a registration that omits them is a caller-input fault: the host
+	// itself is the caller, and only its operator can supply the value.
+	case errors.Is(err, domain.ErrHostFailureDomainRequired):
+		return status.Error(codes.InvalidArgument, "a fleet host must state its failure domain (site/power/network, e.g. rgalileo-room/breaker-a/switch-1) — there is no default, because only a human knows which room and which breaker this machine is on")
+	case errors.Is(err, domain.ErrHostFailureDomainInvalid):
+		return status.Error(codes.InvalidArgument, "invalid fleet host failure domain: want three non-empty lowercase segments site/power/network (e.g. rgalileo-room/breaker-a/switch-1)")
+	case errors.Is(err, domain.ErrHostRegionRequired):
+		return status.Error(codes.InvalidArgument, "a fleet host must state its region")
+	// SentiaeDB standard-ha — the placement invariant refusals (slice 1). All
+	// FailedPrecondition: the claim is legitimate and the caller can retry it
+	// unchanged once the FLEET can satisfy it — which is what FailedPrecondition
+	// means and InvalidArgument does not. Each names the unmet condition, because
+	// the operator action differs completely (buy a machine / state a domain / move
+	// a machine / put them in one region) and "HA unavailable" would send someone
+	// shopping for hardware they may already own.
+	case errors.Is(err, domain.ErrHAHostsInsufficient):
+		return status.Error(codes.FailedPrecondition, "standard-ha refused: it requires two live hosts in DIFFERENT failure domains, and this fleet does not have them — a highly-available database is not provisioned at all rather than provisioned as a single copy that claims otherwise")
+	case errors.Is(err, domain.ErrHAFailureDomainUnattested):
+		return status.Error(codes.FailedPrecondition, "standard-ha refused: fewer than two live hosts have stated a failure domain, so the fleet cannot prove two members would not die together (set APP_FLEET_FAILURE_DOMAIN on each host)")
+	case errors.Is(err, domain.ErrHAFailureDomainShared):
+		return status.Error(codes.FailedPrecondition, "standard-ha refused: every live host is in the SAME failure domain — a second host on one chassis, one breaker or one switch is not a second failure domain")
+	case errors.Is(err, domain.ErrHARegionSplit):
+		return status.Error(codes.FailedPrecondition, "standard-ha refused: the live hosts in different failure domains are in different REGIONS, and the standby must be same-region because the region is part of the database's permanent hostname")
+	case errors.Is(err, domain.ErrHAAvailabilityClassInvalid):
+		return status.Error(codes.InvalidArgument, "unsupported availability class (want single|ha)")
+	case errors.Is(err, domain.ErrHAPlacementUnknowable):
+		return status.Error(codes.FailedPrecondition, "standard-ha refused: this host cannot read the live fleet inventory, so it cannot prove the placement invariant holds")
 	// The pause guard. A refusal is a permanent property of the VM class, never a
 	// transient fault, so it must not reach a caller as Internal (which reads as
 	// "retry") — firecracker vsock does not survive Pause/Resume, so no retry can

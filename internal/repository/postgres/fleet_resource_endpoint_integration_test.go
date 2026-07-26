@@ -67,8 +67,11 @@ func TestMigration0021IsReversible(t *testing.T) {
 		}
 	}
 
-	if err := m.Steps(-1); err != nil {
-		t.Fatalf("migrate down one: %v", err)
+	// Down to 0020 by VERSION, not by one step: this test is about 0021
+	// specifically, and a relative step silently became "undo the newest
+	// migration" the moment 0022 landed.
+	if err := m.Migrate(20); err != nil {
+		t.Fatalf("migrate down to 0020: %v", err)
 	}
 	for _, col := range []string{"endpoint_id", "region", "generation"} {
 		if hasColumn(col) {

@@ -49,8 +49,25 @@ func (s HostStatus) IsValid() bool {
 // (see ImageWorkload). DDL is owned by golang-migrate (migrations/), not
 // AutoMigrate.
 type Host struct {
-	ID                uuid.UUID         `json:"id" gorm:"type:uuid;primary_key"`
-	Region            string            `json:"region" gorm:"type:varchar(64);not null"`
+	ID uuid.UUID `json:"id" gorm:"type:uuid;primary_key"`
+	// Region is the placement region. It is HALF of the standard-ha placement
+	// invariant (different failure domain AND same region) and it must never be
+	// empty: two empty regions compare equal, which would satisfy the same-region
+	// half vacuously. RegisterHost refuses an empty one, and migration 0022 fences
+	// it in the DDL.
+	Region string `json:"region" gorm:"type:varchar(64);not null"`
+	// FailureDomain is this host's structured, human-supplied statement of what it
+	// shares a fate with — site/power/network (see FailureDomain). It is the single
+	// fact separating HA from theatre, so it has NO DEFAULT: RegisterHost refuses a
+	// host that supplies none.
+	//
+	// ⚠ The GORM tag must match migration 0022 EXACTLY (column `failure_domain`,
+	// TEXT, NOT NULL, no default, CHECK <> ''): a divergence here would be a schema
+	// change the migration never authored, which is how a security index silently
+	// reopened once (D-187). Rows created before 0022 carry
+	// HostFailureDomainUnattested, which does not parse and therefore never counts
+	// as a domain.
+	FailureDomain     string            `json:"failure_domain" gorm:"column:failure_domain;type:text;not null"`
 	Labels            map[string]string `json:"labels,omitempty" gorm:"type:jsonb;serializer:json"`
 	CapacityVCPU      int               `json:"capacity_vcpu" gorm:"column:capacity_vcpu;not null"`
 	CapacityMemMB     int64             `json:"capacity_mem_mb" gorm:"not null"`

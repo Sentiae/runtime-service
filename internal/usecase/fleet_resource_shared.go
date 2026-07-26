@@ -220,14 +220,20 @@ func (uc *FleetResourceSharedProvisioner) ProvisionShared(ctx context.Context, i
 		Generation: domain.FleetResourceInitialGeneration,
 		Class:      resourceClassPostgres,
 		Tier:       resourceTierShared,
-		Phase:      domain.FleetResourcePhaseReady,
-		DBName:     lease.DBName,
-		RoleName:   lease.RoleName,
-		Endpoint:   endpoint,
-		SecretRefs: in.SecretRefs,
-		ExpiresAt:  &expires,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		// Stamped explicitly for the same reason as Generation (GORM writes every
+		// field, and '' is refused by the 0022 CHECKs). The shared tier is a logical
+		// database on a shared engine: it has no members of its own to replicate, so
+		// `single` is the true value here, not a placeholder.
+		AvailabilityClass: domain.AvailabilityClassSingle,
+		SyncDegradePolicy: domain.SyncDegradePolicyFailClosed,
+		Phase:             domain.FleetResourcePhaseReady,
+		DBName:            lease.DBName,
+		RoleName:          lease.RoleName,
+		Endpoint:          endpoint,
+		SecretRefs:        in.SecretRefs,
+		ExpiresAt:         &expires,
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 	if err := uc.resources.SaveResource(ctx, res); err != nil {
 		// Lost the insert race: drop this call's orphan logical database (the

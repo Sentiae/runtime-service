@@ -191,7 +191,7 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	// guest control and the artifact store are never reached.
 	snapshotter := NewFleetVolumeSnapshotter(nil, nil, volumes, replicas, resources)
 
-	uc := NewFleetResourceProvisioner(prov, resources, replicas, snapshotter, testEngine(), testEndpointNaming())
+	uc := NewFleetResourceProvisioner(prov, resources, replicas, snapshotter, testEngine(), testEndpointNaming(), nil, 0)
 
 	final, err := uc.DecommissionDedicated(ctx, res.ID, true)
 	if err != nil {

@@ -401,6 +401,25 @@ func resourceError(err error) error {
 		return status.Error(codes.FailedPrecondition, "in-place restore requires exactly one materialized volume")
 	case errors.Is(err, domain.ErrRestoreStoreUnavailable):
 		return status.Error(codes.Unavailable, "restore artifact store not configured on this host")
+	// The D-190 endpoint-naming refusals. These are the four outcomes of
+	// EndpointNaming.Validate(), which runs before anything is created when a host
+	// has no (or a malformed) APP_RESOURCE_ENDPOINT_ZONE / _REGION.
+	//
+	// ⚠ They used to fall through to the default branch, which logged "resource op
+	// failed (unmapped)" and answered `Internal: internal server error` — making a
+	// FLEET MISCONFIGURATION indistinguishable from a server bug, at exactly the
+	// moment an operator needs to be told which env key to set. FailedPrecondition
+	// is the true code: the claim is legitimate and retrying it unchanged succeeds
+	// as soon as the host is configured. The values are NOT echoed (these messages
+	// are tenant-visible); the configured strings stay server-side.
+	case errors.Is(err, domain.ErrEndpointZoneRequired):
+		return status.Error(codes.FailedPrecondition, "this fleet host has no configured database zone, so it cannot mint the permanent hostname a database is reached at — it refuses to create one rather than mint a name nothing will serve")
+	case errors.Is(err, domain.ErrEndpointRegionRequired):
+		return status.Error(codes.FailedPrecondition, "this fleet host has no configured database region, so it cannot mint the permanent hostname a database is reached at — it refuses to create one rather than mint a name nothing will serve")
+	case errors.Is(err, domain.ErrEndpointZoneInvalid):
+		return status.Error(codes.FailedPrecondition, "this fleet host's configured database zone is not a delegable multi-label DNS zone, so a permanent hostname minted under it would be unresolvable")
+	case errors.Is(err, domain.ErrEndpointRegionInvalid):
+		return status.Error(codes.FailedPrecondition, "this fleet host's configured database region is not a legal DNS label, so a permanent hostname minted under it would be unresolvable")
 	case errors.Is(err, domain.ErrVolumeBackingFileMissing):
 		// The refusal is correct — a durable resource whose data cannot be
 		// snapshotted must not be torn down — but it used to reach the caller as a

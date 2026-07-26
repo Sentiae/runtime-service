@@ -41,6 +41,15 @@ type VolumeSnapshotter interface {
 	SnapshotAppVolumes(ctx context.Context, resourceID, appID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error)
 }
 
+// HAPlacementHosts is the narrow slice of FleetHostRegistry the availability gate
+// needs: the live-host candidate set (active + healthy + fresh heartbeat). Same
+// shape as the scheduler's liveHostLister, deliberately — the gate must refuse on
+// exactly the host set a placement would later have to choose from, or it would
+// admit a claim the scheduler cannot satisfy.
+type HAPlacementHosts interface {
+	ListLive(ctx context.Context, staleness time.Duration) ([]domain.Host, error)
+}
+
 var (
 	_ FleetProvisioner  = (*FleetProvision)(nil)
 	_ VolumeSnapshotter = (*FleetVolumeSnapshotter)(nil)
@@ -81,6 +90,14 @@ type FleetResourceProvisioner struct {
 	// string is in a customer's config.
 	naming domain.EndpointNaming
 
+	// hosts + hostStaleness back the standard-ha placement gate (slice 1). nil
+	// hosts ⇒ every `ha` claim is refused with ErrHAPlacementUnknowable: an
+	// invariant that cannot be evaluated is an invariant that is not held, and a
+	// resource provisioned under that uncertainty would be sold a promise nothing
+	// checked.
+	hosts         HAPlacementHosts
+	hostStaleness time.Duration
+
 	// pgReady decides whether the provisioned engine ADMITS clients, over and
 	// above the app health probe's process-alive + TCP-dial (see engineAdmits). A
 	// field rather than a direct call so tests drive both verdicts without a live
@@ -100,15 +117,19 @@ func NewFleetResourceProvisioner(
 	snapshotter VolumeSnapshotter,
 	engine DedicatedEngineConfig,
 	naming domain.EndpointNaming,
+	hosts HAPlacementHosts,
+	hostStaleness time.Duration,
 ) *FleetResourceProvisioner {
 	return &FleetResourceProvisioner{
-		provisioner: provisioner,
-		resources:   resources,
-		replicas:    replicas,
-		snapshotter: snapshotter,
-		engine:      engine,
-		naming:      naming,
-		pgReady:     probePostgresReady,
+		provisioner:   provisioner,
+		resources:     resources,
+		replicas:      replicas,
+		snapshotter:   snapshotter,
+		engine:        engine,
+		naming:        naming,
+		hosts:         hosts,
+		hostStaleness: hostStaleness,
+		pgReady:       probePostgresReady,
 	}
 }
 
@@ -124,6 +145,17 @@ type ProvisionDedicatedInput struct {
 	SecretRefs []string
 	VaultToken string
 	SizeMB     int64
+	// AvailabilityClass is the requested third axis: "single" (one member) or "ha"
+	// (`standard-ha` — a primary plus a synchronous standby in a different failure
+	// domain and the same region).
+	//
+	// Empty means "single". That is a default in the SAFE direction — the weaker
+	// promise — and it exists because the wire cannot express this field yet: the
+	// P19 proto carries no availability class, so every call arriving today is a
+	// single-member claim and must keep behaving exactly as it did. An `ha` claim
+	// can only come from a caller inside this process until that contract is
+	// extended, which is a proto change and therefore not this slice's to make.
+	AvailabilityClass string
 }
 
 // ProvisionDedicatedOutput is the claim result: the resource handle + phase.
@@ -234,6 +266,14 @@ func (uc *FleetResourceProvisioner) ProvisionDedicated(ctx context.Context, in P
 	if err := uc.naming.Validate(); err != nil {
 		return ProvisionDedicatedOutput{}, err
 	}
+	// The availability gate (standard-ha slice 1). BEFORE anything is created and
+	// before the idempotency lookup: an `ha` claim the fleet cannot place must be
+	// refused, not recorded — a claim row naming a tier nothing can build is a
+	// promise on the books.
+	availability, err := uc.resolveAvailability(ctx, in.AvailabilityClass)
+	if err != nil {
+		return ProvisionDedicatedOutput{}, err
+	}
 	revision := in.Revision
 	if revision <= 0 {
 		revision = 1
@@ -286,12 +326,20 @@ func (uc *FleetResourceProvisioner) ProvisionDedicated(ctx context.Context, in P
 		Generation: domain.FleetResourceInitialGeneration,
 		Class:      resourceClassPostgres,
 		Tier:       resourceTierDedicated,
-		Phase:      domain.FleetResourcePhaseProvisioning,
-		AppID:      &appHandle,
-		SecretRefs: in.SecretRefs,
-		SystemID:   in.SystemID,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		// Stamped explicitly for the same reason as Generation: GORM writes every
+		// field it saves, and '' is refused by the 0022 CHECKs rather than silently
+		// stored. The class records what was CLAIMED — an `ha` row does not assert
+		// that a standby exists, because membership and replication are later
+		// slices; it asserts that the placement invariant was satisfiable when the
+		// claim was accepted.
+		AvailabilityClass: availability,
+		SyncDegradePolicy: domain.SyncDegradePolicyFailClosed,
+		Phase:             domain.FleetResourcePhaseProvisioning,
+		AppID:             &appHandle,
+		SecretRefs:        in.SecretRefs,
+		SystemID:          in.SystemID,
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 
 	// The endpoint identity is minted HERE — at birth, in the same INSERT that
@@ -335,6 +383,50 @@ func (uc *FleetResourceProvisioner) ProvisionDedicated(ctx context.Context, in P
 		return ProvisionDedicatedOutput{Handle: winner.ID.String(), Phase: string(winner.Phase)}, nil
 	}
 	return ProvisionDedicatedOutput{}, fmt.Errorf("persist resource: %w", saveErr)
+}
+
+// resolveAvailability validates the requested availability class and, for `ha`,
+// REFUSES unless the fleet can currently satisfy the placement invariant: two live
+// hosts in DIFFERENT failure domains and the SAME region (design §5.1, D-196
+// amendment 2).
+//
+// ⚠ With one physical machine this always refuses, and that refusal is the
+// deliverable — `standard-ha` is refused, never simulated (D-196). A claim
+// accepted here still gets ONE member: membership, replication and promotion are
+// slices 2-3. What acceptance means is exactly "the invariant is satisfiable",
+// never "the promise is held", and nothing downstream may read it as the latter.
+//
+// The `single` path is untouched in every branch — no host lookup, no new failure
+// mode. A gate that could break the tier every existing resource uses in order to
+// guard a tier nothing can provision would be a bad trade.
+func (uc *FleetResourceProvisioner) resolveAvailability(ctx context.Context, requested string) (domain.AvailabilityClass, error) {
+	if requested == "" {
+		return domain.AvailabilityClassSingle, nil
+	}
+	class := domain.AvailabilityClass(requested)
+	if !class.IsValid() {
+		// Refused, never coerced to `single`: silently downgrading would hand back a
+		// resource weaker than the one asked for, with nothing anywhere saying so.
+		return "", domain.ErrHAAvailabilityClassInvalid
+	}
+	if class != domain.AvailabilityClassHA {
+		return class, nil
+	}
+	if uc.hosts == nil {
+		return "", domain.ErrHAPlacementUnknowable
+	}
+	live, err := uc.hosts.ListLive(ctx, uc.hostStaleness)
+	if err != nil {
+		// An unreadable inventory is not an empty one, but neither can prove the
+		// invariant — and the two must not be conflated in the log, because one is a
+		// store fault and the other is the honest state of the fleet.
+		logger.FromContext(ctx).Error("fleet resource: live host inventory unreadable, refusing an ha claim", "err", err)
+		return "", domain.ErrHAPlacementUnknowable
+	}
+	if err := domain.RequireHAPlacement(live); err != nil {
+		return "", err
+	}
+	return class, nil
 }
 
 // dedicatedDescriptor builds the FleetProvision descriptor for a dedicated

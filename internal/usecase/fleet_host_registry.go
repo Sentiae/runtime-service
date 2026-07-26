@@ -42,7 +42,27 @@ func NewFleetHostRegistry(repo repository.HostRepository, leases repository.NetL
 // The ordinal assignment is a REFUSAL point: if the fleet has no free ordinal the
 // registration fails, because admitting a host that would have to share another
 // host's addressing block is worse than not admitting it.
+//
+// The placement FACTS are a second refusal point (SentiaeDB standard-ha slice 0,
+// D-196): a host must state its failure domain and its region, and there is no
+// default for either. A host admitted without them can never be corrected —
+// nothing but a human knows which building and which breaker it is on — and a
+// missing value would satisfy the "different failure domain, same region"
+// invariant vacuously, which is the exact fail-open that makes an HA pair inside
+// one chassis look healthy.
 func (uc *FleetHostRegistry) RegisterHost(ctx context.Context, host domain.Host) (domain.Host, error) {
+	if host.Region == "" {
+		return domain.Host{}, domain.ErrHostRegionRequired
+	}
+	// Parsed, not merely non-empty: an unparseable domain compares unequal to
+	// every other value and would therefore pass an anti-affinity filter by
+	// accident. The sentinel migration 0022 backfilled onto pre-existing rows is
+	// deliberately unparseable for the same reason, so re-registering such a host
+	// WITHOUT a configured domain leaves the row honest rather than promoting a
+	// placeholder to a fact.
+	if _, err := domain.ParseFailureDomain(host.FailureDomain); err != nil {
+		return domain.Host{}, err
+	}
 	now := time.Now().UTC()
 	if host.ID == uuid.Nil {
 		host.ID = uuid.New()
@@ -61,6 +81,12 @@ func (uc *FleetHostRegistry) RegisterHost(ctx context.Context, host domain.Host)
 
 	if existing != nil {
 		existing.Region = host.Region
+		// Re-registering with a stated domain is how the migration-0022 'unattested'
+		// sentinel gets corrected — the only path that ever does. It is refreshed
+		// like the rest of the spec because the machine may genuinely have moved
+		// (a rack, a breaker, a switch), and a stale domain is worse than none: it
+		// would be trusted.
+		existing.FailureDomain = host.FailureDomain
 		existing.Labels = host.Labels
 		existing.CapacityVCPU = host.CapacityVCPU
 		existing.CapacityMemMB = host.CapacityMemMB

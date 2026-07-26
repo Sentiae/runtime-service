@@ -112,6 +112,23 @@ type FleetResource struct {
 	// which the migration's CHECK (generation >= 1) refuses, loudly, rather than
 	// letting a generation-0 prefix exist.
 	Generation int `json:"generation" gorm:"column:generation;type:int;not null;default:1"`
+	// AvailabilityClass is the third axis (migration 0022): whether this resource
+	// has a second, synchronously-replicating member. Independent of Tier
+	// (isolation) and of durability (retention) on purpose — a promise a customer
+	// is sold must be RECORDED, never inferred from a column that means something
+	// else.
+	//
+	// ⚠ It records what was CLAIMED, not what is HELD. The evidence that the
+	// promise is held is a streaming standby member row, and that machinery is
+	// unbuilt; nothing may read this field as protection.
+	//
+	// ⚠ Set EXPLICITLY at creation (GORM writes every field it saves, so a zero
+	// value would be written as '' and refused by the 0022 CHECK — loudly, which is
+	// the point).
+	AvailabilityClass AvailabilityClass `json:"availability_class" gorm:"column:availability_class;type:text;not null;default:'single'"`
+	// SyncDegradePolicy is what an `ha` resource does when its synchronous standby
+	// is gone. Same explicit-stamping rule as AvailabilityClass.
+	SyncDegradePolicy SyncDegradePolicy `json:"sync_degrade_policy" gorm:"column:sync_degrade_policy;type:text;not null;default:'fail_closed'"`
 	// SecretRefs are the resolver-resolvable engine credential refs — references
 	// ONLY, never a credential value.
 	SecretRefs pq.StringArray `json:"secret_refs,omitempty" gorm:"type:text[];not null;default:'{}'"`

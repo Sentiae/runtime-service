@@ -61,6 +61,64 @@ var (
 	// ErrHostDiskReserveInvalid is returned when the disk headroom reserve leaves
 	// no advertisable disk at all, or is negative (which would ADD capacity).
 	ErrHostDiskReserveInvalid = errors.New("invalid fleet host disk reserve")
+
+	// ── Host placement facts (SentiaeDB standard-ha slice 0, D-196) ──────────
+	// Both are REFUSALS at registration, not defaults. A default here would be a
+	// fail-open on the two facts the HA placement invariant is made of, and a host
+	// that registered without them cannot be corrected retroactively: the values
+	// describe a building and a network, and only a human knows them.
+
+	// ErrHostFailureDomainRequired is returned when a host registers without a
+	// failure domain (see FailureDomain). "Different host" on one chassis is not a
+	// different failure domain, and only a human-supplied fact can say which it is.
+	ErrHostFailureDomainRequired = errors.New("fleet host failure domain required")
+	// ErrHostFailureDomainInvalid is returned when a supplied failure domain is not
+	// the frozen site/power/network encoding. Refused rather than stored as-is: a
+	// bare label would compare unequal to every other label and thereby satisfy the
+	// anti-affinity invariant vacuously — two machines on one breaker would read as
+	// two power domains.
+	ErrHostFailureDomainInvalid = errors.New("fleet host failure domain invalid")
+	// ErrHostRegionRequired is returned when a host registers with no region. The
+	// HA invariant is different-domain AND SAME-REGION (D-196 amendment 2), and two
+	// empty regions compare EQUAL — so an unlabelled host would satisfy the
+	// same-region half vacuously while D-190 has already baked a region into the
+	// customer's permanent hostname.
+	ErrHostRegionRequired = errors.New("fleet host region required")
+
+	// ── The standard-ha placement invariant (design §5.1, slice 1) ───────────
+	// Four sentinels rather than one because the operator action differs
+	// completely, and "HA unavailable" would send someone shopping for hardware
+	// they may already own.
+
+	// ErrHAHostsInsufficient — fewer than two hosts that could hold a member exist
+	// at all. This is the true state of the fleet today: one machine is one failure
+	// domain, so standard-ha is unprovisionable and is REFUSED rather than
+	// simulated (D-196: "until then standard-ha is refused, never simulated").
+	ErrHAHostsInsufficient = errors.New("standard-ha requires two live hosts in different failure domains")
+	// ErrHAFailureDomainUnattested — enough live hosts exist, but fewer than two of
+	// them have stated a failure domain (or a region), so the fleet cannot prove
+	// they would not die together. Config, not hardware.
+	ErrHAFailureDomainUnattested = errors.New("standard-ha requires two live hosts with attested failure domains")
+	// ErrHAFailureDomainShared — every candidate host is in the SAME failure
+	// domain. A second host is not a second domain: this is the negative control
+	// the whole tier rests on, because a pair inside one chassis would look `ha`,
+	// `ready`, two members and two hosts, while surviving nothing.
+	ErrHAFailureDomainShared = errors.New("standard-ha requires two live hosts in different failure domains (all candidates share one)")
+	// ErrHARegionSplit — different failure domains exist, but no two of them are in
+	// the same region. The standby must be same-region BY CONSTRUCTION: D-190 puts
+	// the region inside the permanent hostname a customer has already pasted into
+	// an application, so a cross-region standby would serve a name that names the
+	// wrong place, permanently.
+	ErrHARegionSplit = errors.New("standard-ha requires the two failure domains to be in the same region")
+	// ErrHAAvailabilityClassInvalid — a claim named an availability class the fleet
+	// does not recognize. Refused rather than coerced to 'single': silently
+	// downgrading a claim would hand back a resource weaker than the one asked for,
+	// with nothing anywhere saying so.
+	ErrHAAvailabilityClassInvalid = errors.New("fleet resource availability class invalid")
+	// ErrHAPlacementUnknowable — the provisioner has no way to read the live host
+	// inventory, so it cannot prove the invariant. Fail closed: an unprovable
+	// invariant is an unmet one.
+	ErrHAPlacementUnknowable = errors.New("standard-ha placement cannot be evaluated on this host")
 	// ErrNoSchedulableHost is returned when the scheduler finds no live host
 	// that satisfies a placement request's resource + constraint filters.
 	ErrNoSchedulableHost = errors.New("no schedulable host")

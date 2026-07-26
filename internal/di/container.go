@@ -2,6 +2,7 @@ package di
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -567,13 +568,8 @@ func (c *Container) initFleet(cfg *config.Config) error {
 		}
 	}
 
-	// CP4 §9#5 — placement scheduler. Staleness = 3× the heartbeat interval so a
-	// host that misses a couple of beats drops out of the candidate set.
-	schedStaleness := 3 * cfg.Fleet.HeartbeatInterval
-	if schedStaleness <= 0 {
-		schedStaleness = 3 * 30 * time.Second
-	}
-	c.FleetScheduler = usecase.NewFleetScheduler(c.FleetHostRegistry, c.ReplicaRepo, c.FleetAppRepo, schedStaleness)
+	// CP4 §9#5 — placement scheduler.
+	c.FleetScheduler = usecase.NewFleetScheduler(c.FleetHostRegistry, c.ReplicaRepo, c.FleetAppRepo, fleetHostStaleness(cfg))
 
 	// CP4 §9#7 — reconciler-backed app→replicas model. Firecracker host only
 	// (needs the replica runtime); off-host the resident class falls back to the
@@ -677,6 +673,23 @@ func (c *Container) initFleet(cfg *config.Config) error {
 // The snapshotter needs a live guest control channel and so is
 // firecracker-host-only; off-host it stays nil and the snapshot-first
 // decommission of a durable resource fails closed (ErrResourceFinalSnapshotRequired).
+// fleetHostStaleness bounds how old a host's last heartbeat may be for it to
+// still count as LIVE: 3× the heartbeat interval, so a host that misses a couple
+// of beats drops out of the candidate set.
+//
+// One function, two callers, on purpose. The scheduler decides where a replica
+// goes and the standard-ha gate decides whether an `ha` claim is placeable at
+// all; if those two ever disagreed about which hosts are live, the gate would
+// admit claims the scheduler cannot satisfy — a promise accepted against a host
+// that is already gone.
+func fleetHostStaleness(cfg *config.Config) time.Duration {
+	staleness := 3 * cfg.Fleet.HeartbeatInterval
+	if staleness <= 0 {
+		staleness = 3 * 30 * time.Second
+	}
+	return staleness
+}
+
 func (c *Container) initResourceControlPlane(cfg *config.Config) {
 	// Volume snapshotter — firecracker host only (it quiesces the guest over the
 	// real GuestControl client; off-host GuestControl is fail-loud, so every
@@ -737,6 +750,11 @@ func (c *Container) initResourceControlPlane(cfg *config.Config) {
 			Zone:   cfg.Resource.EndpointZone,
 			Region: cfg.Resource.EndpointRegion,
 		},
+		// The live-host inventory the standard-ha placement gate refuses on
+		// (slice 1). The SAME registry and the SAME staleness the scheduler uses, so
+		// the gate can never admit a claim over a host set placement would reject.
+		c.FleetHostRegistry,
+		fleetHostStaleness(cfg),
 	)
 
 	// ResourceProvisioning handler. The shared-tier provisioner is intentionally
@@ -1070,8 +1088,14 @@ func (c *Container) registerSelfHost(cfg *config.Config) error {
 
 	endpoint := fmt.Sprintf("%s:%s", cfg.ImageBoot.AdvertiseHost, cfg.Server.GRPC.Port)
 	self := domain.Host{
-		ID:             hostID,
-		Region:         cfg.Fleet.Region,
+		ID:     hostID,
+		Region: cfg.Fleet.Region,
+		// The structured placement fact (D-196). Unset ⇒ RegisterHost REFUSES below
+		// and this host stays out of the live inventory rather than joining it with
+		// an unknowable failure domain. That is the intended posture: an
+		// un-attested host is not a candidate for a tier whose promise is that two
+		// members do not die together.
+		FailureDomain:  cfg.Fleet.FailureDomain,
 		CapacityVCPU:   capacity.VCPU,
 		CapacityMemMB:  capacity.MemMB,
 		CapacityDiskMB: capacity.DiskMB,
@@ -1080,6 +1104,20 @@ func (c *Container) registerSelfHost(cfg *config.Config) error {
 
 	registered, rerr := c.FleetHostRegistry.RegisterHost(context.Background(), self)
 	if rerr != nil {
+		// The placement facts get their own line: without a registration this host
+		// never heartbeats, so it falls out of the live inventory and the scheduler
+		// stops placing on it — a large, correct consequence that must not be
+		// misdiagnosed as a transient DB error. Name the env key, because the fix is
+		// one line of config and nothing else can supply the fact.
+		if errors.Is(rerr, domain.ErrHostFailureDomainRequired) || errors.Is(rerr, domain.ErrHostFailureDomainInvalid) {
+			log.Printf("ERROR: fleet self-registration REFUSED — this host has not stated its failure domain (APP_FLEET_FAILURE_DOMAIN, structured as site/power/network e.g. rgalileo-room/breaker-a/switch-1; got %q). It will NOT heartbeat and the scheduler will NOT place on it: %v",
+				cfg.Fleet.FailureDomain, rerr)
+			return nil
+		}
+		if errors.Is(rerr, domain.ErrHostRegionRequired) {
+			log.Printf("ERROR: fleet self-registration REFUSED — this host has no region (APP_FLEET_REGION). It will NOT heartbeat and the scheduler will NOT place on it: %v", rerr)
+			return nil
+		}
 		log.Printf("Warning: fleet self-registration failed (continuing without it): %v", rerr)
 		return nil
 	}

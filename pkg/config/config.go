@@ -96,6 +96,17 @@ type FleetConfig struct {
 	HostID string `mapstructure:"host_id"`
 	// Region is the placement region label reported to the registry.
 	Region string `mapstructure:"region"`
+	// FailureDomain is this host's structured statement of what it shares a fate
+	// with — `site/power/network`, e.g. `rgalileo-room/breaker-a/switch-1`
+	// (D-196 amendment 2, domain.FailureDomain).
+	//
+	// ⚠ DEFAULTS TO EMPTY, AND EMPTY REFUSES SELF-REGISTRATION. There is
+	// deliberately no fallback: only a human knows which room, breaker and switch a
+	// machine is on, and a plausible-looking default ("host-<id>") would make two
+	// machines on one breaker read as two independent power domains — which is
+	// precisely the claim `standard-ha` sells. A host that has not stated it is not
+	// a placement candidate for any tier whose promise depends on domains.
+	FailureDomain string `mapstructure:"failure_domain"`
 	// HostVCPU, HostMemMB and HostDiskMB are OVERRIDES of the capacity this host
 	// measures at boot (see internal/infrastructure/hostcapacity), not the source
 	// of it. Zero (the default) advertises the measurement. A value ABOVE the
@@ -549,6 +560,9 @@ func Load() (*Config, error) {
 			// Fleet self-registration + heartbeat (runtime-fleet CP4 §9#4).
 			"fleet.host_id": "",
 			"fleet.region":  "homelab",
+			// Empty ⇒ self-registration is REFUSED. See FleetConfig.FailureDomain:
+			// there is no honest default for which breaker a machine is on.
+			"fleet.failure_domain": "",
 			// 0 ⇒ advertise the MEASURED capacity. A non-zero value is a deliberate
 			// reservation and may only ever be LOWER than what the host measures; the
 			// old 51200 default was a fixed 50GB assertion on a 40GB machine.
@@ -725,6 +739,7 @@ func Load() (*Config, error) {
 			// Fleet self-registration + heartbeat (runtime-fleet CP4)
 			{"fleet.host_id", "APP_FLEET_HOST_ID"},
 			{"fleet.region", "APP_FLEET_REGION"},
+			{"fleet.failure_domain", "APP_FLEET_FAILURE_DOMAIN"},
 			{"fleet.host_vcpu", "APP_FLEET_HOST_VCPU"},
 			{"fleet.host_mem_mb", "APP_FLEET_HOST_MEM_MB"},
 			{"fleet.host_disk_mb", "APP_FLEET_HOST_DISK_MB"},

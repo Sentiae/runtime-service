@@ -110,11 +110,29 @@ func migrateAll(t *testing.T, m *migrate.Migrate) {
 // EnsureHostOrdinal's job, which is itself under test.
 func seedHost(t *testing.T, db *gorm.DB, id uuid.UUID, created time.Time) {
 	t.Helper()
-	err := db.Exec(`INSERT INTO fleet_hosts
+	// failure_domain is NOT NULL with NO DEFAULT since migration 0022: every host
+	// row must state which site/power/network it shares a fate with, and there is
+	// deliberately nothing for a writer to fall back to. Tests that pin an EARLIER
+	// schema version (the 0020 backfill continuity test) seed the same host without
+	// the column, so the insert is chosen from the schema that is actually applied
+	// rather than from the newest one.
+	var hasFailureDomain int64
+	if err := db.Raw(`SELECT count(*) FROM information_schema.columns
+		WHERE table_name = 'fleet_hosts' AND column_name = 'failure_domain'`).Scan(&hasFailureDomain).Error; err != nil {
+		t.Fatalf("introspect fleet_hosts: %v", err)
+	}
+
+	stmt := `INSERT INTO fleet_hosts
 		(id, region, labels, capacity_vcpu, capacity_mem_mb, capacity_disk_mb,
 		 allocatable_vcpu, allocatable_mem_mb, allocatable_disk_mb, health, status, endpoint, created_at, updated_at)
-		VALUES (?, 'homelab', '{}', 4, 8192, 40000, 4, 8192, 40000, 'healthy', 'active', '10.0.10.244:50061', ?, ?)`,
-		id, created, created).Error
+		VALUES (?, 'homelab', '{}', 4, 8192, 40000, 4, 8192, 40000, 'healthy', 'active', '10.0.10.244:50061', ?, ?)`
+	if hasFailureDomain > 0 {
+		stmt = `INSERT INTO fleet_hosts
+		(id, region, failure_domain, labels, capacity_vcpu, capacity_mem_mb, capacity_disk_mb,
+		 allocatable_vcpu, allocatable_mem_mb, allocatable_disk_mb, health, status, endpoint, created_at, updated_at)
+		VALUES (?, 'homelab', 'site-a/breaker-a/switch-1', '{}', 4, 8192, 40000, 4, 8192, 40000, 'healthy', 'active', '10.0.10.244:50061', ?, ?)`
+	}
+	err := db.Exec(stmt, id, created, created).Error
 	if err != nil {
 		t.Fatalf("seed host: %v", err)
 	}

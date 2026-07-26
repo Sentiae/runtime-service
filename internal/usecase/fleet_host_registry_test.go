@@ -47,6 +47,14 @@ func (r *stubHostRepo) ListByStatus(_ context.Context, _ domain.HostStatus) ([]d
 }
 func (r *stubHostRepo) Delete(_ context.Context, _ uuid.UUID) error { return nil }
 
+// attestedHost is a registration payload that carries the two placement FACTS a
+// host must state (region + structured failure domain, D-196). Every test below
+// registers through it because a host that states neither is REFUSED — see
+// TestRegisterHostRefusesUnstatedPlacementFacts, which is the test of that.
+func attestedHost(id uuid.UUID) domain.Host {
+	return domain.Host{ID: id, Region: "homelab", FailureDomain: "site-a/breaker-a/switch-1"}
+}
+
 // A re-register must never leave a host advertising allocatable capacity above
 // the capacity it just measured. The live fleet host reproduced this exactly:
 // seeded at 51200MB disk from a hardcoded config default, then measured at
@@ -95,12 +103,12 @@ func TestRegisterHost_ClampsAllocatableToRefreshedCapacity(t *testing.T) {
 				AllocatableDiskMB: int64(tt.seededDisk),
 			}}
 
-			got, err := NewFleetHostRegistry(repo, newNetFakeLeaseRepo()).RegisterHost(context.Background(), domain.Host{
-				ID:             hostID,
-				CapacityVCPU:   tt.measuredVCPU,
-				CapacityMemMB:  int64(tt.measuredMem),
-				CapacityDiskMB: int64(tt.measuredDisk),
-			})
+			payload := attestedHost(hostID)
+			payload.CapacityVCPU = tt.measuredVCPU
+			payload.CapacityMemMB = int64(tt.measuredMem)
+			payload.CapacityDiskMB = int64(tt.measuredDisk)
+
+			got, err := NewFleetHostRegistry(repo, newNetFakeLeaseRepo()).RegisterHost(context.Background(), payload)
 			if err != nil {
 				t.Fatalf("RegisterHost: %v", err)
 			}
@@ -138,6 +146,87 @@ func TestRegisterHost_ClampsAllocatableToRefreshedCapacity(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// The placement FACTS (SentiaeDB standard-ha slice 0, D-196)
+// ─────────────────────────────────────────────────────────────────────
+
+// A host must STATE its region and its structured failure domain, and there is no
+// default for either. Registration is the only moment the fact can be captured: a
+// host admitted without it can never be corrected, because only a human knows
+// which room and which breaker the machine is on — and a missing value would
+// satisfy the "different failure domain, same region" invariant vacuously, which
+// is exactly how an HA pair inside one chassis comes to look healthy.
+func TestRegisterHostRefusesUnstatedPlacementFacts(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*domain.Host)
+		wantErr error
+	}{
+		{"no failure domain", func(h *domain.Host) { h.FailureDomain = "" }, domain.ErrHostFailureDomainRequired},
+		{
+			"a BARE label is not a failure domain — two machines on one breaker would read as two power domains",
+			func(h *domain.Host) { h.FailureDomain = "host-a" },
+			domain.ErrHostFailureDomainInvalid,
+		},
+		{
+			"the migration-0022 sentinel is not promotable to a fact by re-registering",
+			func(h *domain.Host) { h.FailureDomain = domain.HostFailureDomainUnattested },
+			domain.ErrHostFailureDomainInvalid,
+		},
+		{
+			"a partially-stated domain (site and power, unknown switch)",
+			func(h *domain.Host) { h.FailureDomain = "site-a/breaker-a" },
+			domain.ErrHostFailureDomainInvalid,
+		},
+		{"no region", func(h *domain.Host) { h.Region = "" }, domain.ErrHostRegionRequired},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &stubHostRepo{}
+			payload := attestedHost(uuid.New())
+			tt.mutate(&payload)
+
+			_, err := NewFleetHostRegistry(repo, newNetFakeLeaseRepo()).RegisterHost(context.Background(), payload)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("RegisterHost = %v, want %v", err, tt.wantErr)
+			}
+			// Refused means NOT ADMITTED: no row, so the host never appears in a
+			// placement candidate set with an unknowable failure domain.
+			if repo.created != nil || repo.updated != nil {
+				t.Fatal("a refused host must not be written to the registry at all")
+			}
+		})
+	}
+}
+
+// The one path that ever corrects the migration-0022 sentinel: re-registering WITH
+// a stated domain. Without it the live host would carry 'unattested' forever, and
+// no HA claim could ever be satisfiable however many machines are bought.
+func TestRegisterHostCorrectsTheUnattestedSentinel(t *testing.T) {
+	hostID := uuid.New()
+	repo := &stubHostRepo{existing: &domain.Host{
+		ID:            hostID,
+		Region:        "homelab",
+		FailureDomain: domain.HostFailureDomainUnattested,
+	}}
+
+	got, err := NewFleetHostRegistry(repo, newNetFakeLeaseRepo()).
+		RegisterHost(context.Background(), attestedHost(hostID))
+	if err != nil {
+		t.Fatalf("RegisterHost: %v", err)
+	}
+	if repo.updated == nil {
+		t.Fatal("expected the existing host row to be updated")
+	}
+	if repo.updated.FailureDomain != "site-a/breaker-a/switch-1" {
+		t.Fatalf("persisted failure domain = %q, want the newly stated one", repo.updated.FailureDomain)
+	}
+	if !got.HasAttestedFailureDomain() {
+		t.Fatal("the corrected host must now count as attested")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Net ordinal assignment (SentiaeDB Phase 0 — the microVM addressing plane)
 // ─────────────────────────────────────────────────────────────────────
 
@@ -151,7 +240,7 @@ func TestRegisterHostAssignsAndKeepsItsNetOrdinal(t *testing.T) {
 	second := uuid.New()
 
 	reg := NewFleetHostRegistry(&stubHostRepo{}, leases)
-	got, err := reg.RegisterHost(context.Background(), domain.Host{ID: first})
+	got, err := reg.RegisterHost(context.Background(), attestedHost(first))
 	if err != nil {
 		t.Fatalf("RegisterHost: %v", err)
 	}
@@ -162,7 +251,7 @@ func TestRegisterHostAssignsAndKeepsItsNetOrdinal(t *testing.T) {
 	// A SECOND host must get a different block; sharing one would alias every
 	// address, uid and chroot on both machines.
 	second2, err := NewFleetHostRegistry(&stubHostRepo{}, leases).
-		RegisterHost(context.Background(), domain.Host{ID: second})
+		RegisterHost(context.Background(), attestedHost(second))
 	if err != nil {
 		t.Fatalf("RegisterHost (second host): %v", err)
 	}
@@ -173,7 +262,7 @@ func TestRegisterHostAssignsAndKeepsItsNetOrdinal(t *testing.T) {
 	// Re-registering must return the SAME ordinal: moving it would re-point a block
 	// whose leases (and whose running VMs) are already addressed out of it.
 	again, err := NewFleetHostRegistry(&stubHostRepo{existing: &domain.Host{ID: first}}, leases).
-		RegisterHost(context.Background(), domain.Host{ID: first})
+		RegisterHost(context.Background(), attestedHost(first))
 	if err != nil {
 		t.Fatalf("re-RegisterHost: %v", err)
 	}
@@ -190,7 +279,7 @@ func TestRegisterHostRefusedWhenOrdinalsAreExhausted(t *testing.T) {
 	leases.ordinalErr = domain.ErrNetOrdinalExhausted
 
 	_, err := NewFleetHostRegistry(&stubHostRepo{}, leases).
-		RegisterHost(context.Background(), domain.Host{ID: uuid.New()})
+		RegisterHost(context.Background(), attestedHost(uuid.New()))
 	if !errors.Is(err, domain.ErrNetOrdinalExhausted) {
 		t.Fatalf("RegisterHost with no free ordinal = %v, want ErrNetOrdinalExhausted", err)
 	}
