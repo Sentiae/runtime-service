@@ -457,15 +457,16 @@ func (c *Container) initFleet(cfg *config.Config) error {
 	}
 
 	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
-		booter, planeErr := c.initNetPlane(cfg)
+		booter, verifyPlane, planeErr := c.initNetPlane(cfg)
 		if planeErr != nil {
-			log.Printf("ERROR: fleet microVM addressing plane UNRECONCILED — every boot on this host is REFUSED (teardown, health and ingress still served): %v", planeErr)
+			log.Printf("ERROR: fleet microVM addressing plane UNRECONCILED — boots on this host are REFUSED while it stays that way (teardown, health and ingress still served; each boot re-checks, so the refusal clears itself when the cause does): %v", planeErr)
 		}
 		// The one boot fact /posture structurally cannot carry (see initNetPlane: a
 		// posture control REFUSES boot, which is a worse posture than "refuse boots,
-		// keep serving teardown"). As a gauge it is watchable without being fatal.
+		// keep serving teardown"). As a gauge it is watchable without being fatal, and
+		// each boot's precondition check re-publishes it.
 		usecase.PublishNetPlaneReconciled(planeErr == nil)
-		c.ImageBooter = publishImageBooter(booter, planeErr)
+		c.ImageBooter = publishImageBooter(booter, verifyPlane, planeErr)
 		c.GuestControl = firecracker.NewGuestControlClient(c.guestControlTokens)
 		log.Println("Image-boot Firecracker booter initialized")
 	} else {
@@ -907,19 +908,36 @@ func (c *Container) buildSecretResolver() secret.Resolver {
 // addressing plane's outcome. It is a pure function so the fail-closed rule is
 // assertable without a live host.
 //
-// planeErr != nil ⇒ FAIL CLOSED: every boot is refused with an error naming the
-// unreconciled plane, while teardown is DELEGATED to the real booter. The
-// asymmetry is the point — refusing to boot protects customer data, whereas
-// refusing to tear down protects nothing and strands a running VM together with
-// its /30, its lease and its rootfs.
-func publishImageBooter(real usecase.ImageBooter, planeErr error) usecase.ImageBooter {
-	if planeErr == nil {
-		return real
+// Every boot passes a PRECONDITION that is re-derived from the plane, never a
+// stored verdict: `verify` is consulted per boot, so a host whose violation has
+// been resolved starts serving again on its own. That is the whole difference
+// between fail-closed and stuck — the boot-time reconcile's error used to be frozen
+// into this seam, and a host then refused every boot for as long as the process
+// lived, citing a row that no longer existed.
+//
+// A nil `verify` is the one case that latches, and it must: it means the plane
+// could not be CONSTRUCTED (no host identity, no assigned ordinal), and the
+// allocator was built with that same missing input, so nothing this process can
+// observe would change the answer. planeErr then carries the reason.
+//
+// Teardown is DELEGATED on every path. Refusing to boot protects customer data,
+// whereas refusing to tear down protects nothing, strands a running VM together
+// with its /30, its lease and its rootfs — and is how an operator clears the very
+// row a refusal names.
+func publishImageBooter(real usecase.ImageBooter, verify usecase.NetPlaneVerifier, planeErr error) usecase.ImageBooter {
+	if verify == nil {
+		reason := planeErr
+		if reason == nil {
+			// Unreachable through initNetPlane, and refused rather than trusted: a
+			// booter with no plane check is the fail-OPEN shape of this seam.
+			reason = fmt.Errorf("%w: no addressing-plane verifier was wired for this host", domain.ErrNetPlaneUnreconciled)
+		}
+		return usecase.FailLoudImageBooter{
+			Reason:   fmt.Errorf("%w: %v", domain.ErrNetPlaneUnreconciled, reason),
+			Teardown: real,
+		}
 	}
-	return usecase.FailLoudImageBooter{
-		Reason:   fmt.Errorf("%w: %v", domain.ErrNetPlaneUnreconciled, planeErr),
-		Teardown: real,
-	}
+	return usecase.NetPlaneGuardedImageBooter{Real: real, Verify: verify}
 }
 
 // initNetPlane wires the durable microVM addressing plane (SentiaeDB Phase 0) and
@@ -938,10 +956,12 @@ func publishImageBooter(real usecase.ImageBooter, planeErr error) usecase.ImageB
 // which addresses are held" is to hand out none.
 //
 // The sequence is: resolve this host's ordinal → build the allocator → build the
-// booter over it → reconcile the host's leases. A failure at any step is returned;
-// the caller publishes FailLoudImageBooter and logs loudly (the initNetworkFabric
-// precedent).
-func (c *Container) initNetPlane(cfg *config.Config) (*firecracker.ImageBooter, error) {
+// booter over it → reconcile the host's leases. A failure at any step is returned
+// and logged loudly (the initNetworkFabric precedent); the caller publishes a seam
+// that refuses boots. It also returns the plane VERIFIER, which is what re-asks the
+// question on every boot so a refusal cannot outlive its cause — see
+// publishImageBooter.
+func (c *Container) initNetPlane(cfg *config.Config) (*firecracker.ImageBooter, usecase.NetPlaneVerifier, error) {
 	ctx := context.Background()
 
 	// A negative ordinal is the "unknown" sentinel the allocator refuses to
@@ -981,7 +1001,9 @@ func (c *Container) initNetPlane(cfg *config.Config) (*firecracker.ImageBooter, 
 		alloc,
 	)
 	if planeErr != nil {
-		return booter, planeErr
+		// No verifier: the missing input (identity / ordinal) is read once at boot and
+		// the allocator above was built with it, so re-deriving would change nothing.
+		return booter, nil, planeErr
 	}
 
 	reconciler := usecase.NewFleetNetLeaseReconciler(
@@ -997,9 +1019,14 @@ func (c *Container) initNetPlane(cfg *config.Config) (*firecracker.ImageBooter, 
 		selfHost,
 		cfg.Firecracker.VMUIDBase,
 	)
+	// The verifier is returned on EVERY path below, including the failing one: a
+	// reconcile that refuses today must be re-asked tomorrow, or the host stays
+	// refused after its cause is gone (the latch this returns instead of).
+	verify := usecase.NetPlaneVerifier(reconciler.Verify)
+
 	report, err := reconciler.Reconcile(ctx)
 	if err != nil {
-		return booter, err
+		return booter, verify, err
 	}
 	// Logged, not stashed: /posture reports DECLARED CONTROLS (opshttp.PostureHandler
 	// over a posture.Set), and a control there is asserted by MustHold, which
@@ -1010,7 +1037,7 @@ func (c *Container) initNetPlane(cfg *config.Config) (*firecracker.ImageBooter, 
 	// the ops surface grows a non-fatal report channel.
 	log.Printf("Fleet microVM addressing plane: host_ordinal=%d leases=%d adopted=%d torn_down=%d reclaimed=%d left=%d",
 		report.HostOrdinal, report.Leases, report.Adopted, report.TornDown, report.Reclaimed, report.Left)
-	return booter, nil
+	return booter, verify, nil
 }
 
 // fleetVolumeDir resolves the host root under which per-volume backing files are

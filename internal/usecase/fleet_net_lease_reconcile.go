@@ -60,9 +60,13 @@ type NetLeaseReconcileReport struct {
 //
 // ⚠ It is HOST-SCOPED and it fails CLOSED. It only ever considers leases whose
 // host_id is this instance's, and any condition it cannot explain returns an
-// error, which the wiring turns into "every boot on this host is refused". That
+// error, which the wiring turns into "boots on this host are refused". That
 // asymmetry is deliberate: refusing to boot costs availability, whereas guessing
 // about a live VM's addressing costs a customer's data.
+//
+// The refusal itself is NOT stored. Reconcile's verdict is a startup fact; what
+// gates each boot is Verify, re-derived per boot, so a resolved violation stops
+// refusing without an operator restart. See Verify.
 type FleetNetLeaseReconciler struct {
 	leases    repository.NetLeaseRepository
 	hosts     repository.HostRepository
@@ -124,18 +128,8 @@ func (uc *FleetNetLeaseReconciler) Reconcile(ctx context.Context) (NetLeaseRecon
 	var report NetLeaseReconcileReport
 	log := logger.FromContext(ctx)
 
-	if uc.leases == nil || uc.hosts == nil || uc.replicas == nil || uc.workloads == nil {
-		return report, fmt.Errorf("%w: the reconcile needs the lease, host, replica and workload stores to decide anything",
-			domain.ErrNetPlaneUnreconciled)
-	}
-	// An instance with no host identity cannot scope the reconcile, and an
-	// unscoped reconcile would judge — and tear down — another host's VMs. This is
-	// an ERROR rather than a skipped no-op: the fleet host path guarantees an
-	// identity (APP_FLEET_HOST_ID is fatal there), so its absence is a real
-	// misconfiguration, not a benign off-host case.
-	if uc.selfHost == uuid.Nil {
-		return report, fmt.Errorf("%w: this instance has no fleet host identity to scope by",
-			domain.ErrNetPlaneUnreconciled)
+	if err := uc.checkScope(); err != nil {
+		return report, err
 	}
 
 	ordinal, err := uc.resolveOrdinal(ctx)
@@ -184,6 +178,85 @@ func (uc *FleetNetLeaseReconciler) Reconcile(ctx context.Context) (NetLeaseRecon
 		"adopted", report.Adopted, "torn_down", report.TornDown,
 		"reclaimed", report.Reclaimed, "left", report.Left)
 	return report, nil
+}
+
+// checkScope refuses to judge anything this instance cannot scope.
+//
+// An instance with no host identity cannot scope the pass, and an unscoped pass
+// would judge — and tear down — another host's VMs. This is an ERROR rather than a
+// skipped no-op: the fleet host path guarantees an identity (APP_FLEET_HOST_ID is
+// fatal there), so its absence is a real misconfiguration, not a benign off-host
+// case.
+func (uc *FleetNetLeaseReconciler) checkScope() error {
+	if uc.leases == nil || uc.hosts == nil || uc.replicas == nil || uc.workloads == nil {
+		return fmt.Errorf("%w: the reconcile needs the lease, host, replica and workload stores to decide anything",
+			domain.ErrNetPlaneUnreconciled)
+	}
+	if uc.selfHost == uuid.Nil {
+		return fmt.Errorf("%w: this instance has no fleet host identity to scope by",
+			domain.ErrNetPlaneUnreconciled)
+	}
+	return nil
+}
+
+// Verify re-derives the plane's REFUSAL VERDICT for this host and mutates nothing.
+// Nil means "this host can safely hand out an address right now".
+//
+// ⚠ IT EXISTS BECAUSE A REFUSAL MUST NOT LATCH. Reconcile runs once, at startup,
+// and its error used to be frozen into the booter seam for the whole process
+// lifetime — so a violation that had already been resolved (the offending row
+// deleted) kept refusing every boot until an operator restarted the service. That
+// converts a self-healing fail-closed posture into a stuck host, which is the
+// worse of the two failures: the refusal is a per-boot PRECONDITION, not a latch.
+// Recording a degraded status instead would be worse still — nothing in this
+// service ever clears one — so the verdict is DERIVED on every pass, never stored.
+//
+// It carries every read-only refusal Reconcile can raise, and that completeness is
+// load-bearing: a condition Reconcile fails closed on but Verify does not check
+// would be silently CLEARED by the next boot, widening the fence into a hole.
+// Deliberately absent are only the MUTATING outcomes (adopt / tear down / reclaim),
+// which are judgements about process-restart residue and belong to the one moment
+// the process's memory and the host's kernel state can disagree. Their absence
+// cannot fail open: an unreclaimed lease keeps its slot HELD, which refuses reuse.
+func (uc *FleetNetLeaseReconciler) Verify(ctx context.Context) error {
+	if err := uc.checkScope(); err != nil {
+		return err
+	}
+	ordinal, err := uc.resolveOrdinal(ctx)
+	if err != nil {
+		return err
+	}
+	held, err := uc.leases.ListByHost(ctx, uc.selfHost)
+	if err != nil {
+		return fmt.Errorf("%w: list leases held on host %s: %v",
+			domain.ErrNetPlaneUnreconciled, uc.selfHost, err)
+	}
+
+	leasedOwners := make(map[string]bool, len(held))
+	holderOfIndex := make(map[int]domain.NetLease, len(held))
+	for i := range held {
+		lease := held[i]
+		leasedOwners[ownerKey(lease.OwnerKind, lease.OwnerID)] = true
+		holderOfIndex[lease.NetIndex] = lease
+
+		if err := uc.verifyLease(lease); err != nil {
+			return err
+		}
+		owner, err := uc.loadOwner(ctx, lease)
+		if err != nil {
+			return err
+		}
+		// A lease whose owner row is gone, or whose VM is not running, is residue
+		// Reconcile reclaims at the next start. It holds a slot; it does not refuse a
+		// boot, because nothing is running at that address to collide with.
+		if owner == nil || owner.pid <= 0 || !processAlive(owner.pid) {
+			continue
+		}
+		if err := uc.assertLeaseMatchesLiveOwner(lease, owner); err != nil {
+			return err
+		}
+	}
+	return uc.assertNoLeaselessOwner(ctx, ordinal, leasedOwners, holderOfIndex)
 }
 
 // resolveOrdinal reads this host's assigned block. A missing host row or a NULL
@@ -274,10 +347,8 @@ func (uc *FleetNetLeaseReconciler) reconcileLease(ctx context.Context, lease dom
 	case owner.pid > 0:
 		// A LIVE VM. Adoption is the only safe outcome, and only when the row the
 		// fleet will operate it through names exactly the addressing the lease holds.
-		if !lease.MatchesAddresses(owner.guestIP, owner.tapName) {
-			return fmt.Errorf("%w: live %s %s (pid %d) is recorded at guest_ip=%q tap=%q but its lease %s holds guest_ip=%q tap=%q (net_index %d) — one of the two records is wrong about a RUNNING VM, and this host will not hand out addresses until that is resolved",
-				domain.ErrNetPlaneUnreconciled, lease.OwnerKind, lease.OwnerID, owner.pid,
-				lease.ID, owner.guestIP, owner.tapName, lease.GuestIP, lease.TapName, lease.NetIndex)
+		if err := uc.assertLeaseMatchesLiveOwner(lease, owner); err != nil {
+			return err
 		}
 		report.Adopted++
 		log.Info("fleet net plane: adopted a live VM's lease",
@@ -299,6 +370,20 @@ func (uc *FleetNetLeaseReconciler) reconcileLease(ctx context.Context, lease dom
 			"state", owner.state, "net_index", lease.NetIndex, "age", time.Since(lease.CreatedAt).String())
 		return uc.reclaim(ctx, lease, report)
 	}
+}
+
+// assertLeaseMatchesLiveOwner refuses when a RUNNING VM's row and its lease
+// disagree about the VM's addressing. One of the two records is then wrong about a
+// live VM's identity, which is not repairable by guessing — so the host hands out
+// no addresses until it is resolved. Shared by Reconcile and Verify on purpose: a
+// refusal only one of them knows about would be cleared by the other.
+func (uc *FleetNetLeaseReconciler) assertLeaseMatchesLiveOwner(lease domain.NetLease, owner *leaseOwner) error {
+	if lease.MatchesAddresses(owner.guestIP, owner.tapName) {
+		return nil
+	}
+	return fmt.Errorf("%w: live %s %s (pid %d) is recorded at guest_ip=%q tap=%q but its lease %s holds guest_ip=%q tap=%q (net_index %d) — one of the two records is wrong about a RUNNING VM, and this host will not hand out addresses until that is resolved",
+		domain.ErrNetPlaneUnreconciled, lease.OwnerKind, lease.OwnerID, owner.pid,
+		lease.ID, owner.guestIP, owner.tapName, lease.GuestIP, lease.TapName, lease.NetIndex)
 }
 
 // leaseOwner is the owner row's addressing-relevant facts, flattened so the
@@ -427,6 +512,8 @@ func (uc *FleetNetLeaseReconciler) assertNoLeaselessOwner(
 	leased map[string]bool,
 	holderOfIndex map[int]domain.NetLease,
 ) error {
+	log := logger.FromContext(ctx)
+
 	// describe names the offending row AND, when the index it claims is held by a
 	// lease, the row that holds it — the pair is the collision.
 	describe := func(kind, id, state string, netIndex int, guestIP, tap string) string {
@@ -459,6 +546,35 @@ func (uc *FleetNetLeaseReconciler) assertNoLeaselessOwner(
 				continue
 			}
 			if leased[ownerKey(domain.NetLeaseOwnerReplica, r.ID)] {
+				continue
+			}
+			// An index OUTSIDE this host's own block is not a claim on this host's
+			// plane, and it is the shape every pre-plane row on a non-zero-ordinal host
+			// has: the old allocator had no host term, so it handed out low indices on
+			// every host. Judging such a row by the leaseless rule bricked the whole
+			// host — it can never obtain a lease (net_index is fleet-globally unique and
+			// that index belongs to ordinal 0's block, so minting one here would ADOPT
+			// another host's address), so the refusal could never clear. The workload
+			// path already excludes exactly this class via its `ordinal == 0` guard;
+			// this is the replica equivalent.
+			//
+			// It is excluded only while its VM is NOT running, and that liveness — not
+			// the arithmetic — is the discriminator, because the row's host-local names
+			// (TAP, jail id, uid) were derived by the OLD rule (keyed by the global
+			// index) and a live one can therefore still collide with a slot this host is
+			// about to hand out. Stale residue holds nothing: the jail dir is cleared by
+			// prepare() and a stale TAP by createTap on the next boot.
+			if slot := r.NetIndex - ordinal*domain.NetSlotStride; slot < 1 || slot > domain.NetMaxSlot {
+				if r.PID == nil || !processAlive(*r.PID) {
+					log.Warn("fleet net plane: ignoring a leaseless replica whose index is outside this host's block and whose VM is gone",
+						"replica_id", r.ID, "state", r.State, "net_index", r.NetIndex,
+						"host_ordinal", ordinal, "tap_name", r.TapName, "guest_ip", r.GuestIP)
+					continue
+				}
+				offenders = append(offenders, fmt.Sprintf(
+					"replica %s (state=%s net_index=%d guest_ip=%s tap=%s pid=%d) is RUNNING at an index outside this host's block [%d,%d] and holds NO lease, so its host-local TAP/jail/uid cannot be fenced — decommission it",
+					r.ID, r.State, r.NetIndex, r.GuestIP, r.TapName, *r.PID,
+					ordinal*domain.NetSlotStride+1, ordinal*domain.NetSlotStride+domain.NetMaxSlot))
 				continue
 			}
 			offenders = append(offenders, describe("replica", r.ID.String(), string(r.State), r.NetIndex, r.GuestIP, r.TapName))

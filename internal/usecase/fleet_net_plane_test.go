@@ -156,7 +156,13 @@ func (f *netFakeLeaseRepo) count() int {
 // seed inserts a lease directly (bypassing the allocator) for reconcile tests.
 func (f *netFakeLeaseRepo) seed(t *testing.T, hostID uuid.UUID, slot int, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID, created time.Time) domain.NetLease {
 	t.Helper()
-	lease, err := domain.DeriveNetLease(0, slot, netTestUIDBase)
+	return f.seedAt(t, hostID, 0, slot, kind, ownerID, created)
+}
+
+// seedAt is seed for a host on an arbitrary ordinal — the multi-host cases.
+func (f *netFakeLeaseRepo) seedAt(t *testing.T, hostID uuid.UUID, ordinal, slot int, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID, created time.Time) domain.NetLease {
+	t.Helper()
+	lease, err := domain.DeriveNetLease(ordinal, slot, netTestUIDBase)
 	if err != nil {
 		t.Fatalf("derive seed lease: %v", err)
 	}
@@ -617,9 +623,15 @@ type reconcileFixture struct {
 }
 
 func newReconcileFixture(t *testing.T) *reconcileFixture {
+	return newReconcileFixtureOn(t, 0)
+}
+
+// newReconcileFixtureOn builds the fixture for a host on a given ordinal. A
+// non-zero ordinal is the SECOND fleet host — the case a single-host fleet can
+// never exercise.
+func newReconcileFixtureOn(t *testing.T, ord int) *reconcileFixture {
 	t.Helper()
 	hostID := uuid.New()
-	ord := 0
 	f := &reconcileFixture{
 		leases:    newNetFakeLeaseRepo(),
 		hosts:     &netFakeHostRepo{host: &domain.Host{ID: hostID, NetOrdinal: &ord}},
@@ -972,6 +984,264 @@ func TestFleetNetLeaseReconcileRefusesWithoutHostOrOrdinal(t *testing.T) {
 			t.Fatalf("Reconcile = %v, want ErrNetPlaneUnreconciled", err)
 		}
 	})
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Verify — the per-boot precondition (a refusal that clears itself)
+// ─────────────────────────────────────────────────────────────────────
+
+// ⚠ A REFUSAL MUST NOT LATCH. Every condition Verify refuses on must stop refusing
+// on the very next pass once its cause is gone. Live, the boot-time verdict was
+// frozen into the booter seam and a second fleet host kept refusing every boot for
+// 10+ minutes after the offending replica row had been deleted from both tables —
+// only `systemctl restart runtime-service` cleared it.
+//
+// Each case therefore asserts BOTH directions on the same fixture: refused while
+// the cause exists (the fence is real), served after `resolve` (the fence is a
+// precondition, not a latch).
+func TestFleetNetLeaseVerifyIsAPreconditionNotALatch(t *testing.T) {
+	alive := 5150
+	origAlive := processAlive
+	processAlive = func(pid int) bool { return pid == alive }
+	defer func() { processAlive = origAlive }()
+
+	tests := []struct {
+		name string
+		// setup creates the violation; resolve removes its cause.
+		setup   func(t *testing.T, f *reconcileFixture)
+		resolve func(t *testing.T, f *reconcileFixture)
+		wantErr error
+	}{
+		{
+			name: "an occupying row that holds no lease",
+			setup: func(t *testing.T, f *reconcileFixture) {
+				winner := uuid.New()
+				lease := f.leases.seed(t, f.host, 1, domain.NetLeaseOwnerReplica, winner, time.Now().Add(-time.Hour))
+				f.replicas.put(replicaAt(winner, f.host, lease, domain.ReplicaStateResident, netPID(alive)))
+				loser := uuid.New()
+				f.replicas.put(replicaAt(loser, f.host, lease, domain.ReplicaStateResident, netPID(alive)))
+			},
+			// The operator removed the losing row (what actually happened on .245).
+			resolve: func(t *testing.T, f *reconcileFixture) {
+				f.replicas.byState[domain.ReplicaStateResident] = f.replicas.byState[domain.ReplicaStateResident][:1]
+			},
+			wantErr: domain.ErrNetPlaneUnreconciled,
+		},
+		{
+			name: "a live workload that holds no lease",
+			setup: func(t *testing.T, f *reconcileFixture) {
+				id := uuid.New()
+				f.workloads.put(domain.ImageWorkload{
+					ID: id, State: domain.ImageWorkloadStateRunning, PID: netPID(alive),
+					GuestIP: "10.201.0.6", TapName: "img1", NetIndex: 1,
+				})
+			},
+			resolve: func(t *testing.T, f *reconcileFixture) { f.workloads.active = nil },
+			wantErr: domain.ErrNetPlaneUnreconciled,
+		},
+		{
+			name: "a lease that is not self-consistent",
+			setup: func(t *testing.T, f *reconcileFixture) {
+				lease := f.leases.seed(t, f.host, 1, domain.NetLeaseOwnerReplica, uuid.New(), time.Now().Add(-time.Hour))
+				f.leases.mu.Lock()
+				f.leases.leases[0].VMUID = lease.VMUID + 500
+				f.leases.mu.Unlock()
+			},
+			// A hand-edit is corrected, or the lease is released.
+			resolve: func(t *testing.T, f *reconcileFixture) {
+				f.leases.mu.Lock()
+				f.leases.leases = nil
+				f.leases.mu.Unlock()
+			},
+			wantErr: domain.ErrNetPlaneUnreconciled,
+		},
+		{
+			name: "a RUNNING VM whose row and lease disagree about its addressing",
+			setup: func(t *testing.T, f *reconcileFixture) {
+				id := uuid.New()
+				lease := f.leases.seed(t, f.host, 1, domain.NetLeaseOwnerReplica, id, time.Now().Add(-time.Hour))
+				r := replicaAt(id, f.host, lease, domain.ReplicaStateResident, netPID(alive))
+				r.TapName = "img7"
+				f.replicas.put(r)
+			},
+			// The VM was torn down, so nothing is running at the disputed address.
+			resolve: func(t *testing.T, f *reconcileFixture) {
+				f.replicas.byID = map[uuid.UUID]domain.Replica{}
+				f.replicas.byState = map[domain.ReplicaState][]domain.Replica{}
+			},
+			wantErr: domain.ErrNetPlaneUnreconciled,
+		},
+		{
+			name:  "the host has no assigned ordinal",
+			setup: func(t *testing.T, f *reconcileFixture) { f.hosts.host.NetOrdinal = nil },
+			resolve: func(t *testing.T, f *reconcileFixture) {
+				ord := 0
+				f.hosts.host.NetOrdinal = &ord
+			},
+			wantErr: domain.ErrHostNetOrdinalUnset,
+		},
+		{
+			name:    "the lease store cannot be read",
+			setup:   func(t *testing.T, f *reconcileFixture) { f.leases.listErr = errors.New("connection reset by peer") },
+			resolve: func(t *testing.T, f *reconcileFixture) { f.leases.listErr = nil },
+			wantErr: domain.ErrNetPlaneUnreconciled,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newReconcileFixture(t)
+			tt.setup(t, f)
+
+			if err := f.uc.Verify(context.Background()); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Verify while the cause exists = %v, want %v", err, tt.wantErr)
+			}
+			tt.resolve(t, f)
+			if err := f.uc.Verify(context.Background()); err != nil {
+				t.Fatalf("Verify after the cause was resolved = %v, want nil (the refusal LATCHED)", err)
+			}
+			// Verify decides; it never repairs. Anything it mutated would make the
+			// per-boot check a write path on a live host's addressing.
+			if f.booter.count() != 0 || f.reclaimer.count() != 0 || len(f.leases.releases) != 0 {
+				t.Errorf("Verify mutated the host: teardowns=%d reclaims=%d releases=%d",
+					f.booter.count(), f.reclaimer.count(), len(f.leases.releases))
+			}
+		})
+	}
+}
+
+// Residue is not a refusal. A lease whose owner is gone, or whose VM is not
+// running, holds a SLOT (which the allocator will not reuse until the next
+// boot-time reconcile releases it) but nothing is running at that address, so it
+// cannot collide with a boot — refusing on it would strand the host on its own
+// garbage.
+func TestFleetNetLeaseVerifyServesBootsOverReclaimableResidue(t *testing.T) {
+	origAlive := processAlive
+	processAlive = func(int) bool { return false }
+	defer func() { processAlive = origAlive }()
+
+	f := newReconcileFixture(t)
+	// A lease whose owner row is gone.
+	f.leases.seed(t, f.host, 1, domain.NetLeaseOwnerReplica, uuid.New(), time.Now().Add(-time.Hour))
+	// A lease whose owner exists but whose VMM is dead.
+	id := uuid.New()
+	lease := f.leases.seed(t, f.host, 2, domain.NetLeaseOwnerReplica, id, time.Now().Add(-time.Hour))
+	f.replicas.put(replicaAt(id, f.host, lease, domain.ReplicaStateResident, netPID(4243)))
+
+	if err := f.uc.Verify(context.Background()); err != nil {
+		t.Fatalf("Verify over reclaimable residue = %v, want nil", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// The second fleet host — indices allocated before the plane had a host term
+// ─────────────────────────────────────────────────────────────────────
+
+// legacyReplicaAt builds a replica addressed the way the PRE-PLANE allocator did:
+// one host-global index, with the TAP named after the index itself (there was no
+// host term, so every host handed out low indices).
+func legacyReplicaAt(id, hostID uuid.UUID, netIndex int, state domain.ReplicaState, pid *int) domain.Replica {
+	h := hostID
+	return domain.Replica{
+		ID: id, HostID: &h, State: state, PID: pid,
+		GuestIP:  fmt.Sprintf("10.201.%d.%d", (netIndex*4)>>8, ((netIndex*4)&0xff)+2),
+		TapName:  fmt.Sprintf("img%d", netIndex),
+		NetIndex: netIndex,
+	}
+}
+
+// ⚠ A LEGACY INDEX MUST NOT BRICK A NON-ZERO-ORDINAL HOST. Observed live: an
+// ordinary image-boot app on the second fleet host (.245, ordinal 1) carried
+// net_index=1 — an index inside ORDINAL 0's block, minted before the plane had a
+// host term — with no lease, and the leaseless rule then refused every data-VM
+// provision on that host. Such a row can never obtain a lease here (net_index is
+// fleet-globally unique and that one belongs to another host's block, so minting it
+// would adopt another host's address), so the refusal could never clear.
+//
+// The fence is narrowed by exactly one fact and no more: whether that row's VM is
+// still RUNNING. A running one can still collide on the host-local names its old
+// index derived (TAP, jail id, uid), so it is still refused; stale residue holds
+// nothing (the jail dir is cleared by prepare(), a stale TAP by createTap).
+func TestFleetNetLeaseVerifyOnASecondHostWithALegacyIndex(t *testing.T) {
+	alive := 6060
+	origAlive := processAlive
+	processAlive = func(pid int) bool { return pid == alive }
+	defer func() { processAlive = origAlive }()
+
+	const ordinal = 1
+
+	tests := []struct {
+		name    string
+		setup   func(t *testing.T, f *reconcileFixture)
+		wantErr error
+	}{
+		{
+			// The .245 case: the host must be able to provision.
+			name: "a stale legacy out-of-block replica does not refuse boots",
+			setup: func(t *testing.T, f *reconcileFixture) {
+				f.replicas.put(legacyReplicaAt(uuid.New(), f.host, 1, domain.ReplicaStateResident, netPID(4243)))
+			},
+		},
+		{
+			name: "a legacy out-of-block replica that never recorded a pid does not refuse boots",
+			setup: func(t *testing.T, f *reconcileFixture) {
+				f.replicas.put(legacyReplicaAt(uuid.New(), f.host, 1, domain.ReplicaStateDead, nil))
+			},
+		},
+		{
+			// The hole the exclusion must NOT open: a live VM whose old index derived
+			// tap/jail/uid this host can hand out again.
+			name: "a RUNNING legacy out-of-block replica still refuses boots",
+			setup: func(t *testing.T, f *reconcileFixture) {
+				f.replicas.put(legacyReplicaAt(uuid.New(), f.host, 1, domain.ReplicaStateResident, netPID(alive)))
+			},
+			wantErr: domain.ErrNetPlaneUnreconciled,
+		},
+		{
+			// The fence itself, unchanged: an index INSIDE this host's own block with
+			// no lease is the proven-collision signal, live VM or not.
+			name: "an in-block index with no lease still refuses boots",
+			setup: func(t *testing.T, f *reconcileFixture) {
+				r := legacyReplicaAt(uuid.New(), f.host, ordinal*domain.NetSlotStride+5, domain.ReplicaStateResident, netPID(4243))
+				f.replicas.put(r)
+			},
+			wantErr: domain.ErrNetPlaneUnreconciled,
+		},
+		{
+			// A properly leased VM on this host's block is the healthy case, and it
+			// must stay healthy alongside the legacy row above.
+			name: "a leased in-block replica plus stale legacy residue serves boots",
+			setup: func(t *testing.T, f *reconcileFixture) {
+				id := uuid.New()
+				lease := f.leases.seedAt(t, f.host, ordinal, 3, domain.NetLeaseOwnerReplica, id, time.Now().Add(-time.Hour))
+				f.replicas.put(replicaAt(id, f.host, lease, domain.ReplicaStateResident, netPID(alive)))
+				f.replicas.put(legacyReplicaAt(uuid.New(), f.host, 1, domain.ReplicaStateResident, netPID(4243)))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newReconcileFixtureOn(t, ordinal)
+			tt.setup(t, f)
+
+			err := f.uc.Verify(context.Background())
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("Verify = %v, want %v", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Verify = %v, want nil (this host cannot provision anything)", err)
+			}
+			// The same rule governs the startup pass, or a restart would brick the host
+			// again.
+			if _, rerr := f.uc.Reconcile(context.Background()); rerr != nil {
+				t.Fatalf("Reconcile = %v, want nil", rerr)
+			}
+		})
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────

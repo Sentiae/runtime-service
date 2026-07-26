@@ -123,15 +123,19 @@ var (
 		Help: "microVM addressing leases currently held on a host (rows in fleet_net_leases).",
 	}, []string{"host_id"})
 
-	// netPlaneReconciled is the fail-closed boot signal from initNetPlane: 1 the
-	// plane reconciled and boots are served, 0 it did not and EVERY boot on this
-	// host is refused, MetricUnknown this instance has no addressing plane to
-	// reconcile (non-firecracker executor). Set once at boot — it is a
-	// process-lifetime fact, and its staleness is covered by the process being
-	// up at all.
+	// netPlaneReconciled is the fail-closed signal for this host's addressing
+	// plane: 1 the plane was proven and boots are served, 0 it was not and boots
+	// are refused, MetricUnknown this instance has no addressing plane at all
+	// (non-firecracker executor).
+	//
+	// It is written at boot AND re-written by every boot's precondition check
+	// (NetPlaneGuardedImageBooter), deliberately: the refusal is not a
+	// process-lifetime fact — a host self-heals once the cause is gone — and a gauge
+	// that only carried the boot-time verdict would keep alarming after the plane
+	// recovered, which is exactly the latch the guard exists to remove.
 	netPlaneReconciled = unknownUntilCollected(prometheus.GaugeOpts{
 		Name: "sentiae_fleet_net_plane_reconciled",
-		Help: "1 = the microVM addressing plane reconciled at boot, 0 = it did not and every boot is refused, -1 = this instance has no addressing plane.",
+		Help: "1 = the microVM addressing plane was proven on the last check, 0 = it was not and boots are refused, -1 = this instance has no addressing plane.",
 	})
 
 	// netLeaseAcquires counts allocation attempts by outcome. Write-path driven on

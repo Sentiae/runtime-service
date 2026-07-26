@@ -229,6 +229,79 @@ func (b FailLoudImageBooter) Decommission(ctx context.Context, in ImageDecommiss
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Net-plane-guarded booter (the refusal that clears itself).
+// ─────────────────────────────────────────────────────────────────────
+
+// NetPlaneVerifier re-derives whether this host's microVM addressing plane can
+// safely hand out an address. Nil error means it can.
+type NetPlaneVerifier func(ctx context.Context) error
+
+// NetPlaneGuardedImageBooter refuses BOOTS while the host's addressing plane
+// cannot be proven — and re-derives that verdict ON EVERY BOOT.
+//
+// ⚠ WHY IT IS NOT FailLoudImageBooter WITH A STORED REASON. The plane's verdict
+// used to be computed once at startup and frozen into the booter seam, so a host
+// that hit a transient violation kept refusing every boot after the cause was gone
+// and only `systemctl restart` cleared it (observed live on the second fleet host:
+// 10+ minutes of refusals citing a replica id that no longer existed in any table).
+// Fail-closed is right; LATCHING is not — it turns a self-healing refusal into a
+// stuck host. A stored "degraded" flag would be worse still, because nothing in
+// this service ever clears one. So the verdict is DERIVED per boot and never kept.
+//
+// Teardown keeps FailLoudImageBooter's asymmetry: it is DELEGATED unconditionally,
+// never gated on the verdict. Refusing to boot protects customer data; refusing to
+// tear down protects nothing and strands a running VM with its /30, its lease and
+// its rootfs — and teardown is also how the operator removes the very row a
+// refusal is about.
+type NetPlaneGuardedImageBooter struct {
+	// Real is the booter every permitted call is delegated to.
+	Real ImageBooter
+	// Verify re-derives the verdict. A nil Verify refuses every boot: a guard with
+	// no check is a wiring mistake, and the permissive reading of one is how
+	// fail-closed code silently becomes fail-open.
+	Verify NetPlaneVerifier
+}
+
+var _ ImageBooter = NetPlaneGuardedImageBooter{}
+
+// admit re-derives the verdict and reports it on the gauge, so the self-heal is
+// watchable rather than merely claimed.
+func (b NetPlaneGuardedImageBooter) admit(ctx context.Context) error {
+	if b.Verify == nil || b.Real == nil {
+		PublishNetPlaneReconciled(false)
+		return fmt.Errorf("%w: this host's addressing plane has no verifier wired, so it can prove nothing about which addresses it holds",
+			domain.ErrNetPlaneUnreconciled)
+	}
+	err := b.Verify(ctx)
+	PublishNetPlaneReconciled(err == nil)
+	if err != nil {
+		logger.FromContext(ctx).Error("fleet net plane: refusing a boot — the plane cannot be proven right now", "err", err)
+	}
+	return err
+}
+
+func (b NetPlaneGuardedImageBooter) BootTest(ctx context.Context, in ImageBootInput) (ImageTestResult, error) {
+	if err := b.admit(ctx); err != nil {
+		return ImageTestResult{}, err
+	}
+	return b.Real.BootTest(ctx, in)
+}
+
+func (b NetPlaneGuardedImageBooter) BootResident(ctx context.Context, in ImageBootInput) (ImageResidentResult, error) {
+	if err := b.admit(ctx); err != nil {
+		return ImageResidentResult{}, err
+	}
+	return b.Real.BootResident(ctx, in)
+}
+
+func (b NetPlaneGuardedImageBooter) Decommission(ctx context.Context, in ImageDecommissionInput) error {
+	if b.Real == nil {
+		return domain.ErrImageBootUnavailable
+	}
+	return b.Real.Decommission(ctx, in)
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // FleetProvision use case.
 // ─────────────────────────────────────────────────────────────────────
 
