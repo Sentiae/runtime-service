@@ -101,6 +101,37 @@ var (
 		Help: "Live (non-tombstoned) resource claims. The denominator of every ratio above.",
 	})
 
+	// recoveryPointsByLocation is the fleet's failure-domain census: how many
+	// recovery points are PROVEN to exist in two failure domains versus how many are
+	// known to exist in one versus how many predate the record (migration 0023).
+	//
+	// Three separate series and never a ratio: `unknown` is deliberately NOT folded
+	// into either side. Folding it into two_domains would invent protection, and
+	// folding it into primary_only would invent a definite claim out of a missing
+	// fact. All three are published on every pass (including as 0) so an alert on
+	// `primary_only > 0` is never evaluating an absent series.
+	recoveryPointsByLocation = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sentiae_fleet_recovery_points_by_location",
+		Help: "Recovery points by where their blob is known to exist: primary_and_second_domain (two failure domains, verified), primary_only (one — losing the chassis loses it), unknown (predates the record; NOT to be counted as protected).",
+	}, []string{"locations"})
+
+	// recoveryPointOldestSingleDomainAge is the number to alert on: how long the
+	// LEAST protected recovery point has been sitting in one failure domain.
+	//
+	// An AGE, not a count, for this file's rule 1 — "the oldest copy nobody has
+	// mirrored is nine days old" is then a value rather than something inferred from
+	// a count that stopped moving. It spans primary_only AND unknown, because the
+	// question is "not PROVABLY in two domains" and 0019/0022's doctrine is that
+	// unknown reads as the weakest class.
+	//
+	// MetricUnknown when no such recovery point exists — which is the healthy state,
+	// and must not be reported as an age of 0 (that is the reading a brand-new
+	// single-domain copy produces).
+	recoveryPointOldestSingleDomainAge = unknownUntilCollected(prometheus.GaugeOpts{
+		Name: "sentiae_fleet_recovery_point_oldest_single_domain_age_seconds",
+		Help: "Age in seconds of the OLDEST recovery point not provably in two failure domains (primary_only or unknown); -1 when every recovery point is verified in two domains, or when there are none.",
+	})
+
 	// snapshotFailures surfaces migration 0018's consecutive_snapshot_failures.
 	// A count, not a flag: a blip and a week-long protection outage must not look
 	// alike.
@@ -307,6 +338,8 @@ const DurabilityCollectEvery = time.Minute
 // write to the control plane even by mistake.
 type DurabilityResourceReader interface {
 	ListResourceDurability(ctx context.Context) ([]repository.ResourceDurability, error)
+	// ListRecoveryPointLocations is the failure-domain census (migration 0023).
+	ListRecoveryPointLocations(ctx context.Context) ([]repository.RecoveryPointLocationFacts, error)
 }
 
 // DurabilityHostReader lists the host registry.
@@ -408,6 +441,9 @@ func (c *FleetDurabilityCollector) Collect(ctx context.Context) error {
 	if err := c.collectResources(ctx); err != nil {
 		errs = append(errs, err)
 	}
+	if err := c.collectRecoveryPointLocations(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	if err := c.collectHosts(ctx); err != nil {
 		errs = append(errs, err)
 	}
@@ -428,6 +464,22 @@ func (c *FleetDurabilityCollector) collectResources(ctx context.Context) error {
 		return fmt.Errorf("list resource durability: %w", err)
 	}
 	publishResourceDurability(ComputeResourceDurability(facts, c.now()))
+	return nil
+}
+
+// collectRecoveryPointLocations publishes the failure-domain census. It is its own
+// section so a failure of this query leaves the census gauges at their previous
+// values (or at MetricUnknown before the first pass) instead of publishing a fleet
+// with zero single-domain copies, which is the flattering lie.
+func (c *FleetDurabilityCollector) collectRecoveryPointLocations(ctx context.Context) error {
+	if c.resources == nil {
+		return errors.New("durability collect: no resource ledger wired")
+	}
+	facts, err := c.resources.ListRecoveryPointLocations(ctx)
+	if err != nil {
+		return fmt.Errorf("list recovery point locations: %w", err)
+	}
+	publishRecoveryPointLocations(ComputeRecoveryPointLocations(facts, c.now()))
 	return nil
 }
 
@@ -541,6 +593,67 @@ func ComputeResourceDurability(facts []repository.ResourceDurability, now time.T
 		out.Resources = append(out.Resources, g)
 	}
 	return out
+}
+
+// RecoveryPointLocationSnapshot is one pass's failure-domain census.
+type RecoveryPointLocationSnapshot struct {
+	// CountByLocation carries EVERY known class, including the ones the query
+	// returned no rows for (as 0). A class published as absent would leave its alert
+	// with nothing to evaluate.
+	CountByLocation map[string]float64
+	// OldestSingleDomainAgeSeconds is the age of the oldest recovery point NOT
+	// provably in two domains (primary_only ∪ unknown), MetricUnknown when there is
+	// none.
+	OldestSingleDomainAgeSeconds float64
+}
+
+// ComputeRecoveryPointLocations turns the catalog census into gauge values. Pure
+// (no clock, no I/O) so the encoding decisions are directly testable.
+//
+// An unrecognized class from the database is counted under its own label rather
+// than dropped or folded into a known one: it can only arrive from a writer this
+// build does not know about, and silently attributing it to `primary_and_second_domain`
+// would be the fail-open. It is treated as NOT-two-domains for the age gauge, for
+// the same reason `unknown` is.
+func ComputeRecoveryPointLocations(facts []repository.RecoveryPointLocationFacts, now time.Time) RecoveryPointLocationSnapshot {
+	out := RecoveryPointLocationSnapshot{
+		CountByLocation: map[string]float64{
+			string(domain.RecoveryPointLocationsSecondDomain): 0,
+			string(domain.RecoveryPointLocationsPrimaryOnly):  0,
+			string(domain.RecoveryPointLocationsUnknown):      0,
+		},
+		OldestSingleDomainAgeSeconds: MetricUnknown,
+	}
+	for i := range facts {
+		f := &facts[i]
+		out.CountByLocation[f.Locations] += float64(f.Count)
+		if domain.RecoveryPointLocations(f.Locations).InTwoFailureDomains() {
+			continue
+		}
+		// A class with a count but no usable oldest timestamp contributes to the count
+		// and not to the age: an age derived from a missing fact would be a fabricated
+		// number in the direction that reads as healthy.
+		age := ageSeconds(f.OldestCreatedAt, now)
+		if age == MetricUnknown {
+			continue
+		}
+		if out.OldestSingleDomainAgeSeconds == MetricUnknown || age > out.OldestSingleDomainAgeSeconds {
+			out.OldestSingleDomainAgeSeconds = age
+		}
+	}
+	return out
+}
+
+// publishRecoveryPointLocations writes a computed census to the gauges. Reset first
+// so a class that no longer has any members stops reporting the count it had — but
+// the three known classes are always re-published (as 0 when empty) by
+// ComputeRecoveryPointLocations, so Reset never leaves an alert without a series.
+func publishRecoveryPointLocations(s RecoveryPointLocationSnapshot) {
+	recoveryPointsByLocation.Reset()
+	for class, count := range s.CountByLocation {
+		recoveryPointsByLocation.WithLabelValues(class).Set(count)
+	}
+	recoveryPointOldestSingleDomainAge.Set(s.OldestSingleDomainAgeSeconds)
 }
 
 // ageSeconds is the age of a timestamp, MetricUnknown when there is none.
