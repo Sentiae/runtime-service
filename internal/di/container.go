@@ -113,7 +113,6 @@ type Container struct {
 	ExecutionRunner   usecase.ExecutionRunner
 	EventPublisher    messaging.EventPublisher
 	EventConsumer     *messaging.EventConsumer
-	VsockRunner       *vmcomm.Runner
 
 	// VsockPool is the vsock warm VM pool behind ExecutionRunner when the
 	// executor is firecracker + vsock. Kept on the container so Close() can

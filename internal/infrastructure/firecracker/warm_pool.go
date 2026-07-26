@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -269,6 +270,11 @@ func (p *WarmPool) ensureTemplate(ctx context.Context, language domain.Language)
 // "object-store" on a durable pull or "local" on a fresh build (fleet
 // introspection only).
 func (p *WarmPool) buildTemplate(ctx context.Context, language domain.Language) (*TemplateSnapshot, string, error) {
+	// Whatever this call resolves to, any other-version file for this language is
+	// already unreachable (the names carry templateFormatVersion) — drop it here,
+	// before a pull writes the current-version file beside it.
+	p.reclaimOtherVersionTemplates(ctx, language)
+
 	if p.store != nil {
 		if snap, ok := p.pullTemplate(ctx, language); ok {
 			return snap, templateSourceObjectStore, nil
@@ -307,22 +313,104 @@ func (p *WarmPool) buildTemplateLocal(ctx context.Context, language domain.Langu
 }
 
 // templateObjectKeys returns the durable object-store keys for a language's
-// template state + mem files: templates/<language>/{state,mem}.
+// template state + mem files: templates/<language>/v<N>/{state,mem}.
+//
+// The templateFormatVersion segment is what makes a template baked with different
+// device/machine semantics UNREACHABLE rather than merely wrong: pullTemplate asks
+// Exists() for the CURRENT version's keys only, so after a bump the store looks
+// empty for that language and the pool bakes fresh.
+//
+// ⚠ The superseded object is NOT deleted: usecase.ArtifactStore has no Delete
+// (Put/Get/Exists/VerifyHash only). It is unreachable dead weight in the bucket;
+// reclaiming it needs a store-side lifecycle rule or a new port method.
 func templateObjectKeys(language domain.Language) (stateKey, memKey string) {
-	base := "templates/" + string(language)
+	base := "templates/" + string(language) + "/" + templateVersionTag()
 	return base + "/state", base + "/mem"
 }
 
 // templateLocalPaths returns the stable local paths a pulled template's files
-// land in: <templateDir>/template-<lang>.{state,mem}. Stable per language so
-// concurrent clones all CoW-restore from the same local mem file.
+// land in: <templateDir>/template-<lang>.v<N>.{state,mem}. Stable per language so
+// concurrent clones all CoW-restore from the same local mem file, and per
+// templateFormatVersion so a file left by an older binary can never be restored.
 func (p *WarmPool) templateLocalPaths(language domain.Language) (statePath, memPath string) {
-	dir := p.templateDir
-	if dir == "" {
-		dir = os.TempDir()
+	dir := p.templateLocalDir()
+	base := templateLocalPrefix(language) + templateVersionTag()
+	return filepath.Join(dir, base+".state"), filepath.Join(dir, base+".mem")
+}
+
+// templateLocalDir is where this pool's per-language template files live.
+func (p *WarmPool) templateLocalDir() string {
+	if p.templateDir == "" {
+		return os.TempDir()
 	}
-	return filepath.Join(dir, "template-"+string(language)+".state"),
-		filepath.Join(dir, "template-"+string(language)+".mem")
+	return p.templateDir
+}
+
+// templateLocalPrefix is the base-name prefix every version of one language's
+// local template files shares, INCLUDING the separating dot. The trailing dot is
+// load-bearing for reclaimOtherVersionTemplates: it makes the match exact, so
+// "python" can never match "python3"'s files.
+func templateLocalPrefix(language domain.Language) string {
+	return "template-" + string(language) + "."
+}
+
+// reclaimOtherVersionTemplates removes THIS language's local template files that
+// belong to any other templateFormatVersion — including the pre-versioning
+// "template-<lang>.{state,mem}" names. Called once per template build/pull so a
+// version bump does not leak a full guest-memory image per language forever.
+//
+// Safety of the removal itself: a template file in use is hard-linked into every
+// live clone's chroot, so unlinking this path drops a name, not the inode — a
+// running clone keeps reading its snapshot. And it can only ever unlink an
+// OTHER-version file, which by construction no current-version restore uses.
+//
+// Matching is a LITERAL PREFIX+SUFFIX test over the directory listing,
+// deliberately NOT filepath.Glob (same reasoning as volume.BackingStore's sibling
+// reclaim): a language string containing '*', '?', '[' or '\' would otherwise be
+// read as pattern syntax, and there is no filepath.QuoteMeta to defend with. A
+// candidate must start with "template-<lang>." and end in ".state" or ".mem", so
+// it cannot match another language's template, pullObject's ".template-*.tmp"
+// staging files, or anything outside this directory. (The park/wake VM snapshots
+// live in SnapshotPath's ROOT, not in this templates/ subdirectory.)
+//
+// Best-effort: failures are logged, never fatal — a stale file is wasted disk,
+// not a correctness problem, because it is already unreachable by name.
+func (p *WarmPool) reclaimOtherVersionTemplates(ctx context.Context, language domain.Language) {
+	dir := p.templateLocalDir()
+	keepState, keepMem := p.templateLocalPaths(language)
+	keep := map[string]struct{}{
+		filepath.Base(keepState): {},
+		filepath.Base(keepMem):   {},
+	}
+	prefix := templateLocalPrefix(language)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logger.FromContext(ctx).Warn("warm-pool: list template dir for version reclaim failed",
+				"language", language, "dir", dir, "err", err)
+		}
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if !strings.HasSuffix(name, ".state") && !strings.HasSuffix(name, ".mem") {
+			continue
+		}
+		if _, ok := keep[name]; ok {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+			logger.FromContext(ctx).Warn("warm-pool: reclaim superseded template file failed",
+				"language", language, "file", name, "err", err)
+			continue
+		}
+		logger.FromContext(ctx).Info("warm-pool: reclaimed superseded template file",
+			"language", language, "file", name, "current_version", templateFormatVersion)
+	}
 }
 
 // pullTemplate restores a persisted template from the durable store onto stable

@@ -928,3 +928,139 @@ func TestWarmPool_StoreMiss_BuildsOnceUnderConcurrency(t *testing.T) {
 		t.Fatalf("expected 2 Puts (built once), got %d: %v", len(put), put)
 	}
 }
+
+// --- template format versioning (#warm-clones-bypass-the-drive-helper) ---
+
+// TestTemplateNaming_CarriesFormatVersion pins the version into every persisted
+// template name. A clone is created ONLY by PUT /snapshot/load, so it inherits the
+// persisted template's drive config verbatim — the name is what keeps a template
+// baked under different semantics out of the loader's reach.
+func TestTemplateNaming_CarriesFormatVersion(t *testing.T) {
+	tag := templateVersionTag()
+	if tag != "v2" {
+		t.Fatalf("templateVersionTag = %q, want v2 (bump the test WITH templateFormatVersion)", tag)
+	}
+
+	stateKey, memKey := templateObjectKeys(domain.Language("python"))
+	if stateKey != "templates/python/"+tag+"/state" || memKey != "templates/python/"+tag+"/mem" {
+		t.Fatalf("object keys = %s,%s want versioned", stateKey, memKey)
+	}
+
+	p := newWarmPool(&fakeWarmManager{}, &fakeAgent{})
+	p.templateDir = "/snap/templates"
+	statePath, memPath := p.templateLocalPaths(domain.Language("python"))
+	if filepath.Base(statePath) != "template-python."+tag+".state" ||
+		filepath.Base(memPath) != "template-python."+tag+".mem" {
+		t.Fatalf("local paths = %s,%s want versioned", statePath, memPath)
+	}
+}
+
+// TestWarmPool_PreVersionTemplate_NotLoadedAndReaped is the regression this
+// versioning exists for: a template persisted by a binary with different drive
+// semantics must be invisible to the loader (⇒ a fresh bake) and its files must be
+// reclaimed — while nothing that is not this language's template is touched.
+func TestWarmPool_PreVersionTemplate_NotLoadedAndReaped(t *testing.T) {
+	dir := t.TempDir()
+	mgr := &fakeWarmManager{}
+	agent := &fakeAgent{result: AgentRunResult{Stdout: "ok"}}
+
+	// The store holds ONLY the pre-versioning keys the old binary wrote.
+	store := newFakeArtifactStore()
+	store.seed("templates/python/state", []byte("OLD-STATE"))
+	store.seed("templates/python/mem", []byte("OLD-MEM"))
+
+	// Local leftovers: the pre-versioning pair and a v1-tagged pair.
+	stale := []string{
+		"template-python.state",
+		"template-python.mem",
+		"template-python.v1.state",
+		"template-python.v1.mem",
+	}
+	// Files the reclaim must NEVER touch: another language, a language whose name
+	// merely starts the same, a pullObject staging file, and a park/wake VM
+	// snapshot shape.
+	keep := []string{
+		"template-go." + templateVersionTag() + ".state",
+		"template-python3.state",
+		".template-abc.tmp",
+		uuid.New().String() + ".state",
+	}
+	for _, name := range append(append([]string{}, stale...), keep...) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// persistTemplate reads the freshly-baked files, so give the fake real ones.
+	mgr.snapStatePath = filepath.Join(dir, "baked.state")
+	mgr.snapMemPath = filepath.Join(dir, "baked.mem")
+	for _, p := range []string{mgr.snapStatePath, mgr.snapMemPath} {
+		if err := os.WriteFile(p, []byte("fresh"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	p := newWarmPoolWithStore(mgr, agent, store, dir)
+	if _, err := p.ensureTemplate(context.Background(), domain.Language("python")); err != nil {
+		t.Fatalf("ensureTemplate: %v", err)
+	}
+
+	// The old-version store objects were NOT loaded — the pool baked fresh.
+	if got := atomic.LoadInt32(&mgr.bootCalls); got != 1 {
+		t.Fatalf("expected a fresh bake (old-version template unreachable), BootWarm called %d times", got)
+	}
+	for _, name := range stale {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("superseded template file %s still present (err=%v)", name, err)
+		}
+	}
+	for _, name := range keep {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("reclaim removed a file it must not touch: %s: %v", name, err)
+		}
+	}
+	// The fresh bake was persisted under the CURRENT version's keys.
+	put, _ := store.keys()
+	wantState, wantMem := templateObjectKeys(domain.Language("python"))
+	if len(put) != 2 || put[0] != wantState || put[1] != wantMem {
+		t.Fatalf("persisted keys = %v, want [%s %s]", put, wantState, wantMem)
+	}
+}
+
+// TestWarmPool_CurrentVersionTemplate_LoadsAndSurvivesReclaim proves the other
+// half: a current-version persisted template IS pulled (no bake) and the reclaim
+// pass does not eat the files it just wrote.
+func TestWarmPool_CurrentVersionTemplate_LoadsAndSurvivesReclaim(t *testing.T) {
+	dir := t.TempDir()
+	mgr := &fakeWarmManager{}
+	agent := &fakeAgent{result: AgentRunResult{Stdout: "ok"}}
+
+	store := newFakeArtifactStore()
+	stateKey, memKey := templateObjectKeys(domain.Language("python"))
+	store.seed(stateKey, []byte("STATE-BYTES"))
+	store.seed(memKey, []byte("MEM-BYTES"))
+
+	// An old-version leftover sits beside where the pull will land.
+	oldFile := filepath.Join(dir, "template-python.v1.mem")
+	if err := os.WriteFile(oldFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := newWarmPoolWithStore(mgr, agent, store, dir)
+	snap, err := p.ensureTemplate(context.Background(), domain.Language("python"))
+	if err != nil {
+		t.Fatalf("ensureTemplate: %v", err)
+	}
+	if got := atomic.LoadInt32(&mgr.bootCalls); got != 0 {
+		t.Fatalf("current-version template should have been pulled, BootWarm called %d times", got)
+	}
+	if b, _ := os.ReadFile(snap.StatePath); string(b) != "STATE-BYTES" {
+		t.Fatalf("pulled state = %q", string(b))
+	}
+	if b, _ := os.ReadFile(snap.MemPath); string(b) != "MEM-BYTES" {
+		t.Fatalf("pulled mem = %q", string(b))
+	}
+	if _, err := os.Stat(oldFile); !os.IsNotExist(err) {
+		t.Fatalf("old-version file survived the pull path (err=%v)", err)
+	}
+}

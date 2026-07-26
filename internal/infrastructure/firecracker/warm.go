@@ -48,6 +48,29 @@ const (
 // (the warm pool's index allocator).
 func cloneJailID(n int) string { return fmt.Sprintf("clone%d", n) }
 
+// templateFormatVersion is the version of the CONTENTS of a template snapshot —
+// everything a Full snapshot bakes into its state and can never be changed by the
+// binary that later loads it.
+//
+// ⚠ BUMP IT whenever anything baked in changes semantically: the drive config
+// (cache_type/is_read_only — see driveConfigBody), the machine config (vcpus,
+// memory), the net shape (device names/count), or the guest's boot arguments. A
+// clone is created ONLY by PUT /snapshot/load, so it inherits the persisted
+// template's device configuration verbatim: a template baked before
+// driveConfigBody existed restores clones running Firecracker's default
+// cache_type=Unsafe no matter what this binary would have configured. That is the
+// hazard the version closes — a mismatch means the template MUST be re-baked, and
+// the load path must not be able to find it.
+//
+// The version is carried in the persisted FILE and OBJECT names (not inside the
+// files) so an old template is invisible to the loader by construction rather
+// than by a check somebody has to remember to write.
+const templateFormatVersion = 2
+
+// templateVersionTag is the version token embedded in every persisted template
+// name ("v2"). One function so no site can spell it differently.
+func templateVersionTag() string { return fmt.Sprintf("v%d", templateFormatVersion) }
+
 // linkWarmRootfs hard-links the shared warm rootfs into a warm chroot (the
 // template's or a clone's) and returns its chroot view.
 //
@@ -370,8 +393,21 @@ func (m *WarmManager) CreateTemplateSnapshot(ctx context.Context, warm *WarmVM) 
 	if err := os.MkdirAll(snapshotDir, 0750); err != nil {
 		return nil, fmt.Errorf("create snapshot dir: %w", err)
 	}
-	statePath := filepath.Join(snapshotDir, warm.ID.String()+".state")
-	memPath := filepath.Join(snapshotDir, warm.ID.String()+".mem")
+	// Version-tagged like every other template artifact (templateFormatVersion),
+	// so a file found on disk states which drive/machine/net semantics it was baked
+	// with. These particular names are NOT a load key: warm.ID is a fresh uuid per
+	// bake, so nothing ever looks them up — the per-language names in warm_pool.go
+	// are what a later process resolves. Two consequences, both deliberate:
+	//   - there is nothing to reclaim here (a fresh uuid cannot collide with an
+	//     older version of itself), and
+	//   - orphaned pre-version bake outputs in this directory are NOT reclaimable:
+	//     SnapshotPath's root also holds the park/wake VM snapshots
+	//     (Provider.CreateSnapshot writes <snapshotID>.state/.mem there), which are
+	//     uuid-named with the identical suffixes, so no glob can tell a stale
+	//     template from a live VM's snapshot. Do not add one.
+	base := warm.ID.String() + "." + templateVersionTag()
+	statePath := filepath.Join(snapshotDir, base+".state")
+	memPath := filepath.Join(snapshotDir, base+".mem")
 
 	// The VMM writes the pair itself, resolving the paths AFTER its chroot and
 	// with no rights outside it — so it is asked for jail-local paths it owns and
@@ -381,8 +417,8 @@ func (m *WarmManager) CreateTemplateSnapshot(ctx context.Context, warm *WarmVM) 
 	if err := j.mkdir("snap"); err != nil {
 		return nil, fmt.Errorf("prepare jail snapshot dir: %w", err)
 	}
-	stateRel := "snap/" + warm.ID.String() + ".state"
-	memRel := "snap/" + warm.ID.String() + ".mem"
+	stateRel := "snap/" + base + ".state"
+	memRel := "snap/" + base + ".mem"
 
 	client := m.p.unixHTTPClient(warm.SocketPath)
 
