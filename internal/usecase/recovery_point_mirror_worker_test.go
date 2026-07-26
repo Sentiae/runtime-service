@@ -338,6 +338,101 @@ func TestRecoveryPointMirrorWorker_StalledMirrorIsVisible(t *testing.T) {
 	}
 }
 
+// TestRecoveryPointMirrorWorker_DeferredRowWithholdsLastSuccess closes the hole the
+// test above leaves open: the pass AFTER a failing one.
+//
+// A row that just failed is put on a 15-minute in-memory cooldown so it cannot
+// monopolise the oldest-first batch. That is correct. What is NOT correct is that
+// the pass which skipped it then reported a clean success: a permanently
+// unmirrorable head-of-queue row fails ONCE (last_success withheld) and is then
+// deferred by every pass for the next fifteen minutes, each of them stamping the
+// timestamp forward. `now() - last_success` never grows, so the one instrument built
+// to make a stalled mirror visible reads healthy while nothing is being copied —
+// which is exactly what PublishRecoveryPointMirrorPass's own contract forbids ("a
+// pass that left recovery points uncopied has not established that the backlog is
+// being drained").
+//
+// A deferred row is a recovery point sitting on one chassis that this pass did not
+// copy. It withholds the timestamp for the same reason a failed one does.
+func TestRecoveryPointMirrorWorker_DeferredRowWithholdsLastSuccess(t *testing.T) {
+	tests := []struct {
+		name string
+		// copyErrOnSecondPass is what the second domain does on the LATER pass.
+		copyErrOnSecondPass error
+		// clearBacklog empties the ledger before the later pass, so it considers
+		// nothing at all.
+		clearBacklog bool
+		// wantAdvanced is whether the later pass may stamp last_success.
+		wantAdvanced bool
+		wantDeferred int
+	}{
+		{
+			name:         "a pass that only DEFERRED a failed row has copied nothing and must not stamp success",
+			wantDeferred: 1,
+		},
+		{
+			name:                "a pass that failed again must not stamp success",
+			copyErrOnSecondPass: errors.New("dial r2: connection refused"),
+			// The cooldown suppresses the retry, so this is the deferred shape too — the
+			// point is that neither reading advances the gauge.
+			wantDeferred: 1,
+		},
+		{
+			name: "a pass with a genuinely drained backlog stamps success",
+			// Nothing left uncopied anywhere: the honest idle pass.
+			clearBacklog: true,
+			wantAdvanced: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newMirrorHarness(t)
+			id := h.seedPoint("volumes/v1/gone.ext4", domain.RecoveryPointLocationsPrimaryOnly, mirrorAt.Add(-72*time.Hour))
+			h.mirror.err = errors.New("read back out of the primary store: object not found")
+			// The gauge is a package global; start each case from the never-collected
+			// value so "did this pass stamp it" is a fact and not an artefact of the
+			// previous subtest having stamped the same second.
+			recoveryPointMirrorLastSuccess.Set(MetricUnknown)
+
+			// Pass 1: the copy fails. The gauge holds whatever it held.
+			h.w.pass(context.Background())
+			before := testutil.ToFloat64(recoveryPointMirrorLastSuccess)
+			if before != MetricUnknown {
+				t.Fatalf("last_success = %v after a FAILED pass, want %v", before, float64(MetricUnknown))
+			}
+
+			// Pass 2, one minute later — inside the 15-minute cooldown.
+			h.clock = h.clock.Add(time.Minute)
+			h.mirror.err = tt.copyErrOnSecondPass
+			if tt.clearBacklog {
+				h.ledger.recovery[h.resID] = nil
+			}
+			rep, err := h.w.RunOnce(context.Background())
+			if err != nil {
+				t.Fatalf("the second pass returned an error: %v", err)
+			}
+			if rep.Deferred != tt.wantDeferred {
+				t.Fatalf("deferred = %d, want %d", rep.Deferred, tt.wantDeferred)
+			}
+			h.w.pass(context.Background())
+
+			got := testutil.ToFloat64(recoveryPointMirrorLastSuccess)
+			advanced := got != before
+			if advanced != tt.wantAdvanced {
+				t.Fatalf("last_success advanced = %v (%v → %v), want %v — a pass that skipped a single-domain recovery point has not drained the backlog, and stamping it makes a stalled mirror unobservable",
+					advanced, before, got, tt.wantAdvanced)
+			}
+			if !tt.clearBacklog {
+				// The ledger keeps saying the truth throughout: still one domain.
+				if rp := h.point(t, id); rp.Locations != domain.RecoveryPointLocationsPrimaryOnly {
+					t.Errorf("ledger locations = %q, want %q", rp.Locations, domain.RecoveryPointLocationsPrimaryOnly)
+				}
+			}
+		})
+	}
+}
+
 // TestRecoveryPointMirrorWorker_RequiresBothDependencies proves a half-wired worker
 // cannot be constructed. A non-nil worker that copies nowhere would stamp failures
 // forever while looking wired — strictly worse than holding no worker at all, which

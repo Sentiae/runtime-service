@@ -192,6 +192,14 @@ func (w *RecoveryPointMirrorWorker) run(ctx context.Context) {
 // pass runs one drain and publishes it. A failed pass is logged and counted; it
 // does NOT advance the last-success timestamp, which is the only thing that makes
 // a stalled mirror distinguishable from an idle one.
+//
+// ⚠ NEITHER DOES A PASS THAT ONLY DEFERRED. A row is on cooldown BECAUSE it just
+// failed, so for the fifteen minutes that follow, every pass would otherwise skip it
+// and stamp a clean success — `now() - last_success` never grows and a permanently
+// unmirrorable head-of-queue row reads as a healthy idle mirror. The timestamp means
+// "this pass left nothing on one chassis", which a deferred row contradicts as much
+// as a failed one does. The cooldown still does its job (the row does not consume a
+// batch slot); it just no longer buys silence.
 func (w *RecoveryPointMirrorWorker) pass(ctx context.Context) {
 	rep, err := w.RunOnce(ctx)
 	if err != nil {
@@ -199,6 +207,13 @@ func (w *RecoveryPointMirrorWorker) pass(ctx context.Context) {
 			"second_domain", w.mirror.Domain(),
 			"considered", rep.Considered, "mirrored", rep.Mirrored, "failed", rep.Failed, "deferred", rep.Deferred,
 			"err", err)
+		return
+	}
+	if rep.Deferred > 0 {
+		logger.FromContext(ctx).Warn("recovery-point mirror pass skipped recovery points that are still cooling down from an earlier failure — they exist on ONE chassis and this pass did not change that, so it is NOT recorded as a success",
+			"second_domain", w.mirror.Domain(),
+			"considered", rep.Considered, "mirrored", rep.Mirrored, "deferred", rep.Deferred,
+			"retry_after", w.retryAfter)
 		return
 	}
 	PublishRecoveryPointMirrorPass(w.now())
