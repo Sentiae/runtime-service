@@ -532,11 +532,22 @@ func Load() (*Config, error) {
 			// Durable snapshot object-store defaults. Disabled by default so
 			// existing deployments keep the local-only snapshot flow until
 			// operators opt in. MinIO-friendly defaults (path-style, no TLS).
+			//
+			// ⚠ THE CREDENTIAL HAS NO DEFAULT, DELIBERATELY (D-200). It used to
+			// default to `minioadmin/minioadmin`, and because the fleet host's
+			// /etc/runtime-service.env set only the endpoint, EVERY fleet host
+			// silently authenticated to the object store as MinIO ROOT — read,
+			// write and DELETE over every tenant's recovery points in a bucket
+			// with no versioning and no object lock. A credential default that
+			// happens to be the vendor default is not a convenience; it is a
+			// privilege escalation that survives every code review because
+			// nothing in the deployment mentions it. Supply the credential via
+			// APP_SNAPSHOT_STORE_ACCESS_KEY / _SECRET_KEY.
 			"snapshot_store.enabled":    false,
 			"snapshot_store.endpoint":   "minio:9000",
 			"snapshot_store.bucket":     "sentiae-snapshots",
-			"snapshot_store.access_key": "minioadmin",
-			"snapshot_store.secret_key": "minioadmin",
+			"snapshot_store.access_key": "",
+			"snapshot_store.secret_key": "",
 			"snapshot_store.region":     "us-east-1",
 			"snapshot_store.use_ssl":    false,
 			"snapshot_store.path_style": true,

@@ -2567,6 +2567,18 @@ func (c *Container) buildSnapshotStore(cfg *config.Config) usecase.ArtifactStore
 	if !sc.Enabled {
 		return nil
 	}
+	// D-200: name the miss. The credential has no default any more, so an
+	// unconfigured host lands here — and the failure it would otherwise produce
+	// is a bare 403 from the bucket probe, which reads like a MinIO problem
+	// rather than a missing env var. This is a diagnostic, NOT a fail-closed
+	// gate: the store still degrades to nil below, exactly as before. Whether a
+	// host that cannot protect its data should refuse to serve at all is the
+	// open durability-gate question and an owner call, not a config edit.
+	if sc.AccessKey == "" || sc.SecretKey == "" {
+		log.Printf("[snapshot-store] MISCONFIGURED: snapshot_store.enabled=true but no credential " +
+			"(set APP_SNAPSHOT_STORE_ACCESS_KEY and APP_SNAPSHOT_STORE_SECRET_KEY); " +
+			"this host will fall back to LOCAL-ONLY snapshots and holds no durable recovery points")
+	}
 	remote, err := objectstore.NewS3ArtifactStore(objectstore.S3Config{
 		Endpoint:  sc.Endpoint,
 		Region:    sc.Region,
