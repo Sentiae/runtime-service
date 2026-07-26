@@ -12,10 +12,16 @@ import (
 type FleetResourcePhase string
 
 const (
-	// FleetResourcePhasePending — the claim is recorded but backend work has not
-	// started.
-	FleetResourcePhasePending FleetResourcePhase = "pending"
-	// FleetResourcePhaseProvisioning — the backend is being materialized.
+	// A `pending` phase used to be declared here and accepted by IsValid, but no
+	// code ever wrote it: a resource is born straight into `provisioning`, inside the
+	// same call that records the claim, so there is no moment at which the claim
+	// exists and backend work has not started. A phase that exists in the type but
+	// never in the data is a reader trap — it invites a caller to branch on a state
+	// the fleet cannot produce — so it is gone rather than kept as documentation of
+	// an intent nothing implements (D-046).
+	//
+	// FleetResourcePhaseProvisioning — the backend is being materialized. It is the
+	// BIRTH phase.
 	FleetResourcePhaseProvisioning FleetResourcePhase = "provisioning"
 	// FleetResourcePhaseReady — the resource is provisioned and reachable.
 	FleetResourcePhaseReady FleetResourcePhase = "ready"
@@ -36,7 +42,7 @@ const (
 // IsValid reports whether the phase is one the fleet recognizes.
 func (p FleetResourcePhase) IsValid() bool {
 	switch p {
-	case FleetResourcePhasePending, FleetResourcePhaseProvisioning,
+	case FleetResourcePhaseProvisioning,
 		FleetResourcePhaseReady, FleetResourcePhaseDegraded,
 		FleetResourcePhaseRestoring, FleetResourcePhaseFailed,
 		FleetResourcePhaseDecommissioned:

@@ -770,6 +770,30 @@ func TestSnapshot_NoRowOnUploadFailure(t *testing.T) {
 	}
 }
 
+// A volume ROW with no backing path is a different failure from a missing FILE: the
+// ledger is incomplete, so there is nothing to look for and no recovery point that
+// could repair it. It carries its own sentinel because a bare fmt.Errorf maps to
+// Internal at the boundary — "a bug, retry" — while the fix is an operator repairing
+// the row.
+func TestSnapshot_VolumeRowWithNoBackingPathIsItsOwnRefusal(t *testing.T) {
+	h := newSnapshotHarness(t)
+	appID := uuid.New()
+	h.vols.byApp[appID] = []domain.Volume{{ID: uuid.New(), AppID: appID, BackingPath: ""}}
+
+	_, err := h.s.SnapshotAppVolumes(context.Background(), uuid.New(), appID)
+	if !errors.Is(err, domain.ErrVolumeBackingPathUnset) {
+		t.Fatalf("snapshot of a pathless volume row = %v, want ErrVolumeBackingPathUnset", err)
+	}
+	// It must NOT masquerade as the missing-file condition, whose remedy (restore
+	// from a recovery point) cannot help here.
+	if errors.Is(err, domain.ErrVolumeBackingFileMissing) {
+		t.Errorf("a pathless row must not read as a missing backing FILE: %v", err)
+	}
+	if len(h.store.puts) != 0 {
+		t.Errorf("nothing may be uploaded for a pathless volume row: %d puts", len(h.store.puts))
+	}
+}
+
 func TestSnapshot_UnattachedVolumeNoQuiesce(t *testing.T) {
 	h := newSnapshotHarness(t)
 

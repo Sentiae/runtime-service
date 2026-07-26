@@ -94,6 +94,17 @@ var (
 	// sentinel it reached the caller as a bare Internal, indistinguishable from a
 	// panic (#resource-final-snapshot-failure-is-a-bare-500).
 	ErrVolumeBackingFileMissing = errors.New("fleet resource volume backing file is missing")
+	// ErrVolumeBackingPathUnset is returned when a volume ROW records no backing
+	// path at all, so there is nothing to snapshot and nothing to look for.
+	//
+	// It is deliberately NOT folded into ErrVolumeBackingFileMissing: that one says
+	// "the data is gone from the host", which is a filesystem fact an operator
+	// answers with a restore, whereas this one says "the ledger row is incomplete" —
+	// a control-plane fault, and no recovery point can repair it. Without its own
+	// sentinel it was a bare fmt.Errorf, which the boundary maps to Internal
+	// (indistinguishable from a panic) one line above the missing-file case that
+	// answers correctly.
+	ErrVolumeBackingPathUnset = errors.New("fleet resource volume row records no backing path")
 	// ErrVolumeIdentityMismatch is returned when the file at a volume's backing
 	// path IS a Sentiae-stamped volume but belongs to a DIFFERENT volume. Adoption
 	// used to be a bare os.Stat: "something is here" was accepted as "this volume's

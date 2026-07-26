@@ -365,13 +365,16 @@ func TestRestore_Admission(t *testing.T) {
 			wantPhase: domain.FleetResourcePhaseRestoring,
 		},
 		{
-			name: "from pending is refused",
+			// The CAS reads the DURABLE phase, not the caller's copy: a resource that
+			// was torn down while this call was in flight is refused even though the
+			// input still says `ready`. (This case used to use the `pending` phase,
+			// which no code ever wrote — it is retired.)
+			name: "a phase outside the admit set is refused by the durable CAS",
 			mutate: func(h *restoreHarness) {
-				_ = h.repo.UpdateResourcePhase(context.Background(), h.res.ID, domain.FleetResourcePhasePending)
-				h.res.Phase = domain.FleetResourcePhasePending
+				_ = h.repo.UpdateResourcePhase(context.Background(), h.res.ID, domain.FleetResourcePhaseDecommissioned)
 			},
 			wantErr:   domain.ErrRestoreInProgress,
-			wantPhase: domain.FleetResourcePhasePending,
+			wantPhase: domain.FleetResourcePhaseDecommissioned,
 		},
 		{
 			name: "tombstoned resource is refused (fork territory)",

@@ -267,7 +267,7 @@ func timeOrNever(t *time.Time) string {
 func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID uuid.UUID, vol *domain.Volume) (domain.FleetResourceRecoveryPoint, error) {
 	var zero domain.FleetResourceRecoveryPoint
 	if vol.BackingPath == "" {
-		return zero, fmt.Errorf("volume %s has no backing file to snapshot", vol.ID)
+		return zero, fmt.Errorf("%w: volume %s", domain.ErrVolumeBackingPathUnset, vol.ID)
 	}
 	snapshotID := uuid.New()
 	objectKey := fmt.Sprintf("volumes/%s/%s.ext4", vol.ID, snapshotID)

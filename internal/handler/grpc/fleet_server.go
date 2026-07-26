@@ -553,6 +553,13 @@ func fleetError(err error) error {
 	// server-side (in the Error log); these messages are tenant-visible.
 	case errors.Is(err, domain.ErrVolumeBackingFileMissing):
 		return status.Error(codes.FailedPrecondition, "this app's persistent volume is recorded but its backing file is not on the host — refusing to attach an empty replacement; restore from a recovery point")
+	// A DIFFERENT condition from the one above, and mapped separately for that
+	// reason: the row itself is incomplete (it names no path), so there is no file to
+	// look for and no recovery point that could repair it. It reached the caller as
+	// Internal — "a bug, retry" — while the fix is an operator inspecting the ledger.
+	// The volume id stays server-side; the raw error is logged by the caller.
+	case errors.Is(err, domain.ErrVolumeBackingPathUnset):
+		return status.Error(codes.FailedPrecondition, "this volume's ledger row records no backing path, so it cannot be snapshotted or attached — the row is incomplete and must be repaired before the resource can be used")
 	// The identity refusals MUST be mapped, not left to the default: their errors
 	// carry the host backing PATH and the foreign volume id, and the default branch
 	// echoes err.Error() straight to the tenant. Both name the condition only; the

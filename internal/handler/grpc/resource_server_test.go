@@ -416,6 +416,18 @@ func TestDecommissionResource_ErrorMapping(t *testing.T) {
 			wantMsg:  "the volume's backing file is missing, so a final snapshot cannot be taken",
 		},
 		{
+			// The row-level fault, which is NOT the missing-file one: it must get its
+			// own message, because no restore can repair an incomplete ledger row.
+			// It is curated by fleetError (which owns every runtime-local sentinel), so
+			// it arrives here through the delegating default branch and that branch's
+			// server-side log fires — what must NOT happen is the bare Internal.
+			name:            "a volume row with no backing path gets its own refusal, not the missing-file one",
+			err:             fmt.Errorf("final snapshot: %w: volume 9e5c0f1c-0000-0000-0000-000000000000", domain.ErrVolumeBackingPathUnset),
+			wantCode:        codes.FailedPrecondition,
+			wantMsg:         "this volume's ledger row records no backing path, so it cannot be snapshotted or attached — the row is incomplete and must be repaired before the resource can be used",
+			wantUnmappedLog: true,
+		},
+		{
 			// The sibling refusal path is untouched.
 			name:     "zero recovery points still refuses with its own message",
 			err:      fmt.Errorf("%w: resource %s produced NO recovery point", domain.ErrResourceFinalSnapshotRequired, resID),
