@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -46,9 +47,12 @@ type fakeResourceRepo struct {
 	durabilityErr error
 	// locationsErr fails the failure-domain census the same way.
 	locationsErr error
-	// mirrorLedgerErr fails the second-domain ledger writes, so the snapshotter's
+	// mirrorLedgerErr fails the second-domain ledger writes, so the mirror worker's
 	// "the copy landed but the ledger does not know it" path is reachable.
 	mirrorLedgerErr error
+	// mirrorBacklogErr fails the backlog read so the worker's "the pass could not
+	// even see what needs copying" path is reachable.
+	mirrorBacklogErr error
 }
 
 func newFakeResourceRepo() *fakeResourceRepo {
@@ -236,6 +240,34 @@ func (f *fakeResourceRepo) GetRecoveryPointByRef(_ context.Context, resourceID u
 		}
 	}
 	return nil, domain.ErrRecoveryPointNotFound
+}
+
+// ListRecoveryPointsToMirror mirrors the postgres predicate exactly: locations =
+// 'primary_only', OLDEST FIRST, capped at limit. `unknown` is excluded here as it
+// is there — a fake that swept it in would let a test pass against a worker the
+// database would never feed those rows to.
+func (f *fakeResourceRepo) ListRecoveryPointsToMirror(_ context.Context, limit int) ([]domain.FleetResourceRecoveryPoint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mirrorBacklogErr != nil {
+		return nil, f.mirrorBacklogErr
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	var out []domain.FleetResourceRecoveryPoint
+	for resID := range f.recovery {
+		for _, rp := range f.recovery[resID] {
+			if rp.Locations == domain.RecoveryPointLocationsPrimaryOnly {
+				out = append(out, rp)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 // MarkRecoveryPointInSecondDomain mirrors the postgres UPDATE: it promotes the row

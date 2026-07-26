@@ -104,10 +104,6 @@ type FleetVolumeSnapshotter struct {
 	volumes  repository.VolumeRepository
 	replicas repository.ReplicaRepository
 	recovery repository.FleetResourceRepository
-	// mirror copies each captured blob into a SECOND FAILURE DOMAIN (D-192/D-195).
-	// Nil on a host with no second domain configured — recovery points are then
-	// recorded primary_only, which is the truth and not a degraded mode.
-	mirror SecondDomainMirror
 
 	// Thaw + heartbeat budget. Fields (not constants) so tests drive the retry and
 	// heartbeat paths without waiting on the real timers.
@@ -139,18 +135,14 @@ func NewFleetVolumeSnapshotter(
 	}
 }
 
-// SetSecondDomainMirror wires the second-failure-domain mirror (D-192/D-195/D-199).
-//
-// A setter rather than a constructor argument for the reason the other fleet
-// setters are: it is built from a Vault-held credential that may be absent at boot,
-// and every existing caller of NewFleetVolumeSnapshotter must keep compiling with
-// the honest single-domain behaviour.
-//
-// ⚠ Nil is a VALID and TRUTHFUL wiring: every recovery point is then stamped
-// primary_only and the durability gauges report the whole catalog as
-// not-in-two-domains. What is forbidden is a non-nil mirror that cannot actually
-// reach the second domain — that would stamp failures forever while looking wired.
-func (s *FleetVolumeSnapshotter) SetSecondDomainMirror(m SecondDomainMirror) { s.mirror = m }
+// ⚠ THERE IS DELIBERATELY NO SECOND-DOMAIN MIRROR ON THIS TYPE (D-200). It used to
+// carry one and copy each captured blob to Cloudflare R2 synchronously after the
+// thaw, which required THIS host — the tenant-adjacent one — to hold an off-chassis
+// object-store credential. D-125 leaves its identity with zero standing Vault
+// capability precisely so it cannot, and granting the read would have created a new
+// class of exposure rather than a second copy of an old one. The copy now happens on
+// the control plane (RecoveryPointMirrorWorker), which already holds the ledger and
+// the primary store. Do not reintroduce it here.
 
 // SnapshotAppVolumes snapshots every persistent volume of the app backing a
 // resource and returns the recovery points it created. It aborts on the first
@@ -384,76 +376,12 @@ func (s *FleetVolumeSnapshotter) snapshotVolume(ctx context.Context, resourceID 
 	}
 
 	// The blob now exists in ONE failure domain — the same chassis as the data it
-	// protects. Put it in a second one, and record which of those two facts is true.
-	s.mirrorToSecondDomain(ctx, &rp)
+	// protects — and the row says exactly that. Putting it in a SECOND domain is
+	// deliberately NOT done here: D-200 moved that copy to the control plane so this
+	// tenant-adjacent host holds no off-chassis object-store credential at all (see
+	// RecoveryPointMirrorWorker). The row's promotion to the two-domain class is that
+	// worker's, and only after a checksum-confirmed copy.
 	return rp, nil
-}
-
-// mirrorToSecondDomain copies the just-captured blob into a second failure domain
-// and records the OUTCOME on the recovery-point row, whichever way it went.
-//
-// ⚠ SYNCHRONOUS, on the snapshot path, and deliberately so. The mirror runs AFTER
-// the thaw, so the customer's filesystem is never frozen for the WAN leg — but it
-// runs before SnapshotAppVolumes returns, which means that in the ordinary case the
-// two-domain claim is true the moment the RPC does. The alternative (a background
-// drainer over primary_only rows) keeps snapshots fast at the cost of a window in
-// which the ledger holds copies nobody has protected yet, plus a claiming protocol
-// so two hosts do not both upload the same multi-GB blob. The decommission path
-// settles it: a resource's FINAL recovery point is its last artifact ever, and a
-// mirror merely *scheduled* at that moment has no owner left to run it.
-//
-// ⚠ IT NEVER FAILS THE SNAPSHOT, and it is never silent either. The recovery point
-// exists and is restorable; discarding it because a WAN transfer failed would be
-// strictly worse durability than before this path existed. So the failure is
-// recorded ON THE ROW (second_domain_error), logged at Error with the resource and
-// the cause, and counted by sentiae_fleet_recovery_points{locations="primary_only"}
-// plus the oldest-single-domain age gauge. What must never happen — and is the one
-// line this whole slice exists to forbid — is discarding the error and letting a
-// one-domain copy read as a two-domain one.
-//
-// ⚠ RESIDUAL GAP, stated rather than hidden: nothing RETRIES a failed mirror. A row
-// left primary_only stays that way until another snapshot of the same volume
-// succeeds. That is why the gauge is an age and not a count — a single-domain copy
-// that keeps getting older is visible as a value, not inferable from a series that
-// stopped moving.
-//
-// rp is updated in place so the value the caller receives (and the RPC surfaces)
-// says exactly what was persisted.
-func (s *FleetVolumeSnapshotter) mirrorToSecondDomain(ctx context.Context, rp *domain.FleetResourceRecoveryPoint) {
-	if s.mirror == nil {
-		// Not an error and not a warning: this host has no second domain, the row
-		// already says primary_only, and the durability gauges count it as such.
-		return
-	}
-	receipt, err := s.mirror.Mirror(ctx, rp.ObjectKey, rp.Checksum)
-	if err != nil {
-		rp.SecondDomainError = err.Error()
-		logger.FromContext(ctx).Error("fleet snapshot: the recovery point was captured but could NOT be copied to a second failure domain — it exists ONLY on this chassis, so losing this machine loses it",
-			"resource_id", rp.ResourceID, "recovery_point_id", rp.ID, "object_key", rp.ObjectKey,
-			"second_domain", s.mirror.Domain(), "err", err)
-		if rerr := s.recovery.RecordRecoveryPointMirrorFailure(ctx, rp.ID, time.Now().UTC(), err.Error()); rerr != nil {
-			logger.FromContext(ctx).Error("fleet snapshot: the second-domain failure above could not be recorded on the recovery point, so only this log line says the copy is single-domain",
-				"recovery_point_id", rp.ID, "err", rerr)
-		}
-		return
-	}
-	// Confirmed and verified — only now may the row claim two domains.
-	if rerr := s.recovery.MarkRecoveryPointInSecondDomain(ctx, rp.ID, receipt.Domain, receipt.At); rerr != nil {
-		// The copy IS in the second domain; the LEDGER does not know it. Understating
-		// durability is the safe direction of this failure, and it stays loud because
-		// it will read as an unprotected copy until the next snapshot.
-		logger.FromContext(ctx).Error("fleet snapshot: the recovery point WAS copied to the second failure domain but the ledger could not be updated — it will keep reporting as single-domain",
-			"resource_id", rp.ResourceID, "recovery_point_id", rp.ID, "second_domain", receipt.Domain, "err", rerr)
-		return
-	}
-	at := receipt.At
-	rp.Locations = domain.RecoveryPointLocationsSecondDomain
-	rp.SecondDomainStore = receipt.Domain
-	rp.SecondDomainAt = &at
-	rp.SecondDomainError = ""
-	logger.FromContext(ctx).Info("fleet snapshot: recovery point confirmed in a SECOND failure domain",
-		"resource_id", rp.ResourceID, "recovery_point_id", rp.ID, "object_key", rp.ObjectKey,
-		"second_domain", receipt.Domain, "verified_bytes", receipt.Bytes)
 }
 
 // quiesce flushes and then freezes the guest's data filesystem over the D-185a

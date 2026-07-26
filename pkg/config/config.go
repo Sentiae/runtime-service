@@ -19,6 +19,7 @@ type Config struct {
 	Kafka         KafkaConfig         `mapstructure:"kafka"`
 	Hermetic      HermeticConfig      `mapstructure:"hermetic"`
 	SnapshotStore SnapshotStoreConfig `mapstructure:"snapshot_store"`
+	SecondDomain  SecondDomainConfig  `mapstructure:"second_domain"`
 	Registry      RegistryConfig      `mapstructure:"registry"`
 	ImageBoot     ImageBootConfig     `mapstructure:"imageboot"`
 	Fleet         FleetConfig         `mapstructure:"fleet"`
@@ -199,6 +200,49 @@ type SnapshotStoreConfig struct {
 	// CacheDir is the local FilesystemStore root used as the warm cache in
 	// front of the durable bucket.
 	CacheDir string `mapstructure:"cache_dir"`
+}
+
+// SecondDomainConfig configures the SECOND FAILURE DOMAIN recovery points are
+// mirrored into by the control plane (D-200): a Cloudflare R2 bucket with a 30-day
+// object lock over all prefixes.
+//
+// ⚠ WHY THIS CREDENTIAL IS IN CONFIG AND NOT IN VAULT, stated plainly because it is
+// a static secret and that deserves to be visible rather than discovered.
+//
+// The obvious home is Vault, read by the control plane's workload identity alone.
+// That is NOT available: SPIRE issues the mesh runtime-service and the Firecracker
+// fleet host the SAME SPIFFE ID (`spiffe://sentiae.io/svc/runtime` — two
+// registration entries under different parents, one ID), and Vault's JWT role binds
+// on exactly that subject (`bound_subject`). So there is no policy that can reach
+// the control plane without ALSO reaching the fleet host — which is the precise
+// grant D-200 forbids and D-125 removed. Using Vault here would not be a stronger
+// option quietly skipped; it would silently re-create the exposure this decision
+// exists to avoid.
+//
+// What remains is the compose environment, which is consistent with how the PRIMARY
+// store's credential already reaches this same host (APP_SNAPSHOT_STORE_*), and
+// acceptable under D-200's reasoning that the control plane is already the
+// all-tenant TCB — it holds the ledger and the primary object store itself. It is
+// still a static secret in an env file, and the durable fix is a distinguishable
+// workload identity for the control plane (a new SPIFFE ID + SPIRE entry + Vault
+// role), which is an infrastructure change and not a code one.
+//
+// ⚠ THE FLEET HOST MUST NEVER BE GIVEN THESE VALUES. Nothing reads them there (the
+// worker is gated to the control plane), but an env file that carries them puts an
+// off-chassis, all-tenant credential on a tenant-adjacent machine, which is exactly
+// the state D-200 was decided to prevent.
+type SecondDomainConfig struct {
+	// Enabled turns the control-plane mirror worker on. Off ⇒ no worker is built
+	// and every recovery point stays honestly primary_only.
+	Enabled bool `mapstructure:"enabled"`
+	// Endpoint is the S3 API endpoint. A bare host (no scheme) is treated as HTTPS.
+	Endpoint string `mapstructure:"endpoint"`
+	Bucket   string `mapstructure:"bucket"`
+	// AccessKey/SecretKey are the object read+write token (D-199). The token cannot
+	// LIST and cannot DELETE, both verified live; no code path may depend on either.
+	AccessKey string `mapstructure:"access_key"`
+	SecretKey string `mapstructure:"secret_key"`
+	Region    string `mapstructure:"region"`
 }
 
 // AppConfig contains application metadata.
@@ -553,6 +597,16 @@ func Load() (*Config, error) {
 			"snapshot_store.path_style": true,
 			"snapshot_store.cache_dir":  "/var/lib/firecracker/snapshot-cache",
 
+			// Second failure domain (D-200). Off by default and CREDENTIAL-LESS by
+			// default: a bucket name with no key is inert, whereas a default key is how
+			// the primary store shipped `minioadmin` to every host.
+			"second_domain.enabled":    false,
+			"second_domain.endpoint":   "",
+			"second_domain.bucket":     "",
+			"second_domain.access_key": "",
+			"second_domain.secret_key": "",
+			"second_domain.region":     "auto",
+
 			// OCI registry (image-boot pull source, D-016).
 			"registry.host":        "10.0.10.20:8078",
 			"registry.service_key": "",
@@ -728,6 +782,16 @@ func Load() (*Config, error) {
 			{"snapshot_store.use_ssl", "APP_SNAPSHOT_STORE_USE_SSL"},
 			{"snapshot_store.path_style", "APP_SNAPSHOT_STORE_PATH_STYLE"},
 			{"snapshot_store.cache_dir", "APP_SNAPSHOT_STORE_CACHE_DIR"},
+
+			// Second failure domain — CONTROL PLANE ONLY (D-200). Never set on a
+			// Firecracker fleet host: nothing there reads it, and its presence would put
+			// an off-chassis all-tenant credential on a tenant-adjacent machine.
+			{"second_domain.enabled", "APP_SECOND_DOMAIN_ENABLED"},
+			{"second_domain.endpoint", "APP_SECOND_DOMAIN_ENDPOINT"},
+			{"second_domain.bucket", "APP_SECOND_DOMAIN_BUCKET"},
+			{"second_domain.access_key", "APP_SECOND_DOMAIN_ACCESS_KEY"},
+			{"second_domain.secret_key", "APP_SECOND_DOMAIN_SECRET_KEY"},
+			{"second_domain.region", "APP_SECOND_DOMAIN_REGION"},
 
 			// OCI registry
 			{"registry.host", "APP_REGISTRY_HOST"},

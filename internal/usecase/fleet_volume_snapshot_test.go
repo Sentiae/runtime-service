@@ -402,6 +402,47 @@ func TestSnapshot_AttachedQuiesceUploadThawOrder(t *testing.T) {
 	assertNoLocalStaging(t, dir)
 }
 
+// TestSnapshot_StampsPrimaryOnlyAndNeverClaimsTwoDomains is D-200's side of the
+// snapshot path: the fleet host writes to its LOCAL primary store only and stamps
+// the row primary_only, which is exactly what is true at that moment. It holds no
+// off-chassis object-store credential and must not attempt a second copy — the
+// promotion to the two-domain class belongs to the control-plane
+// RecoveryPointMirrorWorker, and only after a checksum-confirmed copy.
+func TestSnapshot_StampsPrimaryOnlyAndNeverClaimsTwoDomains(t *testing.T) {
+	h := newSnapshotHarness(t)
+	appID, resID, _, _, _ := h.attachedVolume(t)
+
+	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if len(points) != 1 {
+		t.Fatalf("recovery points = %d, want 1", len(points))
+	}
+	rps, err := h.recovery.ListRecoveryPoints(context.Background(), resID)
+	if err != nil {
+		t.Fatalf("list recovery points: %v", err)
+	}
+	rp := rps[0]
+	// primary_only and NOT unknown: unknown is reserved for rows that predate the
+	// column, whereas this host KNOWS the blob went to exactly one store.
+	if rp.Locations != domain.RecoveryPointLocationsPrimaryOnly {
+		t.Errorf("ledger locations = %q, want %q", rp.Locations, domain.RecoveryPointLocationsPrimaryOnly)
+	}
+	if rp.SecondDomainStore != "" || rp.SecondDomainAt != nil {
+		t.Errorf("the fleet host stamped a second-domain claim (store=%q at=%v) it cannot have established — it holds no off-chassis credential (D-200)",
+			rp.SecondDomainStore, rp.SecondDomainAt)
+	}
+	// No cause either: a failure recorded here would mean the host TRIED, and after
+	// D-200 the attempt must not exist at all rather than exist and fail.
+	if rp.SecondDomainError != "" {
+		t.Errorf("second_domain_error = %q — the fleet host attempted a second-domain copy it must never attempt", rp.SecondDomainError)
+	}
+	if points[0].Locations != rp.Locations {
+		t.Errorf("returned locations = %q but the ledger says %q", points[0].Locations, rp.Locations)
+	}
+}
+
 // With the vCPUs running, the dead-man the guest armed at Freeze keeps counting
 // and would auto-thaw mid-transfer on any volume big enough to take longer than
 // the window — and the transfer is now the UPLOAD, which is the slow part. The

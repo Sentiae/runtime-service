@@ -132,6 +132,30 @@ var (
 		Help: "Age in seconds of the OLDEST recovery point not provably in two failure domains (primary_only or unknown); -1 when every recovery point is verified in two domains, or when there are none.",
 	})
 
+	// recoveryPointMirrorAttempts counts what the control-plane mirror worker
+	// (D-200) actually did, by outcome. Write-path driven on purpose: it answers
+	// "are copies being refused", which no periodic read of the ledger can show —
+	// a row that keeps failing looks identical, pass after pass, to a row nobody
+	// has reached yet.
+	recoveryPointMirrorAttempts = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sentiae_fleet_recovery_point_mirror_attempts_total",
+		Help: "Second-failure-domain copy attempts by outcome: mirrored (copied, checksum-confirmed AND recorded), failed (the row still says primary_only, with the cause on it).",
+	}, []string{"outcome"})
+
+	// recoveryPointMirrorLastSuccess is how a STOPPED mirror becomes visible. The
+	// worker passes every minute, so a timestamp that stops advancing is the alert.
+	//
+	// Absolute unix seconds and not an age, for the same reason ledgerLastSuccess
+	// is: an age gauge that stops being written looks constant, whereas an unmoving
+	// timestamp is visibly old to whoever evaluates now() - value. It is
+	// MetricUnknown (-1) on every instance where no pass has completed — which
+	// includes every FLEET HOST, because D-200 moved the copy off them entirely and
+	// no worker is wired there.
+	recoveryPointMirrorLastSuccess = unknownUntilCollected(prometheus.GaugeOpts{
+		Name: "sentiae_fleet_recovery_point_mirror_last_success_timestamp_seconds",
+		Help: "Unix time of the last second-domain mirror pass that completed with NO failures; -1 when none has completed in this process (which is every instance that is not the control plane).",
+	})
+
 	// snapshotFailures surfaces migration 0018's consecutive_snapshot_failures.
 	// A count, not a flag: a blip and a week-long protection outage must not look
 	// alike.
@@ -244,6 +268,12 @@ const (
 	outcomeError   = "error"
 )
 
+// Second-domain mirror outcome labels.
+const (
+	mirrorOutcomeMirrored = "mirrored"
+	mirrorOutcomeFailed   = "failed"
+)
+
 // Net-lease acquire outcome labels.
 const (
 	leaseOutcomeAllocated     = "allocated"
@@ -283,6 +313,19 @@ func outcomeFor(err error) string {
 	default:
 		return outcomeError
 	}
+}
+
+// recordRecoveryPointMirror increments the second-domain copy counter.
+func recordRecoveryPointMirror(outcome string) {
+	recoveryPointMirrorAttempts.WithLabelValues(outcome).Inc()
+}
+
+// PublishRecoveryPointMirrorPass records a mirror pass that completed with no
+// failures. Only call it for such a pass: a pass that left recovery points
+// uncopied has not established that the backlog is being drained, and advancing
+// the timestamp for it would turn a stalled mirror into a healthy-looking one.
+func PublishRecoveryPointMirrorPass(at time.Time) {
+	recoveryPointMirrorLastSuccess.Set(float64(at.Unix()))
 }
 
 // recordLeaseAcquire increments the addressing-lease acquisition counter.
