@@ -162,40 +162,6 @@ echo "==> setting runtime-service.env APP_AUTH_ORG_ENFORCE=true (D-061)"
 "${SSH[@]}" "sudo sed -i '/^APP_AUTH_ORG_ENFORCE=/d' /etc/runtime-service.env \
   && echo 'APP_AUTH_ORG_ENFORCE=true' | sudo tee -a /etc/runtime-service.env >/dev/null"
 
-# --- Caddy fleet ingress (rt#8, D-079) --------------------------------------
-# The fleet owns ingress: Caddy runs co-located on this KVM host, its admin API
-# bound to loopback (127.0.0.1:2019). The reconciler pushes the live route
-# config (from fleet_routes ⋈ fleet_replicas) each tick via admin POST /load;
-# TLS uses Caddy's internal CA on the homelab (public ACME is a prod flip).
-# Idempotent: installs a pinned static binary + a systemd unit, admin off-LAN.
-CADDY_VER="${CADDY_VER:-2.8.4}"
-# sha512 of caddy_${CADDY_VER}_linux_amd64.tar.gz, from the release's own
-# caddy_${CADDY_VER}_checksums.txt. Bumping CADDY_VER without bumping this makes
-# the install REFUSE — which is the point: an unpinned curl into the host's
-# ingress binary is an unauthenticated remote artifact on the fleet boot path.
-CADDY_SHA512="${CADDY_SHA512:-b8bec15d14fb033562af9f207850027bcbaa1f891edc9efe00d38bf39e1bf9944f8b6b8eba041ddd4c171cd70c905174c704d705be2f23bc678fe1eaf37a2485}"
-echo "==> ensuring Caddy $CADDY_VER on $HOST (fleet ingress)"
-"${SSH[@]}" "set -e
-  if ! /usr/local/bin/caddy version 2>/dev/null | grep -q v${CADDY_VER}; then
-    curl -fsSL 'https://github.com/caddyserver/caddy/releases/download/v${CADDY_VER}/caddy_${CADDY_VER}_linux_amd64.tar.gz' -o /tmp/caddy.tgz
-    # Verify BEFORE unpacking: tar would already have written the binary.
-    echo '${CADDY_SHA512}  /tmp/caddy.tgz' | sha512sum -c - || {
-      rm -f /tmp/caddy.tgz
-      echo 'FATAL: Caddy ${CADDY_VER} tarball failed its sha512 pin — refusing to install.' >&2
-      exit 1
-    }
-    sudo tar -xzf /tmp/caddy.tgz -C /usr/local/bin caddy && sudo chmod 0755 /usr/local/bin/caddy && rm -f /tmp/caddy.tgz
-  fi
-  sudo install -d -m 0755 /etc/caddy /var/lib/caddy
-  # Minimal boot config: admin on loopback only; the reconciler loads the real config.
-  printf '%s' '{\"admin\":{\"listen\":\"127.0.0.1:2019\"}}' | sudo tee /etc/caddy/init.json >/dev/null
-  printf '%s\n' '[Unit]' 'Description=Caddy (Sentiae fleet ingress)' 'After=network.target' \
-    '[Service]' 'ExecStart=/usr/local/bin/caddy run --config /etc/caddy/init.json' \
-    'Restart=on-failure' 'RestartSec=2' 'LimitNOFILE=1048576' 'AmbientCapabilities=CAP_NET_BIND_SERVICE' \
-    '[Install]' 'WantedBy=multi-user.target' | sudo tee /etc/systemd/system/caddy.service >/dev/null
-  sudo systemctl daemon-reload && sudo systemctl enable --now caddy && sleep 1 && sudo systemctl is-active caddy"
-# --- end Caddy fleet ingress ------------------------------------------------
-
 if [[ "${1:-}" != "--no-restart" ]]; then
   echo "==> restarting runtime-service.service"
   "${SSH[@]}" 'sudo systemctl restart runtime-service && sleep 2 && sudo systemctl is-active runtime-service'
