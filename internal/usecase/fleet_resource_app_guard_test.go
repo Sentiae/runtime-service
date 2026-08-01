@@ -70,7 +70,7 @@ func newGuardHarness(t *testing.T) guardHarness {
 	}
 	vol := volWithBacking(appID, backing)
 	volumes := newVolRepoFake(vol)
-	h.orch.SetVolumeManager(NewFleetVolumeManager(volumes, unlinkingBackend{}, filepath.Dir(backing)))
+	h.orch.SetVolumeManager(NewFleetVolumeManager(volumes, unlinkingBackend{}, filepath.Dir(backing), nil))
 
 	return guardHarness{orch: h, appID: appID, volumes: volumes, backing: backing, volumeID: vol.ID}
 }
@@ -220,7 +220,8 @@ func TestDecommissionDedicated_LegitimatePathStillTearsDownEndToEnd(t *testing.T
 
 	snap := &fakeSnapshotter{}
 	uc := NewFleetResourceProvisioner(
-		orchProvisioner{orch: g.orch.orch}, g.orch.resources, g.orch.replicas, snap, testEngine(), testEndpointNaming(), nil, 0)
+		orchProvisioner{orch: g.orch.orch}, g.orch.resources, g.orch.replicas, snap,
+		&fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	final, err := uc.DecommissionDedicated(ctx, res.ID, true)
 	if err != nil {
@@ -267,7 +268,8 @@ func TestDecommissionDedicated_FailedTeardownLeavesTheAppGuarded(t *testing.T) {
 
 	boom := errors.New("host unreachable")
 	uc := NewFleetResourceProvisioner(
-		&fakeFleetProvisioner{decommissionErr: boom}, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+		&fakeFleetProvisioner{decommissionErr: boom}, repo, nil, &fakeSnapshotter{},
+		&fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	if _, err := uc.DecommissionDedicated(ctx, res.ID, true); !errors.Is(err, boom) {
 		t.Fatalf("DecommissionDedicated err = %v, want the teardown failure", err)

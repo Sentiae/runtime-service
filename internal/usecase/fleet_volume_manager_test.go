@@ -5,9 +5,11 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/sentiae/runtime-service/internal/domain"
+	"github.com/sentiae/runtime-service/internal/repository"
 )
 
 // volRepoFake is a minimal stateful VolumeRepository for the manager tests.
@@ -36,7 +38,7 @@ func (f *volRepoFake) ListByApp(_ context.Context, appID uuid.UUID) ([]domain.Vo
 	defer f.mu.Unlock()
 	var out []domain.Volume
 	for _, v := range f.store {
-		if v.AppID == appID {
+		if v.AppID != nil && *v.AppID == appID {
 			out = append(out, *v)
 		}
 	}
@@ -142,7 +144,7 @@ func TestEnsureAppVolumes_DeclaresIntentPerCallSite(t *testing.T) {
 				repo = newVolRepoFake(tt.seeded)
 			}
 			backend := &modeBackend{}
-			m := NewFleetVolumeManager(repo, backend, "/vol")
+			m := NewFleetVolumeManager(repo, backend, "/vol", nil)
 
 			if _, err := m.EnsureAppVolumes(context.Background(), appID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}}); err != nil {
 				t.Fatalf("EnsureAppVolumes: %v", err)
@@ -161,7 +163,7 @@ func TestEnsureAppVolumes_DeclaresIntentPerCallSite(t *testing.T) {
 func TestEnsureAppVolumes_MissingBackingFileRefusesProvision(t *testing.T) {
 	appID := uuid.New()
 	repo := newVolRepoFake(volWithBacking(appID, "/vol/x.ext4"))
-	m := NewFleetVolumeManager(repo, &modeBackend{failWith: domain.ErrVolumeBackingFileMissing}, "/vol")
+	m := NewFleetVolumeManager(repo, &modeBackend{failWith: domain.ErrVolumeBackingFileMissing}, "/vol", nil)
 
 	_, err := m.EnsureAppVolumes(context.Background(), appID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}})
 	if !errors.Is(err, domain.ErrVolumeBackingFileMissing) {
@@ -172,7 +174,7 @@ func TestEnsureAppVolumes_MissingBackingFileRefusesProvision(t *testing.T) {
 func volWithBacking(appID uuid.UUID, backing string) *domain.Volume {
 	return &domain.Volume{
 		ID:          uuid.New(),
-		AppID:       appID,
+		AppID:       &appID,
 		SizeMB:      64,
 		MountPath:   "/data",
 		BackingPath: backing,
@@ -187,7 +189,7 @@ func TestDeleteAppVolumes_DeletesBackingFilesAndRows(t *testing.T) {
 		volWithBacking(appID, "/vol/b.ext4"),
 	)
 	backend := &recordingBackend{}
-	m := NewFleetVolumeManager(repo, backend, "/vol")
+	m := NewFleetVolumeManager(repo, backend, "/vol", nil)
 
 	if err := m.DeleteAppVolumes(context.Background(), appID); err != nil {
 		t.Fatalf("DeleteAppVolumes: %v", err)
@@ -207,7 +209,7 @@ func TestDeleteAppVolumes_SkipsEmptyBackingPath(t *testing.T) {
 		volWithBacking(appID, "/vol/c.ext4"),
 	)
 	backend := &recordingBackend{}
-	m := NewFleetVolumeManager(repo, backend, "/vol")
+	m := NewFleetVolumeManager(repo, backend, "/vol", nil)
 
 	if err := m.DeleteAppVolumes(context.Background(), appID); err != nil {
 		t.Fatalf("DeleteAppVolumes: %v", err)
@@ -227,7 +229,7 @@ func TestDeleteAppVolumes_ContinuesAfterDeleteErrorAndReturnsFirst(t *testing.T)
 		volWithBacking(appID, "/vol/b.ext4"),
 	)
 	backend := &recordingBackend{failOn: "/vol/a.ext4"}
-	m := NewFleetVolumeManager(repo, backend, "/vol")
+	m := NewFleetVolumeManager(repo, backend, "/vol", nil)
 
 	err := m.DeleteAppVolumes(context.Background(), appID)
 	if err == nil {
@@ -261,7 +263,7 @@ func TestDetachFrom_PreservesTerminalAndRestoringStatuses(t *testing.T) {
 			replicaID := uuid.New()
 			vol.AttachedReplica = &replicaID
 			repo := newVolRepoFake(vol)
-			m := NewFleetVolumeManager(repo, &recordingBackend{}, "/vol")
+			m := NewFleetVolumeManager(repo, &recordingBackend{}, "/vol", nil)
 
 			if err := m.DetachFrom(context.Background(), appID); err != nil {
 				t.Fatalf("DetachFrom: %v", err)
@@ -274,5 +276,215 @@ func TestDetachFrom_PreservesTerminalAndRestoringStatuses(t *testing.T) {
 				t.Fatal("detach must always clear the attachment")
 			}
 		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// D-203 — claim ownership: the deletion guard and the write-once bind.
+// ─────────────────────────────────────────────────────────────────────
+
+// volClaimLedger answers the ONE ledger read the deletion guard makes. The
+// embedded interface is nil on purpose: any other call would be a seam the guard
+// is not supposed to use, and a panic says so louder than a zero value.
+type volClaimLedger struct {
+	repository.FleetResourceRepository
+	res *domain.FleetResource
+	err error
+}
+
+func (l volClaimLedger) GetResourceByHandle(context.Context, uuid.UUID) (*domain.FleetResource, error) {
+	if l.err != nil {
+		return nil, l.err
+	}
+	return l.res, nil
+}
+
+func ownedVolume(appID, resourceID uuid.UUID, backing string) *domain.Volume {
+	v := volWithBacking(appID, backing)
+	res := resourceID
+	v.ResourceID = &res
+	return v
+}
+
+func liveClaim(id uuid.UUID) *domain.FleetResource {
+	return &domain.FleetResource{ID: id, Class: resourceClassPostgres, Tier: resourceTierDedicated}
+}
+
+func retiredClaim(id uuid.UUID) *domain.FleetResource {
+	res := liveClaim(id)
+	at := time.Now().UTC()
+	res.DecommissionedAt = &at
+	return res
+}
+
+// The refusing direction: a volume a LIVE claim owns must survive an app-level
+// teardown, and it must survive it UNTOUCHED — the guard runs before the first
+// unlink, so neither the backing file nor the row may be gone.
+func TestDeleteAppVolumes_RefusesVolumeOwnedByLiveClaim(t *testing.T) {
+	appID, resID := uuid.New(), uuid.New()
+	repo := newVolRepoFake(ownedVolume(appID, resID, "/vol/a.ext4"))
+	backend := &recordingBackend{}
+	m := NewFleetVolumeManager(repo, backend, "/vol", volClaimLedger{res: liveClaim(resID)})
+
+	err := m.DeleteAppVolumes(context.Background(), appID)
+	if !errors.Is(err, domain.ErrVolumeOwnedByLiveResource) {
+		t.Fatalf("got %v, want ErrVolumeOwnedByLiveResource", err)
+	}
+	if len(backend.deleted) != 0 {
+		t.Fatalf("backing files touched = %v, want none", backend.deleted)
+	}
+	if repo.count() != 1 {
+		t.Fatalf("volume rows = %d, want the row untouched", repo.count())
+	}
+}
+
+// The passing direction: the resource's own snapshot-first teardown tombstones
+// the claim BEFORE it calls down, and that stamp is what lets this through.
+func TestDeleteAppVolumes_ProceedsWhenClaimTombstoned(t *testing.T) {
+	appID, resID := uuid.New(), uuid.New()
+	repo := newVolRepoFake(ownedVolume(appID, resID, "/vol/a.ext4"))
+	backend := &recordingBackend{}
+	m := NewFleetVolumeManager(repo, backend, "/vol", volClaimLedger{res: retiredClaim(resID)})
+
+	if err := m.DeleteAppVolumes(context.Background(), appID); err != nil {
+		t.Fatalf("DeleteAppVolumes: %v", err)
+	}
+	if len(backend.deleted) != 1 {
+		t.Fatalf("backing files deleted = %v, want 1", backend.deleted)
+	}
+	if repo.count() != 0 {
+		t.Fatalf("volume rows remaining = %d, want 0", repo.count())
+	}
+}
+
+func TestDeleteAppVolumes_FailsClosedWhenLedgerUnwired(t *testing.T) {
+	appID, resID := uuid.New(), uuid.New()
+	repo := newVolRepoFake(ownedVolume(appID, resID, "/vol/a.ext4"))
+	backend := &recordingBackend{}
+	m := NewFleetVolumeManager(repo, backend, "/vol", nil)
+
+	err := m.DeleteAppVolumes(context.Background(), appID)
+	if !errors.Is(err, domain.ErrVolumeOwnedByLiveResource) {
+		t.Fatalf("got %v, want ErrVolumeOwnedByLiveResource", err)
+	}
+	if len(backend.deleted) != 0 || repo.count() != 1 {
+		t.Fatalf("nothing may be reclaimed when the claim cannot be checked (deleted=%v rows=%d)", backend.deleted, repo.count())
+	}
+}
+
+func TestDeleteAppVolumes_FailsClosedWhenLedgerUnreadable(t *testing.T) {
+	appID, resID := uuid.New(), uuid.New()
+	repo := newVolRepoFake(ownedVolume(appID, resID, "/vol/a.ext4"))
+	backend := &recordingBackend{}
+	m := NewFleetVolumeManager(repo, backend, "/vol", volClaimLedger{err: errors.New("ledger down")})
+
+	if err := m.DeleteAppVolumes(context.Background(), appID); err == nil {
+		t.Fatal("want a refusal when the claim ledger cannot be read")
+	}
+	if len(backend.deleted) != 0 || repo.count() != 1 {
+		t.Fatalf("nothing may be reclaimed on an unreadable ledger (deleted=%v rows=%d)", backend.deleted, repo.count())
+	}
+}
+
+// The owner row is GONE while the volume still names it: since the 0024 FK that
+// state cannot arise except by manual surgery, so it is a corruption signal, not
+// a licence to reclaim. Refuse, and leave both the file and the row untouched.
+func TestDeleteAppVolumes_RefusesWhenOwnerRowGone(t *testing.T) {
+	appID, resID := uuid.New(), uuid.New()
+	repo := newVolRepoFake(ownedVolume(appID, resID, "/vol/a.ext4"))
+	backend := &recordingBackend{}
+	m := NewFleetVolumeManager(repo, backend, "/vol", volClaimLedger{err: domain.ErrResourceNotFound})
+
+	err := m.DeleteAppVolumes(context.Background(), appID)
+	if !errors.Is(err, domain.ErrVolumeOwnedByLiveResource) {
+		t.Fatalf("got %v, want ErrVolumeOwnedByLiveResource", err)
+	}
+	if len(backend.deleted) != 0 {
+		t.Fatalf("backing files touched = %v, want none", backend.deleted)
+	}
+	if repo.count() != 1 {
+		t.Fatalf("volume rows = %d, want the row untouched", repo.count())
+	}
+}
+
+// The plain stateful-app path must not need the ledger at all: an unowned volume
+// is deleted even with no claim repository wired.
+func TestDeleteAppVolumes_UnownedVolumeDeletes(t *testing.T) {
+	appID := uuid.New()
+	repo := newVolRepoFake(volWithBacking(appID, "/vol/a.ext4"))
+	backend := &recordingBackend{}
+	m := NewFleetVolumeManager(repo, backend, "/vol", nil)
+
+	if err := m.DeleteAppVolumes(context.Background(), appID); err != nil {
+		t.Fatalf("DeleteAppVolumes: %v", err)
+	}
+	if len(backend.deleted) != 1 || repo.count() != 0 {
+		t.Fatalf("unowned volume must be reclaimed (deleted=%v rows=%d)", backend.deleted, repo.count())
+	}
+}
+
+func TestBindToResource_StampsUnownedVolumes(t *testing.T) {
+	appID, resID := uuid.New(), uuid.New()
+	a := volWithBacking(appID, "/vol/a.ext4")
+	b := volWithBacking(appID, "/vol/b.ext4")
+	b.MountPath = "/data2"
+	repo := newVolRepoFake(a, b)
+	m := NewFleetVolumeManager(repo, &recordingBackend{}, "/vol", nil)
+
+	if err := m.BindToResource(context.Background(), appID, resID); err != nil {
+		t.Fatalf("BindToResource: %v", err)
+	}
+	for _, id := range []uuid.UUID{a.ID, b.ID} {
+		got, _ := repo.FindByID(context.Background(), id)
+		if got.ResourceID == nil || *got.ResourceID != resID {
+			t.Fatalf("volume %s resource_id = %v, want %s", id, got.ResourceID, resID)
+		}
+	}
+}
+
+func TestBindToResource_IdempotentForSameResource(t *testing.T) {
+	appID, resID := uuid.New(), uuid.New()
+	repo := newVolRepoFake(volWithBacking(appID, "/vol/a.ext4"))
+	m := NewFleetVolumeManager(repo, &recordingBackend{}, "/vol", nil)
+
+	if err := m.BindToResource(context.Background(), appID, resID); err != nil {
+		t.Fatalf("first bind: %v", err)
+	}
+	if err := m.BindToResource(context.Background(), appID, resID); err != nil {
+		t.Fatalf("second bind must be a no-op, got %v", err)
+	}
+}
+
+// Write-once: re-parenting a customer's bytes onto a different claim is refused,
+// and the recorded owner is left exactly as it was.
+func TestBindToResource_RefusesForeignOwner(t *testing.T) {
+	appID, resA, resB := uuid.New(), uuid.New(), uuid.New()
+	vol := ownedVolume(appID, resA, "/vol/a.ext4")
+	repo := newVolRepoFake(vol)
+	m := NewFleetVolumeManager(repo, &recordingBackend{}, "/vol", nil)
+
+	err := m.BindToResource(context.Background(), appID, resB)
+	if !errors.Is(err, domain.ErrVolumeClaimConflict) {
+		t.Fatalf("got %v, want ErrVolumeClaimConflict", err)
+	}
+	got, _ := repo.FindByID(context.Background(), vol.ID)
+	if got.ResourceID == nil || *got.ResourceID != resA {
+		t.Fatalf("owner = %v, want it unchanged at %s", got.ResourceID, resA)
+	}
+}
+
+// AppID is a pointer now (D-203): a created volume must still carry the app it
+// is attached to, not a nil parent the owner-present CHECK would reject.
+func TestEnsureAppVolumes_SetsAppAttachment(t *testing.T) {
+	appID := uuid.New()
+	repo := newVolRepoFake()
+	m := NewFleetVolumeManager(repo, &modeBackend{}, "/vol", nil)
+
+	vols, err := m.EnsureAppVolumes(context.Background(), appID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}})
+	if err != nil {
+		t.Fatalf("EnsureAppVolumes: %v", err)
+	}
+	if len(vols) != 1 || vols[0].AppID == nil || *vols[0].AppID != appID {
+		t.Fatalf("created volume app attachment = %v, want %s", vols, appID)
 	}
 }

@@ -41,6 +41,12 @@ type VolumeSnapshotter interface {
 	SnapshotAppVolumes(ctx context.Context, resourceID, appID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error)
 }
 
+// ResourceVolumeBinder stamps claim ownership onto a backing app's volumes
+// (D-203). *FleetVolumeManager satisfies it.
+type ResourceVolumeBinder interface {
+	BindToResource(ctx context.Context, appID, resourceID uuid.UUID) error
+}
+
 // HAPlacementHosts is the narrow slice of FleetHostRegistry the availability gate
 // needs: the live-host candidate set (active + healthy + fresh heartbeat). Same
 // shape as the scheduler's liveHostLister, deliberately — the gate must refuse on
@@ -51,8 +57,9 @@ type HAPlacementHosts interface {
 }
 
 var (
-	_ FleetProvisioner  = (*FleetProvision)(nil)
-	_ VolumeSnapshotter = (*FleetVolumeSnapshotter)(nil)
+	_ FleetProvisioner     = (*FleetProvision)(nil)
+	_ VolumeSnapshotter    = (*FleetVolumeSnapshotter)(nil)
+	_ ResourceVolumeBinder = (*FleetVolumeManager)(nil)
 )
 
 // DedicatedEngineConfig is the resolved engine-image + status config for the
@@ -82,7 +89,12 @@ type FleetResourceProvisioner struct {
 	resources   repository.FleetResourceRepository
 	replicas    repository.ReplicaRepository
 	snapshotter VolumeSnapshotter
-	engine      DedicatedEngineConfig
+	// binder stamps the claim's ownership onto the backing app's volumes the
+	// moment the claim row exists (D-203). Nil ⇒ a dedicated provision is
+	// refused: returning success over an unstamped volume would leave the DDL
+	// guard pointing at nothing.
+	binder ResourceVolumeBinder
+	engine DedicatedEngineConfig
 	// naming is the configured zone + region a resource's PERMANENT
 	// customer-facing name is minted into (D-190). Unset ⇒ every dedicated
 	// provision is refused: a resource born with no servable name, or with one
@@ -115,6 +127,7 @@ func NewFleetResourceProvisioner(
 	resources repository.FleetResourceRepository,
 	replicas repository.ReplicaRepository,
 	snapshotter VolumeSnapshotter,
+	binder ResourceVolumeBinder,
 	engine DedicatedEngineConfig,
 	naming domain.EndpointNaming,
 	hosts HAPlacementHosts,
@@ -125,6 +138,7 @@ func NewFleetResourceProvisioner(
 		resources:     resources,
 		replicas:      replicas,
 		snapshotter:   snapshotter,
+		binder:        binder,
 		engine:        engine,
 		naming:        naming,
 		hosts:         hosts,
@@ -245,6 +259,9 @@ func (uc *FleetResourceProvisioner) provisionDedicated(ctx context.Context, in P
 	}
 	if in.Tier != resourceTierDedicated {
 		return ProvisionDedicatedOutput{}, domain.ErrResourceTierUnsupported
+	}
+	if uc.binder == nil {
+		return ProvisionDedicatedOutput{}, fmt.Errorf("no volume binder wired to stamp claim ownership (D-203): refusing dedicated provision")
 	}
 	if in.OwnerOrg == "" {
 		return ProvisionDedicatedOutput{}, domain.ErrResourceOwnerOrgRequired
@@ -368,6 +385,13 @@ func (uc *FleetResourceProvisioner) provisionDedicated(ctx context.Context, in P
 
 		saveErr = uc.resources.SaveResource(ctx, res)
 		if saveErr == nil {
+			// D-203: ownership is stamped the moment the claim exists. A bind failure
+			// fails the provision — the claim row survives, and the caller's retry
+			// (same revision → recoverExisting) re-binds; returning success over an
+			// unstamped volume would leave the DDL guard pointing at nothing.
+			if berr := uc.binder.BindToResource(ctx, appHandle, res.ID); berr != nil {
+				return ProvisionDedicatedOutput{}, fmt.Errorf("bind volumes to resource claim: %w", berr)
+			}
 			return ProvisionDedicatedOutput{Handle: res.ID.String(), Phase: string(res.Phase)}, nil
 		}
 		// The unique index — never this process — decides endpoint uniqueness. A
@@ -389,6 +413,11 @@ func (uc *FleetResourceProvisioner) provisionDedicated(ctx context.Context, in P
 	// both racers converged on one app — return the winning resource row (and with
 	// it the winner's endpoint identity; this call's minted id was never stored).
 	if winner, ferr := uc.resources.FindResource(ctx, ownerUUID, in.ClaimKey, in.Env); ferr == nil {
+		if winner.AppID != nil {
+			if berr := uc.binder.BindToResource(ctx, *winner.AppID, winner.ID); berr != nil {
+				return ProvisionDedicatedOutput{}, fmt.Errorf("bind volumes to winning resource claim: %w", berr)
+			}
+		}
 		return ProvisionDedicatedOutput{Handle: winner.ID.String(), Phase: string(winner.Phase)}, nil
 	}
 	return ProvisionDedicatedOutput{}, fmt.Errorf("persist resource: %w", saveErr)
@@ -512,6 +541,17 @@ func (uc *FleetResourceProvisioner) recoverExisting(ctx context.Context, res *do
 	if _, perr := uc.provisioner.Provision(ctx, uc.dedicatedDescriptor(in)); perr != nil {
 		logger.FromContext(ctx).Error("fleet resource: recover dedicated engine failed (token re-hand / re-drive boot)",
 			"resource_id", res.ID, "app_id", res.AppID, "err", perr)
+		return
+	}
+	// D-203: re-stamp claim ownership on the way through. Best-effort, matching
+	// this method's logged-and-swallowed contract — and it also heals a pre-0024
+	// resource whose volumes the backfill could not see because the claim was
+	// created after them.
+	if uc.binder != nil {
+		if berr := uc.binder.BindToResource(ctx, *res.AppID, res.ID); berr != nil {
+			logger.FromContext(ctx).Error("fleet resource: re-bind volumes to claim failed",
+				"resource_id", res.ID, "app_id", res.AppID, "err", berr)
+		}
 	}
 }
 
@@ -845,9 +885,9 @@ func (uc *FleetResourceProvisioner) decommissionDedicated(ctx context.Context, r
 		if derr := uc.provisioner.Decommission(ctx, res.AppID.String()); derr != nil {
 			// An app row that is ALREADY GONE is not a teardown failure — there is
 			// nothing left to tear down, and the only work still owed is the tombstone.
-			// Without this the resource is stuck forever: fleet_volumes cascades on
-			// fleet_apps (migrations/0001 :89) while fleet_resources.app_id carries no
-			// FK (migrations/0012), so a teardown that deletes the app and then fails
+			// Without this the resource is stuck forever: DeleteAppVolumes reclaims the
+			// volume rows explicitly (0024 removed the cascade) while
+			// fleet_resources.app_id carries no FK (0012), so a teardown that deletes the app and then fails
 			// writing the tombstone leaves a row pointing at a vanished app that can
 			// neither boot (recoverExisting refuses it, correctly — a re-provision
 			// would mint a NEW empty volume) nor retire (this call aborted). The

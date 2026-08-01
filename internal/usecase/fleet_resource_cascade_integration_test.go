@@ -17,8 +17,9 @@ import (
 
 // cascadeVolumeBackend materializes a REAL on-disk file at the same path shape
 // the production BackingStore uses (<dir>/<volume_id>.ext4), without mkfs.ext4 —
-// that is a Linux-host tool and the fact under test here is the CASCADE and the
-// file's SURVIVAL of it, not the filesystem inside the file.
+// that is a Linux-host tool and the facts under test are the database RESTRICT
+// refusal, the seeded historical strand, and the backing file's survival, not
+// the filesystem inside the file.
 type cascadeVolumeBackend struct{ t *testing.T }
 
 func (b cascadeVolumeBackend) Ensure(_ context.Context, in VolumeEnsureInput) (VolumeEnsureOutput, error) {
@@ -43,23 +44,21 @@ func (b cascadeVolumeBackend) Delete(_ context.Context, backingPath string) erro
 }
 
 // TestFleetAppCascadeStrandsAResourceThatMustStillRetire pins, against real
-// Postgres and the real migrations, the schema fact that is the ROOT of this
-// whole failure class:
+// Postgres and the real migrations, two facts:
 //
-//   - fleet_volumes.app_id REFERENCES fleet_apps(id) ON DELETE CASCADE
-//     (migrations/0001_fleet_control_plane.up.sql :89), so deleting an app row
-//     silently deletes its volume ROWS.
-//   - the on-host <dir>/<volume_id>.ext4 backing FILE is not in the database and
-//     therefore SURVIVES that cascade.
-//   - fleet_resources.app_id carries NO foreign key at all
-//     (migrations/0012_create_fleet_resources.up.sql), so the resource row keeps
-//     pointing at an app that no longer exists.
+//   - since 0024, fleet_volumes.app_id is ON DELETE RESTRICT: a bare
+//     fleet_apps delete with volume rows attached is REFUSED by the database
+//     itself (before 0024 it silently cascaded the volume ROWS away — the
+//     root of this whole failure class).
+//   - the historical pre-0024 stranded shape (volume rows gone, app row gone,
+//     resource still pointing at it — reachable today only through the crash
+//     window where DeleteAppVolumes finished reclaiming rows and the process
+//     died before the resource tombstone was written) must still retire on an
+//     existing recovery point.
 //
-// Together those three leave a resource that can neither boot (a re-provision
-// would mint a new app with a new EMPTY volume, which recoverExisting refuses)
-// nor, before this fix, be decommissioned. The teardown is driven here through
-// the REAL *FleetProvision so the already-gone verdict is a real
-// ErrWorkloadNotFound off two real repository lookups, not a fake's answer.
+// The teardown is driven here through the REAL *FleetProvision so the
+// already-gone verdict is a real ErrWorkloadNotFound off two real repository
+// lookups, not a fake's answer.
 func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	ctx := context.Background()
 	db := testutil.NewTestDB(t, "")
@@ -100,7 +99,7 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	}
 
 	volDir := t.TempDir()
-	volMgr := NewFleetVolumeManager(volumes, cascadeVolumeBackend{t: t}, volDir)
+	volMgr := NewFleetVolumeManager(volumes, cascadeVolumeBackend{t: t}, volDir, nil)
 	vols, err := volMgr.EnsureAppVolumes(ctx, app.ID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}})
 	if err != nil {
 		t.Fatalf("ensure app volumes: %v", err)
@@ -118,21 +117,36 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	}
 
 	res := &domain.FleetResource{
-		ID:         uuid.New(),
-		OwnerOrg:   org,
-		ClaimKey:   "orders-db",
-		Env:        "prod",
-		Revision:   1,
-		Class:      resourceClassPostgres,
-		Tier:       resourceTierDedicated,
-		Phase:      domain.FleetResourcePhaseReady,
-		AppID:      &app.ID,
-		SecretRefs: []string{"secret/data/pg#password"},
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		ID:                uuid.New(),
+		OwnerOrg:          org,
+		ClaimKey:          "orders-db",
+		Env:               "prod",
+		Revision:          1,
+		Generation:        domain.FleetResourceInitialGeneration,
+		Class:             resourceClassPostgres,
+		Tier:              resourceTierDedicated,
+		AvailabilityClass: domain.AvailabilityClassSingle,
+		SyncDegradePolicy: domain.SyncDegradePolicyFailClosed,
+		Phase:             domain.FleetResourcePhaseReady,
+		AppID:             &app.ID,
+		SecretRefs:        []string{"secret/data/pg#password"},
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 	if err := resources.SaveResource(ctx, res); err != nil {
 		t.Fatalf("save resource: %v", err)
+	}
+	// Ownership is stamped the moment the claim exists, exactly as the real
+	// provision does it (D-203) — the fixture must carry the production shape.
+	if err := volMgr.BindToResource(ctx, app.ID, res.ID); err != nil {
+		t.Fatalf("bind volume to resource: %v", err)
+	}
+	bound, err := volumes.FindByID(ctx, volumeID)
+	if err != nil {
+		t.Fatalf("reload volume: %v", err)
+	}
+	if bound.ResourceID == nil || *bound.ResourceID != res.ID {
+		t.Fatalf("volume resource_id = %v, want the claim %v", bound.ResourceID, res.ID)
 	}
 	// The recovery point the teardown will legitimately rely on. It exists BEFORE
 	// the app vanishes — exactly like the real crash window, where the snapshot
@@ -150,7 +164,19 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 		t.Fatalf("save recovery point: %v", err)
 	}
 
-	// ── the cascade ───────────────────────────────────────────────────────
+	// ── the strand ────────────────────────────────────────────────────────
+	// 0024 replaced the CASCADE with RESTRICT: a bare fleet_apps delete with
+	// volume rows attached must now be REFUSED by the database itself.
+	if err := db.Exec(`DELETE FROM fleet_apps WHERE id = ?`, app.ID).Error; err == nil {
+		t.Fatal("fleet_apps delete with volume rows attached must be refused (0024 RESTRICT)")
+	}
+	// The stranded shape this test pins (volume ROWS gone, app row gone, resource
+	// still pointing at it) is reproduced the way it can still arise post-0024:
+	// the crash window where DeleteAppVolumes finished reclaiming rows and the
+	// process died before the resource tombstone was written.
+	if err := db.Exec(`DELETE FROM fleet_volumes WHERE app_id = ?`, app.ID).Error; err != nil {
+		t.Fatalf("delete fleet volumes: %v", err)
+	}
 	if err := db.Exec(`DELETE FROM fleet_apps WHERE id = ?`, app.ID).Error; err != nil {
 		t.Fatalf("delete fleet app: %v", err)
 	}
@@ -160,10 +186,10 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 		t.Fatalf("count fleet_volumes: %v", err)
 	}
 	if volRows != 0 {
-		t.Fatalf("fleet_volumes rows = %d, want 0 — the ON DELETE CASCADE this whole class rests on is gone", volRows)
+		t.Fatalf("fleet_volumes rows = %d, want 0 after the explicit strand seed", volRows)
 	}
 	if _, serr := os.Stat(backingPath); serr != nil {
-		t.Fatalf("the backing FILE must survive the row cascade (that asymmetry is the bug's root): %v", serr)
+		t.Fatalf("the backing FILE must survive the row deletion (that asymmetry is the bug's root): %v", serr)
 	}
 	// And the resource row still points at the vanished app: fleet_resources.app_id
 	// has no FK, which is what makes recovery possible at all.
@@ -186,12 +212,12 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	prov := NewFleetProvision(ctx, workloads, nil, nil, t.TempDir(), "127.0.0.1")
 	prov.SetOrchestrator(orch)
 
-	// The REAL snapshotter: with the volume rows cascaded away it walks zero
-	// volumes and returns ([], nil) — a vacuous success that creates nothing, so
-	// guest control and the artifact store are never reached.
+	// The REAL snapshotter: in the explicitly seeded historical shape it walks
+	// zero volumes and returns ([], nil) — a vacuous success that creates
+	// nothing, so guest control and the artifact store are never reached.
 	snapshotter := NewFleetVolumeSnapshotter(nil, nil, volumes, replicas, resources)
 
-	uc := NewFleetResourceProvisioner(prov, resources, replicas, snapshotter, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, resources, replicas, snapshotter, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	final, err := uc.DecommissionDedicated(ctx, res.ID, true)
 	if err != nil {

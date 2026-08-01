@@ -53,6 +53,9 @@ type LedgerVolumeReader interface {
 // repository.FleetResourceRepository satisfies it.
 type LedgerResourceReader interface {
 	FindLiveResourceByApp(ctx context.Context, appID uuid.UUID) (*domain.FleetResource, error)
+	// GetResourceByHandle resolves the claim a volume's ownership column names
+	// (D-203) — authoritative where the reverse app join is only inferential.
+	GetResourceByHandle(ctx context.Context, id uuid.UUID) (*domain.FleetResource, error)
 	ListRecoveryPoints(ctx context.Context, resourceID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error)
 }
 
@@ -335,7 +338,10 @@ func (uc *FleetLedgerReconciler) reportRecoveryPointsWithoutObject(ctx context.C
 		if ctx.Err() != nil {
 			return
 		}
-		appID := rows[i].AppID
+		if rows[i].AppID == nil {
+			continue
+		}
+		appID := *rows[i].AppID
 		if appID == uuid.Nil {
 			continue
 		}
@@ -425,16 +431,28 @@ func (uc *FleetLedgerReconciler) auditRecoveryPoint(
 // Best-effort by design — it enriches a log line, so an unresolvable field is
 // reported empty rather than suppressing the divergence itself.
 func (uc *FleetLedgerReconciler) identify(ctx context.Context, vol *domain.Volume) (resourceID string, ownerOrg string) {
-	if uc.apps != nil {
-		if app, err := uc.apps.FindByID(ctx, vol.AppID); err == nil && app != nil {
+	if uc.apps != nil && vol.AppID != nil {
+		if app, err := uc.apps.FindByID(ctx, *vol.AppID); err == nil && app != nil {
 			ownerOrg = app.OwnerOrg
 		}
 	}
 	if uc.resources != nil {
-		if res, err := uc.resources.FindLiveResourceByApp(ctx, vol.AppID); err == nil && res != nil {
-			resourceID = res.ID.String()
-			if ownerOrg == "" {
-				ownerOrg = res.OwnerOrg.String()
+		// D-203: the ownership column is authoritative when present.
+		if vol.ResourceID != nil {
+			if res, err := uc.resources.GetResourceByHandle(ctx, *vol.ResourceID); err == nil && res != nil {
+				resourceID = res.ID.String()
+				if ownerOrg == "" {
+					ownerOrg = res.OwnerOrg.String()
+				}
+				return resourceID, ownerOrg
+			}
+		}
+		if vol.AppID != nil {
+			if res, err := uc.resources.FindLiveResourceByApp(ctx, *vol.AppID); err == nil && res != nil {
+				resourceID = res.ID.String()
+				if ownerOrg == "" {
+					ownerOrg = res.OwnerOrg.String()
+				}
 			}
 		}
 	}

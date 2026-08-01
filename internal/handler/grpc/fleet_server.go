@@ -546,6 +546,13 @@ func fleetError(err error) error {
 		return status.Error(codes.FailedPrecondition, "a volume-bearing app cannot scale beyond one replica")
 	case errors.Is(err, domain.ErrVolumeBackendUnavailable):
 		return status.Error(codes.FailedPrecondition, "volumes require the firecracker host")
+	// D-203 ownership refusals. Mapped here rather than left to the default: the
+	// raw errors name the owning resource and volume ids, and the default branch
+	// echoes err.Error() straight to the tenant. Both stay server-side in the log.
+	case errors.Is(err, domain.ErrVolumeOwnedByLiveResource):
+		return status.Error(codes.FailedPrecondition, "volume is owned by a live durable resource; decommission the RESOURCE (DecommissionResource), which takes a final snapshot first")
+	case errors.Is(err, domain.ErrVolumeClaimConflict):
+		return status.Error(codes.FailedPrecondition, "this volume is already owned by a DIFFERENT durable resource claim — ownership is write-once and is never silently re-parented")
 	// A provision that had to ADOPT an existing volume and found no data on the
 	// host. Without this it reached the caller as the curated Internal, which reads
 	// as "a bug, retry" — but no retry can invent the data, and the operator needs

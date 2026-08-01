@@ -47,12 +47,29 @@ type Volume struct {
 	// picks by created_at luck, and a final snapshot can capture the empty
 	// duplicate.
 	//
-	// ⚠ The index name here MUST stay equal to the one 0017 creates, over the same
-	// columns: the fleet host runs with APP_DATABASE_AUTO_MIGRATE=true, so a name
-	// or column-set mismatch makes AutoMigrate build a second, differently-keyed
-	// index and silently reopen the race (the same trap documented on
+	// ⚠ The tags here MUST match migration 0024 exactly, and the index name MUST
+	// stay equal to the one 0017 creates over the same columns: the integration
+	// tests AutoMigrate this struct, and the tags are the model's documented
+	// contract (golang-migrate is the sole production schema authority, D-178).
+	// A name or column-set mismatch builds a second, differently-keyed index
+	// under the tests and silently reopens the race (the same trap documented on
 	// FleetApp.OwnerOrg for 0014).
-	AppID        uuid.UUID  `json:"app_id" gorm:"type:uuid;not null;index;uniqueIndex:fleet_volumes_app_mount_key"`
+	//
+	// AppID is now an ATTACHMENT, not the owner (D-203, 0024): it says which
+	// workload currently mounts the volume, and it is nullable because a volume
+	// can outlive its app once the claim owns it.
+	AppID *uuid.UUID `json:"app_id,omitempty" gorm:"type:uuid;index;uniqueIndex:fleet_volumes_app_mount_key"`
+	// ResourceID is the durable claim that OWNS this volume (D-203). Nil for a
+	// plain stateful app's volume — AppID is then the only parent. When set, the
+	// DDL (0024) RESTRICTs the resource delete and DeleteAppVolumes refuses while
+	// the claim is live: a claim-owned volume is deletable only through the
+	// resource's own snapshot-first teardown.
+	ResourceID *uuid.UUID `json:"resource_id,omitempty" gorm:"column:resource_id;type:uuid;index:fleet_volumes_resource_id_idx"`
+	// PoolGUID is the pool-GUID location primitive (D-203): the ZFS pool the
+	// bytes live on, decimal-printed uint64 (TEXT — BIGINT is signed). Nil =
+	// location not pool-attested (every ext4-file-era volume). No writer yet;
+	// the host-identity ruling supplies one.
+	PoolGUID     *string    `json:"pool_guid,omitempty" gorm:"column:pool_guid;type:text"`
 	SizeMB       int64      `json:"size_mb" gorm:"not null"`
 	HostAffinity *uuid.UUID `json:"host_affinity,omitempty" gorm:"type:uuid"`
 	SnapshotRef  string     `json:"snapshot_ref" gorm:"type:varchar(255);not null;default:''"`

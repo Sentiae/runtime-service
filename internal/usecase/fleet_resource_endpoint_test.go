@@ -31,7 +31,7 @@ func endpointOf(t *testing.T, res *domain.FleetResource) string {
 func provisionOnce(t *testing.T, repo *fakeResourceRepo, naming domain.EndpointNaming, in ProvisionDedicatedInput) (*domain.FleetResource, error) {
 	t.Helper()
 	prov := &fakeFleetProvisioner{provisionOut: FleetProvisionOutput{Handle: uuid.New().String()}}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), naming, nil, 0)
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), naming, nil, 0)
 	out, err := uc.ProvisionDedicated(context.Background(), in)
 	if err != nil {
 		return nil, err
@@ -211,7 +211,7 @@ func TestProvisionRefusesWithoutAConfiguredName(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := newFakeResourceRepo()
 			prov := &fakeFleetProvisioner{provisionOut: FleetProvisionOutput{Handle: uuid.New().String()}}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), tt.naming, nil, 0)
+			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), tt.naming, nil, 0)
 
 			_, err := uc.ProvisionDedicated(context.Background(), validDedicatedInput())
 			if !errors.Is(err, tt.wantErr) {

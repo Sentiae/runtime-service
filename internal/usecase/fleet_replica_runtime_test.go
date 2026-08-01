@@ -293,7 +293,7 @@ func TestBootReplica_RefusesWhileVolumeIsRestoring(t *testing.T) {
 			booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5"}}
 			uc := NewFleetReplicaRuntime(fakeMaterializer{rootfs: "/work/rootfs.ext4"}, booter, replicas,
 				&rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
-			uc.SetVolumeManager(NewFleetVolumeManager(newVolRepoFake(vol), &recordingBackend{}, "/vol"))
+			uc.SetVolumeManager(NewFleetVolumeManager(newVolRepoFake(vol), &recordingBackend{}, "/vol", nil))
 
 			err := uc.BootReplica(context.Background(), rep.ID)
 			if !tt.wantRefuse {

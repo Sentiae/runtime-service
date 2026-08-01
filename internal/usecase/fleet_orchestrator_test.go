@@ -485,7 +485,7 @@ func newStatefulOrchHarness(t *testing.T, backing string) (orchHarness, *domain.
 	app := testFleetApp(1)
 	h := newOrchHarness(oneLiveHost(), app)
 	vol := volWithBacking(app.ID, backing)
-	h.orch.SetVolumeManager(NewFleetVolumeManager(newVolRepoFake(vol), &recordingBackend{}, filepath.Dir(backing)))
+	h.orch.SetVolumeManager(NewFleetVolumeManager(newVolRepoFake(vol), &recordingBackend{}, filepath.Dir(backing), nil))
 	return h, app
 }
 
@@ -1127,7 +1127,7 @@ func TestProvisionApp_SameComponentEnvDifferentOrgs_GetsSeparateApps(t *testing.
 
 	h := newOrchHarness(oneLiveHost())
 	vols := newVolRepoFake()
-	h.orch.SetVolumeManager(NewFleetVolumeManager(vols, &recordingBackend{}, "/vol"))
+	h.orch.SetVolumeManager(NewFleetVolumeManager(vols, &recordingBackend{}, "/vol", nil))
 
 	provision := func(org string) uuid.UUID {
 		t.Helper()
@@ -1214,7 +1214,7 @@ func TestProvisionApp_ResourceClaim_GetsNoIngressRoute(t *testing.T) {
 	// drift from what P19 actually provisions. "postgres-main" is the plausible claim
 	// key whose derived label overflows 63 octets once the 36-char org uuid is inside
 	// the id — so the truncation path is exercised end to end too.
-	resources := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+	resources := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 	provision := func(org string) (uuid.UUID, string) {
 		t.Helper()
 		claim := validDedicatedInput()

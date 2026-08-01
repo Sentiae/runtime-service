@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -101,12 +102,17 @@ type FleetVolumeManager struct {
 	volumes repository.VolumeRepository
 	backend VolumeBackend
 	dir     string
+	// resources is the claim ledger the deletion seam consults to prove a
+	// claim-owned volume's owner is retired before any byte is reclaimed (D-203).
+	resources repository.FleetResourceRepository
 }
 
 // NewFleetVolumeManager constructs the use case. dir is the root under which
-// per-volume ext4 backing files are materialized.
-func NewFleetVolumeManager(volumes repository.VolumeRepository, backend VolumeBackend, dir string) *FleetVolumeManager {
-	return &FleetVolumeManager{volumes: volumes, backend: backend, dir: dir}
+// per-volume ext4 backing files are materialized. resources is the claim ledger
+// the deletion guard reads (D-203).
+func NewFleetVolumeManager(volumes repository.VolumeRepository, backend VolumeBackend, dir string,
+	resources repository.FleetResourceRepository) *FleetVolumeManager {
+	return &FleetVolumeManager{volumes: volumes, backend: backend, dir: dir, resources: resources}
 }
 
 // EnsureAppVolumes upserts a domain.Volume per spec (keyed by app + mount path),
@@ -164,9 +170,10 @@ func (m *FleetVolumeManager) EnsureAppVolumes(ctx context.Context, appID uuid.UU
 		if berr != nil {
 			return nil, fmt.Errorf("ensure backing file: %w", berr)
 		}
+		app := appID
 		vol := &domain.Volume{
 			ID:          id,
-			AppID:       appID,
+			AppID:       &app,
 			SizeMB:      spec.SizeMB,
 			MountPath:   mount,
 			BackingPath: out.BackingPath,
@@ -185,9 +192,9 @@ func (m *FleetVolumeManager) EnsureAppVolumes(ctx context.Context, appID uuid.UU
 }
 
 // DeleteAppVolumes reclaims an app's persistent volumes when the APP is fully
-// decommissioned: it removes each on-host ext4 backing file (nothing else frees
-// it — the fleet_apps row cascade deletes only the fleet_volumes rows), then
-// deletes the volume rows. Per-file delete errors are logged and the loop
+// decommissioned: it removes each on-host ext4 backing file, then deletes the
+// volume rows. Nothing cascades (0024): rows AND files are reclaimed here, and
+// only here. Per-file delete errors are logged and the loop
 // continues so one failure never strands the rest; the first error is returned
 // after every backing file has been attempted so the caller can surface it.
 // This must NOT run on a replica restart (that would destroy persisted data) —
@@ -196,6 +203,34 @@ func (m *FleetVolumeManager) DeleteAppVolumes(ctx context.Context, appID uuid.UU
 	vols, err := m.volumes.ListByApp(ctx, appID)
 	if err != nil {
 		return fmt.Errorf("list volumes: %w", err)
+	}
+	// D-203: a volume a LIVE claim owns is deletable only through the resource's
+	// own snapshot-first teardown (which stamps decommissioned_at BEFORE calling
+	// down — that stamp is what lets the legitimate path pass here). Fail closed
+	// on every uncertainty: an unwired ledger, an unreadable one, and an owner
+	// row that does not exist at all all refuse.
+	// The pre-pass runs before ANY file or row is touched: a guard that refuses
+	// after the first unlink is worthless.
+	for i := range vols {
+		if vols[i].ResourceID == nil {
+			continue
+		}
+		if m.resources == nil {
+			return fmt.Errorf("%w: volume %s is owned by resource %s and no claim ledger is wired to prove the claim retired",
+				domain.ErrVolumeOwnedByLiveResource, vols[i].ID, *vols[i].ResourceID)
+		}
+		res, rerr := m.resources.GetResourceByHandle(ctx, *vols[i].ResourceID)
+		if rerr != nil {
+			if errors.Is(rerr, domain.ErrResourceNotFound) {
+				return fmt.Errorf("%w: volume %s names owner resource %s but no such row exists — the 0024 FK makes this state impossible except by manual surgery; refusing to reclaim",
+					domain.ErrVolumeOwnedByLiveResource, vols[i].ID, *vols[i].ResourceID)
+			}
+			return fmt.Errorf("prove volume %s's owning claim retired: %w", vols[i].ID, rerr)
+		}
+		if res.DecommissionedAt == nil {
+			return fmt.Errorf("%w: volume %s is owned by live %s/%s resource %s — decommission the RESOURCE, which snapshots first",
+				domain.ErrVolumeOwnedByLiveResource, vols[i].ID, res.Class, res.Tier, res.ID)
+		}
 	}
 	var firstErr error
 	for i := range vols {
@@ -218,6 +253,34 @@ func (m *FleetVolumeManager) DeleteAppVolumes(ctx context.Context, appID uuid.UU
 		}
 	}
 	return firstErr
+}
+
+// BindToResource stamps claim ownership onto the app's volumes, write-once
+// (mirrors BindToHost): a volume already owned by resourceID is left alone;
+// one owned by a DIFFERENT resource refuses with ErrVolumeClaimConflict —
+// silently re-parenting a customer's bytes is never an upsert.
+func (m *FleetVolumeManager) BindToResource(ctx context.Context, appID, resourceID uuid.UUID) error {
+	vols, err := m.volumes.ListByApp(ctx, appID)
+	if err != nil {
+		return fmt.Errorf("list volumes: %w", err)
+	}
+	now := time.Now().UTC()
+	for i := range vols {
+		if vols[i].ResourceID != nil {
+			if *vols[i].ResourceID != resourceID {
+				return fmt.Errorf("volume %s: %w (owned by %s, asked %s)",
+					vols[i].ID, domain.ErrVolumeClaimConflict, *vols[i].ResourceID, resourceID)
+			}
+			continue
+		}
+		res := resourceID
+		vols[i].ResourceID = &res
+		vols[i].UpdatedAt = now
+		if err := m.volumes.Update(ctx, &vols[i]); err != nil {
+			return fmt.Errorf("bind volume to resource claim: %w", err)
+		}
+	}
+	return nil
 }
 
 // HasVolumes reports whether the app has any persistent volume.

@@ -1165,11 +1165,12 @@ func (uc *FleetOrchestrator) DecommissionApp(ctx context.Context, appID uuid.UUI
 	if err := uc.ReconcileApp(ctx, app.ID); err != nil {
 		return true, err
 	}
-	// rt#9 — reclaim the on-host ext4 backing files before the app row is deleted
-	// (the fleet_apps cascade drops only the fleet_volumes rows, never the backing
-	// files → they leak permanently otherwise). Must run while ListByApp still
-	// returns the volumes. Only the app-level decommission reclaims; a replica
-	// restart (DecommissionReplica) leaves the backing file so data survives.
+	// rt#9 — reclaim the on-host ext4 backing files AND the volume rows before
+	// the app row is deleted (nothing cascades since 0024 —
+	// fleet_volumes_app_id_fkey is RESTRICT, so the app delete below is refused
+	// while rows remain). Must run while ListByApp still returns the volumes.
+	// Only the app-level decommission reclaims; a replica restart
+	// (DecommissionReplica) leaves the backing file so data survives.
 	if uc.volumes != nil {
 		if err := uc.volumes.DeleteAppVolumes(ctx, app.ID); err != nil {
 			return true, fmt.Errorf("delete app volumes: %w", err)

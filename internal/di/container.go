@@ -503,7 +503,7 @@ func (c *Container) initFleet(cfg *config.Config) error {
 		c.VolumeBackend = usecase.FailLoudVolumeBackend{}
 		log.Println("Fleet volume backend: fail-loud (firecracker executor not selected)")
 	}
-	c.FleetVolumeManager = usecase.NewFleetVolumeManager(c.VolumeRepo, c.VolumeBackend, volumeDir)
+	c.FleetVolumeManager = usecase.NewFleetVolumeManager(c.VolumeRepo, c.VolumeBackend, volumeDir, c.FleetResourceRepo)
 
 	// Report-only ledger↔reality audit over the SAME volume root. Deliberately not
 	// gated on the executor: it reads, so there is nothing to fake, and a host that
@@ -777,6 +777,10 @@ func (c *Container) initResourceControlPlane(cfg *config.Config) {
 		c.FleetResourceRepo,
 		c.ReplicaRepo,
 		snapPort,
+		// D-203 — the claim's ownership stamp over the backing app's volumes. The
+		// manager is built earlier in initFleet, so it is non-nil here; a nil
+		// binder refuses every dedicated provision by design.
+		c.FleetVolumeManager,
 		usecase.DedicatedEngineConfig{
 			Registry:   cfg.Resource.EnginePGImageRegistry,
 			Repository: cfg.Resource.EnginePGImageRepository,

@@ -41,6 +41,20 @@ func (f *ledgerResFake) FindLiveResourceByApp(_ context.Context, appID uuid.UUID
 	return res, nil
 }
 
+// GetResourceByHandle serves the D-203 ownership column's lookup off the same
+// map, keyed by resource id.
+func (f *ledgerResFake) GetResourceByHandle(_ context.Context, id uuid.UUID) (*domain.FleetResource, error) {
+	if f.findErr != nil {
+		return nil, f.findErr
+	}
+	for _, res := range f.byApp {
+		if res.ID == id {
+			return res, nil
+		}
+	}
+	return nil, domain.ErrResourceNotFound
+}
+
 func (f *ledgerResFake) ListRecoveryPoints(_ context.Context, resourceID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
@@ -128,7 +142,7 @@ func (w *ledgerWorld) addVolume(t *testing.T, status domain.VolumeStatus, withFi
 	host := w.host
 	vol := &domain.Volume{
 		ID:           id,
-		AppID:        appID,
+		AppID:        &appID,
 		SizeMB:       20480,
 		HostAffinity: &host,
 		MountPath:    "/data",
@@ -158,15 +172,15 @@ func (w *ledgerWorld) addVolume(t *testing.T, status domain.VolumeStatus, withFi
 // store has the object.
 func (w *ledgerWorld) addRecoveryPoint(t *testing.T, vol *domain.Volume, objectKey string, present bool) {
 	t.Helper()
-	res, ok := w.resources.byApp[vol.AppID]
+	res, ok := w.resources.byApp[*vol.AppID]
 	if !ok {
 		res = &domain.FleetResource{
 			ID:       uuid.New(),
 			OwnerOrg: uuid.New(),
-			AppID:    &vol.AppID,
+			AppID:    vol.AppID,
 			Phase:    domain.FleetResourcePhaseReady,
 		}
-		w.resources.byApp[vol.AppID] = res
+		w.resources.byApp[*vol.AppID] = res
 	}
 	volID := vol.ID
 	w.resources.points[res.ID] = append(w.resources.points[res.ID], domain.FleetResourceRecoveryPoint{
@@ -466,9 +480,10 @@ func TestLedgerReconcile_NoStoreSkipsRecoveryPoints(t *testing.T) {
 func TestLedgerReconcile_ScopedToThisHost(t *testing.T) {
 	w := newLedgerWorld(t)
 	other := uuid.New()
+	foreignApp := uuid.New()
 	foreign := &domain.Volume{
 		ID:           uuid.New(),
-		AppID:        uuid.New(),
+		AppID:        &foreignApp,
 		SizeMB:       20480,
 		HostAffinity: &other,
 		BackingPath:  "/var/lib/sentiae/volumes/elsewhere.ext4",

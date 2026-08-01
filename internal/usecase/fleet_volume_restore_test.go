@@ -50,9 +50,12 @@ func (f *restoreVolumeRepo) Update(_ context.Context, v *domain.Volume) error {
 	if f.err != nil {
 		return f.err
 	}
-	for i := range f.byApp[v.AppID] {
-		if f.byApp[v.AppID][i].ID == v.ID {
-			f.byApp[v.AppID][i] = *v
+	if v.AppID == nil {
+		return nil
+	}
+	for i := range f.byApp[*v.AppID] {
+		if f.byApp[*v.AppID][i].ID == v.ID {
+			f.byApp[*v.AppID][i] = *v
 		}
 	}
 	return nil
@@ -273,7 +276,7 @@ func newRestoreHarness(t *testing.T) *restoreHarness {
 	selfHost := uuid.New()
 	vols := newRestoreVolumeRepo()
 	vols.byApp[appID] = []domain.Volume{{
-		ID: volID, AppID: appID, BackingPath: live, MountPath: "/data",
+		ID: volID, AppID: &appID, BackingPath: live, MountPath: "/data",
 		Status: domain.VolumeStatusAttached, SizeMB: 1024, HostAffinity: &selfHost,
 	}}
 	replicas := newRestoreReplicaRepo()
@@ -292,7 +295,7 @@ func newRestoreHarness(t *testing.T) *restoreHarness {
 	uc.budget = 30 * time.Second
 	// Host scope for the boot sweep, through the REAL affinity seam the reconciler
 	// uses (FleetVolumeManager over the same volume rows).
-	uc.SetHostScope(selfHost, NewFleetVolumeManager(vols, &recordingBackend{}, "/vol"))
+	uc.SetHostScope(selfHost, NewFleetVolumeManager(vols, &recordingBackend{}, "/vol", nil))
 
 	return &restoreHarness{
 		uc: uc, res: res, rp: rp, repo: repo, volumes: vols, replicas: replicas,
@@ -401,7 +404,7 @@ func TestRestore_Admission(t *testing.T) {
 			mutate: func(h *restoreHarness) {
 				appID := *h.res.AppID
 				h.volumes.byApp[appID] = append(h.volumes.byApp[appID], domain.Volume{
-					ID: uuid.New(), AppID: appID, BackingPath: filepath.Join(h.dir, "vol2.ext4"),
+					ID: uuid.New(), AppID: &appID, BackingPath: filepath.Join(h.dir, "vol2.ext4"),
 				})
 			},
 			wantErr:   domain.ErrRestoreVolumeAmbiguous,
@@ -990,7 +993,7 @@ func (h *restoreHarness) seedStuckRestore(t *testing.T, host *uuid.UUID, withApp
 		res.AppID = &appID
 		h.volumes.mu.Lock()
 		h.volumes.byApp[appID] = []domain.Volume{{
-			ID: uuid.New(), AppID: appID, BackingPath: "/vol/other.ext4",
+			ID: uuid.New(), AppID: &appID, BackingPath: "/vol/other.ext4",
 			Status: domain.VolumeStatusRestoring, HostAffinity: host,
 		}}
 		h.volumes.mu.Unlock()
@@ -1144,7 +1147,7 @@ func (h *restoreHarness) seedStagedStuckRestore(t *testing.T) (uuid.UUID, string
 	}
 	h.volumes.mu.Lock()
 	h.volumes.byApp[appID] = []domain.Volume{{
-		ID: uuid.New(), AppID: appID, BackingPath: filepath.Join(dir, "vol.ext4"),
+		ID: uuid.New(), AppID: &appID, BackingPath: filepath.Join(dir, "vol.ext4"),
 		Status: domain.VolumeStatusRestoring, HostAffinity: &h.selfHost,
 	}}
 	h.volumes.mu.Unlock()

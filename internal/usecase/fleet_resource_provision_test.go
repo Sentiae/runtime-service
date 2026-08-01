@@ -458,6 +458,26 @@ func (f *fakeFleetProvisioner) Decommission(_ context.Context, handle string) er
 	return f.decommissionErr
 }
 
+// fakeVolumeBinder records the D-203 claim-ownership stamps a provision makes
+// and can refuse them, so both directions of the bind seam are drivable.
+type fakeVolumeBinder struct {
+	calls  int
+	appID  uuid.UUID
+	resID  uuid.UUID
+	err    error
+	errsIn int // when >0, only the first errsIn calls fail
+}
+
+func (f *fakeVolumeBinder) BindToResource(_ context.Context, appID, resourceID uuid.UUID) error {
+	f.calls++
+	f.appID = appID
+	f.resID = resourceID
+	if f.err != nil && (f.errsIn == 0 || f.calls <= f.errsIn) {
+		return f.err
+	}
+	return nil
+}
+
 type fakeSnapshotter struct {
 	calls      int
 	resourceID uuid.UUID
@@ -578,7 +598,7 @@ func TestProvisionDedicated_Validation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := newFakeResourceRepo()
 			prov := &fakeFleetProvisioner{}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 			in := validDedicatedInput()
 			tt.mutate(&in)
 			_, err := uc.ProvisionDedicated(context.Background(), in)
@@ -595,7 +615,7 @@ func TestProvisionDedicated_Validation(t *testing.T) {
 func TestProvisionDedicated_EngineUnconfigured(t *testing.T) {
 	repo := newFakeResourceRepo()
 	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, DedicatedEngineConfig{ConnBudget: 100}, testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, DedicatedEngineConfig{ConnBudget: 100}, testEndpointNaming(), nil, 0)
 	_, err := uc.ProvisionDedicated(context.Background(), validDedicatedInput())
 	if !errors.Is(err, domain.ErrImageRefIncomplete) {
 		t.Fatalf("got %v, want ErrImageRefIncomplete", err)
@@ -606,7 +626,7 @@ func TestProvisionDedicated_HappyPath(t *testing.T) {
 	repo := newFakeResourceRepo()
 	appHandle := uuid.New()
 	prov := &fakeFleetProvisioner{provisionOut: FleetProvisionOutput{Handle: appHandle.String()}}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	in := validDedicatedInput()
 	out, err := uc.ProvisionDedicated(context.Background(), in)
@@ -739,7 +759,7 @@ func TestProvisionDedicated_IdempotentSameRevision(t *testing.T) {
 				healthErr:    tt.healthErr,
 				provisionOut: FleetProvisionOutput{Handle: appID.String()},
 			}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 			in := validDedicatedInput()
 			in.Revision = tt.revision
@@ -800,7 +820,7 @@ func TestProvisionDedicated_DuplicateRaceReturnsWinner(t *testing.T) {
 	repo.findNotFoundFirst = true // pre-check sees no claim
 	repo.saveDuplicate = true     // SaveResource collides with the winner
 	prov := &fakeFleetProvisioner{provisionOut: FleetProvisionOutput{Handle: uuid.New().String()}}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	in := validDedicatedInput()
 	owner := uuid.MustParse(in.OwnerOrg)
@@ -819,6 +839,44 @@ func TestProvisionDedicated_DuplicateRaceReturnsWinner(t *testing.T) {
 	}
 }
 
+// The race LOSER returns the winner's handle, so it must also leave the winner's
+// volumes stamped: both racers converged on one app, and reporting success over
+// an unstamped volume is exactly the hole the binder closes on the winning path.
+// A persistent bind failure therefore fails the loser's call rather than handing
+// back a claim whose DDL guard points at nothing (D-203).
+func TestProvisionDedicated_DuplicateRaceBindFailureRefuses(t *testing.T) {
+	repo := newFakeResourceRepo()
+	repo.findNotFoundFirst = true
+	repo.saveDuplicate = true
+	prov := &fakeFleetProvisioner{provisionOut: FleetProvisionOutput{Handle: uuid.New().String()}}
+	binder := &fakeVolumeBinder{err: errors.New("bind boom")} // persistent: errsIn == 0
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, binder, testEngine(), testEndpointNaming(), nil, 0)
+
+	in := validDedicatedInput()
+	owner := uuid.MustParse(in.OwnerOrg)
+	winnerID, winnerApp := uuid.New(), uuid.New()
+	repo.seed(&domain.FleetResource{
+		ID: winnerID, OwnerOrg: owner, ClaimKey: in.ClaimKey, Env: in.Env,
+		Revision: 1, Tier: "dedicated", Phase: domain.FleetResourcePhaseProvisioning,
+		AppID: &winnerApp,
+	})
+
+	out, err := uc.ProvisionDedicated(context.Background(), in)
+	if err == nil {
+		t.Fatalf("want the bind failure surfaced, got handle %q", out.Handle)
+	}
+	if out.Handle != "" {
+		t.Fatalf("handle = %q, want empty on a refused race loser", out.Handle)
+	}
+	if binder.calls == 0 {
+		t.Fatal("the loser must attempt to stamp the winner's volumes")
+	}
+	if binder.appID != winnerApp || binder.resID != winnerID {
+		t.Fatalf("bound (app %s, res %s), want the WINNER's (app %s, res %s)",
+			binder.appID, binder.resID, winnerApp, winnerID)
+	}
+}
+
 func TestStatusOf_HealthyBecomesReady(t *testing.T) {
 	repo := newFakeResourceRepo()
 	prov := &fakeFleetProvisioner{healthOut: FleetHealthOutput{Healthy: true}}
@@ -826,7 +884,7 @@ func TestStatusOf_HealthyBecomesReady(t *testing.T) {
 	replicas := newFakeResourceReplicaRepo()
 	guestReplica := domain.Replica{ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident, GuestIP: "10.0.0.9", Port: residentPGPort}
 	replicas.byApp[appID] = []domain.Replica{guestReplica}
-	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 	uc.pgReady = func(context.Context, string, int) error { return nil }
 
 	rid := uuid.New()
@@ -863,7 +921,7 @@ func TestStatusOf_DoesNotAdvanceWhileRestoring(t *testing.T) {
 	prov := &fakeFleetProvisioner{healthOut: FleetHealthOutput{Healthy: true}}
 	appID := uuid.New()
 	replicas := newFakeResourceReplicaRepo()
-	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 	uc.pgReady = func(context.Context, string, int) error { return nil }
 
 	rid := uuid.New()
@@ -917,7 +975,7 @@ func TestStatusOf_UnreadableHealthIsAConditionNotAnError(t *testing.T) {
 			prov := &fakeFleetProvisioner{healthErr: tt.healthErr}
 			appID := uuid.New()
 			replicas := newFakeResourceReplicaRepo()
-			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 			rid := uuid.New()
 			repo.seed(&domain.FleetResource{
@@ -1040,7 +1098,7 @@ func TestStatusOf_ReadyRequiresTheEngineToAdmitClients(t *testing.T) {
 			replicas := newFakeResourceReplicaRepo()
 			replicas.byApp[appID] = tt.replicas
 			replicas.listErr = tt.listErr
-			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 			if tt.noProbe {
 				uc.pgReady = nil
 			} else {
@@ -1083,7 +1141,7 @@ func TestDecommissionDedicated_RejectsNoFinalSnapshot(t *testing.T) {
 	repo := newFakeResourceRepo()
 	snap := &fakeSnapshotter{}
 	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	rid := uuid.New()
 	appID := uuid.New()
@@ -1102,7 +1160,7 @@ func TestDecommissionDedicated_SnapshotFirstThenTombstone(t *testing.T) {
 	repo := newFakeResourceRepo()
 	snap := &fakeSnapshotter{}
 	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	rid := uuid.New()
 	appID := uuid.New()
@@ -1136,7 +1194,7 @@ func TestDecommissionDedicated_SnapshotFailureAborts(t *testing.T) {
 	repo := newFakeResourceRepo()
 	snap := &fakeSnapshotter{err: errors.New("upload failed")}
 	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	rid := uuid.New()
 	appID := uuid.New()
@@ -1170,7 +1228,7 @@ func TestDecommissionDedicated_MissingBackingFileIsLegible(t *testing.T) {
 	rid := uuid.New()
 	h.recovery.seed(&domain.FleetResource{ID: rid, Tier: "dedicated", Phase: domain.FleetResourcePhaseReady, AppID: &appID})
 	prov := &fakeFleetProvisioner{}
-	uc := NewFleetResourceProvisioner(prov, h.recovery, h.replicas, h.s, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, h.recovery, h.replicas, h.s, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	final, err := uc.DecommissionDedicated(context.Background(), rid, true)
 	if !errors.Is(err, domain.ErrVolumeBackingFileMissing) {
@@ -1219,7 +1277,7 @@ func TestDecommissionDedicated_RefusesWhenNoRecoveryPointWasCreated(t *testing.T
 			repo := newFakeResourceRepo()
 			snap := &fakeSnapshotter{noVolumes: tt.noVolumes}
 			prov := &fakeFleetProvisioner{}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
+			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 			rid := uuid.New()
 			appID := uuid.New()
@@ -1309,7 +1367,7 @@ func TestDecommissionDedicated_MissingBackingFileFallsBackToTheCatalog(t *testin
 			repo := newFakeResourceRepo()
 			snap := &fakeSnapshotter{err: tt.snapErr}
 			prov := &fakeFleetProvisioner{}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
+			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 			rid := uuid.New()
 			appID := uuid.New()
@@ -1374,11 +1432,13 @@ func TestDecommissionDedicated_MissingBackingFileFallsBackToTheCatalog(t *testin
 }
 
 // A resource whose backing fleet_apps row has VANISHED must still be retirable.
-// fleet_volumes cascades on fleet_apps (migrations/0001 :89) while
+// Before migration 0024, fleet_volumes cascaded on fleet_apps (0001:89) while
 // fleet_resources.app_id carries no FK (migrations/0012), so a teardown that
-// deletes the app and then dies before writing the tombstone leaves a row that
+// deleted the app and then died before writing the tombstone left a row that
 // can neither boot (recoverExisting refuses it) nor retire (Decommission on an
 // unknown handle returns ErrWorkloadNotFound and used to abort the whole call).
+// 0024 replaced that cascade with RESTRICT; a historical or manually repaired
+// database can still contain the stranded shape, which must remain retirable.
 //
 // The tolerance is NARROW by design, and the table proves both halves of that:
 // only already-gone is forgiven, and the snapshot-first precondition still
@@ -1388,7 +1448,7 @@ func TestDecommissionDedicated_VanishedBackingAppStillRetires(t *testing.T) {
 
 	tests := []struct {
 		name string
-		// noVolumes reproduces the post-cascade shape: the final snapshot walks zero
+		// noVolumes reproduces the historical stranded shape: the final snapshot walks zero
 		// volumes and succeeds having captured NOTHING.
 		noVolumes       bool
 		priorPoints     bool
@@ -1442,7 +1502,7 @@ func TestDecommissionDedicated_VanishedBackingAppStillRetires(t *testing.T) {
 			repo := newFakeResourceRepo()
 			snap := &fakeSnapshotter{noVolumes: tt.noVolumes}
 			prov := &fakeFleetProvisioner{decommissionErr: tt.decommissionErr}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
+			uc := NewFleetResourceProvisioner(prov, repo, nil, snap, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 			rid := uuid.New()
 			appID := uuid.New()
@@ -1513,7 +1573,7 @@ func TestDecommissionDedicated_VanishedBackingAppIsIdempotent(t *testing.T) {
 	repo := newFakeResourceRepo()
 	snap := &fakeSnapshotter{noVolumes: true}
 	prov := &fakeFleetProvisioner{decommissionErr: domain.ErrWorkloadNotFound}
-	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, repo, nil, snap, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	rid := uuid.New()
 	appID := uuid.New()
@@ -1633,7 +1693,7 @@ func newResourceRecoveryHarness(t *testing.T) resourceRecoveryHarness {
 		orch:     h,
 		store:    store,
 		repo:     repo,
-		resource: NewFleetResourceProvisioner(orchProvisioner{h.orch}, repo, h.replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0),
+		resource: NewFleetResourceProvisioner(orchProvisioner{h.orch}, repo, h.replicas, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0),
 	}
 }
 
@@ -1815,7 +1875,7 @@ func TestProvisionDedicated_HealthyReProvisionDoesNotChurn(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────
 
 func TestDedicatedDescriptor_ComponentIDIsOrgNamespaced(t *testing.T) {
-	uc := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(&fakeFleetProvisioner{}, newFakeResourceRepo(), nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	in := validDedicatedInput()
 	got := uc.dedicatedDescriptor(in).ComponentID
@@ -1836,5 +1896,95 @@ func TestDedicatedDescriptor_ComponentIDIsOrgNamespaced(t *testing.T) {
 	idB := uc.dedicatedDescriptor(b).ComponentID
 	if idA == idB {
 		t.Fatalf("both orgs derive component_id %q — the cross-tenant defect", idA)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// D-203 — the claim stamps ownership on its volumes at birth.
+// ─────────────────────────────────────────────────────────────────────
+
+func TestProvisionDedicated_BindsVolumesToClaim(t *testing.T) {
+	repo := newFakeResourceRepo()
+	appHandle := uuid.New()
+	prov := &fakeFleetProvisioner{provisionOut: FleetProvisionOutput{Handle: appHandle.String()}}
+	binder := &fakeVolumeBinder{}
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, binder, testEngine(), testEndpointNaming(), nil, 0)
+
+	out, err := uc.ProvisionDedicated(context.Background(), validDedicatedInput())
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	if binder.calls != 1 {
+		t.Fatalf("bind calls = %d, want exactly 1", binder.calls)
+	}
+	if binder.appID != appHandle || binder.resID.String() != out.Handle {
+		t.Fatalf("bound (%s, %s), want (%s, %s)", binder.appID, binder.resID, appHandle, out.Handle)
+	}
+}
+
+// The refusing direction plus its recovery: a bind failure fails the provision
+// (no success over an unstamped volume), and the caller's identical retry runs
+// through recoverExisting, which re-binds.
+func TestProvisionDedicated_BindFailureFailsProvision(t *testing.T) {
+	repo := newFakeResourceRepo()
+	appHandle := uuid.New()
+	prov := &fakeFleetProvisioner{provisionOut: FleetProvisionOutput{Handle: appHandle.String()}}
+	binder := &fakeVolumeBinder{err: errors.New("bind boom"), errsIn: 1}
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, binder, testEngine(), testEndpointNaming(), nil, 0)
+
+	in := validDedicatedInput()
+	if _, err := uc.ProvisionDedicated(context.Background(), in); err == nil {
+		t.Fatal("want the provision to fail when ownership cannot be stamped")
+	}
+	if _, err := uc.ProvisionDedicated(context.Background(), in); err != nil {
+		t.Fatalf("the retry must converge on the existing claim: %v", err)
+	}
+	if binder.calls != 2 {
+		t.Fatalf("bind calls = %d, want 2 (the failed stamp and the recovery re-bind)", binder.calls)
+	}
+}
+
+func TestProvisionDedicated_NilBinderRefuses(t *testing.T) {
+	repo := newFakeResourceRepo()
+	prov := &fakeFleetProvisioner{provisionOut: FleetProvisionOutput{Handle: uuid.New().String()}}
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, nil, testEngine(), testEndpointNaming(), nil, 0)
+
+	in := validDedicatedInput()
+	if _, err := uc.ProvisionDedicated(context.Background(), in); err == nil {
+		t.Fatal("want a refusal: an unstamped volume must never be reported as a provisioned resource")
+	}
+	// The retry direction: the refusal is a precondition, so the SECOND call must
+	// refuse identically rather than find a half-built claim from the first and
+	// converge onto it.
+	if _, err := uc.ProvisionDedicated(context.Background(), in); err == nil {
+		t.Fatal("want the same refusal on retry: a nil binder is a precondition, not a transient")
+	}
+	if len(repo.byID) != 0 || len(repo.byClaim) != 0 {
+		t.Fatalf("resources persisted = %d (by claim %d), want none — a refused provision may not leave a claim row",
+			len(repo.byID), len(repo.byClaim))
+	}
+}
+
+// The re-bind inside recovery is best-effort, exactly like the re-provision it
+// follows: a bind failure must not turn a converging re-provision into an error.
+func TestRecoverExisting_RebindIsBestEffort(t *testing.T) {
+	repo := newFakeResourceRepo()
+	appHandle := uuid.New()
+	prov := &fakeFleetProvisioner{provisionOut: FleetProvisionOutput{Handle: appHandle.String()}}
+	binder := &fakeVolumeBinder{}
+	uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, binder, testEngine(), testEndpointNaming(), nil, 0)
+
+	in := validDedicatedInput()
+	first, err := uc.ProvisionDedicated(context.Background(), in)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	binder.err = errors.New("bind boom")
+	again, err := uc.ProvisionDedicated(context.Background(), in)
+	if err != nil {
+		t.Fatalf("recovery must still return the existing handle: %v", err)
+	}
+	if again.Handle != first.Handle {
+		t.Fatalf("handle = %s, want the existing %s", again.Handle, first.Handle)
 	}
 }

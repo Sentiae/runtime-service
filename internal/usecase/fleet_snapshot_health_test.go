@@ -356,7 +356,7 @@ func TestStatusOf_SnapshotFailingCondition(t *testing.T) {
 				ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident,
 				GuestIP: "10.0.0.9", Port: residentPGPort,
 			}}
-			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 			uc.pgReady = func(context.Context, string, int) error { return nil }
 
 			rid := uuid.New()
@@ -394,7 +394,7 @@ func TestStatusOf_SnapshotFailingDoesNotBlockReady(t *testing.T) {
 		ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident,
 		GuestIP: "10.0.0.9", Port: residentPGPort,
 	}}
-	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), nil, 0)
+	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 	uc.pgReady = func(context.Context, string, int) error { return nil }
 
 	rid := uuid.New()

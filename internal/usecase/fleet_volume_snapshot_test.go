@@ -297,7 +297,7 @@ func (h *snapHarness) attachedVolume(t *testing.T) (appID, resID, volID, replica
 	}
 	appID, resID, volID, replicaID = uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	h.replicas.byID[replicaID] = &domain.Replica{ID: replicaID, SocketPath: "/tmp/x.sock"}
-	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: appID, BackingPath: h.backing, AttachedReplica: &replicaID}}
+	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing, AttachedReplica: &replicaID}}
 	return appID, resID, volID, replicaID, dir
 }
 
@@ -767,7 +767,7 @@ func TestSnapshot_MissingBackingFileIsLegible(t *testing.T) {
 			h := newSnapshotHarness(t)
 			appID, resID, volID, replicaID, _ := h.attachedVolume(t)
 			if !tt.attached {
-				h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: appID, BackingPath: h.backing}}
+				h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing}}
 				_ = replicaID
 			}
 			if err := os.Remove(h.backing); err != nil {
@@ -819,7 +819,7 @@ func TestSnapshot_NoRowOnUploadFailure(t *testing.T) {
 func TestSnapshot_VolumeRowWithNoBackingPathIsItsOwnRefusal(t *testing.T) {
 	h := newSnapshotHarness(t)
 	appID := uuid.New()
-	h.vols.byApp[appID] = []domain.Volume{{ID: uuid.New(), AppID: appID, BackingPath: ""}}
+	h.vols.byApp[appID] = []domain.Volume{{ID: uuid.New(), AppID: &appID, BackingPath: ""}}
 
 	_, err := h.s.SnapshotAppVolumes(context.Background(), uuid.New(), appID)
 	if !errors.Is(err, domain.ErrVolumeBackingPathUnset) {
@@ -844,7 +844,7 @@ func TestSnapshot_UnattachedVolumeNoQuiesce(t *testing.T) {
 	appID := uuid.New()
 	resID := uuid.New()
 	volID := uuid.New()
-	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: appID, BackingPath: h.backing}} // AttachedReplica nil
+	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing}} // AttachedReplica nil
 
 	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
 	if err != nil {
@@ -1182,7 +1182,7 @@ func TestSnapshot_DetachedCaptureStampsDetachedUnclean(t *testing.T) {
 	h.backing = filepath.Join(dir, "vol.ext4")
 	h.writeBacking(t, []byte(volumeBytes))
 	appID, resID, volID := uuid.New(), uuid.New(), uuid.New()
-	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: appID, BackingPath: h.backing}} // AttachedReplica nil
+	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing}} // AttachedReplica nil
 
 	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
 	if err != nil {

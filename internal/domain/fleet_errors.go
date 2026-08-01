@@ -136,6 +136,12 @@ var (
 	// ErrVolumesNotSupported is returned when a workload class that has no volume
 	// path (the test class) is provisioned with volumes.
 	ErrVolumesNotSupported = errors.New("volumes are only supported for resident workloads")
+	// ErrVolumeOwnedByLiveResource — deletion of a claim-owned volume attempted
+	// outside the resource's own snapshot-first teardown (D-203).
+	ErrVolumeOwnedByLiveResource = errors.New("volume is owned by a live durable resource")
+	// ErrVolumeClaimConflict — write-once ownership: a volume already owned by a
+	// different resource claim (D-203).
+	ErrVolumeClaimConflict = errors.New("volume is owned by a different resource claim")
 	// ErrStatefulHostUnavailable is a non-fatal signal that a stateful app's
 	// affinity host is dead/stale: the app is degraded rather than moved off its
 	// data (no cross-host restore this cycle).

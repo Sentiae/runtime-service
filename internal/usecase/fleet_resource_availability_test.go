@@ -168,7 +168,7 @@ func TestProvisionDedicated_AvailabilityGate(t *testing.T) {
 			if !tt.noLister {
 				hosts = fake
 			}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, testEngine(), testEndpointNaming(), hosts, 90*time.Second)
+			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), hosts, 90*time.Second)
 
 			in := validDedicatedInput()
 			in.AvailabilityClass = tt.availability
