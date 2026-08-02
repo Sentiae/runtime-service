@@ -18,6 +18,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
 )
@@ -38,8 +39,8 @@ func main() {
 		target   = flag.String("target", "127.0.0.1:50061", "fleet gRPC target")
 		sock     = flag.String("sock", "unix:///run/spire/agent-sockets/api.sock", "SPIFFE workload API socket")
 		apiKey   = flag.String("apikey", "", "shared service api key (authz metadata)")
-		op       = flag.String("op", "provision", "provision|health|decommission|scale")
-		handle   = flag.String("handle", "", "app handle (health/decommission/scale)")
+		op       = flag.String("op", "provision", "provision|health|status|decommission|scale")
+		handle   = flag.String("handle", "", "app handle (health/decommission/scale); resource handle (status)")
 		replicas = flag.Int("replicas", 1, "scale replicas")
 		// provision descriptor fields
 		component = flag.String("component", "volprobe", "component_id")
@@ -115,6 +116,22 @@ func main() {
 			"state": resp.GetState(), "healthy": resp.GetHealthy(),
 			"message": resp.GetMessage(), "url": resp.GetUrl(),
 		})
+	case "status":
+		// ResourceProvisioning is registered on the SAME gRPC server as
+		// FleetOrchestration, so it reuses this conn, target and SVID.
+		resp, err := runtimev1.NewResourceProvisioningClient(conn).GetResourceStatus(ctx,
+			&runtimev1.GetResourceStatusRequest{Handle: *handle})
+		if err != nil {
+			die("GetResourceStatus: %v", err)
+		}
+		// protojson over the whole message, not a hand-picked map: the verifier
+		// reads the conditions list verbatim, and EmitUnpopulated keeps an EMPTY
+		// conditions list visible as [] instead of vanishing from the output.
+		b, merr := protojson.MarshalOptions{EmitUnpopulated: true}.Marshal(resp)
+		if merr != nil {
+			die("marshal status: %v", merr)
+		}
+		fmt.Println(string(b))
 	case "decommission":
 		_, err := cli.Decommission(ctx, &runtimev1.FleetDecommissionRequest{Handle: *handle})
 		if err != nil {
