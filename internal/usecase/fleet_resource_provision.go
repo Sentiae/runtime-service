@@ -42,9 +42,14 @@ type VolumeSnapshotter interface {
 }
 
 // ResourceVolumeBinder stamps claim ownership onto a backing app's volumes
-// (D-203). *FleetVolumeManager satisfies it.
+// (D-203) and reports whether that stamp actually holds. *FleetVolumeManager
+// satisfies it.
 type ResourceVolumeBinder interface {
 	BindToResource(ctx context.Context, appID, resourceID uuid.UUID) error
+	// HasUnstampedVolumes answers the ownership question StatusOf must not guess
+	// at: a volume with no claim owner is bytes the DDL guard does not protect,
+	// so the error is propagated rather than folded into "stamped".
+	HasUnstampedVolumes(ctx context.Context, appID uuid.UUID) (bool, error)
 }
 
 // HAPlacementHosts is the narrow slice of FleetHostRegistry the availability gate
@@ -228,6 +233,13 @@ const (
 	// cause live on the row (fleet_resources.consecutive_snapshot_failures /
 	// last_snapshot_error) — this token only says that the condition holds.
 	conditionSnapshotFailing = "snapshot-failing"
+	// conditionVolumeOwnershipUnstamped — the resource's backing app still holds a
+	// volume with no claim owner (D-203). The engine may serve perfectly, but the
+	// DDL guard that makes a delete of those bytes RESTRICT points at nothing, so
+	// the resource is not the protected thing its `ready` phase claims. Set on the
+	// unknown too (a failed check): unprovable ownership is reported as absent
+	// ownership, never as present.
+	conditionVolumeOwnershipUnstamped = "volume-ownership-unstamped"
 )
 
 // healthCondition classifies a failed health probe into a condition token. The
@@ -548,7 +560,12 @@ func (uc *FleetResourceProvisioner) recoverExisting(ctx context.Context, res *do
 	// resource whose volumes the backfill could not see because the claim was
 	// created after them.
 	if uc.binder != nil {
-		if berr := uc.binder.BindToResource(ctx, *res.AppID, res.ID); berr != nil {
+		berr := uc.binder.BindToResource(ctx, *res.AppID, res.ID)
+		// The failure is swallowed by contract, so the counter is the only place it
+		// is countable: without it a permanently failing re-bind is invisible
+		// outside a log line nobody alerts on.
+		recordExecution("recover_resource_volume_rebind", outcomeFor(berr))
+		if berr != nil {
 			logger.FromContext(ctx).Error("fleet resource: re-bind volumes to claim failed",
 				"resource_id", res.ID, "app_id", res.AppID, "err", berr)
 		}
@@ -578,6 +595,17 @@ func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uui
 
 	if res.Tier == resourceTierDedicated && res.AppID != nil &&
 		res.Phase != domain.FleetResourcePhaseDecommissioned {
+		// D-203 ownership honesty. A claim whose volumes are not stamped is not
+		// the durable thing a `ready` phase promises: nothing in the database
+		// refuses a delete of those bytes. The persisted phase is deliberately
+		// left alone (same reasoning as the engine-not-admitting branch below —
+		// this call reports an observation, it does not rewrite the row), but the
+		// reported phase is degraded and the ready transition never runs.
+		unstamped := uc.volumeOwnershipUnstamped(ctx, res)
+		if unstamped {
+			status.Conditions = append(status.Conditions, conditionVolumeOwnershipUnstamped)
+			status.Phase = string(domain.FleetResourcePhaseDegraded)
+		}
 		h, herr := uc.provisioner.Health(ctx, res.AppID.String())
 		if herr != nil {
 			// A resource whose health cannot be read is a STATE, not an API error.
@@ -601,7 +629,7 @@ func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uui
 		// here would race the restore's own verification window: the OLD engine can
 		// still be healthy the instant before the restore drains it, and the
 		// restored one is not proven until the restore says so.
-		if herr == nil && h.Healthy && res.Phase != domain.FleetResourcePhaseRestoring {
+		if !unstamped && herr == nil && h.Healthy && res.Phase != domain.FleetResourcePhaseRestoring {
 			// Probed only here, never above: admission is a live network round trip,
 			// and its verdict is unused unless the app is already healthy and not
 			// mid-restore. Reading it eagerly would put a dial on the path of every
@@ -660,6 +688,28 @@ func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uui
 		}
 	}
 	return status, nil
+}
+
+// volumeOwnershipUnstamped reports whether the resource's backing app still holds
+// a volume with no claim owner (D-203).
+//
+// Fail-closed: a check that errors — or that is not wired at all — answers TRUE,
+// because an ownership stamp nobody could confirm is exactly as protective as one
+// that is absent. The status RPC itself never fails on this: like every other
+// probe here, the unknown becomes a condition, not a broken endpoint.
+func (uc *FleetResourceProvisioner) volumeOwnershipUnstamped(ctx context.Context, res *domain.FleetResource) bool {
+	if uc.binder == nil {
+		logger.FromContext(ctx).Error("fleet resource: no volume-ownership checker wired — reporting claim ownership as unstamped",
+			"resource_id", res.ID, "app_id", res.AppID)
+		return true
+	}
+	unstamped, err := uc.binder.HasUnstampedVolumes(ctx, *res.AppID)
+	if err != nil {
+		logger.FromContext(ctx).Error("fleet resource: claim-ownership check failed — reporting it as unstamped",
+			"resource_id", res.ID, "app_id", res.AppID, "err", err)
+		return true
+	}
+	return unstamped
 }
 
 // engineAdmits checks that every resident replica of the app lets a client

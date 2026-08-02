@@ -260,27 +260,26 @@ func (m *FleetVolumeManager) DeleteAppVolumes(ctx context.Context, appID uuid.UU
 // one owned by a DIFFERENT resource refuses with ErrVolumeClaimConflict —
 // silently re-parenting a customer's bytes is never an upsert.
 func (m *FleetVolumeManager) BindToResource(ctx context.Context, appID, resourceID uuid.UUID) error {
-	vols, err := m.volumes.ListByApp(ctx, appID)
+	res, err := m.volumes.BindVolumesToResource(ctx, appID, resourceID)
 	if err != nil {
-		return fmt.Errorf("list volumes: %w", err)
+		return fmt.Errorf("bind volume to resource claim: %w", err)
 	}
-	now := time.Now().UTC()
-	for i := range vols {
-		if vols[i].ResourceID != nil {
-			if *vols[i].ResourceID != resourceID {
-				return fmt.Errorf("volume %s: %w (owned by %s, asked %s)",
-					vols[i].ID, domain.ErrVolumeClaimConflict, *vols[i].ResourceID, resourceID)
-			}
-			continue
-		}
-		res := resourceID
-		vols[i].ResourceID = &res
-		vols[i].UpdatedAt = now
-		if err := m.volumes.Update(ctx, &vols[i]); err != nil {
-			return fmt.Errorf("bind volume to resource claim: %w", err)
-		}
+	if res.Outcome == repository.VolumeBindConflict {
+		return fmt.Errorf("volume %s: %w (owned by %s, asked %s)",
+			res.ConflictVolumeID, domain.ErrVolumeClaimConflict, res.ConflictOwner, resourceID)
 	}
 	return nil
+}
+
+// HasUnstampedVolumes reports whether the app still holds a volume that carries
+// no claim owner. The repository error is propagated, never folded into false: a
+// failed query must never be read as "stamped".
+func (m *FleetVolumeManager) HasUnstampedVolumes(ctx context.Context, appID uuid.UUID) (bool, error) {
+	unstamped, err := m.volumes.HasUnstampedVolumes(ctx, appID)
+	if err != nil {
+		return false, fmt.Errorf("check unstamped volumes: %w", err)
+	}
+	return unstamped, nil
 }
 
 // HasVolumes reports whether the app has any persistent volume.

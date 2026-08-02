@@ -64,12 +64,7 @@ type Volume struct {
 	// DDL (0024) RESTRICTs the resource delete and DeleteAppVolumes refuses while
 	// the claim is live: a claim-owned volume is deletable only through the
 	// resource's own snapshot-first teardown.
-	ResourceID *uuid.UUID `json:"resource_id,omitempty" gorm:"column:resource_id;type:uuid;index:fleet_volumes_resource_id_idx"`
-	// PoolGUID is the pool-GUID location primitive (D-203): the ZFS pool the
-	// bytes live on, decimal-printed uint64 (TEXT — BIGINT is signed). Nil =
-	// location not pool-attested (every ext4-file-era volume). No writer yet;
-	// the host-identity ruling supplies one.
-	PoolGUID     *string    `json:"pool_guid,omitempty" gorm:"column:pool_guid;type:text"`
+	ResourceID   *uuid.UUID `json:"resource_id,omitempty" gorm:"column:resource_id;type:uuid;index:fleet_volumes_resource_id_idx"`
 	SizeMB       int64      `json:"size_mb" gorm:"not null"`
 	HostAffinity *uuid.UUID `json:"host_affinity,omitempty" gorm:"type:uuid"`
 	SnapshotRef  string     `json:"snapshot_ref" gorm:"type:varchar(255);not null;default:''"`

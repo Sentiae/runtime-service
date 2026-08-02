@@ -16,17 +16,8 @@
 --   * host_affinity SET NULL -> RESTRICT: silently erasing where the bytes
 --                    ARE is the worst available failure mode for a locality
 --                    fact. Deleting a host row with pinned volumes is refused.
---   * pool_guid    — the pool-GUID location primitive's column shape, decided
---                    NOW so this table is never migrated twice (D-203). A ZFS
---                    pool GUID is an unsigned 64-bit integer printed decimal;
---                    TEXT + a digits CHECK holds the full range (BIGINT is
---                    signed and would reinterpret the upper half). The CHECK
---                    also bounds the value at 2^64-1: digits alone admit
---                    20-digit values past the uint64 range. NULL means
---                    "location not pool-attested" — true of every ext4-file-era
---                    volume. No writer yet; the writer arrives with the
---                    host-identity ruling, and a future fleet_storage_pools FK
---                    is additive over this same column.
+--
+-- pool location primitive: deliberately ABSENT — D-210 moved it to the DB2/host-identity ruling.
 --
 -- Deletion of volume rows is now possible ONLY through explicit verbs
 -- (FleetVolumeManager.DeleteAppVolumes, itself claim-guarded in Go).
@@ -48,7 +39,6 @@ SET lock_timeout = '5s';
 BEGIN;
 
 ALTER TABLE fleet_volumes ADD COLUMN IF NOT EXISTS resource_id UUID;
-ALTER TABLE fleet_volumes ADD COLUMN IF NOT EXISTS pool_guid TEXT;
 -- squawk-ignore ban-drop-not-null
 ALTER TABLE fleet_volumes ALTER COLUMN app_id DROP NOT NULL;
 
@@ -85,9 +75,6 @@ ALTER TABLE fleet_volumes ADD CONSTRAINT fleet_volumes_resource_id_fkey FOREIGN 
 
 -- squawk-ignore constraint-missing-not-valid
 ALTER TABLE fleet_volumes ADD CONSTRAINT fleet_volumes_owner_present_ck CHECK (resource_id IS NOT NULL OR app_id IS NOT NULL);
-
--- squawk-ignore constraint-missing-not-valid
-ALTER TABLE fleet_volumes ADD CONSTRAINT fleet_volumes_pool_guid_ck CHECK (pool_guid IS NULL OR (pool_guid ~ '^[0-9]{1,20}$' AND pool_guid::numeric <= 18446744073709551615::numeric));
 
 -- Plain CREATE INDEX inside the transaction, not CONCURRENTLY: §24 requires
 -- CONCURRENTLY only on tables >100k rows; here it would force a separate

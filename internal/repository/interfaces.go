@@ -446,6 +446,35 @@ type FleetResourceRepository interface {
 	MarkRecoveryPointRestoredInPlace(ctx context.Context, id uuid.UUID) error
 }
 
+// VolumeBindOutcome is the typed result of a claim-ownership bind. The bind is
+// a datastore-atomic command, so the caller never re-derives what happened from
+// row state it read separately.
+type VolumeBindOutcome string
+
+const (
+	// VolumeBindNoVolumes — the app holds no volume rows. Not an error: a
+	// stateless app has nothing to stamp.
+	VolumeBindNoVolumes VolumeBindOutcome = "no_volumes"
+	// VolumeBindBound — at least one unowned volume was stamped with the claim.
+	VolumeBindBound VolumeBindOutcome = "bound"
+	// VolumeBindAlreadyBound — every volume already carried THIS claim; nothing
+	// was written (the idempotent re-bind).
+	VolumeBindAlreadyBound VolumeBindOutcome = "already_bound"
+	// VolumeBindConflict — a volume is owned by a DIFFERENT claim. Nothing is
+	// written: re-parenting a customer's bytes is never an upsert.
+	VolumeBindConflict VolumeBindOutcome = "conflict"
+)
+
+// VolumeBindResult carries the bind outcome plus, on conflict, the identity of
+// the offending row so the caller can name it without a second read.
+type VolumeBindResult struct {
+	Outcome VolumeBindOutcome
+	// ConflictVolumeID / ConflictOwner are meaningful only when Outcome is
+	// VolumeBindConflict.
+	ConflictVolumeID uuid.UUID
+	ConflictOwner    uuid.UUID
+}
+
 // VolumeRepository persists volumes for fleet apps.
 type VolumeRepository interface {
 	Create(ctx context.Context, volume *domain.Volume) error
@@ -454,4 +483,14 @@ type VolumeRepository interface {
 	Update(ctx context.Context, volume *domain.Volume) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	ListByHost(ctx context.Context, hostID uuid.UUID) ([]domain.Volume, error)
+	// BindVolumesToResource stamps claim ownership onto every unowned volume of
+	// an app in ONE transaction (row locks held across the check and the write),
+	// all-or-nothing: a read-then-Save loop let two concurrent provisions each
+	// observe resource_id NULL and stamp a different claim over the same bytes.
+	// updated_at is database-authored (now()).
+	BindVolumesToResource(ctx context.Context, appID, resourceID uuid.UUID) (VolumeBindResult, error)
+	// HasUnstampedVolumes reports whether the app holds any volume with no claim
+	// owner. The error is propagated, never folded into false: a failed query
+	// must never be read as "stamped".
+	HasUnstampedVolumes(ctx context.Context, appID uuid.UUID) (bool, error)
 }

@@ -466,6 +466,16 @@ type fakeVolumeBinder struct {
 	resID  uuid.UUID
 	err    error
 	errsIn int // when >0, only the first errsIn calls fail
+	// unstamped / unstampedErr drive the D-203 ownership check StatusOf runs.
+	unstamped    bool
+	unstampedErr error
+}
+
+func (f *fakeVolumeBinder) HasUnstampedVolumes(context.Context, uuid.UUID) (bool, error) {
+	if f.unstampedErr != nil {
+		return false, f.unstampedErr
+	}
+	return f.unstamped, nil
 }
 
 func (f *fakeVolumeBinder) BindToResource(_ context.Context, appID, resourceID uuid.UUID) error {
@@ -1987,4 +1997,106 @@ func TestRecoverExisting_RebindIsBestEffort(t *testing.T) {
 	if again.Handle != first.Handle {
 		t.Fatalf("handle = %s, want the existing %s", again.Handle, first.Handle)
 	}
+}
+
+// D-203 / C5 — an unstamped volume is reported honestly. The resource may serve
+// perfectly, but nothing in the database refuses a delete of its bytes, so it is
+// degraded with a stable token — and the DURABLE phase is never touched by the
+// observation (neither advanced to ready nor demoted).
+func TestStatusOf_UnstampedVolumeOwnershipIsDegraded(t *testing.T) {
+	tests := []struct {
+		name         string
+		phase        domain.FleetResourcePhase
+		unstamped    bool
+		unstampedErr error
+	}{
+		{name: "provisioning with an unstamped volume", phase: domain.FleetResourcePhaseProvisioning, unstamped: true},
+		{name: "ready with an unstamped volume", phase: domain.FleetResourcePhaseReady, unstamped: true},
+		{name: "the check itself fails — unknown reads as unstamped", phase: domain.FleetResourcePhaseReady, unstampedErr: errors.New("query boom")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newFakeResourceRepo()
+			prov := &fakeFleetProvisioner{healthOut: FleetHealthOutput{Healthy: true}}
+			appID := uuid.New()
+			replicas := newFakeResourceReplicaRepo()
+			replicas.byApp[appID] = []domain.Replica{{
+				ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident,
+				GuestIP: "10.0.0.9", Port: residentPGPort,
+			}}
+			binder := &fakeVolumeBinder{unstamped: tt.unstamped, unstampedErr: tt.unstampedErr}
+			uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, binder, testEngine(), testEndpointNaming(), nil, 0)
+			uc.pgReady = func(context.Context, string, int) error { return nil }
+
+			rid := uuid.New()
+			repo.seed(&domain.FleetResource{
+				ID: rid, OwnerOrg: uuid.New(), ClaimKey: "c", Env: "prod",
+				Tier: "dedicated", Phase: tt.phase, AppID: &appID,
+			})
+
+			st, err := uc.StatusOf(context.Background(), rid)
+			if err != nil {
+				t.Fatalf("the ownership check must never fail the status call: %v", err)
+			}
+			if st.Phase != string(domain.FleetResourcePhaseDegraded) {
+				t.Errorf("phase = %q, want degraded", st.Phase)
+			}
+			if !containsCondition(st.Conditions, conditionVolumeOwnershipUnstamped) {
+				t.Errorf("conditions = %v, want %s", st.Conditions, conditionVolumeOwnershipUnstamped)
+			}
+			if containsCondition(st.Conditions, conditionEngineNotAdmitting) {
+				t.Errorf("conditions = %v, the readiness probe must not run at all", st.Conditions)
+			}
+			stored, _ := repo.GetResourceByHandle(context.Background(), rid)
+			if stored.Phase != tt.phase {
+				t.Errorf("stored phase = %q, want the durable phase untouched at %q", stored.Phase, tt.phase)
+			}
+		})
+	}
+}
+
+// The stamped direction: ownership held ⇒ the token is absent and the ready
+// transition happens exactly as before.
+func TestStatusOf_StampedVolumeOwnershipStillReachesReady(t *testing.T) {
+	repo := newFakeResourceRepo()
+	prov := &fakeFleetProvisioner{healthOut: FleetHealthOutput{Healthy: true}}
+	appID := uuid.New()
+	replicas := newFakeResourceReplicaRepo()
+	replicas.byApp[appID] = []domain.Replica{{
+		ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident,
+		GuestIP: "10.0.0.9", Port: residentPGPort,
+	}}
+	uc := NewFleetResourceProvisioner(prov, repo, replicas, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
+	uc.pgReady = func(context.Context, string, int) error { return nil }
+
+	rid := uuid.New()
+	repo.seed(&domain.FleetResource{
+		ID: rid, OwnerOrg: uuid.New(), ClaimKey: "c", Env: "prod",
+		Tier: "dedicated", Phase: domain.FleetResourcePhaseProvisioning, AppID: &appID,
+	})
+
+	st, err := uc.StatusOf(context.Background(), rid)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if st.Phase != string(domain.FleetResourcePhaseReady) {
+		t.Errorf("phase = %q, want ready", st.Phase)
+	}
+	if containsCondition(st.Conditions, conditionVolumeOwnershipUnstamped) {
+		t.Errorf("conditions = %v, want no ownership condition on a stamped claim", st.Conditions)
+	}
+	stored, _ := repo.GetResourceByHandle(context.Background(), rid)
+	if stored.Phase != domain.FleetResourcePhaseReady {
+		t.Errorf("stored phase = %q, want the observed ready persisted", stored.Phase)
+	}
+}
+
+func containsCondition(conds []string, want string) bool {
+	for _, c := range conds {
+		if c == want {
+			return true
+		}
+	}
+	return false
 }

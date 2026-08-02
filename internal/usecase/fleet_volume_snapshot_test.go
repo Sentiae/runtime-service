@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sentiae/runtime-service/internal/domain"
+	"github.com/sentiae/runtime-service/internal/repository"
 )
 
 // ─────────────────────────────────────────────────────────────────────
@@ -242,6 +243,14 @@ func (f *fakeVolumeRepo) Update(_ context.Context, v *domain.Volume) error {
 func (f *fakeVolumeRepo) Delete(context.Context, uuid.UUID) error { return nil }
 func (f *fakeVolumeRepo) ListByHost(context.Context, uuid.UUID) ([]domain.Volume, error) {
 	return nil, nil
+}
+
+// The snapshotter never binds claims; the stubs exist only to satisfy the port.
+func (f *fakeVolumeRepo) BindVolumesToResource(context.Context, uuid.UUID, uuid.UUID) (repository.VolumeBindResult, error) {
+	return repository.VolumeBindResult{}, errors.New("not implemented")
+}
+func (f *fakeVolumeRepo) HasUnstampedVolumes(context.Context, uuid.UUID) (bool, error) {
+	return false, errors.New("not implemented")
 }
 
 // snapHarness bundles the snapshotter and every fake behind it.

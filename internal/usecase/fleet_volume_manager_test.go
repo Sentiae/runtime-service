@@ -78,6 +78,51 @@ func (f *volRepoFake) ListByHost(_ context.Context, hostID uuid.UUID) ([]domain.
 	}
 	return out, nil
 }
+func (f *volRepoFake) BindVolumesToResource(_ context.Context, appID, resourceID uuid.UUID) (repository.VolumeBindResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var mine []*domain.Volume
+	for _, v := range f.store {
+		if v.AppID != nil && *v.AppID == appID {
+			mine = append(mine, v)
+		}
+	}
+	if len(mine) == 0 {
+		return repository.VolumeBindResult{Outcome: repository.VolumeBindNoVolumes}, nil
+	}
+	for _, v := range mine {
+		if v.ResourceID != nil && *v.ResourceID != resourceID {
+			return repository.VolumeBindResult{
+				Outcome:          repository.VolumeBindConflict,
+				ConflictVolumeID: v.ID,
+				ConflictOwner:    *v.ResourceID,
+			}, nil
+		}
+	}
+	stamped := 0
+	for _, v := range mine {
+		if v.ResourceID == nil {
+			res := resourceID
+			v.ResourceID = &res
+			v.UpdatedAt = time.Now().UTC()
+			stamped++
+		}
+	}
+	if stamped > 0 {
+		return repository.VolumeBindResult{Outcome: repository.VolumeBindBound}, nil
+	}
+	return repository.VolumeBindResult{Outcome: repository.VolumeBindAlreadyBound}, nil
+}
+func (f *volRepoFake) HasUnstampedVolumes(_ context.Context, appID uuid.UUID) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, v := range f.store {
+		if v.AppID != nil && *v.AppID == appID && v.ResourceID == nil {
+			return true, nil
+		}
+	}
+	return false, nil
+}
 func (f *volRepoFake) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
