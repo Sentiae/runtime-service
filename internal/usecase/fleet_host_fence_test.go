@@ -1272,15 +1272,33 @@ func TestRestore_ReReadsOwnershipBeforeTouchingBytes(t *testing.T) {
 // TestActuateScheduledOwned_ConcurrentCallersBootExactlyOnce.
 //
 // The pass has TWO callers by design (the reconcile tick and the activator's
-// wake path) and the transition underneath it is a read-then-write, not a
-// compare-and-set: BootReplica does FindByID and then unconditionally persists
-// `booting`. Without serialization both callers observe `scheduled` and both
-// boot the SAME row — and the second boot re-derives the same jail slot, whose
-// prepare() begins with os.RemoveAll(jailDir), so it deletes the live first VM's
-// chroot and hands its uid and /30 to a second Firecracker.
+// wake path) and the transition under it is a read-then-write, not a CAS:
+// BootReplica does FindByID and then unconditionally persists `booting`. Two
+// overlapping passes therefore both observe `scheduled` and both boot one row —
+// and the second boot re-derives the SAME jail slot, whose prepare() begins with
+// os.RemoveAll(jailDir), so it deletes the live first VM's chroot and hands its
+// uid and /30 to a second Firecracker.
+//
+// ⚠ THE BARRIERS ARE WHAT MAKE THIS DETERMINISTIC, and there are two of them.
+// Starting two goroutines alone reproduced the double boot only occasionally —
+// the loser usually arrived after `booting` was already persisted, so the test
+// passed against the broken code most of the time and was therefore not a
+// control. Barring ListByHost forces both passes to snapshot `scheduled`, but
+// that is still not enough: BootReplica RE-READS the row, so a loser that reads
+// after the winner wrote `resident` exits on the resident no-op. The window the
+// bug lives in is FindByID → Update(booting), so a second barrier sits on that
+// read. Verified against the mutation: with the two actuateMu lines removed this
+// fails on every run; with them present it passes on every run.
 func TestActuateScheduledOwned_ConcurrentCallersBootExactlyOnce(t *testing.T) {
+	const callers = 2
 	app := testFleetApp(0)
 	h := newOrchHarness(t, oneLiveHost(), app)
+	// The timeouts only matter on the SERIALIZED side, where the second caller
+	// cannot arrive until the first is done: the first must then be able to give up
+	// waiting and proceed. They cost time only on the passing path.
+	h.replicas.listHostBarrier = newListBarrier(callers, 500*time.Millisecond)
+	h.replicas.findBarrier = newListBarrier(callers, 500*time.Millisecond)
+
 	row := &domain.Replica{
 		ID: uuid.New(), AppID: app.ID, HostID: hostPtr(testSelfHost),
 		State: domain.ReplicaStateScheduled, CreatedAt: time.Now().UTC(),
@@ -1291,8 +1309,8 @@ func TestActuateScheduledOwned_ConcurrentCallersBootExactlyOnce(t *testing.T) {
 
 	var wg sync.WaitGroup
 	start := make(chan struct{})
-	errs := make([]error, 2)
-	for i := 0; i < 2; i++ {
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -1308,8 +1326,7 @@ func TestActuateScheduledOwned_ConcurrentCallersBootExactlyOnce(t *testing.T) {
 			t.Fatalf("actuateScheduledOwned[%d]: %v", i, err)
 		}
 	}
-	booter := h.booter()
-	if n := booter.bootCount(); n != 1 {
+	if n := h.booter().bootCount(); n != 1 {
 		t.Fatalf("BootResident called %d times for ONE scheduled row, want exactly 1 — a second boot would RemoveAll the first VM's live jail", n)
 	}
 	got, _ := h.replicas.FindByID(context.Background(), row.ID)
@@ -1630,5 +1647,65 @@ func TestFleetProvisionRunResident_PersistRollbackPropagatesAnUnprovenTeardown(t
 	}
 	if booter.decommN != 1 {
 		t.Fatalf("booter Decommission called %d times, want 1", booter.decommN)
+	}
+}
+
+// TestReconcileApp_AFailedTeardownStillLetsTheSurplusDrain.
+//
+// The carried teardown error suppresses PLACEMENT and nothing else. Returning it
+// before the desired-count switch also stopped the SURPLUS loop, so one stuck
+// dead row froze every other reduction on the app: at desired=0 with a scheduled
+// row alongside a failing dead row, the scheduled row was never drained and the
+// app could never converge.
+func TestReconcileApp_AFailedTeardownStillLetsTheSurplusDrain(t *testing.T) {
+	app := testFleetApp(0) // desired 0 → everything occupying is surplus
+	h := newOrchHarness(t, oneLiveHost(), app)
+	cause := errors.New("tap delete failed")
+	h.booter().decommErr = cause
+
+	pid := 4242
+	dead := &domain.Replica{
+		ID: uuid.New(), AppID: app.ID, HostID: hostPtr(testSelfHost),
+		State: domain.ReplicaStateDead, PID: &pid, CreatedAt: time.Now().UTC(),
+	}
+	// The scheduled row has NO boot artifacts, so its teardown needs no booter
+	// proof and must succeed even while the dead row's does not.
+	scheduled := &domain.Replica{
+		ID: uuid.New(), AppID: app.ID, HostID: hostPtr(testSelfHost),
+		State: domain.ReplicaStateScheduled, CreatedAt: time.Now().UTC(),
+	}
+	for _, r := range []*domain.Replica{dead, scheduled} {
+		if err := h.replicas.Create(context.Background(), r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err := h.orch.ReconcileApp(context.Background(), app.ID)
+	if !errors.Is(err, cause) {
+		t.Fatalf("ReconcileApp = %v, want the first teardown error %v", err, cause)
+	}
+	if _, ferr := h.replicas.FindByID(context.Background(), scheduled.ID); ferr == nil {
+		t.Fatal("the surplus scheduled row was NOT drained — a failing dead-row teardown must not freeze the surplus loop")
+	}
+	if _, ferr := h.replicas.FindByID(context.Background(), dead.ID); ferr != nil {
+		t.Fatalf("the undrained dead row was deleted: %v", ferr)
+	}
+}
+
+// (4) An unavailable booter is a teardown that could not PROVE termination.
+func TestFleetProvisionDecommission_UnavailableBooterIsNotAProof(t *testing.T) {
+	repo := newFakeWorkloadRepo()
+	wl := seedRunningResident(t, repo)
+	booter := &provisionBooter{decommErr: domain.ErrImageBootUnavailable}
+	uc := newUC(repo, fakeMaterializer{}, booter)
+
+	err := uc.Decommission(context.Background(), wl.ID.String())
+	if !errors.Is(err, domain.ErrImageBootUnavailable) {
+		t.Fatalf("Decommission = %v, want ErrImageBootUnavailable — a host with no booter observed nothing", err)
+	}
+	got, _ := repo.FindByID(context.Background(), wl.ID)
+	if got.State != domain.ImageWorkloadStateRunning {
+		t.Fatalf("state = %q, want it left at %q — marking `exited` asserts the VM is gone on the strength of being unable to look",
+			got.State, domain.ImageWorkloadStateRunning)
 	}
 }

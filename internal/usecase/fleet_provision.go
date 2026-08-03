@@ -1121,7 +1121,22 @@ func (uc *FleetProvision) Decommission(ctx context.Context, handle string) error
 		return nil
 	}
 	if wl.Class == domain.ImageWorkloadClassResident && wl.State == domain.ImageWorkloadStateRunning {
-		if err := uc.booter.Decommission(ctx, decommissionInput(wl)); err != nil && !errors.Is(err, domain.ErrImageBootUnavailable) {
+		// ⚠ ErrImageBootUnavailable IS NO LONGER AN EXCEPTION. It used to be waved
+		// through so a booter-less instance could still clear stale rows, but under
+		// the termination-proof rule it is the plainest possible unproven teardown:
+		// the host has no booter, so it did not signal anything, did not observe
+		// anything, and released no lease, TAP or jail. Marking the row `exited` on
+		// that basis asserts the VM is gone on the strength of this process being
+		// unable to look.
+		//
+		// The lost convenience is real and it is now an EXPLICIT operator repair
+		// rather than a silent state write: a row left `running` by a host that can
+		// no longer boot (a decommissioned fleet host, a dev box with the executor
+		// switched off) is cleared by an operator who has confirmed the VM is gone,
+		// not by a Decommission call that could not check. That is the correct
+		// direction — the same call on a REAL fleet host, transiently fail-loud,
+		// used to retire a row whose microVM was still running.
+		if err := uc.booter.Decommission(ctx, decommissionInput(wl)); err != nil {
 			// ⚠ RETURN, do not log-and-mark-exited. Swallowing this was the same
 			// proof-discard as the replica path: the row went to `exited` while the VMM
 			// may still have been running, and `exited` is terminal — the branch above

@@ -671,20 +671,26 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 		}
 	}
 
-	// ⚠ A FAILED TEARDOWN BLOCKS THE REPLACEMENT, and this is the whole reason the
-	// error is carried rather than logged. A retained `dead` row does not count as
-	// occupying, so without this guard the shortfall branch below would place and
-	// boot a fresh replica while the previous VMM — which teardown could not prove
-	// had exited — may still be running and still holding the app's single-writer
-	// backing file. Two Firecrackers writing one ext4 is the one outcome no
-	// availability argument justifies. The app is left short for this pass; the
-	// next tick retries the teardown and converges the instant it succeeds.
-	if teardownErr != nil {
-		return teardownErr
-	}
-
 	switch {
 	case len(occupying) < app.DesiredReplicas:
+		// ⚠ A FAILED TEARDOWN BLOCKS THE REPLACEMENT — and ONLY the replacement.
+		// This is the whole reason the error is carried rather than logged: a
+		// retained `dead` row does not count as occupying, so without this guard the
+		// branch below would place and boot a fresh replica while the previous VMM —
+		// which teardown could not prove had exited — may still be running and still
+		// holding the app's single-writer backing file. Two Firecrackers writing one
+		// ext4 is the one outcome no availability argument justifies.
+		//
+		// It suppresses PLACEMENT only, and the return sits here rather than before
+		// the switch for that reason: a failing dead-row teardown must not also stop
+		// the SURPLUS drain below, which is itself a teardown and is how an
+		// over-capacity app (desired=0 with a scheduled row, say) converges. Blocking
+		// it would let one stuck row freeze every other reduction on the app.
+		if teardownErr != nil {
+			logger.FromContext(ctx).Warn("fleet reconcile: placement held for this pass — a teardown on this app could not be proven complete",
+				"app_id", app.ID, "desired", app.DesiredReplicas, "occupying", len(occupying), "err", teardownErr)
+			break
+		}
 		// A volume-bearing app whose backing FILE is gone cannot be booted by any
 		// number of attempts. Without this gate every tick minted a fresh replica
 		// row, materialized the image and resolved the boot secrets, watched the VM

@@ -30,6 +30,56 @@ import (
 type orchReplicaRepo struct {
 	mu    sync.Mutex
 	store map[uuid.UUID]*domain.Replica
+	// listHostBarrier / findBarrier, when set, hold each caller AFTER it has taken
+	// its snapshot until every expected caller has one. Together they make the
+	// double-actuation race deterministic instead of a scheduling coin-flip.
+	//
+	// BOTH are needed, and the second is the load-bearing one. The barrier on
+	// ListByHost forces both passes to snapshot `scheduled` — but BootReplica then
+	// RE-READS the row through FindByID, and if the winner has already persisted
+	// `resident` by that point the loser exits on the resident no-op and never
+	// boots. The read-then-write window the bug actually lives in is FindByID →
+	// Update(booting), so that is where the second barrier sits.
+	listHostBarrier *listBarrier
+	findBarrier     *listBarrier
+}
+
+// listBarrier releases its arrivals only once n of them have arrived, or once
+// the deadline passes.
+//
+// The deadline is what keeps it usable on BOTH sides of the mutation it exists
+// to kill: with actuateScheduledOwned serialized, the second caller can never
+// reach the barrier while the first holds it, so the first must be able to time
+// out and proceed (the test then still asserts one boot). Without the lock both
+// callers arrive, are released together, and each holds a snapshot taken before
+// either wrote `booting` — which is precisely the interleaving that produces the
+// double boot.
+type listBarrier struct {
+	mu      sync.Mutex
+	once    sync.Once
+	waiting int
+	n       int
+	release chan struct{}
+	timeout time.Duration
+}
+
+func newListBarrier(n int, timeout time.Duration) *listBarrier {
+	return &listBarrier{n: n, release: make(chan struct{}), timeout: timeout}
+}
+
+func (b *listBarrier) arrive() {
+	b.mu.Lock()
+	b.waiting++
+	reached := b.waiting >= b.n
+	b.mu.Unlock()
+	if reached {
+		b.once.Do(func() { close(b.release) })
+		return
+	}
+	select {
+	case <-b.release:
+	case <-time.After(b.timeout):
+	}
 }
 
 func newOrchReplicaRepo() *orchReplicaRepo {
@@ -51,12 +101,19 @@ func (f *orchReplicaRepo) Update(_ context.Context, r *domain.Replica) error {
 }
 func (f *orchReplicaRepo) FindByID(_ context.Context, id uuid.UUID) (*domain.Replica, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	r, ok := f.store[id]
 	if !ok {
+		f.mu.Unlock()
 		return nil, domain.ErrReplicaNotFound
 	}
 	cp := *r
+	barrier := f.findBarrier
+	// Released before blocking: the write that follows this read takes the same
+	// lock, so holding it across the barrier would deadlock the interleaving.
+	f.mu.Unlock()
+	if barrier != nil {
+		barrier.arrive()
+	}
 	return &cp, nil
 }
 func (f *orchReplicaRepo) ListByApp(_ context.Context, appID uuid.UUID) ([]domain.Replica, error) {
@@ -72,12 +129,19 @@ func (f *orchReplicaRepo) ListByApp(_ context.Context, appID uuid.UUID) ([]domai
 }
 func (f *orchReplicaRepo) ListByHost(_ context.Context, hostID uuid.UUID) ([]domain.Replica, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	var out []domain.Replica
 	for _, r := range f.store {
 		if r.HostID != nil && *r.HostID == hostID {
 			out = append(out, *r)
 		}
+	}
+	barrier := f.listHostBarrier
+	// The store lock is released BEFORE blocking: BootReplica's own FindByID takes
+	// it, so holding it across the barrier would deadlock the very interleaving
+	// this is built to produce.
+	f.mu.Unlock()
+	if barrier != nil {
+		barrier.arrive()
 	}
 	return out, nil
 }

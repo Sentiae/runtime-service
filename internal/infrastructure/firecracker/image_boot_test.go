@@ -542,6 +542,36 @@ func TestDecommissionWaitsOutThePowerOffWindowAfterAShutdownError(t *testing.T) 
 	f.assertEverythingReclaimed(t)
 }
 
+// TestDecommissionPowerOffWindowSurvivesCallerCancellation.
+//
+// The window belongs to the GUEST, not to the caller. Taken on the caller's
+// context, waitProcessGone returns the instant an RPC deadline passes — so a
+// cancelled caller skipped the window entirely and sent SIGTERM to a database
+// that may have been mid-checkpoint, i.e. the cancellation decided the guest got
+// crash-stopped. It is bounded by powerOff and by nothing else.
+func TestDecommissionPowerOffWindowSurvivesCallerCancellation(t *testing.T) {
+	rec := &stopRecorder{}
+	// Probe #1 is admission and probe #2 is the window's first look — both find it
+	// alive — so the wait MUST pass through its select (the point a cancelled
+	// context would abandon it) before probe #3 observes the power-off. A fake that
+	// disappeared on probe #2 would return before any context is consulted, and the
+	// test would pass against the caller-ctx mutation too.
+	proc := newFakeProcess(rec, 3, true)
+	f := newStopFixture(t, &fakeGuestControl{rec: rec}, proc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := f.b.Decommission(ctx, f.in); err != nil {
+		t.Fatalf("Decommission: %v", err)
+	}
+	want := []string{"shutdown"}
+	if got := rec.got(); !slices.Equal(got, want) {
+		t.Fatalf("stop sequence = %v, want %v — a cancelled caller must not shorten the guest's power-off window into a SIGTERM", got, want)
+	}
+	f.assertEverythingReclaimed(t)
+}
+
 // TestDecommissionKillLadderProvesExit walks the full TERM→KILL ladder for a
 // guest that ignores everything until SIGKILL.
 func TestDecommissionKillLadderProvesExit(t *testing.T) {

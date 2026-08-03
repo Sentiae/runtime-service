@@ -811,6 +811,12 @@ func (b *ImageBooter) proveTerminated(ctx context.Context, in usecase.ImageDecom
 func (b *ImageBooter) stopAndProve(ctx context.Context, in usecase.ImageDecommissionInput, proc vmProcess) error {
 	log := logger.FromContext(ctx)
 
+	// Every WAIT below is bounded by its own timer and by nothing else. A cancelled
+	// caller may cut the graceful REQUEST short (that is a bounded RPC), but it must
+	// never shorten a window in which the guest is dying cleanly or the VMM is being
+	// killed — abandoning either is what leaves an orphan behind released resources.
+	stopCtx := context.WithoutCancel(ctx)
+
 	if b.guestControl == nil || in.SocketPath == "" {
 		log.Warn("image-boot: resident stop has no guest control channel, signalling the vmm instead",
 			"socket_path", in.SocketPath)
@@ -834,7 +840,13 @@ func (b *ImageBooter) stopAndProve(ctx context.Context, in usecase.ImageDecommis
 		// failure mode the control channel was added to remove. Waiting costs at most
 		// the power-off budget on a guest that really is wedged, and that guest still
 		// gets TERM and KILL below.
-		gone, werr := waitProcessGone(ctx, proc, b.stop.powerOff, b.stop.exitPoll)
+		//
+		// ⚠ stopCtx, NOT the caller's ctx. On the caller's context a cancelled RPC
+		// makes waitProcessGone return immediately, which skips the window entirely
+		// and sends SIGTERM to a database that may be mid-checkpoint — i.e. the
+		// cancellation would decide the guest gets crash-stopped. The window is the
+		// guest's, not the caller's, and it is already bounded by powerOff.
+		gone, werr := waitProcessGone(stopCtx, proc, b.stop.powerOff, b.stop.exitPoll)
 		if gone {
 			return nil
 		}
@@ -842,8 +854,10 @@ func (b *ImageBooter) stopAndProve(ctx context.Context, in usecase.ImageDecommis
 			"socket_path", in.SocketPath, "pid", in.PID, "shutdown_err", err, "err", werr)
 	}
 
-	// The fallback. Its own timers bound it; the caller's cancellation does not.
-	fallbackCtx := context.WithoutCancel(ctx)
+	// The fallback, on the same stopCtx as the window above: its own timers bound
+	// it and the caller's cancellation does not. This is the last chance to stop
+	// the process, and abandoning it because an RPC deadline passed is what leaves
+	// a live VM behind a destroyed TAP and a released lease.
 	for _, step := range []struct {
 		sig   syscall.Signal
 		grace time.Duration
@@ -859,7 +873,7 @@ func (b *ImageBooter) stopAndProve(ctx context.Context, in usecase.ImageDecommis
 			return fmt.Errorf("%w: pid %d could not be sent %v and its absence was not observed: %v",
 				domain.ErrVMTerminationUnproven, in.PID, step.sig, err)
 		}
-		gone, werr := waitProcessGone(fallbackCtx, proc, step.grace, b.stop.exitPoll)
+		gone, werr := waitProcessGone(stopCtx, proc, step.grace, b.stop.exitPoll)
 		if gone {
 			return nil
 		}
