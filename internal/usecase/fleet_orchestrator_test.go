@@ -295,19 +295,50 @@ type orchHarness struct {
 	resources *fakeResourceRepo
 }
 
-func newOrchHarness(hosts []domain.Host, apps ...*domain.FleetApp) orchHarness {
+func newOrchHarness(t *testing.T, hosts []domain.Host, apps ...*domain.FleetApp) orchHarness {
+	t.Helper()
 	appRepo := newOrchAppRepo(apps...)
 	repRepo := newOrchReplicaRepo()
 	resRepo := newFakeResourceRepo()
 	sched := NewFleetScheduler(orchHostLister{hosts: hosts}, repRepo, appRepo, time.Minute)
-	runtime := NewFleetReplicaRuntime(fakeMaterializer{rootfs: "/work/r.ext4"}, &orchBooter{}, repRepo, appRepo, "/tmp/imgwork", "10.0.0.9")
-	orch := NewFleetOrchestrator(appRepo, repRepo, sched, runtime, resRepo)
+	runtime := newTestReplicaRuntime(t, fakeMaterializer{rootfs: "/work/r.ext4"}, &orchBooter{}, repRepo, appRepo, "/tmp/imgwork", "10.0.0.9")
+	orch := newTestOrchestrator(t, appRepo, repRepo, sched, runtime, resRepo)
 	return orchHarness{orch: orch, apps: appRepo, replicas: repRepo, resources: resRepo}
+}
+
+// oneLiveHost is THIS host. The orchestrator is constructed with testSelfHost,
+// and the host fence means a placement onto any other id is a row this instance
+// may not actuate — so a random host id here would exercise the foreign path in
+// every test that is not about it (the foreign cases pass testForeignHost
+// explicitly).
+// actuate runs the owning host's single actuation pass — the step that turns a
+// `scheduled` placement into a running microVM.
+//
+// The host fence separated the two: ReconcileApp (and therefore ProvisionApp /
+// ScaleApp) now only WRITE desired placement, and the stamped host boots it. In
+// production the pass runs at the tail of every ReconcileAll tick and again
+// synchronously on the activator's wake path, so any test asserting on a
+// RESIDENT replica has to run it too.
+func (h orchHarness) actuate(t *testing.T) {
+	t.Helper()
+	if err := h.orch.actuateScheduledOwned(context.Background()); err != nil {
+		t.Fatalf("actuateScheduledOwned: %v", err)
+	}
+}
+
+// converge is one full tick for a single app: reconcile the desired set, then
+// actuate this host's placements.
+func (h orchHarness) converge(t *testing.T, appID uuid.UUID) error {
+	t.Helper()
+	if err := h.orch.ReconcileApp(context.Background(), appID); err != nil {
+		return err
+	}
+	return h.orch.actuateScheduledOwned(context.Background())
 }
 
 func oneLiveHost() []domain.Host {
 	return []domain.Host{{
-		ID:             uuid.New(),
+		ID:             testSelfHost,
 		Region:         "local",
 		CapacityVCPU:   100,
 		CapacityMemMB:  100000,
@@ -370,7 +401,8 @@ func TestReconcileApp(t *testing.T) {
 			desired: 1,
 			seed: func(appID uuid.UUID) []*domain.Replica {
 				return []*domain.Replica{{
-					ID: uuid.New(), AppID: appID, State: domain.ReplicaStateDead,
+					ID: uuid.New(), AppID: appID, HostID: hostPtr(testSelfHost),
+					State:         domain.ReplicaStateDead,
 					RestartPolicy: domain.RestartPolicyAlways, CreatedAt: time.Now().UTC(),
 				}}
 			},
@@ -386,8 +418,9 @@ func TestReconcileApp(t *testing.T) {
 				reps := make([]*domain.Replica, 3)
 				for i := range reps {
 					reps[i] = &domain.Replica{
-						ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident,
-						PID: &pid, RestartPolicy: domain.RestartPolicyAlways,
+						ID: uuid.New(), AppID: appID, HostID: hostPtr(testSelfHost),
+						State: domain.ReplicaStateResident,
+						PID:   &pid, RestartPolicy: domain.RestartPolicyAlways,
 						CreatedAt: time.Now().UTC().Add(time.Duration(i) * time.Second),
 					}
 				}
@@ -410,7 +443,7 @@ func TestReconcileApp(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			app := testFleetApp(tt.desired)
-			h := newOrchHarness(tt.hosts, app)
+			h := newOrchHarness(t, tt.hosts, app)
 			if tt.seed != nil {
 				for _, r := range tt.seed(app.ID) {
 					if err := h.replicas.Create(context.Background(), r); err != nil {
@@ -419,7 +452,7 @@ func TestReconcileApp(t *testing.T) {
 				}
 			}
 
-			err := h.orch.ReconcileApp(context.Background(), app.ID)
+			err := h.converge(t, app.ID)
 			if tt.wantErr && err == nil {
 				t.Fatalf("want error, got nil")
 			}
@@ -483,9 +516,9 @@ const syntheticExt4Size = 4096 * 64
 func newStatefulOrchHarness(t *testing.T, backing string) (orchHarness, *domain.FleetApp) {
 	t.Helper()
 	app := testFleetApp(1)
-	h := newOrchHarness(oneLiveHost(), app)
+	h := newOrchHarness(t, oneLiveHost(), app)
 	vol := volWithBacking(app.ID, backing)
-	h.orch.SetVolumeManager(NewFleetVolumeManager(newVolRepoFake(vol), &recordingBackend{}, filepath.Dir(backing), nil))
+	h.orch.SetVolumeManager(newTestVolumeManager(t, newVolRepoFake(vol), &recordingBackend{}, filepath.Dir(backing), nil))
 	return h, app
 }
 
@@ -598,7 +631,7 @@ func TestReconcileApp_BackingFilePrecondition(t *testing.T) {
 			var app *domain.FleetApp
 			if backing == "" {
 				app = testFleetApp(1)
-				h = newOrchHarness(oneLiveHost(), app)
+				h = newOrchHarness(t, oneLiveHost(), app)
 			} else {
 				h, app = newStatefulOrchHarness(t, backing)
 			}
@@ -639,7 +672,7 @@ func TestReconcileApp_BackingFilePreconditionIsNotALatch(t *testing.T) {
 
 	// The file comes back. The NEXT tick must recover on its own.
 	writeSyntheticExt4(t, backing, syntheticExt4Size)
-	if err := h.orch.ReconcileApp(context.Background(), app.ID); err != nil {
+	if err := h.converge(t, app.ID); err != nil {
 		t.Fatalf("recovery tick: %v", err)
 	}
 	if got := h.replicas.count(); got != 1 {
@@ -917,7 +950,7 @@ func TestHealthApp_SurfacesPlacementCondition(t *testing.T) {
 
 	t.Run("healthy app message is unchanged", func(t *testing.T) {
 		app := testFleetApp(1)
-		h := newOrchHarness(oneLiveHost(), app)
+		h := newOrchHarness(t, oneLiveHost(), app)
 		out, isApp, err := h.orch.HealthApp(context.Background(), app.ID)
 		if err != nil || !isApp {
 			t.Fatalf("HealthApp: isApp=%v err=%v", isApp, err)
@@ -929,7 +962,7 @@ func TestHealthApp_SurfacesPlacementCondition(t *testing.T) {
 }
 
 func TestOrchestrator_UnknownAppReturnsFalse(t *testing.T) {
-	h := newOrchHarness(oneLiveHost())
+	h := newOrchHarness(t, oneLiveHost())
 	unknown := uuid.New()
 
 	if _, isApp, err := h.orch.HealthApp(context.Background(), unknown); err != nil || isApp {
@@ -948,7 +981,7 @@ func TestOrchestrator_ProvisionNilSecretRefsPersistsNonNil(t *testing.T) {
 	processAlive = func(int) bool { return true }
 	defer func() { processAlive = origAlive }()
 
-	h := newOrchHarness(oneLiveHost())
+	h := newOrchHarness(t, oneLiveHost())
 	// No SecretRefs — the every-secret-less-provision path that wrote SQL NULL into
 	// the JSONB NOT NULL secret_refs column before the nil→[] normalization.
 	in := FleetProvisionInput{
@@ -996,7 +1029,7 @@ func TestOrchestrator_IngressRouteAndSync(t *testing.T) {
 	processAlive = func(int) bool { return true }
 	defer func() { processAlive = origAlive }()
 
-	h := newOrchHarness(oneLiveHost())
+	h := newOrchHarness(t, oneLiveHost())
 	routes := newOrchRouteRepo()
 	syncer := &fakeIngressSyncer{}
 	h.orch.SetIngress(routes, "fleet.sentiae.local", syncer)
@@ -1035,6 +1068,10 @@ func TestOrchestrator_IngressRouteAndSync(t *testing.T) {
 		t.Fatalf("routes after re-provision = %d, want 1 (idempotent)", len(rs))
 	}
 
+	// The placement is actuated by the owning host's pass — only then is there a
+	// resident endpoint for the gateway to proxy to.
+	h.actuate(t)
+
 	// SyncIngress pushes the route with the resident replica as an upstream.
 	if err := h.orch.SyncIngress(context.Background()); err != nil {
 		t.Fatalf("SyncIngress: %v", err)
@@ -1067,7 +1104,7 @@ func TestOrchestrator_ProvisionThenScaleThenDecommission(t *testing.T) {
 	processAlive = func(int) bool { return true }
 	defer func() { processAlive = origAlive }()
 
-	h := newOrchHarness(oneLiveHost())
+	h := newOrchHarness(t, oneLiveHost())
 	in := FleetProvisionInput{
 		ComponentID: "comp-1", Env: "prod", OwnerOrg: orgA,
 		Registry: "reg", Repository: "org/app", Digest: "sha256:abc",
@@ -1084,6 +1121,8 @@ func TestOrchestrator_ProvisionThenScaleThenDecommission(t *testing.T) {
 	if !h.apps.has(appID) {
 		t.Fatalf("app not persisted")
 	}
+	// ProvisionApp writes the placement; the owning host boots it.
+	h.actuate(t)
 	if got := h.replicas.countState(domain.ReplicaStateResident); got != 1 {
 		t.Fatalf("resident after provision = %d, want 1", got)
 	}
@@ -1091,6 +1130,7 @@ func TestOrchestrator_ProvisionThenScaleThenDecommission(t *testing.T) {
 	if isApp, err := h.orch.ScaleApp(context.Background(), appID, 3); err != nil || !isApp {
 		t.Fatalf("ScaleApp: isApp=%v err=%v", isApp, err)
 	}
+	h.actuate(t)
 	if got := h.replicas.countState(domain.ReplicaStateResident); got != 3 {
 		t.Fatalf("resident after scale = %d, want 3", got)
 	}
@@ -1125,9 +1165,9 @@ func TestProvisionApp_SameComponentEnvDifferentOrgs_GetsSeparateApps(t *testing.
 	processAlive = func(int) bool { return true }
 	defer func() { processAlive = origAlive }()
 
-	h := newOrchHarness(oneLiveHost())
+	h := newOrchHarness(t, oneLiveHost())
 	vols := newVolRepoFake()
-	h.orch.SetVolumeManager(NewFleetVolumeManager(vols, &recordingBackend{}, "/vol", nil))
+	h.orch.SetVolumeManager(newTestVolumeManager(t, vols, &recordingBackend{}, "/vol", nil))
 
 	provision := func(org string) uuid.UUID {
 		t.Helper()
@@ -1206,7 +1246,7 @@ func TestProvisionApp_ResourceClaim_GetsNoIngressRoute(t *testing.T) {
 	processAlive = func(int) bool { return true }
 	defer func() { processAlive = origAlive }()
 
-	h := newOrchHarness(oneLiveHost())
+	h := newOrchHarness(t, oneLiveHost())
 	routes := newOrchRouteRepo()
 	h.orch.SetIngress(routes, "fleet.sentiae.local", &fakeIngressSyncer{})
 
@@ -1298,7 +1338,7 @@ func TestProvisionApp_IngressRouteOnlyForHTTPServedWorkloads(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newOrchHarness(oneLiveHost())
+			h := newOrchHarness(t, oneLiveHost())
 			routes := newOrchRouteRepo()
 			h.orch.SetIngress(routes, "fleet.sentiae.local", &fakeIngressSyncer{})
 
@@ -1448,7 +1488,7 @@ func TestHostForApp(t *testing.T) {
 }
 
 func TestProvisionApp_EmptyOwnerOrg_Rejected(t *testing.T) {
-	h := newOrchHarness(oneLiveHost())
+	h := newOrchHarness(t, oneLiveHost())
 
 	_, _, err := h.orch.ProvisionApp(context.Background(), FleetProvisionInput{
 		ComponentID: "comp-1", Env: "prod", // no OwnerOrg

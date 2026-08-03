@@ -206,10 +206,16 @@ var (
 // handles fall through to the (empty) workload repo → not-found. claim is the
 // P19 resource ledger the app-seam guard reads; a nil-res fake means the app is
 // claimed by nothing (the ordinary component deploy).
-func newFleetServerWithApp(appID, ownerOrg uuid.UUID, claim *fakeResourceRepo) *FleetServer {
+func newFleetServerWithApp(t *testing.T, appID, ownerOrg uuid.UUID, claim *fakeResourceRepo) *FleetServer {
+	t.Helper()
 	prov := usecase.NewFleetProvision(context.Background(), fakeWorkloadRepo{}, nil, nil, "", "")
 	app := &domain.FleetApp{ID: appID, OwnerOrg: ownerOrg.String()}
-	orch := usecase.NewFleetOrchestrator(&fakeAppRepo{app: app}, fakeReplicaRepo{}, nil, nil, claim)
+	// The orchestrator now REQUIRES this instance's fleet host identity (the
+	// host-authority fence): it decides which globally visible rows may be actuated.
+	orch, err := usecase.NewFleetOrchestrator(&fakeAppRepo{app: app}, fakeReplicaRepo{}, nil, nil, claim, uuid.New())
+	if err != nil {
+		t.Fatalf("NewFleetOrchestrator: %v", err)
+	}
 	prov.SetOrchestrator(orch)
 	return &FleetServer{provision: prov}
 }
@@ -270,7 +276,7 @@ func TestFleetHandleOps_OrgGate(t *testing.T) {
 	for _, rpc := range rpcs {
 		for _, tc := range cases {
 			t.Run(rpc.name+"/"+tc.name, func(t *testing.T) {
-				s := newFleetServerWithApp(appID, ownerOrg, &fakeResourceRepo{})
+				s := newFleetServerWithApp(t, appID, ownerOrg, &fakeResourceRepo{})
 				err := rpc.invoke(s, ctxWithOrg(tc.callerOrg), tc.handle)
 				if code := status.Code(err); code != tc.wantCode {
 					t.Fatalf("%s(%s): want %s, got %s (%v)", rpc.name, tc.name, tc.wantCode, code, err)
@@ -288,7 +294,7 @@ func TestFleetHandleOps_ShadowForeignOrg_DoesNotDeny(t *testing.T) {
 	appID := uuid.New()
 	ownerOrg := uuid.New()
 	foreignOrg := uuid.New()
-	s := newFleetServerWithApp(appID, ownerOrg, &fakeResourceRepo{})
+	s := newFleetServerWithApp(t, appID, ownerOrg, &fakeResourceRepo{})
 
 	_, err := s.Health(ctxWithOrg(foreignOrg), &runtimev1.FleetHealthRequest{Handle: appID.String()})
 	if code := status.Code(err); code == codes.PermissionDenied || code == codes.Unauthenticated {
@@ -324,7 +330,7 @@ func TestFleetDecommission_AppBacksDurableResource_FailedPrecondition(t *testing
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := newFleetServerWithApp(appID, ownerOrg, &fakeResourceRepo{res: tt.claim})
+			s := newFleetServerWithApp(t, appID, ownerOrg, &fakeResourceRepo{res: tt.claim})
 			_, err := s.Decommission(ctxWithOrg(ownerOrg), &runtimev1.FleetDecommissionRequest{Handle: appID.String()})
 			if code := status.Code(err); code != tt.wantCode {
 				t.Fatalf("Decommission: code = %s, want %s (%v)", code, tt.wantCode, err)

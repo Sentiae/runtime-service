@@ -81,6 +81,12 @@ type FleetOrchestrator struct {
 	// clock is the time seam (§30.6). Defaults to time.Now; tests drive the
 	// throttle window through it rather than sleeping.
 	clock func() time.Time
+
+	// selfHost is this process's durable fleet host identity
+	// (#fleet-reconciler-acts-on-foreign-host-replicas). The reconciler reads a
+	// GLOBAL desired-state table and may only ACTUATE the rows stamped with this
+	// id. Immutable and constructor-required.
+	selfHost uuid.UUID
 }
 
 // ActivityFeed reports per-host request activity observed at the ingress gateway
@@ -96,14 +102,21 @@ type ActivityFeed interface {
 	Warm() bool
 }
 
-// NewFleetOrchestrator constructs the reconciler.
+// NewFleetOrchestrator constructs the reconciler. selfHost is this instance's
+// durable fleet host id — REQUIRED, because the reconciler's entire job is to
+// decide which globally-visible rows THIS machine may act on.
 func NewFleetOrchestrator(
 	apps repository.FleetAppRepository,
 	replicas repository.ReplicaRepository,
 	scheduler *FleetScheduler,
 	runtime *FleetReplicaRuntime,
 	resources repository.FleetResourceRepository,
-) *FleetOrchestrator {
+	selfHost uuid.UUID,
+) (*FleetOrchestrator, error) {
+	if selfHost == uuid.Nil {
+		return nil, fmt.Errorf("%w: a fleet orchestrator needs this instance's fleet host identity before it may actuate any placement",
+			domain.ErrReplicaHostMismatch)
+	}
 	return &FleetOrchestrator{
 		apps:      apps,
 		replicas:  replicas,
@@ -111,7 +124,14 @@ func NewFleetOrchestrator(
 		runtime:   runtime,
 		resources: resources,
 		clock:     time.Now,
-	}
+		selfHost:  selfHost,
+	}, nil
+}
+
+// ownsReplica reports whether this instance may perform a host-local action on a
+// replica row. Nil host id is NOT ours — see requireOwnedReplica.
+func (uc *FleetOrchestrator) ownsReplica(r *domain.Replica) bool {
+	return r.HostID != nil && *r.HostID == uc.selfHost
 }
 
 // SetVolumeManager wires the persistent-volume manager (rt#9). Optional: a nil
@@ -569,10 +589,23 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 		}
 	}
 
-	// Dead replicas → decommission (frees the handle + deletes the row). With
-	// restart_policy=always the shortfall step below re-creates them.
+	// A row placed on another fleet host is a valid GLOBAL desired-state fact, not
+	// an error and not a degraded condition — it is simply not this host's to
+	// execute. Counted once per pass on a bounded counter, with no per-tick warning
+	// and no app condition: at a ten-second tick a log line per foreign row per app
+	// would be a flood describing normal operation.
 	for i := range replicas {
-		if replicas[i].State == domain.ReplicaStateDead {
+		if !uc.ownsReplica(&replicas[i]) {
+			recordExecution("reconcile_replica", "foreign_skipped")
+		}
+	}
+
+	// Dead replicas → decommission (frees the handle + deletes the row). With
+	// restart_policy=always the shortfall step below re-creates them. Only the
+	// OWNING host may do this: a dead row's VMM may still be running, and its TAP,
+	// jail and lease are on the machine the row names.
+	for i := range replicas {
+		if replicas[i].State == domain.ReplicaStateDead && uc.ownsReplica(&replicas[i]) {
 			if derr := uc.runtime.DecommissionReplica(ctx, replicas[i].ID); derr != nil {
 				logger.FromContext(ctx).Warn("fleet reconcile: decommission dead replica", "replica_id", replicas[i].ID, "err", derr)
 			}
@@ -580,9 +613,11 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 	}
 
 	// Refresh resident health; a now-dead resident is decommissioned so it is
-	// replaced by the shortfall step.
+	// replaced by the shortfall step. Foreign residents are NOT probed: their PID
+	// means nothing here, and marking them dead on that basis would make another
+	// host replace a replica that never stopped serving.
 	for i := range replicas {
-		if replicas[i].State != domain.ReplicaStateResident {
+		if replicas[i].State != domain.ReplicaStateResident || !uc.ownsReplica(&replicas[i]) {
 			continue
 		}
 		healthy, herr := uc.runtime.RefreshHealth(ctx, &replicas[i])
@@ -598,6 +633,13 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 	}
 
 	// Recount occupying replicas after the dead cleanup.
+	//
+	// ⚠ CAPACITY IS COUNTED GLOBALLY — foreign and nil-host rows included. Counting
+	// only local rows is the fail-open direction and it is the exact shape of a
+	// second occupant: a host that cannot touch the first replica would see zero,
+	// declare a shortfall and boot a duplicate — two VMs writing one customer's
+	// single-writer volume. What this host may not do is ACTUATE a foreign row; the
+	// row's existence is still an authoritative fact about the fleet.
 	occupying := make([]domain.Replica, 0, len(replicas))
 	for i := range replicas {
 		switch replicas[i].State {
@@ -627,17 +669,25 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 			return nil
 		}
 		shortfall := app.DesiredReplicas - len(occupying)
-		// rt#9 — a volume-bearing app is pinned to the host that holds its data:
-		// every replica placement targets the affinity host so the same backing
-		// file is re-attached. Resolved once per reconcile tick.
+		// rt#9 + the host fence — a volume-bearing app is placed ONLY on the host
+		// that holds its bytes, and that host is now decided when the bytes are
+		// materialized (EnsureAppVolumes writes host_affinity into the first insert),
+		// never afterwards. There is deliberately no post-scheduling bind left: the
+		// scheduler is TOLD the affinity and its answer is then VERIFIED, so a
+		// scheduler change can never quietly place a stateful replica off its data.
+		//
+		// AffinityHost answers all three cases in one call: (nil,false,nil) for an app
+		// with no volumes (free placement), a single agreed host when the app is
+		// stateful, and an error when its volumes are unstamped or disagree — which
+		// fails the reconcile rather than guessing a location for customer data.
 		var affHostID *uuid.UUID
-		pinned := false
 		if uc.volumes != nil {
-			h, p, aerr := uc.volumes.AffinityHost(ctx, app.ID)
+			h, pinned, aerr := uc.volumes.AffinityHost(ctx, app.ID)
 			if aerr != nil {
-				logger.FromContext(ctx).Warn("fleet reconcile: affinity host lookup", "app_id", app.ID, "err", aerr)
-			} else {
-				affHostID, pinned = h, p
+				return aerr
+			}
+			if pinned {
+				affHostID = h
 			}
 		}
 		for n := 0; n < shortfall; n++ {
@@ -648,7 +698,7 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 				NeedDiskMB: 0,
 				Constraint: domain.PlacementConstraintBinPack,
 			}
-			if pinned && affHostID != nil {
+			if affHostID != nil {
 				req.AffinityHostID = affHostID
 			}
 			host, serr := uc.scheduler.SelectHost(ctx, req)
@@ -659,20 +709,14 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 				}
 				return fmt.Errorf("select host: %w", serr)
 			}
-			// First placement of a volume-bearing app: pin its data to this host
-			// (write-once). Subsequent placements this tick target the same host.
-			if uc.volumes != nil && !pinned {
-				hasVol, herr := uc.volumes.HasVolumes(ctx, app.ID)
-				if herr != nil {
-					logger.FromContext(ctx).Warn("fleet reconcile: has-volumes lookup", "app_id", app.ID, "err", herr)
-				} else if hasVol {
-					if berr := uc.volumes.BindToHost(ctx, app.ID, host); berr != nil {
-						logger.FromContext(ctx).Warn("fleet reconcile: bind volume host", "app_id", app.ID, "err", berr)
-					} else {
-						bound := host
-						affHostID, pinned = &bound, true
-					}
-				}
+			// The scheduler is expected to honor AffinityHostID; this asserts it did.
+			// A stateful replica placed anywhere else would boot on an empty disk, so
+			// the disagreement is refused BEFORE any row is created rather than
+			// "corrected" — the two components disagreeing about where a customer's
+			// data is, is not a condition to paper over.
+			if affHostID != nil && host != *affHostID {
+				return fmt.Errorf("%w: app %s is pinned to the host holding its data but the scheduler selected a different one",
+					domain.ErrVolumeHostMismatch, app.ID)
 			}
 			hostID := host
 			now := time.Now().UTC()
@@ -691,13 +735,25 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 			if cerr := uc.replicas.Create(ctx, replica); cerr != nil {
 				return fmt.Errorf("create replica: %w", cerr)
 			}
-			if berr := uc.runtime.BootReplica(ctx, replica.ID); berr != nil {
-				// BootReplica marks the replica dead on failure; next tick retries.
-				logger.FromContext(ctx).Warn("fleet reconcile: boot replica", "replica_id", replica.ID, "err", berr)
-			}
+			// ⚠ NO INLINE BOOT. Placement WRITES desired state and stops; actuation is
+			// the owning host's, through the single actuateScheduledOwned pass at the
+			// tail of ReconcileAll. Booting here is what made the reconciler act on
+			// foreign placements: whichever process happened to run the RPC would
+			// materialize an image, take a lease and start a VMM for a row the
+			// scheduler had just assigned to a different machine.
 		}
 	case len(occupying) > app.DesiredReplicas:
-		surplus := surplusOrder(occupying)
+		// The DRAIN COUNT is global (capacity is), but the CANDIDATES are local: a
+		// surplus this host cannot legally tear down is not a reason to tear down a
+		// foreign row remotely, and there is no such remote verb. If the surplus lives
+		// elsewhere, its owner drains it on its own next pass.
+		local := make([]domain.Replica, 0, len(occupying))
+		for i := range occupying {
+			if uc.ownsReplica(&occupying[i]) {
+				local = append(local, occupying[i])
+			}
+		}
+		surplus := surplusOrder(local)
 		drain := len(occupying) - app.DesiredReplicas
 		for i := 0; i < drain && i < len(surplus); i++ {
 			if derr := uc.runtime.DecommissionReplica(ctx, surplus[i].ID); derr != nil {
@@ -886,8 +942,8 @@ func (uc *FleetOrchestrator) evalPlaceableOnBackingFile(ctx context.Context, app
 	return false, conditionBackingFileMissing
 }
 
-// ReconcileAll reconciles every known app. A per-app error is logged, never
-// aborting the loop.
+// ReconcileAll reconciles every known app, then actuates the placements this
+// host owns. A per-app error is logged, never aborting the loop.
 func (uc *FleetOrchestrator) ReconcileAll(ctx context.Context) error {
 	apps, err := uc.apps.List(ctx)
 	if err != nil {
@@ -897,6 +953,49 @@ func (uc *FleetOrchestrator) ReconcileAll(ctx context.Context) error {
 		if rerr := uc.ReconcileApp(ctx, apps[i].ID); rerr != nil {
 			logger.FromContext(ctx).Error("fleet reconcile: app failed", "app_id", apps[i].ID, "err", rerr)
 		}
+	}
+	// ONE actuation pass, after the whole app loop. Placement (any process) and
+	// actuation (the stamped host) are now separate, and this is the single seam
+	// where the second happens.
+	return uc.actuateScheduledOwned(ctx)
+}
+
+// actuateScheduledOwned boots every `scheduled` replica stamped with THIS host.
+//
+// It is the other half of the split the fence introduces: ReconcileApp writes a
+// globally visible placement and stops, and the host the placement names is the
+// only one that turns it into a running microVM. Its single input query is
+// ListByHost(selfHost), so a row placed elsewhere is not merely skipped — it is
+// invisible here, and there is no branch that could act on one.
+//
+// Idempotence comes from the state machine, not from bookkeeping: only
+// `scheduled` rows enter, and BootReplica persists `booting` before any host
+// side effect, then `resident` on success or `dead` on a handled failure. So a
+// repeated pass finds nothing to redo, and a pass that crosses a boot sees a row
+// that has already left `scheduled`.
+//
+// Per-row failures are isolated exactly like per-app failures in ReconcileAll —
+// one app's bad image must not stop every other placement on the host. Only the
+// host-list query itself is fatal: without it the pass has no work list at all
+// and reporting success would hide a broken tick.
+func (uc *FleetOrchestrator) actuateScheduledOwned(ctx context.Context) error {
+	rows, err := uc.replicas.ListByHost(ctx, uc.selfHost)
+	if err != nil {
+		return fmt.Errorf("list replicas placed on this host: %w", err)
+	}
+	for i := range rows {
+		if rows[i].State != domain.ReplicaStateScheduled {
+			continue
+		}
+		if berr := uc.runtime.BootReplica(ctx, rows[i].ID); berr != nil {
+			// BootReplica marks the replica dead on a handled boot failure; the next
+			// tick's shortfall step replaces it.
+			recordExecution("actuate_scheduled_replica", "error")
+			logger.FromContext(ctx).Warn("fleet actuate: boot scheduled replica",
+				"replica_id", rows[i].ID, "app_id", rows[i].AppID, "err", berr)
+			continue
+		}
+		recordExecution("actuate_scheduled_replica", "ok")
 	}
 	return nil
 }
@@ -1063,17 +1162,42 @@ func (uc *FleetOrchestrator) HealthApp(ctx context.Context, appID uuid.UUID) (Fl
 	for i := range replicas {
 		switch replicas[i].State {
 		case domain.ReplicaStateResident:
-			ok, herr := uc.runtime.RefreshHealth(ctx, &replicas[i])
-			if herr != nil {
-				logger.FromContext(ctx).Warn("fleet health: refresh", "replica_id", replicas[i].ID, "err", herr)
+			// An OWNED resident is probed as before: this host holds its PID and can
+			// reach its guest address.
+			if uc.ownsReplica(&replicas[i]) {
+				ok, herr := uc.runtime.RefreshHealth(ctx, &replicas[i])
+				if herr != nil {
+					logger.FromContext(ctx).Warn("fleet health: refresh", "replica_id", replicas[i].ID, "err", herr)
+				}
+				if ok {
+					healthy++
+					if url == "" {
+						url = replicas[i].Endpoint
+					}
+				}
+				continue
 			}
-			if ok {
+			// A FOREIGN resident must not be probed, and must not therefore be reported
+			// permanently red either — that would turn the fence into a false outage on
+			// every app whose replica happens to live on the other host. The globally
+			// recorded `resident` state is the only evidence available here, and it is
+			// trusted ONLY while the host that recorded it is currently live: a stale
+			// host's `resident` row is a claim nobody is refreshing. Either way NOTHING
+			// is mutated — the owning host's own reconcile is what corrects the row.
+			live, lerr := uc.hostLive(ctx, replicas[i].HostID)
+			if lerr != nil {
+				logger.FromContext(ctx).Warn("fleet health: liveness of the host a foreign resident is placed on",
+					"replica_id", replicas[i].ID, "err", lerr)
+			}
+			if live {
 				healthy++
 				if url == "" {
 					url = replicas[i].Endpoint
 				}
 			}
 		case domain.ReplicaStateScheduled, domain.ReplicaStateBooting:
+			// Pending regardless of which host owns the row: it is not serving yet
+			// anywhere.
 			pending++
 		}
 	}
@@ -1108,6 +1232,25 @@ func (uc *FleetOrchestrator) HealthApp(ctx context.Context, appID uuid.UUID) (Fl
 	}
 	out.Message += fmt.Sprintf("healthy=%d pending=%d desired=%d replicas=%d", healthy, pending, app.DesiredReplicas, len(replicas))
 	return out, true, nil
+}
+
+// hostLive reports whether a replica's stamped host is currently in the
+// scheduler's live-candidate set. Everything it cannot answer positively — a nil
+// stamp, no scheduler wired, a lookup failure — is a "no": an unprovable
+// liveness is not liveness, and counting it healthy is exactly the false-green
+// the fence must not introduce.
+func (uc *FleetOrchestrator) hostLive(ctx context.Context, hostID *uuid.UUID) (bool, error) {
+	if hostID == nil {
+		return false, nil
+	}
+	if uc.scheduler == nil {
+		return false, nil
+	}
+	live, err := uc.scheduler.IsHostLive(ctx, *hostID)
+	if err != nil {
+		return false, err
+	}
+	return live, nil
 }
 
 // refuseIfResourceBacked refuses an app-level teardown of an app that a LIVE
@@ -1164,6 +1307,35 @@ func (uc *FleetOrchestrator) DecommissionApp(ctx context.Context, appID uuid.UUI
 	}
 	if err := uc.ReconcileApp(ctx, app.ID); err != nil {
 		return true, err
+	}
+	// The app-row cascade is the obvious way AROUND the replica fence, so it is
+	// closed here: DecommissionApp deletes backing FILES, routes and the app row,
+	// and doing any of that while a replica still exists would strand a live VM
+	// with no record and no disk. The replica set is therefore RE-LISTED after the
+	// drain — the list from before desired=0 says nothing about what survived it.
+	remaining, err := uc.replicas.ListByApp(ctx, app.ID)
+	if err != nil {
+		return true, fmt.Errorf("re-list replicas before teardown: %w", err)
+	}
+	// LOCAL rows first: they mean OUR teardown failed, and that cause is the more
+	// actionable of the two.
+	for i := range remaining {
+		if uc.ownsReplica(&remaining[i]) {
+			// Our own teardown returned an error (ErrVMTerminationUnproven or worse) and
+			// the row is still here. Preserve EVERYTHING after this point and surface it:
+			// a retry of the same call finishes the job once the VM can be proven gone.
+			return true, fmt.Errorf("replica %s of app %s is still present after the drain, so its volumes, routes and app row are preserved: %w",
+				remaining[i].ID, app.ID, domain.ErrVMTerminationUnproven)
+		}
+	}
+	if len(remaining) > 0 {
+		// Only foreign or nil-host rows are left: their owner drains them on its next
+		// ReconcileAll (desired is now 0 and that fact is global). This host deletes
+		// NOTHING further — a caller retry then performs finalization. Deliberately
+		// retry-based: a decommission-intent column would be durable state invented to
+		// describe a wait that resolves in a tick.
+		return true, fmt.Errorf("%w: replica %s of app %s is placed on another fleet host and must be drained by its owner before this app can be torn down",
+			domain.ErrReplicaHostMismatch, remaining[0].ID, app.ID)
 	}
 	// rt#9 — reclaim the on-host ext4 backing files AND the volume rows before
 	// the app row is deleted (nothing cascades since 0024 —

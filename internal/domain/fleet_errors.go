@@ -204,4 +204,31 @@ var (
 	// addressing plane could not be reconciled at startup. A host that cannot
 	// prove which addresses are held must not hand any out.
 	ErrNetPlaneUnreconciled = errors.New("microVM net addressing plane is unreconciled on this host")
+
+	// ── Host authority (#fleet-reconciler-acts-on-foreign-host-replicas) ─────
+	// The database is GLOBAL; authority over PIDs, TCP probes, files, guest
+	// control, TAPs, jails, sockets and leases is HOST-LOCAL. A durable row
+	// stamped with another host is a valid desired-state fact, never an error to
+	// repair locally — so a direct verb asked to execute such a row REFUSES, and
+	// reconciliation quietly skips it. These are runtime-local and hand-mapped by
+	// fleetError; they are deliberately NOT in the platform error registry
+	// (fleetError consults it only in its default branch, so a registration would
+	// be dead code that looks like a control).
+
+	// ErrReplicaHostMismatch is returned when a replica verb is asked to act on a
+	// replica whose host_id is nil or names another fleet host. Nil is refused
+	// exactly like a foreign id: an unstamped row proves nothing about who owns
+	// the PID, the TAP and the jail it would signal.
+	ErrReplicaHostMismatch = errors.New("fleet replica belongs to another host")
+	// ErrVolumeHostMismatch is returned when a volume byte/attachment/ownership
+	// verb is asked to act on a volume whose host_affinity is nil or names another
+	// host. The bytes are on ONE filesystem; a host that does not hold them can
+	// neither adopt, attach, snapshot, restore nor delete them.
+	ErrVolumeHostMismatch = errors.New("fleet volume belongs to another host")
+	// ErrVMTerminationUnproven is returned when a teardown cannot POSITIVELY
+	// observe that a microVM's VMM process exited. Everything the VM holds — TAP,
+	// lease, token, socket, jail, rootfs — is retained, because releasing a
+	// capability a live VM still uses is how one tenant's address, uid and chroot
+	// reach the next. Retryable once the owning host can prove the exit.
+	ErrVMTerminationUnproven = errors.New("microVM termination could not be proven")
 )

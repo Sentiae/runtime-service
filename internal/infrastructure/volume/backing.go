@@ -108,7 +108,10 @@ func (b *BackingStore) Ensure(ctx context.Context, in usecase.VolumeEnsureInput)
 				return usecase.VolumeEnsureOutput{}, verr
 			}
 		}
-		return usecase.VolumeEnsureOutput{BackingPath: path}, nil
+		// Created stays FALSE: this call validated a file that already existed, it
+		// did not bring it into being. The caller's compensation seam keys its only
+		// delete on that distinction.
+		return usecase.VolumeEnsureOutput{BackingPath: path, Created: false}, nil
 	} else if !os.IsNotExist(err) {
 		return usecase.VolumeEnsureOutput{}, fmt.Errorf("stat backing file: %w", err)
 	}
@@ -150,7 +153,11 @@ func (b *BackingStore) Ensure(ctx context.Context, in usecase.VolumeEnsureInput)
 		_ = os.Remove(path)
 		return usecase.VolumeEnsureOutput{}, fmt.Errorf("mkfs.ext4 backing file: %s: %w", strings.TrimSpace(string(o)), e)
 	}
-	return usecase.VolumeEnsureOutput{BackingPath: path}, nil
+	// Created=true is reported ONLY here: past the absent-file check, past the
+	// truncate and past a successful mkfs. Every earlier return either found the
+	// file already present or failed, and in both cases the file is not this
+	// invocation's to reclaim.
+	return usecase.VolumeEnsureOutput{BackingPath: path, Created: true}, nil
 }
 
 // backingBytes is the size a backing file is materialized at, and therefore the

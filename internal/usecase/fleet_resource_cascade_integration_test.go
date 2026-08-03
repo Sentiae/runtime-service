@@ -13,6 +13,7 @@ import (
 	"github.com/sentiae/platform-kit/testutil"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
+	"gorm.io/gorm"
 )
 
 // cascadeVolumeBackend materializes a REAL on-disk file at the same path shape
@@ -72,6 +73,13 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	resources := postgres.NewFleetResourceRepository(db)
 	workloads := postgres.NewImageWorkloadRepository(db)
 
+	// This instance's fleet host must EXIST as a row: since the host-authority
+	// fence a newly materialized volume carries host_affinity from its first
+	// insert, and fleet_volumes.host_affinity is FK-constrained to fleet_hosts. In
+	// production the self-registration always precedes any volume work; here the
+	// row is seeded directly.
+	seedFenceSelfHost(t, db)
+
 	// ── a dedicated resource with a backing app and a materialized volume ──
 	org := uuid.New()
 	now := time.Now().UTC()
@@ -99,7 +107,7 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	}
 
 	volDir := t.TempDir()
-	volMgr := NewFleetVolumeManager(volumes, cascadeVolumeBackend{t: t}, volDir, nil)
+	volMgr := newTestVolumeManager(t, volumes, cascadeVolumeBackend{t: t}, volDir, nil)
 	vols, err := volMgr.EnsureAppVolumes(ctx, app.ID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}})
 	if err != nil {
 		t.Fatalf("ensure app volumes: %v", err)
@@ -210,7 +218,7 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	// through to image_workloads (unknown → ErrWorkloadNotFound), which is the
 	// exact production route. Neither the scheduler nor the replica runtime is
 	// reachable on a missing-app decommission, so both are left nil.
-	orch := NewFleetOrchestrator(apps, replicas, nil, nil, resources)
+	orch := newTestOrchestrator(t, apps, replicas, nil, nil, resources)
 	orch.SetVolumeManager(volMgr)
 	prov := NewFleetProvision(ctx, workloads, nil, nil, t.TempDir(), "127.0.0.1")
 	prov.SetOrchestrator(orch)
@@ -218,7 +226,10 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	// The REAL snapshotter: in the explicitly seeded historical shape it walks
 	// zero volumes and returns ([], nil) — a vacuous success that creates
 	// nothing, so guest control and the artifact store are never reached.
-	snapshotter := NewFleetVolumeSnapshotter(nil, nil, volumes, replicas, resources)
+	snapshotter, serr := NewFleetVolumeSnapshotter(nil, nil, volumes, replicas, resources, testSelfHost)
+	if serr != nil {
+		t.Fatalf("NewFleetVolumeSnapshotter: %v", serr)
+	}
 
 	uc := newTestResourceProvisioner(prov, resources, replicas, snapshotter, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
@@ -248,5 +259,21 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	}
 	if tomb.Phase != domain.FleetResourcePhaseDecommissioned || tomb.DecommissionedAt == nil {
 		t.Fatalf("resource not tombstoned: phase=%q at=%v", tomb.Phase, tomb.DecommissionedAt)
+	}
+}
+
+// seedFenceSelfHost inserts the fleet_hosts row testSelfHost names, so a volume
+// materialized under the host-authority fence can satisfy its affinity FK.
+func seedFenceSelfHost(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	now := time.Now().UTC()
+	err := db.Exec(`INSERT INTO fleet_hosts
+		(id, region, failure_domain, labels, capacity_vcpu, capacity_mem_mb, capacity_disk_mb,
+		 allocatable_vcpu, allocatable_mem_mb, allocatable_disk_mb, health, status, endpoint, created_at, updated_at)
+		VALUES (?, 'homelab', 'site-a/breaker-a/switch-1', '{}', 4, 8192, 40000, 4, 8192, 40000,
+		        'healthy', 'active', '10.0.10.244:50061', ?, ?)
+		ON CONFLICT (id) DO NOTHING`, testSelfHost, now, now).Error
+	if err != nil {
+		t.Fatalf("seed fleet host %s: %v", testSelfHost, err)
 	}
 }

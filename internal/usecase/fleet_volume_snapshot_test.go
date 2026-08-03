@@ -288,7 +288,11 @@ func newSnapshotHarness(t *testing.T) *snapHarness {
 		recovery: newFakeResourceRepo(),
 		replicas: newFakeResourceReplicaRepo(),
 	}
-	h.s = NewFleetVolumeSnapshotter(h.guest, h.store, h.vols, h.replicas, h.recovery)
+	snapshotter, err := NewFleetVolumeSnapshotter(h.guest, h.store, h.vols, h.replicas, h.recovery, testSelfHost)
+	if err != nil {
+		t.Fatalf("NewFleetVolumeSnapshotter: %v", err)
+	}
+	h.s = snapshotter
 	// Keep the thaw retry loop reachable without burning the real 10s deadline,
 	// and park the heartbeat far out so only the tests that exercise it see one.
 	h.s.thawDeadline = 60 * time.Millisecond
@@ -310,7 +314,7 @@ func (h *snapHarness) attachedVolume(t *testing.T) (appID, resID, volID, replica
 	}
 	appID, resID, volID, replicaID = uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	h.replicas.byID[replicaID] = &domain.Replica{ID: replicaID, SocketPath: "/tmp/x.sock"}
-	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing, AttachedReplica: &replicaID}}
+	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing, AttachedReplica: &replicaID, HostAffinity: hostPtr(testSelfHost)}}
 	return appID, resID, volID, replicaID, dir
 }
 
@@ -780,7 +784,7 @@ func TestSnapshot_MissingBackingFileIsLegible(t *testing.T) {
 			h := newSnapshotHarness(t)
 			appID, resID, volID, replicaID, _ := h.attachedVolume(t)
 			if !tt.attached {
-				h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing}}
+				h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing, HostAffinity: hostPtr(testSelfHost)}}
 				_ = replicaID
 			}
 			if err := os.Remove(h.backing); err != nil {
@@ -832,7 +836,7 @@ func TestSnapshot_NoRowOnUploadFailure(t *testing.T) {
 func TestSnapshot_VolumeRowWithNoBackingPathIsItsOwnRefusal(t *testing.T) {
 	h := newSnapshotHarness(t)
 	appID := uuid.New()
-	h.vols.byApp[appID] = []domain.Volume{{ID: uuid.New(), AppID: &appID, BackingPath: ""}}
+	h.vols.byApp[appID] = []domain.Volume{{ID: uuid.New(), AppID: &appID, BackingPath: "", HostAffinity: hostPtr(testSelfHost)}}
 
 	_, err := h.s.SnapshotAppVolumes(context.Background(), uuid.New(), appID)
 	if !errors.Is(err, domain.ErrVolumeBackingPathUnset) {
@@ -857,7 +861,7 @@ func TestSnapshot_UnattachedVolumeNoQuiesce(t *testing.T) {
 	appID := uuid.New()
 	resID := uuid.New()
 	volID := uuid.New()
-	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing}} // AttachedReplica nil
+	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing, HostAffinity: hostPtr(testSelfHost)}} // AttachedReplica nil
 
 	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
 	if err != nil {
@@ -1195,7 +1199,7 @@ func TestSnapshot_DetachedCaptureStampsDetachedUnclean(t *testing.T) {
 	h.backing = filepath.Join(dir, "vol.ext4")
 	h.writeBacking(t, []byte(volumeBytes))
 	appID, resID, volID := uuid.New(), uuid.New(), uuid.New()
-	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing}} // AttachedReplica nil
+	h.vols.byApp[appID] = []domain.Volume{{ID: volID, AppID: &appID, BackingPath: h.backing, HostAffinity: hostPtr(testSelfHost)}} // AttachedReplica nil
 
 	points, err := h.s.SnapshotAppVolumes(context.Background(), resID, appID)
 	if err != nil {
@@ -1233,4 +1237,11 @@ func TestSnapshot_AbortedFreezeLeavesNoStampedRecoveryPoint(t *testing.T) {
 	if len(rps) != 0 {
 		t.Fatalf("aborted capture recorded %d recovery point(s): %+v", len(rps), rps)
 	}
+}
+
+// BindHostAffinity — the per-volume host CAS added by the host-authority fence.
+// This fake is not exercising the CAS itself, so it reports the idempotent
+// already-bound outcome and writes nothing.
+func (f *fakeVolumeRepo) BindHostAffinity(context.Context, uuid.UUID, uuid.UUID) (repository.VolumeHostBindResult, error) {
+	return repository.VolumeHostBindResult{Outcome: repository.VolumeHostBindAlreadyBound}, nil
 }

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/sentiae/runtime-service/internal/domain"
@@ -98,6 +99,63 @@ func (r *volumeRepository) BindVolumesToResource(ctx context.Context, appID, res
 	})
 	if err != nil {
 		return repository.VolumeBindResult{}, err
+	}
+	return out, nil
+}
+
+// BindHostAffinity is the per-volume host CAS (#fleet-reconciler-acts-on-
+// foreign-host-replicas). It mirrors BindVolumesToResource's transactional shape
+// deliberately: SELECT ... FOR UPDATE, decide, then a TARGETED update whose WHERE
+// re-states the precondition — never a read + Save, which lets two concurrent
+// adopters each observe host_affinity NULL and each believe it won.
+//
+// The row lock makes the compare, the set and the reported outcome one atomic
+// command, so the caller acts on what the DATABASE decided rather than on state
+// it read a moment earlier. A non-nil affinity is never overwritten: it is the
+// physical location of the customer's bytes.
+func (r *volumeRepository) BindHostAffinity(ctx context.Context, volumeID, hostID uuid.UUID) (repository.VolumeHostBindResult, error) {
+	var out repository.VolumeHostBindResult
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var vol domain.Volume
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", volumeID).
+			First(&vol).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return domain.ErrVolumeNotFound
+			}
+			return err
+		}
+		if vol.HostAffinity != nil {
+			if *vol.HostAffinity == hostID {
+				out = repository.VolumeHostBindResult{Outcome: repository.VolumeHostBindAlreadyBound}
+				return nil
+			}
+			out = repository.VolumeHostBindResult{
+				Outcome:    repository.VolumeHostBindConflict,
+				ActualHost: *vol.HostAffinity,
+			}
+			return nil
+		}
+		// The IS NULL predicate is redundant under the row lock and is kept anyway:
+		// it is the statement's own proof of what it may overwrite, so the write can
+		// never widen if the lock above is ever weakened.
+		res := tx.Model(&domain.Volume{}).
+			Where("id = ? AND host_affinity IS NULL", volumeID).
+			Updates(map[string]any{
+				"host_affinity": hostID,
+				"updated_at":    gorm.Expr("now()"),
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected != 1 {
+			return fmt.Errorf("bind volume %s host affinity: expected 1 row, updated %d", volumeID, res.RowsAffected)
+		}
+		out = repository.VolumeHostBindResult{Outcome: repository.VolumeHostBindBound}
+		return nil
+	})
+	if err != nil {
+		return repository.VolumeHostBindResult{}, err
 	}
 	return out, nil
 }

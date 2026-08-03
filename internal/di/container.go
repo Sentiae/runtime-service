@@ -509,7 +509,30 @@ func (c *Container) initFleet(cfg *config.Config) error {
 		c.VolumeBackend = usecase.FailLoudVolumeBackend{}
 		log.Println("Fleet volume backend: fail-loud (firecracker executor not selected)")
 	}
-	c.FleetVolumeManager = usecase.NewFleetVolumeManager(c.VolumeRepo, c.VolumeBackend, volumeDir, c.FleetResourceRepo)
+	// The host-authoritative use cases are constructed ONLY with a durable self
+	// identity, and only on the firecracker executor. Off-host they stay true nil:
+	// a manager built with some placeholder host would be a component that can
+	// adopt, attach, snapshot or delete volumes it cannot see, and
+	// FleetResourceProvisioner's nil binder already refuses dedicated provisioning
+	// (a typed-nil interface would defeat that guard, so the nil must be real).
+	//
+	// The identity source is the DURABLE self-registration above and nothing else.
+	// There is deliberately no config/env fallback: a host id typed into an env var
+	// is a host id that can be typed wrong, and this one decides whose VMs a
+	// process may signal.
+	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
+		if c.fleetSelf == nil {
+			// Unreachable via registerSelfHost (which is fatal without an identity) and
+			// checked anyway: a firecracker executor that reached here without one must
+			// FAIL STARTUP, not construct unfenced components.
+			return fmt.Errorf("fleet: this firecracker host has no registered fleet identity, so no host-authoritative use case can be constructed")
+		}
+		vm, err := usecase.NewFleetVolumeManager(c.VolumeRepo, c.VolumeBackend, volumeDir, c.FleetResourceRepo, c.fleetSelf.ID)
+		if err != nil {
+			return fmt.Errorf("fleet volume manager: %w", err)
+		}
+		c.FleetVolumeManager = vm
+	}
 
 	// Report-only ledger↔reality audit over the SAME volume root. Deliberately not
 	// gated on the executor: it reads, so there is nothing to fake, and a host that
@@ -573,14 +596,19 @@ func (c *Container) initFleet(cfg *config.Config) error {
 	// CP4 §9#6 — resident replica runtime (firecracker host only; the fail-loud
 	// booter would reject every boot off-host so it stays nil there).
 	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
-		c.FleetReplicaRuntimeUC = usecase.NewFleetReplicaRuntime(
+		replicaRuntime, err := usecase.NewFleetReplicaRuntime(
 			c.ImageMaterializer,
 			c.ImageBooter,
 			c.ReplicaRepo,
 			c.FleetAppRepo,
 			cfg.ImageBoot.WorkDir,
 			cfg.ImageBoot.AdvertiseHost,
+			c.fleetSelf.ID,
 		)
+		if err != nil {
+			return fmt.Errorf("fleet replica runtime: %w", err)
+		}
+		c.FleetReplicaRuntimeUC = replicaRuntime
 		// rt#9 — attach persistent data disks on resident boot.
 		c.FleetReplicaRuntimeUC.SetVolumeManager(c.FleetVolumeManager)
 		// D-124 — read each app's handed registry pull token at materialize.
@@ -621,7 +649,7 @@ func (c *Container) initFleet(cfg *config.Config) error {
 	// (needs the replica runtime); off-host the resident class falls back to the
 	// CP3 single-workload path in FleetProvision.
 	if c.FleetReplicaRuntimeUC != nil {
-		c.FleetOrchestratorUC = usecase.NewFleetOrchestrator(
+		orchestrator, err := usecase.NewFleetOrchestrator(
 			c.FleetAppRepo,
 			c.ReplicaRepo,
 			c.FleetScheduler,
@@ -629,7 +657,12 @@ func (c *Container) initFleet(cfg *config.Config) error {
 			// The P19 claim ledger: DecommissionApp refuses to tear down an app a
 			// live durable resource backs (data loss with no recovery point).
 			c.FleetResourceRepo,
+			c.fleetSelf.ID,
 		)
+		if err != nil {
+			return fmt.Errorf("fleet orchestrator: %w", err)
+		}
+		c.FleetOrchestratorUC = orchestrator
 		// rt#9 — persistent-volume lifecycle (ensure/affinity/attach/degrade).
 		c.FleetOrchestratorUC.SetVolumeManager(c.FleetVolumeManager)
 
@@ -688,16 +721,13 @@ func (c *Container) initFleet(cfg *config.Config) error {
 		)
 	}
 
-	c.initResourceControlPlane(cfg)
-
-	// D-184 — scope the boot-time restore sweep to the resources whose data lives
-	// on THIS host, reusing the volume host-affinity the reconciler already uses
-	// to decide whether a stateful app is ours. Wired only AFTER self-registration
-	// (the host id does not exist before it); without it the sweep is a no-op, so
-	// a restore live on another host is never stamped by this instance.
-	if c.ResourceRestorer != nil && c.fleetSelf != nil && c.FleetVolumeManager != nil {
-		c.ResourceRestorer.SetHostScope(c.fleetSelf.ID, c.FleetVolumeManager)
+	if err := c.initResourceControlPlane(cfg); err != nil {
+		return err
 	}
+
+	// D-184's restore host scope is no longer wired here: it is a CONSTRUCTOR
+	// requirement of NewFleetVolumeRestorer (host-authority fence item 27), so
+	// there is no window in which a constructed restorer is unscoped.
 
 	// Same scoping for the report-only ledger audit: it may only judge the volumes
 	// pinned HERE. Off a fleet host it stays scope-less and reports nothing — a
@@ -745,7 +775,7 @@ func fleetHostStaleness(cfg *config.Config) time.Duration {
 	return staleness
 }
 
-func (c *Container) initResourceControlPlane(cfg *config.Config) {
+func (c *Container) initResourceControlPlane(cfg *config.Config) error {
 	// Volume snapshotter — firecracker host only (it quiesces the guest over the
 	// real GuestControl client; off-host GuestControl is fail-loud, so every
 	// attached-volume snapshot would be refused anyway) AND only with a configured
@@ -754,13 +784,21 @@ func (c *Container) initResourceControlPlane(cfg *config.Config) {
 	// pointer is deliberate off-host; it is never wrapped in a non-nil interface
 	// (see the explicit branches below).
 	if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil && c.snapshotArtifactStore != nil {
-		c.ResourceSnapshotter = usecase.NewFleetVolumeSnapshotter(
+		if c.fleetSelf == nil {
+			return fmt.Errorf("fleet resource snapshotter: this firecracker host has no registered fleet identity")
+		}
+		snapshotter, err := usecase.NewFleetVolumeSnapshotter(
 			c.GuestControl,
 			c.snapshotArtifactStore,
 			c.VolumeRepo,
 			c.ReplicaRepo,
 			c.FleetResourceRepo,
+			c.fleetSelf.ID,
 		)
+		if err != nil {
+			return fmt.Errorf("fleet resource snapshotter: %w", err)
+		}
+		c.ResourceSnapshotter = snapshotter
 	} else if cfg.App.ExecutorType == "firecracker" && c.FCProvider != nil {
 		log.Println("Fleet resource snapshotter DISABLED: no snapshot artifact store configured (APP_SNAPSHOT_STORE_ENABLED) — snapshot/restore report unsupported")
 	}
@@ -769,7 +807,10 @@ func (c *Container) initResourceControlPlane(cfg *config.Config) {
 	// and the artifact store (fetch the recovery point); nil without either, so
 	// GetResourceCapabilities keeps reporting supports_restore honestly.
 	if c.FleetOrchestratorUC != nil && c.snapshotArtifactStore != nil {
-		c.ResourceRestorer = usecase.NewFleetVolumeRestorer(
+		if c.fleetSelf == nil {
+			return fmt.Errorf("fleet resource restorer: this firecracker host has no registered fleet identity")
+		}
+		restorer, err := usecase.NewFleetVolumeRestorer(
 			context.Background(),
 			c.FleetResourceRepo,
 			c.VolumeRepo,
@@ -777,7 +818,12 @@ func (c *Container) initResourceControlPlane(cfg *config.Config) {
 			c.FleetOrchestratorUC,
 			c.FleetProvisionUC,
 			c.snapshotArtifactStore,
+			c.fleetSelf.ID,
 		)
+		if err != nil {
+			return fmt.Errorf("fleet resource restorer: %w", err)
+		}
+		c.ResourceRestorer = restorer
 	}
 
 	// Dedicated-tier provisioner (R2) — always wired. Pass the snapshotter as the
@@ -787,15 +833,25 @@ func (c *Container) initResourceControlPlane(cfg *config.Config) {
 	if c.ResourceSnapshotter != nil {
 		snapPort = c.ResourceSnapshotter
 	}
+	// Same typed-nil care for the volume binder, and it is now load-bearing: the
+	// host-authority fence leaves FleetVolumeManager nil off the firecracker host
+	// (a manager without a durable host identity would be one that can act on
+	// volumes it cannot see). Assigning that nil POINTER straight into the
+	// ResourceVolumeBinder INTERFACE would produce a non-nil interface holding a
+	// nil pointer, so `uc.binder == nil` would read false and every dedicated
+	// provision would nil-panic instead of being refused.
+	var binderPort usecase.ResourceVolumeBinder
+	if c.FleetVolumeManager != nil {
+		binderPort = c.FleetVolumeManager
+	}
 	c.FleetResourceUC = usecase.NewFleetResourceProvisioner(
 		c.FleetProvisionUC,
 		c.FleetResourceRepo,
 		c.ReplicaRepo,
 		snapPort,
-		// D-203 — the claim's ownership stamp over the backing app's volumes. The
-		// manager is built earlier in initFleet, so it is non-nil here; a nil
-		// binder refuses every dedicated provision by design.
-		c.FleetVolumeManager,
+		// D-203 — the claim's ownership stamp over the backing app's volumes. A nil
+		// binder refuses every dedicated provision by design (see binderPort above).
+		binderPort,
 		usecase.DedicatedEngineConfig{
 			Registry:   cfg.Resource.EnginePGImageRegistry,
 			Repository: cfg.Resource.EnginePGImageRepository,
@@ -863,6 +919,7 @@ func (c *Container) initResourceControlPlane(cfg *config.Config) {
 		restoreHandler = c.ResourceRestorer
 	}
 	c.ResourceServer = grpchandler.NewResourceServer(c.FleetResourceUC, nil, snapHandler, restoreHandler, c.FleetResourceRepo)
+	return nil
 }
 
 // initNetworkFabric wires the P21 fleet network fabric (CP4.5 §9#5, D-164).

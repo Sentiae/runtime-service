@@ -65,6 +65,13 @@ type VolumeEnsureInput struct {
 // VolumeEnsureOutput is the backing-file result.
 type VolumeEnsureOutput struct {
 	BackingPath string
+	// Created reports that THIS invocation brought the file into existence and
+	// formatted it. It is the compensation seam's only licence to delete: a file
+	// this call did not create is either a pre-existing customer volume or another
+	// caller's, and unlinking it to tidy up after a failed row insert would be the
+	// data-loss the whole saga is ordered to avoid. Validated pre-existing files
+	// (both modes) report false.
+	Created bool
 }
 
 // FailLoudVolumeBackend is wired when the executor is not firecracker. Every call
@@ -105,14 +112,59 @@ type FleetVolumeManager struct {
 	// resources is the claim ledger the deletion seam consults to prove a
 	// claim-owned volume's owner is retired before any byte is reclaimed (D-203).
 	resources repository.FleetResourceRepository
+
+	// selfHost is this process's durable fleet host identity, and it is what makes
+	// host_affinity MEAN something (#fleet-reconciler-acts-on-foreign-host-
+	// replicas). Immutable and constructor-required: a manager that could be
+	// re-scoped, or that defaulted to "no host", would be a manager that can adopt,
+	// attach, snapshot or delete bytes sitting on a filesystem it does not have.
+	selfHost uuid.UUID
 }
 
 // NewFleetVolumeManager constructs the use case. dir is the root under which
 // per-volume ext4 backing files are materialized. resources is the claim ledger
-// the deletion guard reads (D-203).
+// the deletion guard reads (D-203). selfHost is this instance's durable fleet
+// host id — REQUIRED, because every method below is an authority claim over
+// bytes that exist on exactly one machine.
 func NewFleetVolumeManager(volumes repository.VolumeRepository, backend VolumeBackend, dir string,
-	resources repository.FleetResourceRepository) *FleetVolumeManager {
-	return &FleetVolumeManager{volumes: volumes, backend: backend, dir: dir, resources: resources}
+	resources repository.FleetResourceRepository, selfHost uuid.UUID) (*FleetVolumeManager, error) {
+	if selfHost == uuid.Nil {
+		// Refused rather than defaulted: with a nil self host every affinity
+		// comparison below would fail closed for OWNED rows and the manager would be
+		// useless, or (if it were made permissive) would act on every host's bytes.
+		return nil, fmt.Errorf("%w: a volume manager needs this instance's fleet host identity before it may touch any backing file",
+			domain.ErrVolumeHostMismatch)
+	}
+	return &FleetVolumeManager{volumes: volumes, backend: backend, dir: dir, resources: resources, selfHost: selfHost}, nil
+}
+
+// ownedVolumes lists an app's volumes and proves EVERY one of them is pinned to
+// this host before the caller performs any write or local side effect.
+//
+// It returns the rows so the caller does not list a second time: a re-list is a
+// second point in time, and a fence that checks one snapshot while the method
+// mutates another is not a fence. Zero volumes passes vacuously — a stateless
+// app has nothing on any host — so callers keep their existing no-op behavior.
+//
+// A nil affinity is refused exactly like a foreign one. An unstamped row proves
+// nothing about where its bytes are, and the whole point of the fence is that
+// only positive evidence authorizes a local side effect.
+func (m *FleetVolumeManager) ownedVolumes(ctx context.Context, appID uuid.UUID) ([]domain.Volume, error) {
+	vols, err := m.volumes.ListByApp(ctx, appID)
+	if err != nil {
+		return nil, fmt.Errorf("list volumes: %w", err)
+	}
+	for i := range vols {
+		if vols[i].HostAffinity == nil {
+			return nil, fmt.Errorf("%w: volume %s carries no host affinity, so this host cannot prove its data is here",
+				domain.ErrVolumeHostMismatch, vols[i].ID)
+		}
+		if *vols[i].HostAffinity != m.selfHost {
+			return nil, fmt.Errorf("%w: volume %s is pinned to another fleet host",
+				domain.ErrVolumeHostMismatch, vols[i].ID)
+		}
+	}
+	return vols, nil
 }
 
 // EnsureAppVolumes upserts a domain.Volume per spec (keyed by app + mount path),
@@ -142,16 +194,50 @@ func (m *FleetVolumeManager) EnsureAppVolumes(ctx context.Context, appID uuid.UU
 			// customer's data: re-attach it, and if it is not on this host REFUSE.
 			// Creating here would hand a re-provision (or a reboot after the host
 			// lost its disk) a brand-new empty filesystem under the same row.
+			//
+			// The affinity is inspected BEFORE the backend is touched: a foreign row
+			// must cost zero backend and zero repository calls, so that "this host did
+			// nothing" is a property of the code path and not of what the backend
+			// happened to answer.
+			if vol.HostAffinity != nil && *vol.HostAffinity != m.selfHost {
+				return nil, fmt.Errorf("%w: volume %s at %s is pinned to another fleet host",
+					domain.ErrVolumeHostMismatch, vol.ID, mount)
+			}
+			legacy := vol.HostAffinity == nil
+			// Adopt mode on BOTH branches, including the legacy nil-affinity one. A
+			// successfully VALIDATED local file is the only evidence that this host may
+			// claim a row that names no host; a missing file returns
+			// ErrVolumeBackingFileMissing and binds nothing, because "the file is not
+			// here" must never become "so I will make one and call it mine".
 			out, berr := m.backend.Ensure(ctx, VolumeEnsureInput{VolumeID: vol.ID, SizeMB: vol.SizeMB, Dir: m.dir, Mode: VolumeEnsureAdopt})
 			if berr != nil {
 				return nil, fmt.Errorf("ensure backing file: %w", berr)
 			}
+			if vol.BackingPath == "" {
+				return nil, fmt.Errorf("%w: volume %s", domain.ErrVolumeBackingPathUnset, vol.ID)
+			}
+			// No broad Save here, deliberately: writing the whole row back would race
+			// the affinity CAS below and could stamp a stale HostAffinity over the
+			// winner's. The path is a pure function of (dir, volume id) on both sides,
+			// so a divergence is a wiring fault to surface, never a field to repair.
 			if vol.BackingPath != out.BackingPath {
-				vol.BackingPath = out.BackingPath
-				vol.UpdatedAt = now
-				if err := m.volumes.Update(ctx, vol); err != nil {
-					return nil, fmt.Errorf("update volume: %w", err)
+				return nil, fmt.Errorf("volume %s: the adopted backing file %s is not the path the ledger records (%s) — this host's volume directory does not match the row",
+					vol.ID, out.BackingPath, vol.BackingPath)
+			}
+			if legacy {
+				// The atomic CAS, not a read-then-Save: two hosts adopting the same
+				// legacy row concurrently must produce exactly one winner, and the LOSER
+				// must not delete anything. It did not create those bytes.
+				res, cerr := m.volumes.BindHostAffinity(ctx, vol.ID, m.selfHost)
+				if cerr != nil {
+					return nil, fmt.Errorf("bind volume %s host affinity: %w", vol.ID, cerr)
 				}
+				if res.Outcome == repository.VolumeHostBindConflict {
+					return nil, fmt.Errorf("%w: volume %s was bound to another fleet host while this host was adopting it",
+						domain.ErrVolumeHostMismatch, vol.ID)
+				}
+				self := m.selfHost
+				vol.HostAffinity = &self
 			}
 			result = append(result, *vol)
 			continue
@@ -171,24 +257,106 @@ func (m *FleetVolumeManager) EnsureAppVolumes(ctx context.Context, appID uuid.UU
 			return nil, fmt.Errorf("ensure backing file: %w", berr)
 		}
 		app := appID
+		self := m.selfHost
 		vol := &domain.Volume{
-			ID:          id,
-			AppID:       &app,
-			SizeMB:      spec.SizeMB,
-			MountPath:   mount,
-			BackingPath: out.BackingPath,
-			Status:      domain.VolumeStatusAvailable,
-			DeviceName:  "/dev/vdb",
-			CreatedAt:   now,
-			UpdatedAt:   now,
+			ID:    id,
+			AppID: &app,
+			// The affinity is written INTO the first insert, never stamped afterwards:
+			// the bytes were just materialized here, so there is no moment at which a
+			// persisted row exists without naming the host that holds them. It is also
+			// what makes a stateful app's later scheduling deterministic — it can only
+			// be placed back on the host that has its disk.
+			HostAffinity: &self,
+			SizeMB:       spec.SizeMB,
+			MountPath:    mount,
+			BackingPath:  out.BackingPath,
+			Status:       domain.VolumeStatusAvailable,
+			DeviceName:   "/dev/vdb",
+			CreatedAt:    now,
+			UpdatedAt:    now,
 		}
 		if err := m.volumes.Create(ctx, vol); err != nil {
-			return nil, fmt.Errorf("create volume: %w", err)
+			// A filesystem/DB saga, not a transaction: the bytes exist and the row does
+			// not. Every branch below is decided by AUTHORITATIVE evidence, and every
+			// uncertainty resolves toward keeping the file — an unattributed file is a
+			// report-only ledger-reconciler finding, whereas a wrongly deleted one is a
+			// customer's data.
+			return nil, m.compensateCreate(ctx, appID, mount, vol, out, err)
 		}
 		byMount[mount] = vol
 		result = append(result, *vol)
 	}
 	return result, nil
+}
+
+// compensateCreate decides what to do with the file a failed volume-row insert
+// left behind, and returns the error EnsureAppVolumes reports.
+//
+// It never deletes a file this attempt did not create (out.Created == false),
+// and it never deletes on an uncertain read: the re-list is the only authority
+// on who owns the mount path, so a re-list that fails means ownership is
+// unknown, and unknown ownership is never permission to unlink possible customer
+// bytes.
+func (m *FleetVolumeManager) compensateCreate(ctx context.Context, appID uuid.UUID, mount string,
+	attempt *domain.Volume, out VolumeEnsureOutput, cause error) error {
+	// Authoritative re-read: did a concurrent provision commit a row for this
+	// (app, mount) while this attempt was losing?
+	after, lerr := m.volumes.ListByApp(ctx, appID)
+	if lerr != nil {
+		// Ownership is now UNKNOWN. Retain the file and report; the report-only
+		// ledger reconciler surfaces an unattributed file, and no path here may
+		// trade that for a possible deletion of live data.
+		logger.FromContext(ctx).Error("fleet volume: create failed and the authoritative re-read failed too — the materialized backing file is RETAINED because nothing can prove who owns it",
+			"app_id", appID, "volume_id", attempt.ID, "backing_path", attempt.BackingPath, "err", cause, "reread_err", lerr)
+		return fmt.Errorf("create volume: %w (ownership of %s could not be re-read: %v)", cause, attempt.BackingPath, lerr)
+	}
+	var winner *domain.Volume
+	for i := range after {
+		if after[i].MountPath == mount {
+			winner = &after[i]
+			break
+		}
+	}
+	switch {
+	case winner == nil:
+		// Proven: no row owns this path. The file is this attempt's residue and may
+		// be reclaimed — but only if this attempt is what created it.
+		m.deleteOwnAttempt(ctx, attempt, out)
+		return fmt.Errorf("create volume: %w", cause)
+
+	case winner.ID == attempt.ID && winner.BackingPath == attempt.BackingPath &&
+		winner.HostAffinity != nil && *winner.HostAffinity == m.selfHost:
+		// The insert actually landed (a lost ack, a retried write): the committed row
+		// IS this attempt. Adopting it is correct and deleting the file would destroy
+		// the volume the ledger now promises.
+		logger.FromContext(ctx).Warn("fleet volume: create reported an error but the committed row is this attempt's — adopting it and keeping the backing file",
+			"app_id", appID, "volume_id", winner.ID, "backing_path", winner.BackingPath, "err", cause)
+		return nil
+
+	default:
+		// Someone else owns this mount, or owns it on another host. This attempt's
+		// file is not the winner's, so it may be reclaimed — again only when this
+		// attempt created it.
+		m.deleteOwnAttempt(ctx, attempt, out)
+		if winner.HostAffinity == nil || *winner.HostAffinity != m.selfHost {
+			return fmt.Errorf("%w: volume %s at %s was committed on another fleet host while this host was materializing it",
+				domain.ErrVolumeHostMismatch, winner.ID, mount)
+		}
+		return fmt.Errorf("create volume: %w (volume %s already holds mount %s)", cause, winner.ID, mount)
+	}
+}
+
+// deleteOwnAttempt removes the backing file THIS attempt materialized, and only
+// then. A Created=false path is a pre-existing file the create branch merely
+// validated, and unlinking it would delete data this call did not produce.
+func (m *FleetVolumeManager) deleteOwnAttempt(ctx context.Context, attempt *domain.Volume, out VolumeEnsureOutput) {
+	if !out.Created || attempt.BackingPath == "" {
+		return
+	}
+	if derr := m.backend.Delete(ctx, attempt.BackingPath); derr != nil {
+		logger.FromContext(ctx).Warn("fleet volume: reclaim the backing file of a failed create",
+			"volume_id", attempt.ID, "backing_path", attempt.BackingPath, "err", derr)
+	}
 }
 
 // DeleteAppVolumes reclaims an app's persistent volumes when the APP is fully
@@ -200,9 +368,14 @@ func (m *FleetVolumeManager) EnsureAppVolumes(ctx context.Context, appID uuid.UU
 // This must NOT run on a replica restart (that would destroy persisted data) —
 // only DecommissionApp calls it, never DecommissionReplica.
 func (m *FleetVolumeManager) DeleteAppVolumes(ctx context.Context, appID uuid.UUID) error {
-	vols, err := m.volumes.ListByApp(ctx, appID)
+	// The host fence runs FIRST, before the claim guard and before any unlink: a
+	// host that does not hold the bytes cannot reclaim them, and a delete loop that
+	// discovered that after the first unlink would already have destroyed data. It
+	// also returns the rows, so the guard and the loop below judge exactly the
+	// snapshot the fence approved.
+	vols, err := m.ownedVolumes(ctx, appID)
 	if err != nil {
-		return fmt.Errorf("list volumes: %w", err)
+		return err
 	}
 	// D-203: a volume a LIVE claim owns is deletable only through the resource's
 	// own snapshot-first teardown (which stamps decommissioned_at BEFORE calling
@@ -260,6 +433,13 @@ func (m *FleetVolumeManager) DeleteAppVolumes(ctx context.Context, appID uuid.UU
 // one owned by a DIFFERENT resource refuses with ErrVolumeClaimConflict —
 // silently re-parenting a customer's bytes is never an upsert.
 func (m *FleetVolumeManager) BindToResource(ctx context.Context, appID, resourceID uuid.UUID) error {
+	// Claim ownership may only be stamped by the host that holds the bytes: it is
+	// the stamp the durability machinery later reads to decide WHERE a resource's
+	// protection runs, so a foreign stamp would point the cadence at a filesystem
+	// that has no such file. Preflighted before the atomic bind, all-or-nothing.
+	if _, err := m.ownedVolumes(ctx, appID); err != nil {
+		return err
+	}
 	res, err := m.volumes.BindVolumesToResource(ctx, appID, resourceID)
 	if err != nil {
 		return fmt.Errorf("bind volume to resource claim: %w", err)
@@ -305,50 +485,48 @@ func (m *FleetVolumeManager) PrimaryVolume(ctx context.Context, appID uuid.UUID)
 	return &v, true, nil
 }
 
-// AffinityHost returns the host a volume-bearing app is pinned to. The bool is
-// true when any of the app's volumes carries a host_affinity (authoritative);
-// (nil,false) otherwise.
+// AffinityHost returns the host a volume-bearing app's data is pinned to. The
+// bool is true when the app has volumes and they AGREE on one non-nil host.
+//
+// It is deliberately unanimous rather than first-match. It is the input the
+// scheduler pins a stateful placement with, so an app whose volumes disagree —
+// or one carrying an unstamped row — has no single answer, and returning the
+// first non-nil one would place a replica on a host holding only part of its
+// data. That refuses (ErrVolumeHostMismatch) instead of guessing.
 func (m *FleetVolumeManager) AffinityHost(ctx context.Context, appID uuid.UUID) (*uuid.UUID, bool, error) {
 	vols, err := m.volumes.ListByApp(ctx, appID)
 	if err != nil {
 		return nil, false, fmt.Errorf("list volumes: %w", err)
 	}
+	if len(vols) == 0 {
+		return nil, false, nil // a stateless app is pinned to nothing
+	}
+	var host *uuid.UUID
 	for i := range vols {
-		if vols[i].HostAffinity != nil {
-			host := *vols[i].HostAffinity
-			return &host, true, nil
+		if vols[i].HostAffinity == nil {
+			return nil, false, fmt.Errorf("%w: volume %s of app %s carries no host affinity, so the app's data has no provable location",
+				domain.ErrVolumeHostMismatch, vols[i].ID, appID)
 		}
-	}
-	return nil, false, nil
-}
-
-// BindToHost pins the app's volumes to a host, write-once: a volume that already
-// carries a host_affinity is never re-pinned (its data lives on that host).
-func (m *FleetVolumeManager) BindToHost(ctx context.Context, appID, hostID uuid.UUID) error {
-	vols, err := m.volumes.ListByApp(ctx, appID)
-	if err != nil {
-		return fmt.Errorf("list volumes: %w", err)
-	}
-	now := time.Now().UTC()
-	for i := range vols {
-		if vols[i].HostAffinity != nil {
+		if host == nil {
+			h := *vols[i].HostAffinity
+			host = &h
 			continue
 		}
-		host := hostID
-		vols[i].HostAffinity = &host
-		vols[i].UpdatedAt = now
-		if err := m.volumes.Update(ctx, &vols[i]); err != nil {
-			return fmt.Errorf("bind volume to host: %w", err)
+		if *vols[i].HostAffinity != *host {
+			return nil, false, fmt.Errorf("%w: app %s has volumes pinned to DIFFERENT hosts, so no single host holds its data",
+				domain.ErrVolumeHostMismatch, appID)
 		}
 	}
-	return nil
+	return host, true, nil
 }
 
 // AttachTo marks the app's volumes attached to a replica (single-writer).
 func (m *FleetVolumeManager) AttachTo(ctx context.Context, appID, replicaID uuid.UUID) error {
-	vols, err := m.volumes.ListByApp(ctx, appID)
+	// Attachment is a host-local claim on a host-local file: only the host holding
+	// the bytes may declare a replica the single writer of them.
+	vols, err := m.ownedVolumes(ctx, appID)
 	if err != nil {
-		return fmt.Errorf("list volumes: %w", err)
+		return err
 	}
 	now := time.Now().UTC()
 	for i := range vols {
@@ -365,9 +543,12 @@ func (m *FleetVolumeManager) AttachTo(ctx context.Context, appID, replicaID uuid
 
 // DetachFrom clears the app's volume attachment (status back to available).
 func (m *FleetVolumeManager) DetachFrom(ctx context.Context, appID uuid.UUID) error {
-	vols, err := m.volumes.ListByApp(ctx, appID)
+	// Fenced like AttachTo: releasing the single-writer claim is the other half of
+	// the same host-local authority, and a foreign detach would tell the owning
+	// host's live VM that nothing holds its disk.
+	vols, err := m.ownedVolumes(ctx, appID)
 	if err != nil {
-		return fmt.Errorf("list volumes: %w", err)
+		return err
 	}
 	now := time.Now().UTC()
 	for i := range vols {
@@ -390,6 +571,14 @@ func (m *FleetVolumeManager) DetachFrom(ctx context.Context, appID uuid.UUID) er
 
 // MarkDegraded marks the app's volumes degraded (affinity host gone). Terminal
 // this cycle — there is no cross-host restore.
+//
+// ⚠ DELIBERATELY NOT HOST-FENCED, and this exception must not be widened. It is
+// a ledger-only availability ANNOTATION: it touches no byte, no guest, no
+// attachment, no claim. Fencing it would be actively wrong — the condition it
+// records is precisely "the host that holds this data is gone", so requiring
+// that host to record it would mean the fact can only be written by a machine
+// that cannot write it. Every byte, attach, detach, bind, snapshot and restore
+// verb on this type IS fenced; this one alone is not.
 func (m *FleetVolumeManager) MarkDegraded(ctx context.Context, appID uuid.UUID) error {
 	vols, err := m.volumes.ListByApp(ctx, appID)
 	if err != nil {

@@ -43,7 +43,7 @@ func TestSweepIdle(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newOrchHarness(oneLiveHost(), tt.app)
+			h := newOrchHarness(t, oneLiveHost(), tt.app)
 			if tt.seedResident {
 				pid := 4000
 				if err := h.replicas.Create(context.Background(), &domain.Replica{
@@ -130,7 +130,7 @@ func TestSweepIdleActivityGuard(t *testing.T) {
 				LastActiveAt: lastActive, Port: 8080, ResourcesVCPU: 1, ResourcesMemMB: 512,
 				RestartPolicy: domain.RestartPolicyAlways, CreatedAt: now, UpdatedAt: now,
 			}
-			h := newOrchHarness(oneLiveHost(), app)
+			h := newOrchHarness(t, oneLiveHost(), app)
 
 			routes := newOrchRouteRepo()
 			if err := routes.Create(context.Background(), &domain.Route{

@@ -2,6 +2,7 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -67,6 +68,11 @@ type ImageBooter struct {
 	// production always runs the os.FindProcess default.
 	findProcess func(pid int) (vmProcess, error)
 
+	// inspect reads the /proc + pidfile facts the termination proof is built
+	// from. A field for the same reason as findProcess; production is
+	// procInspector.
+	inspect processInspector
+
 	natOnce sync.Once
 	natErr  error
 
@@ -101,6 +107,7 @@ func NewImageBooter(p *Provider, advertiseHost string, controlTokens *GuestContr
 		guestControl: NewGuestControlClient(controlTokens),
 		stop:         defaultStopTimings(),
 		findProcess:  osFindProcess,
+		inspect:      procInspector{},
 		alloc:        alloc,
 	}
 }
@@ -124,6 +131,12 @@ type stopTimings struct {
 	// sigtermGrace is the fallback path's wait between SIGTERM and SIGKILL —
 	// unchanged from the pre-control-channel behaviour.
 	sigtermGrace time.Duration
+	// sigkillGrace is the wait AFTER SIGKILL before the teardown gives up and
+	// declares the termination unproven. It exists because SIGKILL is not
+	// instantaneous — an uninterruptible-sleep VMM does not die until it leaves
+	// D-state — and "we sent SIGKILL" was never evidence that anything exited.
+	// That assumption is precisely what left seven live VMMs behind deleted jails.
+	sigkillGrace time.Duration
 }
 
 func defaultStopTimings() stopTimings {
@@ -132,6 +145,7 @@ func defaultStopTimings() stopTimings {
 		powerOff:      15 * time.Second,
 		exitPoll:      100 * time.Millisecond,
 		sigtermGrace:  5 * time.Second,
+		sigkillGrace:  5 * time.Second,
 	}
 }
 
@@ -654,31 +668,62 @@ func (b *ImageBooter) BootResident(ctx context.Context, in usecase.ImageBootInpu
 	}, nil
 }
 
-// Decommission tears down a resident workload: stop the guest, remove the TAP,
-// free the index, delete the rootfs. rt#8 retired the per-VM DNAT so there is no
-// host-port rule or port to reclaim.
+// Decommission tears down a resident workload in ONE mandatory order:
 //
-// ⚠ Teardown is NEVER blockable. stopVM returns nothing to fail on and every
-// step below runs unconditionally — including when the guest refuses to die and
-// when the caller's context is already cancelled. That is the deliberate
-// opposite of the snapshot path's fail-closed posture, and the asymmetry is the
-// point: refusing to snapshot protects data, whereas refusing to tear down
-// protects nothing and strands the customer's resource (a running VM, its /30,
-// its rootfs) with no way to release it.
+//  1. PROVE the VMM is gone (or make it gone and prove that);
+//  2. destroy the TAP;
+//  3. release this host's lease, and require that to succeed;
+//  4. delete the control token, sockets, jail and rootfs;
+//  5. return nil.
+//
+// ⚠ THE ORDER IS THE FIX, not a preference. The previous version was
+// "teardown is never blockable": it stopped the VM best-effort and then removed
+// the TAP, the lease, the jail and the rootfs UNCONDITIONALLY — including when
+// the guest refused to die. The reasoning was that refusing to tear down strands
+// a customer resource. What it actually produced is worse than a strand: a
+// RUNNING microVM whose jail, executable link and addressing record have all
+// been deleted out from under it, invisible to every ledger and impossible to
+// clean up correctly. Seven such processes are on the live fleet host right now,
+// with /proc/<pid>/root and /proc/<pid>/exe marked deleted — direct evidence of
+// this exact ordering defect.
+//
+// Releasing a lease, deleting a TAP or clearing a jail slot while its VM still
+// runs is not merely untidy: those are the resources the NEXT boot allocates
+// from, so it hands a second tenant a live VM's address, uid and chroot. The
+// fail-closed direction is therefore to retain everything and report
+// ErrVMTerminationUnproven, which is retryable and which the replica row and
+// volume attachment are deliberately preserved for.
 func (b *ImageBooter) Decommission(ctx context.Context, in usecase.ImageDecommissionInput) error {
-	b.stopVM(ctx, in)
+	// 1. Nothing below this line may run without positive proof.
+	if err := b.proveTerminated(ctx, in); err != nil {
+		logger.FromContext(ctx).Error("image-boot: teardown REFUSED — the VMM could not be proven to have exited, so its tap, lease, socket, jail and rootfs are ALL retained (retry once it can be proven gone)",
+			"owner_kind", in.OwnerKind, "owner_id", in.OwnerID, "pid", in.PID,
+			"tap_name", in.TapName, "net_index", in.NetIndex, "err", err)
+		return err
+	}
+
+	// 2. The VM is gone: its device may go.
 	b.destroyTap(ctx, in.TapName)
-	// The lease is released by OWNER, not by index: the index is only an address,
-	// whereas the lease row is the allocation. Releasing runs even when the guest
-	// refused to die and even when the caller's context is already cancelled —
-	// a lease that outlives its VM burns its slot until the next reconcile.
-	b.releaseLease(ctx, in.OwnerKind, in.OwnerID)
+
+	// 3. The lease is released by OWNER, not by index: the index is only an
+	//    address, whereas the lease row is the allocation. It is now REQUIRED to
+	//    succeed — a swallowed failure leaves the slot held while every artifact
+	//    that identifies it is deleted below, which is unrecoverable except by
+	//    hand. Returning here keeps the jail and rootfs in place so a retry can
+	//    finish the job.
+	if err := b.releaseLease(ctx, in.OwnerKind, in.OwnerID); err != nil {
+		return err
+	}
+
+	// 4. Only now the host-local files.
 	if in.SocketPath != "" {
 		// The VM is gone; stop bearing its control token (D-185a). This MUST stay
-		// after stopVM: that token is what authenticates the guest SHUTDOWN, so
+		// after the stop: that token is what authenticates the guest SHUTDOWN, so
 		// dropping it first would make every graceful stop fail and fall back to
 		// killing the VMM — the exact defect this path fixes.
 		b.controlTokens.Delete(in.SocketPath)
+		// Best-effort removals of files whose VM is provably gone; a leftover socket
+		// inode fences nothing and the next boot on this slot clears the jail dir.
 		_ = os.Remove(in.SocketPath)
 		_ = os.Remove(in.SocketPath + ".vsock")
 		// "" for a pre-jail VM, whose socket lives outside any chroot.
@@ -687,123 +732,178 @@ func (b *ImageBooter) Decommission(ctx context.Context, in usecase.ImageDecommis
 		}
 	}
 	if in.RootfsPath != "" {
+		// Best-effort for the same reason: the inode is unreferenced once the jail's
+		// hard link above is gone.
 		_ = os.Remove(in.RootfsPath)
 	}
 	return nil
 }
 
-// stopVM stops the microVM, preferring a clean in-guest shutdown over killing
-// the VMM.
+// proveTerminated returns nil only when this microVM's VMM process is PROVEN not
+// to be running — either it was already absent, or this call stopped it and
+// observed the absence.
 //
-// Signalling the Firecracker process stops the guest the way pulling the power
-// cord does: the workload never gets its SIGINT, so Postgres never runs its fast
-// shutdown, and image-init never runs its own sync-and-power-off. Doing that on
-// every scale-to-zero and every decommission meant every customer database was
-// crash-stopped, and left a detached volume's snapshot only as consistent as
-// that crash. So the guest is asked to stop ITSELF first; the signals below are
-// the fallback for a guest that cannot.
-func (b *ImageBooter) stopVM(ctx context.Context, in usecase.ImageDecommissionInput) {
+// Absence is observed with signal 0 and nothing else. Wait() is never used and
+// no goroutine is started to call it: the boot path may already own the wait on
+// the exec.Cmd, and after a service restart the VMM is not this process's child
+// at all — in both cases Wait() returns an error immediately, which reads as
+// "exited" for a process that is still running. That misreading is how a live VM
+// gets its jail deleted.
+func (b *ImageBooter) proveTerminated(ctx context.Context, in usecase.ImageDecommissionInput) error {
 	if in.PID <= 0 {
-		return
+		// No usable pid. Whether that is fine depends entirely on whether anything
+		// was ever booted for this owner.
+		if in.SocketPath == "" && in.TapName == "" && in.NetIndex <= 0 {
+			// A scheduled row that never booted: no process, no artifacts, nothing to
+			// stop. Proceeding is correct — there is nothing a live VM could be holding.
+			return nil
+		}
+		// Artifacts exist but no pid does. NEVER guess a process from a socket name
+		// and never kill by name: the VM may be running under a pid this row simply
+		// failed to record, and picking a victim by pattern is how an unrelated
+		// process gets killed.
+		return fmt.Errorf("%w: %s %s records boot artifacts (socket=%q tap=%q net_index=%d) but no pid, so nothing can prove its VMM is gone",
+			domain.ErrVMTerminationUnproven, in.OwnerKind, in.OwnerID, in.SocketPath, in.TapName, in.NetIndex)
 	}
+
 	find := b.findProcess
 	if find == nil {
 		find = osFindProcess
 	}
 	proc, err := find(in.PID)
 	if err != nil {
-		// No handle means nothing to signal AND no way to observe the power-off,
-		// so there is no graceful attempt to make either.
-		logger.FromContext(ctx).Warn("image-boot: no handle for vmm process", "pid", in.PID, "err", err)
-		return
+		return fmt.Errorf("%w: no process handle for pid %d: %v", domain.ErrVMTerminationUnproven, in.PID, err)
 	}
-	if b.shutdownGuest(ctx, in.SocketPath, proc) {
-		return
+
+	// Absence FIRST, and it needs no identity check: a pid that does not exist
+	// cannot be anyone's live VM, so ESRCH is complete proof on its own.
+	gone, serr := processGone(proc)
+	if gone {
+		return nil
 	}
-	b.signalStop(proc)
+	if serr != nil {
+		// A permission error (or anything else) is NOT absence. It means we cannot
+		// see the process, not that there is none.
+		return fmt.Errorf("%w: pid %d could not be probed with signal 0: %v", domain.ErrVMTerminationUnproven, in.PID, serr)
+	}
+
+	// Something is alive at that pid. Prove it is OUR VM before signalling it.
+	if err := proveVMIdentity(b.inspect, b.p.cfg.ChrootBase, in); err != nil {
+		return err
+	}
+	return b.stopAndProve(ctx, in, proc)
 }
 
-// shutdownGuest asks the guest to stop itself over the post-boot control channel
-// and waits for the VMM to exit on its own. It reports whether that fully
-// succeeded.
+// stopAndProve executes the bounded stop ladder and returns nil only on observed
+// absence.
 //
-// Every failure mode — a VM booted before the control channel existed, a guest
-// too old to know the verb, an unreachable or wedged guest, a timeout, a
-// cancelled caller — returns false so the caller falls back to signalling, and
-// is logged at WARN: a fleet that has silently stopped shutting down cleanly has
-// to be visible rather than invisible.
-func (b *ImageBooter) shutdownGuest(ctx context.Context, socketPath string, proc vmProcess) bool {
-	if b.guestControl == nil || socketPath == "" {
-		logger.FromContext(ctx).Warn("image-boot: resident stop has no guest control channel, signalling the vmm instead",
-			"socket_path", socketPath)
-		return false
-	}
-
-	// The caller's context is threaded, not replaced: a cancelled caller cuts the
-	// graceful attempt short and drops straight to the bounded fallback below,
-	// which is what keeps teardown finishing rather than being abandoned.
-	shutdownCtx, cancel := context.WithTimeout(ctx, b.stop.guestShutdown)
-	defer cancel()
-	if err := b.guestControl.Shutdown(shutdownCtx, socketPath); err != nil {
-		logger.FromContext(ctx).Warn("image-boot: guest shutdown failed, falling back to signalling the vmm",
-			"socket_path", socketPath, "err", err)
-		return false
-	}
-
-	// The guest powers itself off once it has acked, so the VMM exits on its own.
-	if err := waitForProcessExit(ctx, proc, b.stop.powerOff, b.stop.exitPoll); err != nil {
-		logger.FromContext(ctx).Warn("image-boot: vmm still alive after guest shutdown, falling back to signalling",
-			"socket_path", socketPath, "err", err)
-		return false
-	}
-	return true
-}
-
-// signalStop is the pre-control-channel stop: SIGTERM the VMM, grace window,
-// SIGKILL. It is the fallback, not the norm — it stops the guest without letting
-// it flush anything.
+//  1. ask the guest to stop itself (the clean path: the workload gets its SIGINT,
+//     Postgres runs its fast shutdown, image-init syncs and powers off);
+//  2. poll signal 0 for the power-off budget;
+//  3. SIGTERM, poll signal 0 for sigtermGrace;
+//  4. SIGKILL, poll signal 0 for sigkillGrace;
+//  5. still there ⇒ unproven.
 //
-// Deliberately NOT bounded by the caller's context: this is the last chance to
-// stop the process, and a cancelled caller must never leave a live VM behind a
-// destroyed TAP and a deleted rootfs.
-func (b *ImageBooter) signalStop(proc vmProcess) {
-	_ = proc.Signal(syscall.SIGTERM)
-	done := make(chan struct{})
-	// No ctx by design (see above): the wait is bounded by the select's grace
-	// window, and the goroutine only reaps a process we are already killing.
-	go func() {
-		defer func() { _ = recover() }()
-		_, _ = proc.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(b.stop.sigtermGrace):
-		_ = proc.Kill()
-	}
-}
+// Steps 3–4 deliberately ignore a cancelled caller context: this is the last
+// chance to stop the process, and abandoning it because an RPC deadline passed
+// is what leaves an orphan. They remain bounded by their own timers, so nothing
+// blocks indefinitely.
+func (b *ImageBooter) stopAndProve(ctx context.Context, in usecase.ImageDecommissionInput, proc vmProcess) error {
+	log := logger.FromContext(ctx)
 
-// waitForProcessExit polls until the process is gone, bounded by both timeout
-// and the caller's context.
-//
-// It polls signal 0 instead of calling Wait(): the boot path already started a
-// reaper goroutine on the VMM's exec.Cmd, and after a service restart the VMM is
-// not this process's child at all — in both cases a Wait() here returns an error
-// immediately, which would read as "exited" for a process that is still running.
-func waitForProcessExit(ctx context.Context, proc vmProcess, timeout, poll time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		// ESRCH (or Go's ErrProcessDone) is the only report of "gone" that does not
-		// depend on being the parent.
-		if err := proc.Signal(syscall.Signal(0)); err != nil {
+	if b.guestControl == nil || in.SocketPath == "" {
+		log.Warn("image-boot: resident stop has no guest control channel, signalling the vmm instead",
+			"socket_path", in.SocketPath)
+	} else {
+		// The caller's context is threaded, not replaced: a cancelled caller cuts the
+		// graceful attempt short and drops straight to the bounded fallback.
+		shutdownCtx, cancel := context.WithTimeout(ctx, b.stop.guestShutdown)
+		err := b.guestControl.Shutdown(shutdownCtx, in.SocketPath)
+		cancel()
+		if err != nil {
+			log.Warn("image-boot: guest shutdown failed, falling back to signalling the vmm",
+				"socket_path", in.SocketPath, "err", err)
+		} else {
+			gone, werr := waitProcessGone(ctx, proc, b.stop.powerOff, b.stop.exitPoll)
+			if gone {
+				return nil
+			}
+			log.Warn("image-boot: vmm still alive after guest shutdown, falling back to signalling",
+				"socket_path", in.SocketPath, "pid", in.PID, "err", werr)
+		}
+	}
+
+	// The fallback. Its own timers bound it; the caller's cancellation does not.
+	fallbackCtx := context.WithoutCancel(ctx)
+	for _, step := range []struct {
+		sig   syscall.Signal
+		grace time.Duration
+	}{
+		{syscall.SIGTERM, b.stop.sigtermGrace},
+		{syscall.SIGKILL, b.stop.sigkillGrace},
+	} {
+		if err := proc.Signal(step.sig); err != nil {
+			// A delivery failure that IS absence is proof; anything else is not.
+			if signalReportsGone(err) {
+				return nil
+			}
+			return fmt.Errorf("%w: pid %d could not be sent %v and its absence was not observed: %v",
+				domain.ErrVMTerminationUnproven, in.PID, step.sig, err)
+		}
+		gone, werr := waitProcessGone(fallbackCtx, proc, step.grace, b.stop.exitPoll)
+		if gone {
 			return nil
 		}
+		if werr != nil {
+			return fmt.Errorf("%w: pid %d could not be probed after %v: %v",
+				domain.ErrVMTerminationUnproven, in.PID, step.sig, werr)
+		}
+	}
+	return fmt.Errorf("%w: pid %d is still running %s after SIGKILL",
+		domain.ErrVMTerminationUnproven, in.PID, b.stop.sigkillGrace)
+}
+
+// processGone reports whether a process is provably absent. The bool is the
+// proof; the error is a probe that could not answer (permission, anything else),
+// which is explicitly NOT absence.
+func processGone(proc vmProcess) (bool, error) {
+	err := proc.Signal(syscall.Signal(0))
+	if err == nil {
+		return false, nil
+	}
+	if signalReportsGone(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+// signalReportsGone reports whether a signal error means "no such process".
+// ESRCH and Go's os.ErrProcessDone are the ONLY two reports of absence that do
+// not depend on being the process's parent — which matters because after a
+// service restart the VMM is not our child.
+func signalReportsGone(err error) bool {
+	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH)
+}
+
+// waitProcessGone polls signal 0 until the process is provably absent, the
+// timeout elapses, or the context ends. The bool is the proof; a non-nil error
+// is a probe that could not answer.
+func waitProcessGone(ctx context.Context, proc vmProcess, timeout, poll time.Duration) (bool, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		gone, err := processGone(proc)
+		if gone {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
 		if !time.Now().Before(deadline) {
-			return fmt.Errorf("vmm still running %s after guest shutdown", timeout)
+			return false, nil
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for vmm exit: %w", ctx.Err())
+			return false, nil
 		case <-time.After(poll):
 		}
 	}
@@ -831,29 +931,43 @@ func (b *ImageBooter) setupNet(ctx context.Context, kind domain.NetLeaseOwnerKin
 	}
 	nw := imgNetFromLease(lease)
 	if err := b.createTap(nw, nw.uid, nw.uid); err != nil {
-		b.releaseLease(ctx, kind, ownerID)
+		// Boot-failure path: no VM was started, so the release outcome cannot change
+		// what is reported — the createTap error IS the cause. releaseLease logs its
+		// own failure.
+		_ = b.releaseLease(ctx, kind, ownerID)
 		return imgNet{}, func() {}, err
 	}
 	cleanup := func() {
 		b.destroyTap(ctx, nw.tapName)
-		b.releaseLease(ctx, kind, ownerID)
+		// Same reasoning: this cleanup runs on a boot failure or after a single-shot
+		// VM has already exited, and it has no error channel to report through.
+		_ = b.releaseLease(ctx, kind, ownerID)
 	}
 	return nw, cleanup, nil
 }
 
-// releaseLease frees an owner's addressing lease. It never propagates: every
-// caller is on a teardown or boot-failure path, where the operation that matters
-// has already been decided. A failure is logged at ERROR because a lease that
-// outlives its VM burns its slot until the next boot-time reconcile — the
-// fail-CLOSED direction (the slot is never re-used), but still an operator event.
-func (b *ImageBooter) releaseLease(ctx context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) {
+// releaseLease frees an owner's addressing lease and REPORTS whether it did.
+//
+// It used to log-and-swallow, on the reasoning that every caller is already on a
+// teardown path. That made Decommission claim success while the slot stayed
+// held — and Decommission then went on to delete the jail, the socket and the
+// rootfs, i.e. every artifact that could later identify what the held slot
+// belongs to. The allocator's own host check (a foreign lease is refused) also
+// reaches the caller through this return, which is what stops one host quietly
+// freeing another's addressing.
+//
+// The operational detail is still logged at ERROR here so the condition is
+// visible even on the paths that legitimately cannot propagate it.
+func (b *ImageBooter) releaseLease(ctx context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) error {
 	if b.alloc == nil {
-		return
+		return nil
 	}
 	if err := b.alloc.Release(ctx, kind, ownerID); err != nil {
 		logger.FromContext(ctx).Error("image-boot: release microVM addressing lease failed; its slot stays held until the next reconcile",
 			"owner_kind", kind, "owner_id", ownerID, "err", err)
+		return fmt.Errorf("release microVM addressing lease for %s %s: %w", kind, ownerID, err)
 	}
+	return nil
 }
 
 // ReclaimLeaseArtifacts removes the host-side artifacts a lease names: its TAP

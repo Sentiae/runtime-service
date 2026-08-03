@@ -32,7 +32,7 @@ func TestBootReplica_BootstrapNonceThreadedToBothLegs(t *testing.T) {
 
 	mat := &capturingMaterializer{rootfs: "/work/rep/rootfs.ext4"}
 	booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5", HostPort: 20001}}
-	uc := NewFleetReplicaRuntime(mat, booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
+	uc := newTestReplicaRuntime(t, mat, booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
 	uc.SetSecretSelfTest(true) // ExpectSecrets without needing a resolver
 
 	if err := uc.BootReplica(context.Background(), rep.ID); err != nil {
@@ -70,7 +70,7 @@ func TestBootReplica_NoNonceWhenNoSecrets(t *testing.T) {
 
 	mat := &capturingMaterializer{rootfs: "/work/rep/rootfs.ext4"}
 	booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5", HostPort: 20001}}
-	uc := NewFleetReplicaRuntime(mat, booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
+	uc := newTestReplicaRuntime(t, mat, booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
 
 	if err := uc.BootReplica(context.Background(), rep.ID); err != nil {
 		t.Fatalf("BootReplica: %v", err)

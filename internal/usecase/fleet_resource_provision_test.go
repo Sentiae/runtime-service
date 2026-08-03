@@ -1852,7 +1852,7 @@ type resourceRecoveryHarness struct {
 
 func newResourceRecoveryHarness(t *testing.T) resourceRecoveryHarness {
 	t.Helper()
-	h := newOrchHarness(oneLiveHost())
+	h := newOrchHarness(t, oneLiveHost())
 	h.orch.runtime.SetSecretResolver(handedTokenGateResolver{
 		inner: secret.NewEnvelopeVaultResolver(stubKV{val: "vault:v1:ct"}, stubKEK{pt: []byte("s3cr3t")}),
 	})
@@ -1914,6 +1914,9 @@ func TestProvisionDedicated_RecoversAfterRestart(t *testing.T) {
 	if _, ok := h.store.Get(appID); !ok {
 		t.Fatalf("first provision must hand the token for app %s", appID)
 	}
+	// The provision WRITES the placement; the owning host's actuation pass boots
+	// it (the host fence separated the two).
+	h.orch.actuate(t)
 	if got := h.orch.replicas.countState(domain.ReplicaStateResident); got != 1 {
 		t.Fatalf("resident replicas after first provision = %d, want 1", got)
 	}
@@ -1938,7 +1941,7 @@ func TestProvisionDedicated_RecoversAfterRestart(t *testing.T) {
 
 	// The defect: reconcile alone can never bring it back — the boot fails closed
 	// on the missing handed token, forever, with no path to re-supply one.
-	if rerr := h.orch.orch.ReconcileApp(ctx, appID); rerr != nil {
+	if rerr := h.orch.converge(t, appID); rerr != nil {
 		t.Fatalf("ReconcileApp: %v", rerr)
 	}
 	if got := h.orch.replicas.countState(domain.ReplicaStateResident); got != 0 {
@@ -1963,6 +1966,7 @@ func TestProvisionDedicated_RecoversAfterRestart(t *testing.T) {
 	if tok != in.VaultToken {
 		t.Fatalf("re-handed token = %q, want the freshly supplied one", tok)
 	}
+	h.orch.actuate(t)
 	if got := h.orch.replicas.countState(domain.ReplicaStateResident); got != 1 {
 		t.Fatalf("resident replicas after recovery = %d, want 1", got)
 	}
@@ -2010,6 +2014,7 @@ func TestProvisionDedicated_HealthyReProvisionDoesNotChurn(t *testing.T) {
 	}
 	row, _ := h.repo.GetResourceByHandle(ctx, uuid.MustParse(first.Handle))
 	appID := *row.AppID
+	h.orch.actuate(t)
 	before, _ := h.orch.replicas.ListByApp(ctx, appID)
 	if len(before) != 1 || before[0].State != domain.ReplicaStateResident {
 		t.Fatalf("expected one resident replica, got %+v", before)
@@ -2261,4 +2266,11 @@ func containsCondition(conds []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// BindHostAffinity — the per-volume host CAS added by the host-authority fence.
+// This fake is not exercising the CAS itself, so it reports the idempotent
+// already-bound outcome and writes nothing.
+func (f *fakeVolumeBinder) BindHostAffinity(context.Context, uuid.UUID, uuid.UUID) (repository.VolumeHostBindResult, error) {
+	return repository.VolumeHostBindResult{Outcome: repository.VolumeHostBindAlreadyBound}, nil
 }

@@ -19,6 +19,18 @@ type AppScaler interface {
 	ScaleApp(ctx context.Context, appID uuid.UUID, replicas int) (bool, error)
 }
 
+// scheduledActuator is the orchestrator's own actuation pass, exposed to the
+// wake path as an OPTIONAL capability of whatever AppScaler is wired.
+//
+// The method is unexported deliberately: only a type in this package can satisfy
+// it, so there is no way for a caller outside the reconciler to acquire a second
+// boot codepath through it. A scaler that does not implement it (every test fake)
+// simply leaves actuation to the reconcile tick, which is the pre-amendment
+// behavior.
+type scheduledActuator interface {
+	actuateScheduledOwned(ctx context.Context) error
+}
+
 // activatePollInterval is how often Activate re-checks the replica set while
 // waiting for a resident+healthy replica after the wake.
 const activatePollInterval = 250 * time.Millisecond
@@ -120,6 +132,23 @@ func (uc *FleetActivator) Activate(ctx context.Context, host string) (string, er
 	}
 	if !isApp {
 		return "", domain.ErrRouteNotFound
+	}
+
+	// ScaleApp now only WRITES the placement (the host fence moved actuation out of
+	// replica creation), so the wake path runs the owning host's actuation pass
+	// itself rather than waiting for the next reconcile tick. That wait is up to a
+	// full ten-second interval, which a 30s ActivateTimeout cannot afford to spend
+	// before the boot has even started.
+	//
+	// This is a SECOND CALLER of the one pass, never a second boot codepath: same
+	// method, same ListByHost(selfHost) input, same per-row isolation. Best-effort —
+	// the tick calls it too, and the readiness poll below is what decides the
+	// outcome either way.
+	if act, ok := uc.orch.(scheduledActuator); ok {
+		if aerr := act.actuateScheduledOwned(ctx); aerr != nil {
+			logger.FromContext(ctx).Warn("fleet activate: actuate scheduled placements on this host",
+				"app_id", route.AppID, "host", host, "err", aerr)
+		}
 	}
 
 	deadline := time.Now().Add(uc.timeout)

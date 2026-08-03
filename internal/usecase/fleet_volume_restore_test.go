@@ -29,11 +29,26 @@ import (
 type restoreVolumeRepo struct {
 	mu    sync.Mutex
 	byApp map[uuid.UUID][]domain.Volume
-	err   error
+	// claimOnly holds volume rows that carry a resource owner but NO app — the
+	// shape D-204 creates and the shape an app-keyed ownership lookup cannot see.
+	claimOnly []domain.Volume
+	err       error
+	// beforeFindByID runs on the FIRST FindByID, which is the restore goroutine's
+	// earliest action — the window a test uses to change ownership under it.
+	beforeFindByID func()
 }
 
 func newRestoreVolumeRepo() *restoreVolumeRepo {
 	return &restoreVolumeRepo{byApp: map[uuid.UUID][]domain.Volume{}}
+}
+
+// all returns every stored row (app-attached and claim-only).
+func (f *restoreVolumeRepo) all() []domain.Volume {
+	out := append([]domain.Volume(nil), f.claimOnly...)
+	for _, vs := range f.byApp {
+		out = append(out, vs...)
+	}
+	return out
 }
 
 func (f *restoreVolumeRepo) Create(context.Context, *domain.Volume) error { return nil }
@@ -42,7 +57,22 @@ func (f *restoreVolumeRepo) ListByApp(_ context.Context, appID uuid.UUID) ([]dom
 	defer f.mu.Unlock()
 	return append([]domain.Volume(nil), f.byApp[appID]...), nil
 }
-func (f *restoreVolumeRepo) FindByID(context.Context, uuid.UUID) (*domain.Volume, error) {
+func (f *restoreVolumeRepo) FindByID(_ context.Context, id uuid.UUID) (*domain.Volume, error) {
+	f.mu.Lock()
+	hook := f.beforeFindByID
+	f.beforeFindByID = nil
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, v := range f.all() {
+		if v.ID == id {
+			cp := v
+			return &cp, nil
+		}
+	}
 	return nil, domain.ErrVolumeNotFound
 }
 func (f *restoreVolumeRepo) Update(_ context.Context, v *domain.Volume) error {
@@ -66,8 +96,21 @@ func (f *restoreVolumeRepo) ListByHost(context.Context, uuid.UUID) ([]domain.Vol
 	return nil, nil
 }
 
-func (f *restoreVolumeRepo) ListByResource(context.Context, uuid.UUID) ([]domain.Volume, error) {
-	return nil, nil
+// ListByResource is what the boot sweep now scopes ownership by: the CLAIM's own
+// volumes, which survive an app replacement and exist even with no app at all.
+func (f *restoreVolumeRepo) ListByResource(_ context.Context, resourceID uuid.UUID) ([]domain.Volume, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []domain.Volume
+	for _, v := range f.all() {
+		if v.ResourceID != nil && *v.ResourceID == resourceID {
+			out = append(out, v)
+		}
+	}
+	return out, nil
 }
 
 // The restorer never binds claims; the stubs exist only to satisfy the port.
@@ -140,6 +183,14 @@ type restoreScaler struct {
 	calls    []int
 	err      error
 	unknown  bool
+}
+
+// count reports how many scale calls were made. A refused restore must not have
+// drained the app at all.
+func (f *restoreScaler) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
 }
 
 func (f *restoreScaler) ScaleApp(_ context.Context, appID uuid.UUID, n int) (bool, error) {
@@ -215,10 +266,30 @@ type restoreStore struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	getErr  error
+	// beforeGet runs on the FIRST fetch, which is the restore goroutine's earliest
+	// action — the window a test uses to change the world under it.
+	beforeGet func()
+	getCalls  int
+}
+
+// gets reports how many times the recovery point was fetched. A refused restore
+// must never have fetched at all.
+func (f *restoreStore) gets() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getCalls
 }
 
 func (f *restoreStore) Put(string, io.Reader) error { return nil }
 func (f *restoreStore) Get(key string) (io.ReadCloser, error) {
+	f.mu.Lock()
+	f.getCalls++
+	hook := f.beforeGet
+	f.beforeGet = nil
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.getErr != nil {
@@ -287,10 +358,10 @@ func newRestoreHarness(t *testing.T) *restoreHarness {
 	}
 	_ = repo.SaveRecoveryPoint(context.Background(), rp)
 
-	selfHost := uuid.New()
+	selfHost := testSelfHost
 	vols := newRestoreVolumeRepo()
 	vols.byApp[appID] = []domain.Volume{{
-		ID: volID, AppID: &appID, BackingPath: live, MountPath: "/data",
+		ID: volID, AppID: &appID, ResourceID: &resID, BackingPath: live, MountPath: "/data",
 		Status: domain.VolumeStatusAttached, SizeMB: 1024, HostAffinity: &selfHost,
 	}}
 	replicas := newRestoreReplicaRepo()
@@ -300,17 +371,16 @@ func newRestoreHarness(t *testing.T) *restoreHarness {
 	pg := &restorePG{}
 	store := &restoreStore{objects: map[string][]byte{objectKey: []byte(restoreBytes)}}
 
-	uc := NewFleetVolumeRestorer(context.Background(), repo, vols, replicas, scaler, health, store)
+	uc, cerr := NewFleetVolumeRestorer(context.Background(), repo, vols, replicas, scaler, health, store, selfHost)
+	if cerr != nil {
+		t.Fatalf("NewFleetVolumeRestorer: %v", cerr)
+	}
 	uc.pgReady = pg.probe
 	uc.drainTimeout = 2 * time.Second
 	uc.drainPoll = time.Millisecond
 	uc.healthTimeout = 100 * time.Millisecond
 	uc.healthPoll = time.Millisecond
 	uc.budget = 30 * time.Second
-	// Host scope for the boot sweep, through the REAL affinity seam the reconciler
-	// uses (FleetVolumeManager over the same volume rows).
-	uc.SetHostScope(selfHost, NewFleetVolumeManager(vols, &recordingBackend{}, "/vol", nil))
-
 	return &restoreHarness{
 		uc: uc, res: res, rp: rp, repo: repo, volumes: vols, replicas: replicas,
 		scaler: scaler, health: health, pg: pg, store: store, live: live, dir: dir,
@@ -1007,11 +1077,29 @@ func (h *restoreHarness) seedStuckRestore(t *testing.T, host *uuid.UUID, withApp
 		res.AppID = &appID
 		h.volumes.mu.Lock()
 		h.volumes.byApp[appID] = []domain.Volume{{
-			ID: uuid.New(), AppID: &appID, BackingPath: "/vol/other.ext4",
+			ID: uuid.New(), AppID: &appID, ResourceID: &res.ID, BackingPath: "/vol/other.ext4",
 			Status: domain.VolumeStatusRestoring, HostAffinity: host,
 		}}
 		h.volumes.mu.Unlock()
 	}
+	h.repo.seed(res)
+	return res.ID
+}
+
+// seedClaimOnlyStuckRestore seeds a stuck resource whose volume carries a
+// resource owner and NO app id — the row shape D-204 introduces.
+func (h *restoreHarness) seedClaimOnlyStuckRestore(t *testing.T, host *uuid.UUID) uuid.UUID {
+	t.Helper()
+	res := &domain.FleetResource{
+		ID: uuid.New(), OwnerOrg: uuid.New(), ClaimKey: uuid.NewString(), Env: "prod",
+		Tier: resourceTierDedicated, Phase: domain.FleetResourcePhaseRestoring,
+	}
+	h.volumes.mu.Lock()
+	h.volumes.claimOnly = append(h.volumes.claimOnly, domain.Volume{
+		ID: uuid.New(), ResourceID: &res.ID, BackingPath: "/vol/claim-only.ext4",
+		Status: domain.VolumeStatusRestoring, HostAffinity: host,
+	})
+	h.volumes.mu.Unlock()
 	h.repo.seed(res)
 	return res.ID
 }
@@ -1023,7 +1111,6 @@ func TestSweepInterruptedRestores(t *testing.T) {
 		name string
 		// seed returns the resource id under test.
 		seed        func(t *testing.T, h *restoreHarness) uuid.UUID
-		unscoped    bool
 		wantSwept   bool
 		wantPhase   domain.FleetResourcePhase
 		wantLastErr string
@@ -1061,21 +1148,22 @@ func TestSweepInterruptedRestores(t *testing.T) {
 			wantPhase: domain.FleetResourcePhaseRestoring,
 		},
 		{
-			name: "no host scope wired: sweep touches nothing",
+			// D-204 shape: the claim owns the volume, the volume names NO app. An
+			// app-keyed ownership lookup cannot see this row at all and would leave the
+			// resource stuck in `restoring` forever; the claim-keyed one releases it.
+			name: "claim-only volume on this host (no app row) is still ours",
 			seed: func(t *testing.T, h *restoreHarness) uuid.UUID {
-				return h.seedStuckRestore(t, &h.selfHost, true)
+				return h.seedClaimOnlyStuckRestore(t, &h.selfHost)
 			},
-			unscoped:  true,
-			wantPhase: domain.FleetResourcePhaseRestoring,
+			wantSwept:   true,
+			wantPhase:   domain.FleetResourcePhaseFailed,
+			wantLastErr: restoreInterruptedMsg,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newRestoreHarness(t)
-			if tt.unscoped {
-				h.uc.SetHostScope(uuid.Nil, nil)
-			}
 			id := tt.seed(t, h)
 
 			n, err := h.uc.SweepInterruptedRestores(context.Background())
@@ -1161,7 +1249,7 @@ func (h *restoreHarness) seedStagedStuckRestore(t *testing.T) (uuid.UUID, string
 	}
 	h.volumes.mu.Lock()
 	h.volumes.byApp[appID] = []domain.Volume{{
-		ID: uuid.New(), AppID: &appID, BackingPath: filepath.Join(dir, "vol.ext4"),
+		ID: uuid.New(), AppID: &appID, ResourceID: &resID, BackingPath: filepath.Join(dir, "vol.ext4"),
 		Status: domain.VolumeStatusRestoring, HostAffinity: &h.selfHost,
 	}}
 	h.volumes.mu.Unlock()
@@ -1446,4 +1534,11 @@ func sparseSupported(t *testing.T) bool {
 		t.Fatalf("close probe: %v", err)
 	}
 	return allocatedBytes(t, probe) < 4<<20
+}
+
+// BindHostAffinity — the per-volume host CAS added by the host-authority fence.
+// This fake is not exercising the CAS itself, so it reports the idempotent
+// already-bound outcome and writes nothing.
+func (f *restoreVolumeRepo) BindHostAffinity(context.Context, uuid.UUID, uuid.UUID) (repository.VolumeHostBindResult, error) {
+	return repository.VolumeHostBindResult{Outcome: repository.VolumeHostBindAlreadyBound}, nil
 }

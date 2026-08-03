@@ -18,6 +18,10 @@ import (
 type rtReplicaRepo struct {
 	mu    sync.Mutex
 	store map[uuid.UUID]*domain.Replica
+	// updates counts persisted row writes. It is a SIDE-EFFECT counter: a fence
+	// that returned the right error after stamping `booting` on a globally visible
+	// row has still told the owning host a boot is in flight that never was.
+	updates int
 }
 
 func newRTReplicaRepo() *rtReplicaRepo {
@@ -33,6 +37,7 @@ func (f *rtReplicaRepo) Create(_ context.Context, r *domain.Replica) error {
 func (f *rtReplicaRepo) Update(_ context.Context, r *domain.Replica) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.updates++
 	cp := *r
 	f.store[r.ID] = &cp
 	return nil
@@ -91,6 +96,7 @@ func (f *rtAppRepo) Delete(context.Context, uuid.UUID) error { return nil }
 type recordingBooter struct {
 	resident    ImageResidentResult
 	resErr      error
+	decommErr   error
 	bootInput   *ImageBootInput
 	decommInput *ImageDecommissionInput
 	decommN     int
@@ -108,7 +114,30 @@ func (b *recordingBooter) Decommission(_ context.Context, in ImageDecommissionIn
 	b.decommN++
 	cp := in
 	b.decommInput = &cp
-	return nil
+	return b.decommErr
+}
+
+// countingMaterializer counts image materializations. Materializing pulls an OCI
+// image and writes a multi-hundred-MB rootfs onto THIS host's disk, so a fence
+// that let one happen for a foreign row has already done real local work.
+type countingMaterializer struct {
+	rootfs string
+	err    error
+	calls  int
+}
+
+func (m *countingMaterializer) Materialize(context.Context, ImageMaterializeInput) (ImageMaterializeOutput, error) {
+	m.calls++
+	return ImageMaterializeOutput{RootfsPath: m.rootfs}, m.err
+}
+
+// mkdirAllForTest / dirExistsForTest keep the staging-directory assertions in the
+// fence tests readable.
+func mkdirAllForTest(dir string) error { return os.MkdirAll(dir, 0o750) }
+
+func dirExistsForTest(dir string) bool {
+	_, err := os.Stat(dir)
+	return err == nil
 }
 
 func newTestApp() *domain.FleetApp {
@@ -122,11 +151,16 @@ func newTestApp() *domain.FleetApp {
 	}
 }
 
+// newTestReplica seeds a replica placed on THIS host. Every replica verb is now
+// host-fenced, and a nil HostID is refused exactly like a foreign one — so an
+// unstamped seed would exercise the refusal in every test that is not about it
+// (the nil/foreign cases have their own tests).
 func newTestReplica(appID uuid.UUID) *domain.Replica {
 	return &domain.Replica{
-		ID:    uuid.New(),
-		AppID: appID,
-		State: domain.ReplicaStateScheduled,
+		ID:     uuid.New(),
+		AppID:  appID,
+		HostID: hostPtr(testSelfHost),
+		State:  domain.ReplicaStateScheduled,
 	}
 }
 
@@ -140,7 +174,7 @@ func TestBootReplica_Success(t *testing.T) {
 		PID: 4242, GuestIP: "10.0.0.5", HostPort: 20001, NetIndex: 3,
 		TapName: "imgtap3", SocketPath: "/run/fc-3.sock",
 	}}
-	uc := NewFleetReplicaRuntime(
+	uc := newTestReplicaRuntime(t,
 		fakeMaterializer{rootfs: "/work/rep/rootfs.ext4"},
 		booter,
 		replicas,
@@ -201,7 +235,7 @@ func TestBootReplica_SecretSelfTest(t *testing.T) {
 			_ = replicas.Create(context.Background(), rep)
 
 			booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5", HostPort: 20001}}
-			uc := NewFleetReplicaRuntime(
+			uc := newTestReplicaRuntime(t,
 				fakeMaterializer{rootfs: "/work/rep/rootfs.ext4"},
 				booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9",
 			)
@@ -237,7 +271,7 @@ func TestBootReplica_Idempotent(t *testing.T) {
 	_ = replicas.Create(context.Background(), rep)
 
 	booter := &recordingBooter{}
-	uc := NewFleetReplicaRuntime(fakeMaterializer{}, booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
+	uc := newTestReplicaRuntime(t, fakeMaterializer{}, booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
 
 	if err := uc.BootReplica(context.Background(), rep.ID); err != nil {
 		t.Fatalf("BootReplica idempotent: %v", err)
@@ -252,7 +286,7 @@ func TestBootReplica_BootFailure_MarksDead(t *testing.T) {
 
 	bootErr := errors.New("kvm exploded")
 	booter := &recordingBooter{resErr: bootErr}
-	uc := NewFleetReplicaRuntime(fakeMaterializer{rootfs: "/work/rep/rootfs.ext4"}, booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
+	uc := newTestReplicaRuntime(t, fakeMaterializer{rootfs: "/work/rep/rootfs.ext4"}, booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
 
 	err := uc.BootReplica(context.Background(), rep.ID)
 	if !errors.Is(err, bootErr) {
@@ -291,9 +325,9 @@ func TestBootReplica_RefusesWhileVolumeIsRestoring(t *testing.T) {
 			vol := volWithBacking(app.ID, "/vol/data.ext4")
 			vol.Status = tt.volStatus
 			booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5"}}
-			uc := NewFleetReplicaRuntime(fakeMaterializer{rootfs: "/work/rootfs.ext4"}, booter, replicas,
+			uc := newTestReplicaRuntime(t, fakeMaterializer{rootfs: "/work/rootfs.ext4"}, booter, replicas,
 				&rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
-			uc.SetVolumeManager(NewFleetVolumeManager(newVolRepoFake(vol), &recordingBackend{}, "/vol", nil))
+			uc.SetVolumeManager(newTestVolumeManager(t, newVolRepoFake(vol), &recordingBackend{}, "/vol", nil))
 
 			err := uc.BootReplica(context.Background(), rep.ID)
 			if !tt.wantRefuse {
@@ -326,7 +360,7 @@ func TestBootReplica_MaterializeFailure_MarksDead(t *testing.T) {
 	_ = replicas.Create(context.Background(), rep)
 
 	matErr := errors.New("pull failed")
-	uc := NewFleetReplicaRuntime(fakeMaterializer{err: matErr}, &recordingBooter{}, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
+	uc := newTestReplicaRuntime(t, fakeMaterializer{err: matErr}, &recordingBooter{}, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
 
 	err := uc.BootReplica(context.Background(), rep.ID)
 	if !errors.Is(err, matErr) {
@@ -355,7 +389,7 @@ func TestDecommissionReplica_TearsDownAndDeletes(t *testing.T) {
 	_ = replicas.Create(context.Background(), rep)
 
 	booter := &recordingBooter{}
-	uc := NewFleetReplicaRuntime(fakeMaterializer{}, booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
+	uc := newTestReplicaRuntime(t, fakeMaterializer{}, booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9")
 
 	if err := uc.DecommissionReplica(context.Background(), rep.ID); err != nil {
 		t.Fatalf("DecommissionReplica: %v", err)
@@ -408,7 +442,7 @@ func TestBootReplica_SecretResolution(t *testing.T) {
 		replicas := newRTReplicaRepo()
 		_ = replicas.Create(context.Background(), rep)
 		booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5", HostPort: 20001}}
-		uc := NewFleetReplicaRuntime(
+		uc := newTestReplicaRuntime(t,
 			fakeMaterializer{rootfs: "/work/rep/rootfs.ext4"},
 			booter, replicas, &rtAppRepo{app: app}, "/tmp/imgwork", "10.0.0.9",
 		)
@@ -502,7 +536,7 @@ func TestBootReplica_SecretResolution(t *testing.T) {
 func TestDecommissionReplica_MissingIsNoop(t *testing.T) {
 	replicas := newRTReplicaRepo()
 	booter := &recordingBooter{}
-	uc := NewFleetReplicaRuntime(fakeMaterializer{}, booter, replicas, &rtAppRepo{}, "/tmp/imgwork", "10.0.0.9")
+	uc := newTestReplicaRuntime(t, fakeMaterializer{}, booter, replicas, &rtAppRepo{}, "/tmp/imgwork", "10.0.0.9")
 
 	if err := uc.DecommissionReplica(context.Background(), uuid.New()); err != nil {
 		t.Fatalf("missing replica should be no-op, got %v", err)
@@ -570,7 +604,7 @@ func TestBootReplica_FailedBootLeavesNoStagingDir(t *testing.T) {
 				resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5"},
 				resErr:   tt.bootErr,
 			}
-			uc := NewFleetReplicaRuntime(stagingMaterializer{err: tt.matErr}, booter, replicas,
+			uc := newTestReplicaRuntime(t, stagingMaterializer{err: tt.matErr}, booter, replicas,
 				&rtAppRepo{app: app}, workDir, "10.0.0.9")
 
 			err := uc.BootReplica(context.Background(), rep.ID)
@@ -602,7 +636,7 @@ func TestBootReplica_PersistFailureReclaimsStagingDir(t *testing.T) {
 	_ = replicas.Create(context.Background(), rep)
 
 	booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5"}}
-	uc := NewFleetReplicaRuntime(stagingMaterializer{}, booter, replicas, &rtAppRepo{app: app}, workDir, "10.0.0.9")
+	uc := newTestReplicaRuntime(t, stagingMaterializer{}, booter, replicas, &rtAppRepo{app: app}, workDir, "10.0.0.9")
 
 	if err := uc.BootReplica(context.Background(), rep.ID); err == nil {
 		t.Fatal("want an error when the resident row cannot be persisted")
@@ -628,7 +662,7 @@ func TestDecommissionReplica_LeavesNoStagingDir(t *testing.T) {
 	_ = replicas.Create(context.Background(), rep)
 
 	booter := &recordingBooter{resident: ImageResidentResult{PID: 1, GuestIP: "10.0.0.5"}}
-	uc := NewFleetReplicaRuntime(stagingMaterializer{}, booter, replicas, &rtAppRepo{app: app}, workDir, "10.0.0.9")
+	uc := newTestReplicaRuntime(t, stagingMaterializer{}, booter, replicas, &rtAppRepo{app: app}, workDir, "10.0.0.9")
 
 	if err := uc.BootReplica(context.Background(), rep.ID); err != nil {
 		t.Fatalf("BootReplica: %v", err)

@@ -57,6 +57,22 @@ type FleetReplicaRuntime struct {
 	// real secret. Off by default → behavior-neutral (no /vsock, no push). Mirrors
 	// FleetProvision.secretSelfTest for the test/fallback path.
 	secretSelfTest bool
+
+	// selfHost is this process's durable fleet host identity
+	// (#fleet-reconciler-acts-on-foreign-host-replicas). Every method on this type
+	// is a HOST-LOCAL capability — signalling a PID, probing a guest address,
+	// destroying a TAP, unlinking a jail — while fleet_replicas is a GLOBAL table.
+	// Immutable and constructor-required: a runtime that could be re-scoped could
+	// be pointed at another machine's live VMs.
+	selfHost uuid.UUID
+
+	// procAlive / dialGuest are the two host-local probes RefreshHealth performs.
+	// They are fields so a refusal test can prove NEITHER was invoked on a foreign
+	// row — "returned the sentinel" and "did not probe another host's VM" are
+	// different claims, and only the second is the invariant. Production always
+	// runs the package defaults.
+	procAlive func(pid int) bool
+	dialGuest func(host string, port int) bool
 }
 
 // SetSecretSelfTest enables the gated vsock self-test marker injection on the
@@ -159,13 +175,21 @@ func fieldName(ref string) string {
 // NewFleetReplicaRuntime constructs the use case. workDir is the per-replica
 // materialize staging root (mirrors FleetProvision); advertiseHost is the host
 // address published in a resident replica's endpoint URL.
+// selfHost is this instance's durable fleet host id — REQUIRED, because every
+// verb here acts on a process, a socket and a device that exist on exactly one
+// machine.
 func NewFleetReplicaRuntime(
 	materializer ImageMaterializer,
 	booter ImageBooter,
 	replicas repository.ReplicaRepository,
 	apps repository.FleetAppRepository,
 	workDir, advertiseHost string,
-) *FleetReplicaRuntime {
+	selfHost uuid.UUID,
+) (*FleetReplicaRuntime, error) {
+	if selfHost == uuid.Nil {
+		return nil, fmt.Errorf("%w: a replica runtime needs this instance's fleet host identity before it may boot, probe or tear down anything",
+			domain.ErrReplicaHostMismatch)
+	}
 	return &FleetReplicaRuntime{
 		materializer: materializer,
 		booter:       booter,
@@ -173,7 +197,31 @@ func NewFleetReplicaRuntime(
 		apps:         apps,
 		workDir:      workDir,
 		advertise:    advertiseHost,
+		selfHost:     selfHost,
+		procAlive:    func(pid int) bool { return processAlive(pid) },
+		dialGuest:    dialTCP,
+	}, nil
+}
+
+// requireOwnedReplica refuses every host-local action on a replica this instance
+// does not own.
+//
+// A NIL HostID is refused exactly like a foreign one. An unstamped row is not
+// "probably mine": nothing about it proves which machine holds the PID it names,
+// and every verb guarded by this check would then act on a number that may
+// belong to an unrelated process on this host or to a live VM on another. The
+// comparison is over UUID VALUES — never pointers, never endpoints, which are
+// re-derived per boot and can coincide across hosts.
+func (uc *FleetReplicaRuntime) requireOwnedReplica(replica *domain.Replica) error {
+	if replica.HostID == nil {
+		return fmt.Errorf("%w: replica %s carries no host id, so no host may act on it locally",
+			domain.ErrReplicaHostMismatch, replica.ID)
 	}
+	if *replica.HostID != uc.selfHost {
+		return fmt.Errorf("%w: replica %s is placed on another fleet host",
+			domain.ErrReplicaHostMismatch, replica.ID)
+	}
+	return nil
 }
 
 // BootReplica materializes the replica's app image and boots it as a resident
@@ -182,6 +230,14 @@ func NewFleetReplicaRuntime(
 func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.UUID) error {
 	replica, err := uc.replicas.FindByID(ctx, replicaID)
 	if err != nil {
+		return err
+	}
+	// BEFORE the resident no-op, the app load, the state write, secret resolution,
+	// volume lookup, materialize, lease allocation and boot. Everything past this
+	// line is a side effect on THIS machine, and a row placed elsewhere must cost
+	// exactly zero of them — including the "harmless" booting-state write, which
+	// would tell the owning host's reconciler a boot it never started is in flight.
+	if err := uc.requireOwnedReplica(replica); err != nil {
 		return err
 	}
 	if replica.State == domain.ReplicaStateResident {
@@ -324,8 +380,17 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 	return nil
 }
 
-// DecommissionReplica tears down a replica's microVM (best-effort) and deletes
-// the replica row. Idempotent: a missing replica is a no-op.
+// DecommissionReplica tears down a replica's microVM and deletes the replica
+// row. Idempotent: a missing replica is a no-op.
+//
+// ⚠ IT IS NO LONGER BEST-EFFORT PAST A BOOTER ERROR. A teardown that could not
+// prove the VMM exited used to log the failure and delete the row anyway, which
+// is how a running microVM lost every record of itself: the row, the volume
+// attachment and the staging tree all went, while the process, its TAP, its jail
+// and its /30 stayed. Seven such orphans are on the live fleet host. The booter
+// now returns ErrVMTerminationUnproven instead of guessing, and this function's
+// job is to PRESERVE the evidence when it does — the replica row and the volume
+// attachment are the only handles a retry has.
 func (uc *FleetReplicaRuntime) DecommissionReplica(ctx context.Context, replicaID uuid.UUID) error {
 	replica, err := uc.replicas.FindByID(ctx, replicaID)
 	if err != nil {
@@ -334,10 +399,20 @@ func (uc *FleetReplicaRuntime) DecommissionReplica(ctx context.Context, replicaI
 		}
 		return err
 	}
+	// Before the local handle fields are even inspected: signalling a PID, deleting
+	// a TAP or unlinking a jail named by a foreign row are all actions on another
+	// host's live VM.
+	if err := uc.requireOwnedReplica(replica); err != nil {
+		return err
+	}
 	if replica.PID != nil || replica.SocketPath != "" || replica.TapName != "" {
 		if err := uc.booter.Decommission(ctx, replicaDecommissionInput(replica)); err != nil {
-			// Best-effort: a half-gone VM must still clear its row.
-			logger.FromContext(ctx).Warn("fleet replica decommission teardown", "replica_id", replica.ID, "err", err)
+			// STOP. Detaching the volume, reclaiming the staging directory or deleting
+			// the row here would each erase a fact the retry needs, for a VM that may
+			// still be running and still holding the disk.
+			logger.FromContext(ctx).Error("fleet replica: teardown did not complete — the replica row, its volume attachment and its staging directory are PRESERVED so the teardown can be retried",
+				"replica_id", replica.ID, "err", err)
+			return err
 		}
 	}
 	// rt#9 — release the data volume (the backing file survives; only
@@ -364,12 +439,20 @@ func (uc *FleetReplicaRuntime) DecommissionReplica(ctx context.Context, replicaI
 // the reconciler's job (§9#7). Non-resident replicas are reported not-healthy
 // without a probe.
 func (uc *FleetReplicaRuntime) RefreshHealth(ctx context.Context, replica *domain.Replica) (bool, error) {
+	// Before the state is even inspected and before either probe. A PID is only
+	// meaningful on the machine that owns it — on this one it names an unrelated
+	// process or nothing — so probing it and then writing `dead` onto a globally
+	// visible row would report another host's healthy VM as gone, and the reconciler
+	// there would replace a replica that never stopped serving.
+	if err := uc.requireOwnedReplica(replica); err != nil {
+		return false, err
+	}
 	if replica.State != domain.ReplicaStateResident {
 		return false, nil
 	}
-	alive := replica.PID != nil && processAlive(*replica.PID)
+	alive := replica.PID != nil && uc.procAlive(*replica.PID)
 	if alive && replica.GuestIP != "" && replica.Port > 0 {
-		alive = dialTCP(replica.GuestIP, replica.Port)
+		alive = uc.dialGuest(replica.GuestIP, replica.Port)
 	}
 	if !alive {
 		replica.State = domain.ReplicaStateDead

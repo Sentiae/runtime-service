@@ -105,6 +105,12 @@ type FleetVolumeSnapshotter struct {
 	replicas repository.ReplicaRepository
 	recovery repository.FleetResourceRepository
 
+	// selfHost is this process's fleet host identity. A snapshot reads a BACKING
+	// FILE and freezes a GUEST: both exist on exactly one machine, so the fence
+	// below is not defence in depth alone — a foreign snapshot would open a path
+	// that is absent (or, worse, another volume's) on this filesystem.
+	selfHost uuid.UUID
+
 	// Thaw + heartbeat budget. Fields (not constants) so tests drive the retry and
 	// heartbeat paths without waiting on the real timers.
 	thawDeadline    time.Duration
@@ -121,18 +127,24 @@ func NewFleetVolumeSnapshotter(
 	volumes repository.VolumeRepository,
 	replicas repository.ReplicaRepository,
 	recovery repository.FleetResourceRepository,
-) *FleetVolumeSnapshotter {
+	selfHost uuid.UUID,
+) (*FleetVolumeSnapshotter, error) {
+	if selfHost == uuid.Nil {
+		return nil, fmt.Errorf("%w: a snapshotter needs this instance's fleet host identity before it may read any backing file",
+			domain.ErrVolumeHostMismatch)
+	}
 	return &FleetVolumeSnapshotter{
 		guest:           guest,
 		store:           store,
 		volumes:         volumes,
 		replicas:        replicas,
 		recovery:        recovery,
+		selfHost:        selfHost,
 		thawDeadline:    defaultThawDeadline,
 		thawRetry:       defaultThawRetry,
 		thawAttempt:     defaultThawAttempt,
 		freezeHeartbeat: defaultFreezeHeartbeat,
-	}
+	}, nil
 }
 
 // ⚠ THERE IS DELIBERATELY NO SECOND-DOMAIN MIRROR ON THIS TYPE (D-200). It used to
@@ -161,7 +173,31 @@ func NewFleetVolumeSnapshotter(
 // makes a failed recovery point visible to an operator instead of legible solely
 // from a returned error the caller may swallow.
 func (s *FleetVolumeSnapshotter) SnapshotAppVolumes(ctx context.Context, resourceID, appID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error) {
-	points, err := s.snapshotAppVolumes(ctx, resourceID, appID)
+	// The host fence runs FIRST — before the replica lookup, before the guest
+	// quiesce, before any file is opened, before a single byte reaches the object
+	// store, and before any recovery point or resource-health field is written.
+	//
+	// It is defence in depth over D-202 (whose due-list is host-scoped and so never
+	// routes a foreign resource here) and it stays the last authority if any caller
+	// is ever wrong: the cadence's work list is a query, this is a proof.
+	vols, herr := s.ownedVolumes(ctx, appID)
+	if herr != nil {
+		if errors.Is(herr, domain.ErrVolumeHostMismatch) {
+			// ⚠ NOT recordSnapshotOutcome. A routing refusal is not a failed attempt to
+			// PROTECT this resource: recording it would start a consecutive-failure
+			// streak, raise a protection condition and eventually claim a customer's
+			// database is unprotected — describing the ledger's host stamps rather than
+			// the data. The ordinary use-case counter below still counts the call.
+			recordExecution("snapshot_app_volumes", outcomeFor(herr))
+			return nil, herr
+		}
+		// Anything else (an unreadable volume table) IS a failed protection attempt:
+		// the resource genuinely has no new recovery point and nothing proved why.
+		s.recordSnapshotOutcome(ctx, resourceID, 0, herr)
+		recordExecution("snapshot_app_volumes", outcomeFor(herr))
+		return nil, herr
+	}
+	points, err := s.snapshotAppVolumes(ctx, resourceID, vols)
 	s.recordSnapshotOutcome(ctx, resourceID, len(points), err)
 	// §22 use case counter. Only ok/error: whether a successful call actually
 	// PROTECTED anything is answered by sentiae_fleet_recovery_point_* (the ledger
@@ -170,12 +206,31 @@ func (s *FleetVolumeSnapshotter) SnapshotAppVolumes(ctx context.Context, resourc
 	return points, err
 }
 
-// snapshotAppVolumes is the snapshot itself, unobserved.
-func (s *FleetVolumeSnapshotter) snapshotAppVolumes(ctx context.Context, resourceID, appID uuid.UUID) ([]domain.FleetResourceRecoveryPoint, error) {
+// ownedVolumes lists the app's volumes once and proves every one of them is
+// pinned to this host. The slice is passed into the snapshot body so the capture
+// operates on exactly the rows the fence approved — a re-list would be a second
+// point in time.
+func (s *FleetVolumeSnapshotter) ownedVolumes(ctx context.Context, appID uuid.UUID) ([]domain.Volume, error) {
 	vols, err := s.volumes.ListByApp(ctx, appID)
 	if err != nil {
 		return nil, fmt.Errorf("list volumes: %w", err)
 	}
+	for i := range vols {
+		if vols[i].HostAffinity == nil {
+			return nil, fmt.Errorf("%w: volume %s carries no host affinity, so this host cannot prove its data is here to snapshot",
+				domain.ErrVolumeHostMismatch, vols[i].ID)
+		}
+		if *vols[i].HostAffinity != s.selfHost {
+			return nil, fmt.Errorf("%w: volume %s is pinned to another fleet host, which is the host that snapshots it",
+				domain.ErrVolumeHostMismatch, vols[i].ID)
+		}
+	}
+	return vols, nil
+}
+
+// snapshotAppVolumes is the snapshot itself, unobserved, over the already
+// host-verified volume set.
+func (s *FleetVolumeSnapshotter) snapshotAppVolumes(ctx context.Context, resourceID uuid.UUID, vols []domain.Volume) ([]domain.FleetResourceRecoveryPoint, error) {
 	points := make([]domain.FleetResourceRecoveryPoint, 0, len(vols))
 	for i := range vols {
 		rp, err := s.snapshotVolume(ctx, resourceID, &vols[i])

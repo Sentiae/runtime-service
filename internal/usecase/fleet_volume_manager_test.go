@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,33 @@ import (
 type volRepoFake struct {
 	mu    sync.Mutex
 	store map[uuid.UUID]*domain.Volume
+	// hostBinds counts BindHostAffinity calls, and createErr / creates let a test
+	// drive the create-compensation matrix. Side effects are counted, not just
+	// return values: "returned the sentinel" and "wrote nothing" are different
+	// claims and only the second is the fence.
+	hostBinds int
+	creates   int
+	createErr error
+	updates   int
+	// listErr fails the AUTHORITATIVE re-read the create-compensation saga makes.
+	listErr error
+	// onCreate runs inside a failing Create, so a test can install the committed
+	// "winner" the compensation logic will then re-read.
+	onCreate func(attempt *domain.Volume)
+	// beforeHostBind runs inside BindHostAffinity, so a test can make another host
+	// win the CAS in the window this one is adopting.
+	beforeHostBind func()
+}
+
+// put installs a row directly (the committed winner of a race).
+func (f *volRepoFake) put(v *domain.Volume) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if v.ID == uuid.Nil {
+		v.ID = uuid.New()
+	}
+	cp := *v
+	f.store[v.ID] = &cp
 }
 
 func newVolRepoFake(vols ...*domain.Volume) *volRepoFake {
@@ -29,6 +57,15 @@ func newVolRepoFake(vols ...*domain.Volume) *volRepoFake {
 func (f *volRepoFake) Create(_ context.Context, v *domain.Volume) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.creates++
+	if f.createErr != nil {
+		if f.onCreate != nil {
+			f.mu.Unlock()
+			f.onCreate(v)
+			f.mu.Lock()
+		}
+		return f.createErr
+	}
 	cp := *v
 	f.store[v.ID] = &cp
 	return nil
@@ -36,6 +73,9 @@ func (f *volRepoFake) Create(_ context.Context, v *domain.Volume) error {
 func (f *volRepoFake) ListByApp(_ context.Context, appID uuid.UUID) ([]domain.Volume, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	var out []domain.Volume
 	for _, v := range f.store {
 		if v.AppID != nil && *v.AppID == appID {
@@ -57,6 +97,7 @@ func (f *volRepoFake) FindByID(_ context.Context, id uuid.UUID) (*domain.Volume,
 func (f *volRepoFake) Update(_ context.Context, v *domain.Volume) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.updates++
 	cp := *v
 	f.store[v.ID] = &cp
 	return nil
@@ -128,6 +169,37 @@ func (f *volRepoFake) BindVolumesToResource(_ context.Context, appID, resourceID
 	}
 	return repository.VolumeBindResult{Outcome: repository.VolumeBindAlreadyBound}, nil
 }
+
+// BindHostAffinity mirrors the postgres CAS: compare and set under one lock, and
+// report which of the three states it found. The mutex stands in for the row
+// lock, so the concurrent-adopt test exercises a real serialization point rather
+// than a check-then-act it would always win.
+func (f *volRepoFake) BindHostAffinity(_ context.Context, volumeID, hostID uuid.UUID) (repository.VolumeHostBindResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hostBinds++
+	if f.beforeHostBind != nil {
+		f.beforeHostBind()
+	}
+	v, ok := f.store[volumeID]
+	if !ok {
+		return repository.VolumeHostBindResult{}, domain.ErrVolumeNotFound
+	}
+	if v.HostAffinity != nil {
+		if *v.HostAffinity == hostID {
+			return repository.VolumeHostBindResult{Outcome: repository.VolumeHostBindAlreadyBound}, nil
+		}
+		return repository.VolumeHostBindResult{
+			Outcome:    repository.VolumeHostBindConflict,
+			ActualHost: *v.HostAffinity,
+		}, nil
+	}
+	h := hostID
+	v.HostAffinity = &h
+	v.UpdatedAt = time.Now().UTC()
+	return repository.VolumeHostBindResult{Outcome: repository.VolumeHostBindBound}, nil
+}
+
 func (f *volRepoFake) HasUnstampedVolumes(_ context.Context, appID uuid.UUID) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -182,6 +254,27 @@ func (b *modeBackend) Ensure(_ context.Context, in VolumeEnsureInput) (VolumeEns
 }
 func (b *modeBackend) Delete(context.Context, string) error { return nil }
 
+// recordingModeBackend is modeBackend plus a Created flag and a delete log — the
+// two facts the create-compensation matrix is decided by.
+type recordingModeBackend struct {
+	created bool
+	modes   []VolumeEnsureMode
+	deleted []string
+}
+
+func (b *recordingModeBackend) Ensure(_ context.Context, in VolumeEnsureInput) (VolumeEnsureOutput, error) {
+	b.modes = append(b.modes, in.Mode)
+	return VolumeEnsureOutput{
+		BackingPath: in.Dir + "/" + in.VolumeID.String() + ".ext4",
+		Created:     b.created && in.Mode == VolumeEnsureCreate,
+	}, nil
+}
+
+func (b *recordingModeBackend) Delete(_ context.Context, backingPath string) error {
+	b.deleted = append(b.deleted, backingPath)
+	return nil
+}
+
 // TestEnsureAppVolumes_DeclaresIntentPerCallSite is the ledger half of the
 // data-loss fix: the backend cannot see fleet_volumes, so the manager must say
 // which of the two meanings an absent backing file has. A volume the ledger
@@ -195,7 +288,7 @@ func TestEnsureAppVolumes_DeclaresIntentPerCallSite(t *testing.T) {
 		wantMode VolumeEnsureMode
 	}{
 		{"no ledger row for (app, mount) → first provision creates", nil, VolumeEnsureCreate},
-		{"ledger already records the volume → attach may only adopt", volWithBacking(appID, "/vol/x.ext4"), VolumeEnsureAdopt},
+		{"ledger already records the volume → attach may only adopt", volAt(appID, "/vol"), VolumeEnsureAdopt},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -204,7 +297,7 @@ func TestEnsureAppVolumes_DeclaresIntentPerCallSite(t *testing.T) {
 				repo = newVolRepoFake(tt.seeded)
 			}
 			backend := &modeBackend{}
-			m := NewFleetVolumeManager(repo, backend, "/vol", nil)
+			m := newTestVolumeManager(t, repo, backend, "/vol", nil)
 
 			if _, err := m.EnsureAppVolumes(context.Background(), appID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}}); err != nil {
 				t.Fatalf("EnsureAppVolumes: %v", err)
@@ -223,7 +316,7 @@ func TestEnsureAppVolumes_DeclaresIntentPerCallSite(t *testing.T) {
 func TestEnsureAppVolumes_MissingBackingFileRefusesProvision(t *testing.T) {
 	appID := uuid.New()
 	repo := newVolRepoFake(volWithBacking(appID, "/vol/x.ext4"))
-	m := NewFleetVolumeManager(repo, &modeBackend{failWith: domain.ErrVolumeBackingFileMissing}, "/vol", nil)
+	m := newTestVolumeManager(t, repo, &modeBackend{failWith: domain.ErrVolumeBackingFileMissing}, "/vol", nil)
 
 	_, err := m.EnsureAppVolumes(context.Background(), appID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}})
 	if !errors.Is(err, domain.ErrVolumeBackingFileMissing) {
@@ -231,14 +324,32 @@ func TestEnsureAppVolumes_MissingBackingFileRefusesProvision(t *testing.T) {
 	}
 }
 
+// volAt seeds a volume whose recorded BackingPath is the one the backend derives
+// for it (dir + volume id + ".ext4"). EnsureAppVolumes now requires the adopted
+// path to EQUAL the recorded one — a divergence means this host's volume
+// directory is not the row's — so any test that goes through the adopt path has
+// to seed a self-consistent row, exactly as production writes it.
+func volAt(appID uuid.UUID, dir string) *domain.Volume {
+	id := uuid.New()
+	v := volWithBacking(appID, filepath.Join(dir, id.String()+".ext4"))
+	v.ID = id
+	v.BackingPath = filepath.Join(dir, id.String()+".ext4")
+	return v
+}
+
+// volWithBacking seeds a volume that lives on THIS host. Every host-fenced verb
+// requires a positive affinity, so an unstamped seed would exercise the refusal
+// path rather than the behavior each test is about (the nil/foreign cases have
+// their own tests).
 func volWithBacking(appID uuid.UUID, backing string) *domain.Volume {
 	return &domain.Volume{
-		ID:          uuid.New(),
-		AppID:       &appID,
-		SizeMB:      64,
-		MountPath:   "/data",
-		BackingPath: backing,
-		Status:      domain.VolumeStatusAvailable,
+		ID:           uuid.New(),
+		AppID:        &appID,
+		SizeMB:       64,
+		MountPath:    "/data",
+		BackingPath:  backing,
+		HostAffinity: hostPtr(testSelfHost),
+		Status:       domain.VolumeStatusAvailable,
 	}
 }
 
@@ -249,7 +360,7 @@ func TestDeleteAppVolumes_DeletesBackingFilesAndRows(t *testing.T) {
 		volWithBacking(appID, "/vol/b.ext4"),
 	)
 	backend := &recordingBackend{}
-	m := NewFleetVolumeManager(repo, backend, "/vol", nil)
+	m := newTestVolumeManager(t, repo, backend, "/vol", nil)
 
 	if err := m.DeleteAppVolumes(context.Background(), appID); err != nil {
 		t.Fatalf("DeleteAppVolumes: %v", err)
@@ -269,7 +380,7 @@ func TestDeleteAppVolumes_SkipsEmptyBackingPath(t *testing.T) {
 		volWithBacking(appID, "/vol/c.ext4"),
 	)
 	backend := &recordingBackend{}
-	m := NewFleetVolumeManager(repo, backend, "/vol", nil)
+	m := newTestVolumeManager(t, repo, backend, "/vol", nil)
 
 	if err := m.DeleteAppVolumes(context.Background(), appID); err != nil {
 		t.Fatalf("DeleteAppVolumes: %v", err)
@@ -289,7 +400,7 @@ func TestDeleteAppVolumes_ContinuesAfterDeleteErrorAndReturnsFirst(t *testing.T)
 		volWithBacking(appID, "/vol/b.ext4"),
 	)
 	backend := &recordingBackend{failOn: "/vol/a.ext4"}
-	m := NewFleetVolumeManager(repo, backend, "/vol", nil)
+	m := newTestVolumeManager(t, repo, backend, "/vol", nil)
 
 	err := m.DeleteAppVolumes(context.Background(), appID)
 	if err == nil {
@@ -323,7 +434,7 @@ func TestDetachFrom_PreservesTerminalAndRestoringStatuses(t *testing.T) {
 			replicaID := uuid.New()
 			vol.AttachedReplica = &replicaID
 			repo := newVolRepoFake(vol)
-			m := NewFleetVolumeManager(repo, &recordingBackend{}, "/vol", nil)
+			m := newTestVolumeManager(t, repo, &recordingBackend{}, "/vol", nil)
 
 			if err := m.DetachFrom(context.Background(), appID); err != nil {
 				t.Fatalf("DetachFrom: %v", err)
@@ -384,7 +495,7 @@ func TestDeleteAppVolumes_RefusesVolumeOwnedByLiveClaim(t *testing.T) {
 	appID, resID := uuid.New(), uuid.New()
 	repo := newVolRepoFake(ownedVolume(appID, resID, "/vol/a.ext4"))
 	backend := &recordingBackend{}
-	m := NewFleetVolumeManager(repo, backend, "/vol", volClaimLedger{res: liveClaim(resID)})
+	m := newTestVolumeManager(t, repo, backend, "/vol", volClaimLedger{res: liveClaim(resID)})
 
 	err := m.DeleteAppVolumes(context.Background(), appID)
 	if !errors.Is(err, domain.ErrVolumeOwnedByLiveResource) {
@@ -404,7 +515,7 @@ func TestDeleteAppVolumes_ProceedsWhenClaimTombstoned(t *testing.T) {
 	appID, resID := uuid.New(), uuid.New()
 	repo := newVolRepoFake(ownedVolume(appID, resID, "/vol/a.ext4"))
 	backend := &recordingBackend{}
-	m := NewFleetVolumeManager(repo, backend, "/vol", volClaimLedger{res: retiredClaim(resID)})
+	m := newTestVolumeManager(t, repo, backend, "/vol", volClaimLedger{res: retiredClaim(resID)})
 
 	if err := m.DeleteAppVolumes(context.Background(), appID); err != nil {
 		t.Fatalf("DeleteAppVolumes: %v", err)
@@ -421,7 +532,7 @@ func TestDeleteAppVolumes_FailsClosedWhenLedgerUnwired(t *testing.T) {
 	appID, resID := uuid.New(), uuid.New()
 	repo := newVolRepoFake(ownedVolume(appID, resID, "/vol/a.ext4"))
 	backend := &recordingBackend{}
-	m := NewFleetVolumeManager(repo, backend, "/vol", nil)
+	m := newTestVolumeManager(t, repo, backend, "/vol", nil)
 
 	err := m.DeleteAppVolumes(context.Background(), appID)
 	if !errors.Is(err, domain.ErrVolumeOwnedByLiveResource) {
@@ -436,7 +547,7 @@ func TestDeleteAppVolumes_FailsClosedWhenLedgerUnreadable(t *testing.T) {
 	appID, resID := uuid.New(), uuid.New()
 	repo := newVolRepoFake(ownedVolume(appID, resID, "/vol/a.ext4"))
 	backend := &recordingBackend{}
-	m := NewFleetVolumeManager(repo, backend, "/vol", volClaimLedger{err: errors.New("ledger down")})
+	m := newTestVolumeManager(t, repo, backend, "/vol", volClaimLedger{err: errors.New("ledger down")})
 
 	if err := m.DeleteAppVolumes(context.Background(), appID); err == nil {
 		t.Fatal("want a refusal when the claim ledger cannot be read")
@@ -453,7 +564,7 @@ func TestDeleteAppVolumes_RefusesWhenOwnerRowGone(t *testing.T) {
 	appID, resID := uuid.New(), uuid.New()
 	repo := newVolRepoFake(ownedVolume(appID, resID, "/vol/a.ext4"))
 	backend := &recordingBackend{}
-	m := NewFleetVolumeManager(repo, backend, "/vol", volClaimLedger{err: domain.ErrResourceNotFound})
+	m := newTestVolumeManager(t, repo, backend, "/vol", volClaimLedger{err: domain.ErrResourceNotFound})
 
 	err := m.DeleteAppVolumes(context.Background(), appID)
 	if !errors.Is(err, domain.ErrVolumeOwnedByLiveResource) {
@@ -473,7 +584,7 @@ func TestDeleteAppVolumes_UnownedVolumeDeletes(t *testing.T) {
 	appID := uuid.New()
 	repo := newVolRepoFake(volWithBacking(appID, "/vol/a.ext4"))
 	backend := &recordingBackend{}
-	m := NewFleetVolumeManager(repo, backend, "/vol", nil)
+	m := newTestVolumeManager(t, repo, backend, "/vol", nil)
 
 	if err := m.DeleteAppVolumes(context.Background(), appID); err != nil {
 		t.Fatalf("DeleteAppVolumes: %v", err)
@@ -489,7 +600,7 @@ func TestBindToResource_StampsUnownedVolumes(t *testing.T) {
 	b := volWithBacking(appID, "/vol/b.ext4")
 	b.MountPath = "/data2"
 	repo := newVolRepoFake(a, b)
-	m := NewFleetVolumeManager(repo, &recordingBackend{}, "/vol", nil)
+	m := newTestVolumeManager(t, repo, &recordingBackend{}, "/vol", nil)
 
 	if err := m.BindToResource(context.Background(), appID, resID); err != nil {
 		t.Fatalf("BindToResource: %v", err)
@@ -505,7 +616,7 @@ func TestBindToResource_StampsUnownedVolumes(t *testing.T) {
 func TestBindToResource_IdempotentForSameResource(t *testing.T) {
 	appID, resID := uuid.New(), uuid.New()
 	repo := newVolRepoFake(volWithBacking(appID, "/vol/a.ext4"))
-	m := NewFleetVolumeManager(repo, &recordingBackend{}, "/vol", nil)
+	m := newTestVolumeManager(t, repo, &recordingBackend{}, "/vol", nil)
 
 	if err := m.BindToResource(context.Background(), appID, resID); err != nil {
 		t.Fatalf("first bind: %v", err)
@@ -521,7 +632,7 @@ func TestBindToResource_RefusesForeignOwner(t *testing.T) {
 	appID, resA, resB := uuid.New(), uuid.New(), uuid.New()
 	vol := ownedVolume(appID, resA, "/vol/a.ext4")
 	repo := newVolRepoFake(vol)
-	m := NewFleetVolumeManager(repo, &recordingBackend{}, "/vol", nil)
+	m := newTestVolumeManager(t, repo, &recordingBackend{}, "/vol", nil)
 
 	err := m.BindToResource(context.Background(), appID, resB)
 	if !errors.Is(err, domain.ErrVolumeClaimConflict) {
@@ -538,7 +649,7 @@ func TestBindToResource_RefusesForeignOwner(t *testing.T) {
 func TestEnsureAppVolumes_SetsAppAttachment(t *testing.T) {
 	appID := uuid.New()
 	repo := newVolRepoFake()
-	m := NewFleetVolumeManager(repo, &modeBackend{}, "/vol", nil)
+	m := newTestVolumeManager(t, repo, &modeBackend{}, "/vol", nil)
 
 	vols, err := m.EnsureAppVolumes(context.Background(), appID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}})
 	if err != nil {

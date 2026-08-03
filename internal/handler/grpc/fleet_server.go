@@ -629,6 +629,22 @@ func fleetError(err error) error {
 		return status.Error(codes.FailedPrecondition, "refused: this VM carries data and the component asked to hold it pauses its VMs — firecracker vsock does not survive Pause/Resume")
 	case errors.Is(err, domain.ErrVMClassUndeclared):
 		return status.Error(codes.FailedPrecondition, "refused: a VM handed to a pausing component must declare its class (pausable|resident)")
+	// The host-authority fence (#fleet-reconciler-acts-on-foreign-host-replicas).
+	// FailedPrecondition, not PermissionDenied or Internal: the call is legitimate
+	// and unchanged retries succeed once it reaches the host that owns the row —
+	// which is what FailedPrecondition means. NOTHING host-identifying is echoed
+	// (no host uuid, path, pid or lease coordinate): the tenant learns that the
+	// operation belongs elsewhere and that this host changed nothing, which is the
+	// whole actionable content.
+	case errors.Is(err, domain.ErrReplicaHostMismatch):
+		return status.Error(codes.FailedPrecondition, "this replica belongs to another fleet host — no local action was taken; the operation is performed by the host the replica is placed on")
+	case errors.Is(err, domain.ErrVolumeHostMismatch):
+		return status.Error(codes.FailedPrecondition, "this volume's data lives on another fleet host — no local action was taken; the operation is performed by the host that holds the bytes")
+	// Unavailable, not Internal or FailedPrecondition: the teardown was RETAINED
+	// intact (nothing was released, nothing was deleted) and the same call may be
+	// retried, which is exactly what Unavailable tells a caller.
+	case errors.Is(err, domain.ErrVMTerminationUnproven):
+		return status.Error(codes.Unavailable, "teardown retained: this workload's microVM could not be proven to have exited, so none of its resources were released — retry once the owning host can prove the VM is gone")
 	default:
 		return registryOrInternal(err)
 	}

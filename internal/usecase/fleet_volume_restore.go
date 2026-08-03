@@ -38,19 +38,7 @@ type AppHealthProbe interface {
 	Health(ctx context.Context, handle string) (FleetHealthOutput, error)
 }
 
-// AppHostAffinity reports the host a volume-bearing app's data is pinned to.
-// This is the SAME seam the reconciler consults to decide whether a stateful app
-// belongs to this host (fleet_orchestrator.ReconcileApp) — the restore sweep
-// reuses it rather than inventing a second notion of "mine".
-// *FleetVolumeManager satisfies it.
-type AppHostAffinity interface {
-	AffinityHost(ctx context.Context, appID uuid.UUID) (*uuid.UUID, bool, error)
-}
-
-var (
-	_ AppHealthProbe  = (*FleetProvision)(nil)
-	_ AppHostAffinity = (*FleetVolumeManager)(nil)
-)
+var _ AppHealthProbe = (*FleetProvision)(nil)
 
 const (
 	// prerestoreSuffix names the pre-restore original kept beside the live
@@ -108,11 +96,16 @@ type FleetVolumeRestorer struct {
 	// (the durable phase CAS cannot distinguish that from a post-crash re-issue).
 	active sync.Map // uuid.UUID → struct{}
 
-	// selfHost + affinity scope the boot-time sweep to the resources whose data
-	// lives on THIS host. Unset (zero uuid / nil) means ownership cannot be
-	// determined, and the sweep then touches nothing.
+	// selfHost is this process's fleet host identity. It scopes the boot-time
+	// sweep AND fences the restore itself: a restore renames the live backing file
+	// on a local filesystem, so a foreign one would either operate on nothing or on
+	// a path that belongs to a different volume.
+	//
+	// It is a CONSTRUCTOR requirement, not a Set* option. As an option it was a
+	// window: the restorer existed, was reachable, and answered "I own nothing"
+	// until the wiring got around to scoping it — and any bug that skipped the
+	// wiring produced a silently unscoped restorer rather than a failed startup.
 	selfHost uuid.UUID
-	affinity AppHostAffinity
 
 	// baseCtx is the service root context: a restore must outlive the RPC that
 	// asked for it (the RPC returns as soon as the phase is claimed).
@@ -146,7 +139,12 @@ func NewFleetVolumeRestorer(
 	scaler AppScaler,
 	health AppHealthProbe,
 	store ArtifactStore,
-) *FleetVolumeRestorer {
+	selfHost uuid.UUID,
+) (*FleetVolumeRestorer, error) {
+	if selfHost == uuid.Nil {
+		return nil, fmt.Errorf("%w: a restorer needs this instance's fleet host identity before it may swap any backing file",
+			domain.ErrVolumeHostMismatch)
+	}
 	return &FleetVolumeRestorer{
 		resources:     resources,
 		volumes:       volumes,
@@ -154,6 +152,7 @@ func NewFleetVolumeRestorer(
 		scaler:        scaler,
 		health:        health,
 		store:         store,
+		selfHost:      selfHost,
 		pgReady:       probePostgresReady,
 		baseCtx:       baseCtx,
 		budget:        30 * time.Minute,
@@ -161,17 +160,22 @@ func NewFleetVolumeRestorer(
 		drainPoll:     500 * time.Millisecond,
 		healthTimeout: 2 * time.Minute,
 		healthPoll:    2 * time.Second,
-	}
+	}, nil
 }
 
-// SetHostScope wires this instance's fleet host identity and the app→host
-// affinity seam, which together scope the boot-time sweep to the resources whose
-// backing files live on THIS host. Wired after self-registration (the host id
-// does not exist before it). Without it the sweep is a no-op — a restore live on
-// another host must never be stamped by this one.
-func (uc *FleetVolumeRestorer) SetHostScope(selfHost uuid.UUID, affinity AppHostAffinity) {
-	uc.selfHost = selfHost
-	uc.affinity = affinity
+// requireOwnedVolume proves a volume's data is on THIS host before anything
+// local happens to it. Nil affinity is refused like a foreign one: an unstamped
+// row cannot locate the bytes it names.
+func (uc *FleetVolumeRestorer) requireOwnedVolume(vol *domain.Volume) error {
+	if vol.HostAffinity == nil {
+		return fmt.Errorf("%w: volume %s carries no host affinity, so no host can prove the bytes it names are here",
+			domain.ErrVolumeHostMismatch, vol.ID)
+	}
+	if *vol.HostAffinity != uc.selfHost {
+		return fmt.Errorf("%w: volume %s is pinned to another fleet host, which is the host that restores it",
+			domain.ErrVolumeHostMismatch, vol.ID)
+	}
+	return nil
 }
 
 // Wait blocks until every in-flight restore goroutine has finished. Called on
@@ -237,6 +241,15 @@ func (uc *FleetVolumeRestorer) restore(ctx context.Context, in RestoreResourceIn
 	if err != nil {
 		return zero, err
 	}
+	// ADMISSION FENCE — after the sole target volume is resolved and BEFORE the
+	// active-map insertion, the phase CAS, the download, the staging file or the
+	// scale-down. Every one of those is either a local file action or a durable
+	// claim on this resource, so a foreign restore must cost none of them: an
+	// admitted-then-refused restore would have already parked the resource in
+	// `restoring`, which refuses every boot until something releases it.
+	if err := uc.requireOwnedVolume(vol); err != nil {
+		return zero, err
+	}
 
 	if _, busy := uc.active.LoadOrStore(res.ID, struct{}{}); busy {
 		return zero, domain.ErrRestoreInProgress
@@ -289,10 +302,6 @@ func (uc *FleetVolumeRestorer) restore(ctx context.Context, in RestoreResourceIn
 // file, because this sweep only walks ListResourcesByPhase(restoring).
 func (uc *FleetVolumeRestorer) SweepInterruptedRestores(ctx context.Context) (int, error) {
 	log := logger.FromContext(ctx)
-	if uc.selfHost == uuid.Nil || uc.affinity == nil {
-		log.Warn("fleet restore sweep: skipped, this instance has no fleet host identity to scope by")
-		return 0, nil
-	}
 	stuck, err := uc.resources.ListResourcesByPhase(ctx, domain.FleetResourcePhaseRestoring)
 	if err != nil {
 		return 0, fmt.Errorf("list restoring resources: %w", err)
@@ -389,20 +398,32 @@ func (uc *FleetVolumeRestorer) reclaimStagingFiles(ctx context.Context, res *dom
 	}
 }
 
-// ownedByThisHost reports whether a resource's data lives on this host, via the
-// SAME app→volume affinity the reconciler uses for stateful apps. Anything it
-// cannot answer positively is a "no".
+// ownedByThisHost reports whether a resource's data lives on this host.
+//
+// Ownership is read from the CLAIM's own volumes (D-203's resource_id), never
+// from the app the resource currently points at. Two reasons, both load-bearing:
+// D-203 ownership SURVIVES an app replacement, so a rebuild would make an
+// app-keyed lookup answer about the wrong (or no) app; and D-204 creates
+// claim-only volume rows that carry no app_id at all, which an app-keyed lookup
+// cannot see. Every returned volume must be pinned here — a claim with no
+// volumes, a mixed set, or an unstamped row is ambiguous, and an ambiguous row
+// is LEFT ALONE rather than stamped by a host that may not own the restore.
 func (uc *FleetVolumeRestorer) ownedByThisHost(ctx context.Context, res *domain.FleetResource) bool {
-	if res.AppID == nil {
-		return false
-	}
-	host, pinned, err := uc.affinity.AffinityHost(ctx, *res.AppID)
+	vols, err := uc.volumes.ListByResource(ctx, res.ID)
 	if err != nil {
-		logger.FromContext(ctx).Warn("fleet restore sweep: affinity host lookup, leaving resource alone",
+		logger.FromContext(ctx).Warn("fleet restore sweep: list claim-owned volumes, leaving resource alone",
 			"resource_id", res.ID, "err", err)
 		return false
 	}
-	return pinned && host != nil && *host == uc.selfHost
+	if len(vols) == 0 {
+		return false
+	}
+	for i := range vols {
+		if vols[i].HostAffinity == nil || *vols[i].HostAffinity != uc.selfHost {
+			return false
+		}
+	}
+	return true
 }
 
 // soleVolume resolves the app's single materialized data volume. In-place
@@ -445,6 +466,28 @@ func (uc *FleetVolumeRestorer) start(resourceID, appID uuid.UUID, rp *domain.Fle
 // leaves a state the next re-issued restore can reason about.
 func (uc *FleetVolumeRestorer) run(ctx context.Context, resourceID, appID uuid.UUID, rp *domain.FleetResourceRecoveryPoint, vol *domain.Volume, prevPhase domain.FleetResourcePhase) {
 	log := logger.FromContext(ctx)
+
+	// RE-READ before the first stage/download/file action. Admission proved
+	// ownership at RPC time; this goroutine runs detached on the service base
+	// context and can start after an operator or a competing path has changed the
+	// row. Re-checking the host AND the backing path here is what keeps the very
+	// first byte written from landing on a file this host no longer owns or that
+	// the row no longer names.
+	fresh, rerr := uc.volumes.FindByID(ctx, vol.ID)
+	if rerr != nil {
+		uc.abandon(ctx, resourceID, prevPhase, fmt.Errorf("re-read restore target volume %s: %w", vol.ID, rerr))
+		return
+	}
+	if herr := uc.requireOwnedVolume(fresh); herr != nil {
+		uc.abandon(ctx, resourceID, prevPhase, herr)
+		return
+	}
+	if fresh.BackingPath != vol.BackingPath {
+		uc.abandon(ctx, resourceID, prevPhase,
+			fmt.Errorf("restore target volume %s changed its backing path between admission and execution, so nothing was swapped", vol.ID))
+		return
+	}
+
 	live := vol.BackingPath
 	dir := filepath.Dir(live)
 	staged := restoreStagingPath(dir, rp.ID)

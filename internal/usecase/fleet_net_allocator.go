@@ -197,9 +197,17 @@ func (a *FleetNetAllocator) acquire(ctx context.Context, kind domain.NetLeaseOwn
 		domain.ErrNetLeaseConflict, a.selfHost, netLeaseAcquireAttempts)
 }
 
-// Release frees an owner's lease. It is called from teardown, which is never
-// blockable, so it does the one thing it can do and reports the error for the
-// caller to log rather than swallowing it.
+// Release frees an owner's lease — an OWN-HOST lease and no other.
+//
+// Acquire has always refused to adopt a foreign lease; Release did not check at
+// all, so a teardown running on the wrong host would delete by (owner_kind,
+// owner_id) the lease that fences a LIVE VM on another machine. The next boot
+// there would then be handed that VM's /30, uid and chroot — the exact
+// cross-tenant hole the plane exists to close, reached from the one path that is
+// deliberately never blockable.
+//
+// The repository's owner-key delete and its idempotency are unchanged: this use
+// case is the host-authorization layer above it, not a second implementation.
 func (a *FleetNetAllocator) Release(ctx context.Context, kind domain.NetLeaseOwnerKind, ownerID uuid.UUID) error {
 	if a.leases == nil {
 		return fmt.Errorf("%w: no lease store wired", domain.ErrNetPlaneUnreconciled)
@@ -210,6 +218,21 @@ func (a *FleetNetAllocator) Release(ctx context.Context, kind domain.NetLeaseOwn
 		// addresses — which the next boot would then re-use underneath it.
 		return fmt.Errorf("%w: cannot release a net lease without an owner identity (kind=%q id=%s)",
 			domain.ErrNetCoordinateOutOfRange, kind, ownerID)
+	}
+	lease, err := a.leases.FindByOwner(ctx, kind, ownerID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNetLeaseNotFound) {
+			// Nothing to free. Idempotent success keeps teardown retries converging —
+			// this is the ordinary second call, not a fault.
+			return nil
+		}
+		// Never delete under uncertainty: a DB blip must not become "the lease is
+		// probably mine, drop it".
+		return fmt.Errorf("look up net lease before release: %w", err)
+	}
+	if lease.HostID != a.selfHost {
+		return fmt.Errorf("%w: %s %s holds net_index %d on another fleet host, which is the host that releases it",
+			domain.ErrNetLeaseConflict, kind, ownerID, lease.NetIndex)
 	}
 	return a.leases.Release(ctx, kind, ownerID)
 }

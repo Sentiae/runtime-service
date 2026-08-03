@@ -499,6 +499,34 @@ type VolumeBindResult struct {
 	ConflictOwner    uuid.UUID
 }
 
+// VolumeHostBindOutcome is the typed result of a per-volume host-affinity
+// compare-and-set. Like VolumeBindOutcome it is decided INSIDE the transaction
+// that holds the row lock, so the caller never re-derives what happened from
+// state it read separately — the read and the write are one command.
+type VolumeHostBindOutcome string
+
+const (
+	// VolumeHostBindBound — the row carried no affinity and now names the asked
+	// host.
+	VolumeHostBindBound VolumeHostBindOutcome = "bound"
+	// VolumeHostBindAlreadyBound — the row already named the asked host; nothing
+	// was written (the idempotent re-bind).
+	VolumeHostBindAlreadyBound VolumeHostBindOutcome = "already_bound"
+	// VolumeHostBindConflict — the row names a DIFFERENT host. Nothing is
+	// written: a volume's affinity is where its bytes physically are, so
+	// overwriting it would point the fleet at a filesystem that does not hold
+	// them.
+	VolumeHostBindConflict VolumeHostBindOutcome = "conflict"
+)
+
+// VolumeHostBindResult carries the host-bind outcome plus, on conflict, the host
+// that actually owns the row so the caller can name it without a second read.
+type VolumeHostBindResult struct {
+	Outcome VolumeHostBindOutcome
+	// ActualHost is meaningful only when Outcome is VolumeHostBindConflict.
+	ActualHost uuid.UUID
+}
+
 // VolumeRepository persists volumes for fleet apps.
 type VolumeRepository interface {
 	Create(ctx context.Context, volume *domain.Volume) error
@@ -522,4 +550,11 @@ type VolumeRepository interface {
 	// owner. The error is propagated, never folded into false: a failed query
 	// must never be read as "stamped".
 	HasUnstampedVolumes(ctx context.Context, appID uuid.UUID) (bool, error)
+	// BindHostAffinity compare-and-sets ONE volume's host_affinity from NULL to
+	// hostID inside a single transaction holding the row lock, and reports which
+	// of the three states it found. A non-nil affinity is NEVER overwritten: it
+	// records which machine physically holds the bytes, so re-pointing it would
+	// make the fleet look for a customer's data on a filesystem that does not
+	// have it. updated_at is database-authored (now()).
+	BindHostAffinity(ctx context.Context, volumeID, hostID uuid.UUID) (VolumeHostBindResult, error)
 }

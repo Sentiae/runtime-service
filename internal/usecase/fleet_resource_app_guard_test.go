@@ -50,7 +50,7 @@ func newGuardHarness(t *testing.T) guardHarness {
 	processAlive = func(int) bool { return true }
 	t.Cleanup(func() { processAlive = origAlive })
 
-	h := newOrchHarness(oneLiveHost())
+	h := newOrchHarness(t, oneLiveHost())
 	handle, _, err := h.orch.ProvisionApp(context.Background(), FleetProvisionInput{
 		ComponentID: "resource/" + orgA + "/db", Env: "prod", OwnerOrg: orgA,
 		Registry: "reg", Repository: "sentiae/pg", Digest: "sha256:abc",
@@ -60,6 +60,10 @@ func newGuardHarness(t *testing.T) guardHarness {
 		t.Fatalf("ProvisionApp: %v", err)
 	}
 	appID := uuid.MustParse(handle)
+	// ProvisionApp writes the placement; the owning host's actuation pass boots
+	// it. The guard's whole assertion is that a REFUSED teardown leaves the
+	// running replica alone, so it must actually be running.
+	h.actuate(t)
 
 	// The volume manager is attached AFTER the provision so the app is created
 	// without one — the volume row + backing file are seeded directly, which keeps
@@ -70,7 +74,7 @@ func newGuardHarness(t *testing.T) guardHarness {
 	}
 	vol := volWithBacking(appID, backing)
 	volumes := newVolRepoFake(vol)
-	h.orch.SetVolumeManager(NewFleetVolumeManager(volumes, unlinkingBackend{}, filepath.Dir(backing), nil))
+	h.orch.SetVolumeManager(newTestVolumeManager(t, volumes, unlinkingBackend{}, filepath.Dir(backing), nil))
 
 	return guardHarness{orch: h, appID: appID, volumes: volumes, backing: backing, volumeID: vol.ID}
 }
@@ -181,9 +185,9 @@ func TestDecommissionApp_FailsClosedWhenTheLedgerCannotBeRead(t *testing.T) {
 	processAlive = func(int) bool { return true }
 	defer func() { processAlive = origAlive }()
 
-	h := newOrchHarness(oneLiveHost())
+	h := newOrchHarness(t, oneLiveHost())
 	// No ledger wired at all: the app cannot be SHOWN free of a claim.
-	blind := NewFleetOrchestrator(h.apps, h.replicas, nil, nil, nil)
+	blind := newTestOrchestrator(t, h.apps, h.replicas, nil, nil, nil)
 	app := testFleetApp(1)
 	if err := h.apps.Create(context.Background(), app); err != nil {
 		t.Fatalf("seed app: %v", err)
