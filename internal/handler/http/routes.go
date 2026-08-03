@@ -11,6 +11,7 @@ import (
 	"github.com/sentiae/runtime-service/internal/infrastructure/canvasservice"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
 	"github.com/sentiae/runtime-service/internal/usecase"
+	"github.com/sentiae/runtime-service/internal/version"
 )
 
 // Server represents the HTTP server with all handlers
@@ -327,6 +328,10 @@ func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 		"status":  "healthy",
 		"service": "runtime-service",
 		"version": "1.0.0",
+		// Deploy provenance: the commit this image was built from, identical to
+		// the image's org.opencontainers.image.revision label (same build arg).
+		"vcs.revision": version.Revision,
+		"vcs.modified": version.Modified,
 	})
 }
 

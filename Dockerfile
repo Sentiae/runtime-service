@@ -10,6 +10,29 @@ RUN git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "htt
 
 WORKDIR /app
 
+# Deploy provenance (#mesh-images-have-no-deploy-provenance-stamp). VCS_REVISION
+# is REQUIRED and comes from deploy.sh, which derives it from the staged
+# committed tree it is about to ship — never from the working tree and never
+# from an operator-supplied value. The checkout-root .dockerignore excludes
+# .git, so Go's automatic VCS stamping cannot work here and MUST NOT be
+# "fixed" by importing repository metadata into the build context; explicit
+# injection is the mechanism.
+#
+# The check below is the fail-closed control: an absent, short, uppercase or
+# non-hex revision aborts the image build rather than producing an image whose
+# source cannot be identified. VCS_MODIFIED is likewise constrained to the two
+# values that mean something.
+ARG VCS_REVISION
+ARG VCS_MODIFIED
+RUN case "$VCS_REVISION" in \
+      *[!0-9a-f]* | "") echo "BUILD REFUSED: VCS_REVISION must be a full 40-char lowercase hex commit (got: '${VCS_REVISION}')" >&2; exit 1 ;; \
+    esac; \
+    [ "${#VCS_REVISION}" -eq 40 ] || { echo "BUILD REFUSED: VCS_REVISION must be 40 chars (got ${#VCS_REVISION}: '${VCS_REVISION}')" >&2; exit 1; }; \
+    case "$VCS_MODIFIED" in \
+      true|false) ;; \
+      *) echo "BUILD REFUSED: VCS_MODIFIED must be 'true' or 'false' (got: '${VCS_MODIFIED}')" >&2; exit 1 ;; \
+    esac
+
 # Copy local replace dependencies
 COPY foundry-service/ /foundry-service/
 COPY canvas-service/ /canvas-service/
@@ -43,7 +66,7 @@ ARG BUILD_TIME
 RUN CGO_ENABLED=0 go build \
     -a \
     -installsuffix cgo \
-    -ldflags="-w -s -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" \
+    -ldflags="-w -s -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X github.com/sentiae/runtime-service/internal/version.Revision=${VCS_REVISION} -X github.com/sentiae/runtime-service/internal/version.Modified=${VCS_MODIFIED}" \
     -o /build/bin/runtime-service \
     ./cmd/server/
 
@@ -55,6 +78,12 @@ RUN mkdir -p /build/migrations /build/configs
 
 # Runtime Stage - Minimal Production Image
 FROM alpine:3.19
+
+# Same build argument that produced the binary's linked revision, so the image
+# label and the binary's /health report cannot disagree. Re-declared because a
+# stage does not inherit ARGs from a previous stage.
+ARG VCS_REVISION
+LABEL org.opencontainers.image.revision="${VCS_REVISION}"
 
 # Install runtime dependencies (includes openssh-client for VM communication, and
 # docker-cli so the ProjectCompiler can `docker run` an ephemeral build container

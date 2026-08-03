@@ -19,6 +19,7 @@ import (
 	otelkit "github.com/sentiae/platform-kit/otel"
 	"github.com/sentiae/runtime-service/internal/app"
 	"github.com/sentiae/runtime-service/internal/di"
+	"github.com/sentiae/runtime-service/internal/version"
 	"github.com/sentiae/runtime-service/pkg/config"
 	"github.com/sentiae/runtime-service/pkg/logger"
 )
@@ -121,6 +122,17 @@ func main() {
 	// anything can serve (§16.3). Must precede the gRPC server: an unregistered
 	// sentinel silently degrades to codes.Internal at the boundary.
 	app.RegisterErrors()
+
+	// Deploy provenance, structured so it is queryable in the log plane. The
+	// same VCS_REVISION build arg labels the image
+	// (org.opencontainers.image.revision), so this line and `docker inspect`
+	// cannot disagree about what source is running.
+	pklogger.FromContext(context.Background()).Info("runtime-service build provenance",
+		"vcs.revision", version.Revision,
+		"vcs.modified", version.Modified,
+		"version", Version,
+		"build_time", BuildTime,
+	)
 
 	log.Printf("Starting Runtime Service v%s (built: %s)", Version, BuildTime)
 	log.Printf("Environment: %s", cfg.App.Environment)
