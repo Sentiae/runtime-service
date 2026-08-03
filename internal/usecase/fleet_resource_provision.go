@@ -379,6 +379,12 @@ func (uc *FleetResourceProvisioner) provisionDedicated(ctx context.Context, in P
 			// the only authenticated moment a fresh token arrives, so it is THE
 			// designed post-restart recovery path. A database you lose on reboot is
 			// not durable.
+			//
+			// D-202 attach-on-recover: a claim accepted BEFORE the gate existed
+			// carries no enrolment, and this declarative re-provision is the moment
+			// the fleet can bring it under protection without anyone asking for a
+			// migration. Best-effort and never a refusal — see attachOnRecover.
+			uc.attachOnRecover(ctx, existing)
 			uc.recoverExisting(ctx, existing, in)
 			return ProvisionDedicatedOutput{Handle: existing.ID.String(), Phase: string(existing.Phase)}, nil
 		}
@@ -540,7 +546,7 @@ func (uc *FleetResourceProvisioner) attachProtection(ctx context.Context, durabi
 	if durability != domain.DurabilityDurable {
 		return nil, nil
 	}
-	eval := uc.evaluateProtection(ctx, uc.acceptScopes(ctx))
+	eval := uc.evaluateProtection(ctx, uc.acceptScopes(ctx), uc.protection.CadenceSeconds)
 	var cadenceSeconds *int
 	if eval.Cadence.Attached {
 		cs := uc.protection.CadenceSeconds
@@ -556,6 +562,49 @@ func (uc *FleetResourceProvisioner) attachProtection(ctx context.Context, durabi
 			"unattachable", err)
 	}
 	return cadenceSeconds, nil
+}
+
+// attachOnRecover brings an already-accepted durable claim under protection when
+// it is not yet enrolled — the pre-D-202 rows, which exist because the gate did
+// not exist when they were created.
+//
+// It runs on the declarative re-provision because that is the only recurring,
+// authenticated moment this control plane touches an existing claim, and a row
+// that could be protected should not have to wait for someone to notice it. It is
+// deliberately NOT a migration: whether protection can attach is a live fact, and
+// a backfill would stamp an enrolment nothing was proven to serve.
+//
+// ⚠ It NEVER refuses and never blocks. Every failure — the evaluation, the save —
+// is logged and swallowed, and recovery proceeds exactly as it did before. This
+// path exists to serve a database that already exists; a regressed platform must
+// still recover what it already promised (#p19-handed-token-not-rehandable), and
+// refusing here would take a customer's live database down to enforce a rule that
+// was not in force when it was created.
+//
+// The scope is the resource's OWN AFFINITY HOST (statusScopes), not the
+// all-candidate accept set. At recover the placement is already made and the
+// volumes are pinned: the one host holding the bytes is the one host whose worker
+// can protect them, and requiring every candidate host's beat would refuse an
+// attach that is genuinely available.
+func (uc *FleetResourceProvisioner) attachOnRecover(ctx context.Context, res *domain.FleetResource) {
+	if res.Durability != domain.DurabilityDurable || res.ProtectionAttachedAt != nil || res.ProtectionWaivedBy != "" {
+		return
+	}
+	eval := uc.evaluateProtection(ctx, uc.statusScopes(ctx, res), uc.protection.CadenceSeconds)
+	if err := eval.Err(); err != nil {
+		logger.FromContext(ctx).Warn("fleet resource: existing durable claim remains UNPROTECTED — its protection still cannot attach",
+			"resource_id", res.ID, "err", err)
+		return
+	}
+	now := uc.now()
+	cadenceSeconds := uc.protection.CadenceSeconds
+	res.ProtectionCadenceSeconds = &cadenceSeconds
+	res.ProtectionAttachedAt = &now
+	res.UpdatedAt = now
+	if err := uc.resources.SaveResource(ctx, res); err != nil {
+		logger.FromContext(ctx).Warn("fleet resource: protection attached on recover but the enrolment could not be persisted",
+			"resource_id", res.ID, "err", err)
+	}
 }
 
 // resolveAvailability validates the requested availability class and, for `ha`,
@@ -841,7 +890,17 @@ func (uc *FleetResourceProvisioner) protectionConditions(ctx context.Context, re
 	if res.ProtectionWaivedBy != "" {
 		conditions = append(conditions, conditionProtectionWaived)
 	}
-	eval := uc.evaluateProtection(ctx, uc.statusScopes(ctx, res))
+	// The enrolment this status is about is the one on the ROW, never the fleet's
+	// current configured default (J3, one computation / two consumers). A resource
+	// enrolled at an hour must keep being judged against an hour: re-reading the
+	// config here would let a changed (or cleared) default silently re-classify an
+	// enrolment nobody touched, reporting a fact about the config as if it were a
+	// fact about this database.
+	enrolled := 0
+	if res.ProtectionCadenceSeconds != nil {
+		enrolled = *res.ProtectionCadenceSeconds
+	}
+	eval := uc.evaluateProtection(ctx, uc.statusScopes(ctx, res), enrolled)
 	if !eval.Offsite.Attached {
 		conditions = append(conditions, conditionProtectionOffsiteUnavailable)
 	}

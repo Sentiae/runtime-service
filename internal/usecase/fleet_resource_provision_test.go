@@ -32,7 +32,10 @@ type fakeResourceRepo struct {
 	findNotFoundFirst bool
 	findCalls         int
 	saveDuplicate     bool
-	casErr            error
+	// saveErr fails every SaveResource, so a caller's best-effort
+	// logged-and-swallowed persist path is reachable.
+	saveErr error
+	casErr  error
 	// endpointTaken makes the next N SaveResource calls collide on the endpoint-id
 	// unique index (what the real repository translates a 23505 on
 	// fleet_resources_endpoint_id_key into). mintedEndpointIDs records every id
@@ -234,6 +237,9 @@ func (f *fakeResourceRepo) SaveResource(_ context.Context, r *domain.FleetResour
 	defer f.mu.Unlock()
 	if r.EndpointID != nil {
 		f.mintedEndpointIDs = append(f.mintedEndpointIDs, *r.EndpointID)
+	}
+	if f.saveErr != nil {
+		return f.saveErr
 	}
 	if f.endpointTaken > 0 {
 		f.endpointTaken--

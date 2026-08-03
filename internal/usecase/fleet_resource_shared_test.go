@@ -79,6 +79,60 @@ func TestProvisionShared_Validation(t *testing.T) {
 	}
 }
 
+// D-202 — the shared tier HONORS OR REJECTS the wire durability claim; it never
+// ignores it. The tier is TTL-reaped, so "durable" is a promise it cannot hold,
+// and it is refused rather than silently downgraded — before a credential is
+// resolved and before a logical database exists.
+func TestProvisionShared_DurabilityIsHonoredOrRejected(t *testing.T) {
+	tests := []struct {
+		name       string
+		durability string
+		wantErr    error
+	}{
+		{"an absent claim means ephemeral — the tier is ephemeral", "", nil},
+		{"an explicit ephemeral claim is accepted", "ephemeral", nil},
+		{"a durable shared claim is refused, never silently downgraded", "durable", domain.ErrResourceDurabilityInvalid},
+		{"garbage is refused", "sort-of-durable", domain.ErrResourceDurabilityInvalid},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newFakeResourceRepo()
+			logical := &fakeLogical{}
+			uc := NewFleetResourceSharedProvisioner(logical, repo, testSharedCfg())
+			uc.SetSecretResolver(jobResolver("s3cr3t"))
+
+			in := validSharedInput()
+			// I28 — the resolver only reads a tenant-namespaced ref, so the accepting
+			// direction reaches the real resolve path rather than dying before it.
+			in.SecretRefs = []string{"tenants/" + in.OwnerOrg + "/pg#password"}
+			in.Durability = tt.durability
+			out, err := uc.ProvisionShared(context.Background(), in)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tt.wantErr)
+				}
+				// The refusal lands before ANY of it exists: no resolved credential,
+				// no role, no database, no row.
+				if len(logical.provisioned) != 0 || len(repo.byID) != 0 {
+					t.Fatalf("a refused claim must materialize nothing (logical=%d rows=%d)", len(logical.provisioned), len(repo.byID))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ProvisionShared: %v", err)
+			}
+			row := repo.byID[uuid.MustParse(out.Handle)]
+			if row == nil {
+				t.Fatal("the accepted claim was not persisted")
+			}
+			// The stored value is what the tier IS, not what the wire said.
+			if row.Durability != domain.DurabilityEphemeral {
+				t.Fatalf("stored durability = %q, want ephemeral", row.Durability)
+			}
+		})
+	}
+}
+
 func TestProvisionShared_IdempotentSameRevision(t *testing.T) {
 	repo := newFakeResourceRepo()
 	logical := &fakeLogical{}

@@ -120,6 +120,12 @@ type ProvisionSharedInput struct {
 	SecretRefs   []string
 	VaultToken   string
 	SeedTemplate string
+	// Durability is the retention promise claimed for this resource (D-202).
+	// ""/"ephemeral" ⇒ ephemeral; "durable" is REFUSED on the shared tier, which
+	// is TTL-reaped by construction. The claim is HONORED OR REJECTED, never
+	// ignored: a wire field the server silently drops is a promise the caller
+	// believes it made.
+	Durability string
 }
 
 // ProvisionSharedOutput is the claim result.
@@ -139,6 +145,15 @@ func (uc *FleetResourceSharedProvisioner) ProvisionShared(ctx context.Context, i
 	}
 	if in.Tier != resourceTierShared {
 		return ProvisionSharedOutput{}, domain.ErrResourceTierUnsupported
+	}
+	// D-202 — the retention claim is HONORED OR REJECTED, and here (with the other
+	// input validation) rather than later: a refusal must land before a credential
+	// is resolved out of Vault and before a logical database is materialized, so a
+	// claim this tier cannot hold leaves nothing behind. The resolved value is not
+	// stored from here — the birth literal below stamps `ephemeral`, which is what
+	// a TTL-reaped logical database IS.
+	if _, err := resolveSharedDurability(in.Durability); err != nil {
+		return ProvisionSharedOutput{}, err
 	}
 	if in.OwnerOrg == "" {
 		return ProvisionSharedOutput{}, domain.ErrResourceOwnerOrgRequired

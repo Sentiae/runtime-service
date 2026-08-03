@@ -335,7 +335,16 @@ func outcomeFor(err error) string {
 		errors.Is(err, domain.ErrResourceClassUnsupported),
 		errors.Is(err, domain.ErrResourceTierUnsupported),
 		errors.Is(err, domain.ErrResourceNotFound),
-		errors.Is(err, domain.ErrRecoveryPointNotFound):
+		errors.Is(err, domain.ErrRecoveryPointNotFound),
+		// D-202 — both are InvalidArgument at the boundary and are counted the same
+		// way here: a durability the tier cannot hold, and a half-written waiver, are
+		// CALLER bugs. Counting them as platform errors would make a client sending
+		// bad claims look like a fleet that is failing, and blunt the one signal the
+		// `error` label exists to carry. The protection REFUSAL
+		// (ErrProtectionUnattachable) is deliberately NOT here: that one is a true
+		// statement about the platform's own state.
+		errors.Is(err, domain.ErrResourceDurabilityInvalid),
+		errors.Is(err, domain.ErrProtectionWaiverIncomplete):
 		return outcomeInvalid
 	default:
 		return outcomeError

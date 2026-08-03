@@ -121,6 +121,81 @@ const (
 	resourceTierShared    = "shared"
 )
 
+// ─────────────────────────────────────────────────────────────────────
+// D-202 / D-218 — the protection waiver's ACTOR is DERIVED, never carried.
+//
+// The wire carries a REASON and nothing else (proto field 16). Who the waiver is
+// attributed to is read from the authenticated principal at the same
+// tenant.FromContext seam every other identity check in this package uses,
+// because an audit field the caller writes is not an audit: a service that can
+// name itself can name anyone, and the whole justification for allowing a durable
+// database to be accepted unprotected is that the record of who allowed it is
+// true. Exactly two principals may waive, and everything else is refused.
+// ─────────────────────────────────────────────────────────────────────
+const (
+	// deliveryWaiverSVID is delivery-service's exact peer SPIFFE ID. Exact, not a
+	// prefix and not the `x-service-name` label: the SVID is the one statement
+	// about the caller the caller cannot write, and a prefix match would admit
+	// `…/svc/delivery-something`.
+	deliveryWaiverSVID = "spiffe://sentiae.io/svc/delivery"
+	// drillOrgPrimary and drillOrgAuxiliary are the two pinned D-205 fleet-drill
+	// organizations (locked.md D-205 amendment 2026-08-02: an EXACT allowlist of
+	// two v5 literals, permanently reserved and never identity-minted, which only
+	// mints v4). Delivery may waive for these and ONLY these: a drill is the one
+	// automated caller that legitimately creates a durable database on a fleet that
+	// cannot yet protect it, and letting that authority reach a customer org would
+	// make an unprotected customer database creatable by a machine. Compared
+	// against the canonical lowercase form the drill emits.
+	drillOrgPrimary   = "909e8c2f-4dad-50e4-b49a-b2eafa846415"
+	drillOrgAuxiliary = "ee0ad5dd-926b-5a83-86cb-775da4683c64"
+)
+
+// resolveProtectionWaiver turns a wire reason into the typed, server-attributed
+// waiver the use case takes — or refuses the call.
+//
+// An EMPTY reason is not a waiver and derives nothing: an ordinary provision must
+// not acquire an identity requirement it never had.
+//
+// A non-empty reason must be attributable, and only two principals can be:
+//
+//   - a VERIFIED user token carrying platform_admin with a subject ⇒ `user:<sub>`.
+//     Claims is non-nil only when the token verified, so a JWKS outage (or any
+//     other verification failure) leaves it nil and this branch fails closed
+//     rather than trusting an unverified assertion.
+//   - delivery's exact peer SVID, acting for one of the two pinned drill orgs
+//     ⇒ the SVID itself.
+//
+// A caller holding user claims that are NOT platform-admin is refused outright
+// rather than falling through to the service branch: a token is a statement about
+// a human, and letting a non-admin user's request be re-attributed to a service
+// identity is exactly the laundering this derivation exists to prevent.
+func resolveProtectionWaiver(ctx context.Context, reason, ownerOrg string) (*usecase.ProtectionWaiver, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return nil, nil
+	}
+	// The refusal is deliberately identical in every branch and names no internals:
+	// it must not become an oracle for which orgs are drill orgs, which SVID is
+	// delivery's, or whether a token verified.
+	denied := status.Error(codes.PermissionDenied,
+		"a protection waiver may only be granted by a platform administrator, or by the delivery service acting for a designated fleet-drill organization")
+
+	p, ok := tenant.FromContext(ctx)
+	if !ok {
+		return nil, denied
+	}
+	if p.Claims != nil {
+		if p.Claims.PlatformAdmin && p.Claims.Subject != "" {
+			return &usecase.ProtectionWaiver{Actor: "user:" + p.Claims.Subject, Reason: reason}, nil
+		}
+		return nil, denied
+	}
+	if p.ServiceSVID == deliveryWaiverSVID && (ownerOrg == drillOrgPrimary || ownerOrg == drillOrgAuxiliary) {
+		return &usecase.ProtectionWaiver{Actor: p.ServiceSVID, Reason: reason}, nil
+	}
+	return nil, denied
+}
+
 // ProvisionResource claims a managed resource. It runs the D-061 owner-org
 // carriage cross-check + shadow-authz (identical to FleetServer.Provision), then
 // routes by tier to the dedicated or shared provisioner.
@@ -149,6 +224,15 @@ func (s *ResourceServer) ProvisionResource(ctx context.Context, req *runtimev1.P
 		if s.dedicated == nil {
 			return nil, status.Error(codes.Unavailable, "dedicated resource provisioner not configured")
 		}
+		// D-218 — the waiver's actor is derived here, from the authenticated
+		// principal, and the call is refused outright when nobody on it may waive.
+		// Before the use case runs: a request that may not waive must not provision
+		// unwaived either, or a denied override would quietly become a refusal for a
+		// different reason (or, worse, a silent unprotected acceptance).
+		waiver, werr := resolveProtectionWaiver(ctx, req.GetProtectionWaiverReason(), ownerOrgRaw)
+		if werr != nil {
+			return nil, werr
+		}
 		out, err := s.dedicated.ProvisionDedicated(ctx, usecase.ProvisionDedicatedInput{
 			OwnerOrg:   ownerOrgRaw,
 			ClaimKey:   req.GetClaimKey(),
@@ -164,6 +248,7 @@ func (s *ResourceServer) ProvisionResource(ctx context.Context, req *runtimev1.P
 			// reader. Empty and "durable" both mean durable on this tier; "ephemeral"
 			// is refused by the use case, which owns the rule.
 			Durability: req.GetDurability(),
+			Waiver:     waiver,
 		})
 		if err != nil {
 			return nil, resourceError(err)
@@ -183,6 +268,11 @@ func (s *ResourceServer) ProvisionResource(ctx context.Context, req *runtimev1.P
 			SecretRefs:   req.GetSecretRefs(),
 			VaultToken:   req.GetVaultToken(),
 			SeedTemplate: req.GetSeedTemplateKey(),
+			// D-202 — the shared tier reads the same wire durability field the
+			// dedicated tier does. It is honored or rejected by the use case, never
+			// dropped: a claim the server silently ignores is a promise the caller
+			// believes it made.
+			Durability: req.GetDurability(),
 		})
 		if err != nil {
 			return nil, resourceError(err)

@@ -145,7 +145,7 @@ func TestEvaluateProtection_AcceptRequiresEveryEligibleHost(t *testing.T) {
 			tt.seed(repo)
 			uc := protectionUC(t, repo, &fakeFleetProvisioner{}, tt.hosts, nil)
 
-			eval := uc.evaluateProtection(context.Background(), uc.acceptScopes(context.Background()))
+			eval := uc.evaluateProtection(context.Background(), uc.acceptScopes(context.Background()), uc.protection.CadenceSeconds)
 
 			assertComponent(t, "cadence", eval.Cadence, tt.wantCadence)
 			assertComponent(t, "offsite", eval.Offsite, tt.wantOffsite)
@@ -254,7 +254,7 @@ func TestEvaluateProtection_StatusEvaluatesOnlyTheAffinityHost(t *testing.T) {
 			}
 			uc := protectionUC(t, repo, &fakeFleetProvisioner{}, hostsWithIDs(own, other), affinity)
 
-			eval := uc.evaluateProtection(context.Background(), uc.statusScopes(context.Background(), res))
+			eval := uc.evaluateProtection(context.Background(), uc.statusScopes(context.Background(), res), uc.protection.CadenceSeconds)
 			if eval.Cadence.Attached != tt.wantAttached {
 				t.Fatalf("cadence attached = %v, want %v (err %v)", eval.Cadence.Attached, tt.wantAttached, eval.Cadence.Err)
 			}
@@ -443,6 +443,199 @@ func TestProvisionDedicated_DurabilityIsStoredAndEnforced(t *testing.T) {
 				t.Fatalf("stored durability = %q, want durable", row.Durability)
 			}
 		})
+	}
+}
+
+// Attach-on-recover: a claim accepted BEFORE the gate existed carries no
+// enrolment, and the declarative re-provision is where the fleet brings it under
+// protection. It is best-effort in BOTH directions — it never refuses the
+// recovery, and it stamps only what it could actually prove.
+func TestProvisionDedicated_AttachesProtectionOnRecover(t *testing.T) {
+	tests := []struct {
+		name string
+		// seed decides which beats exist, on the resource's own affinity host.
+		seed func(*fakeResourceRepo, uuid.UUID)
+		// mutate shapes the pre-existing row.
+		mutate     func(*domain.FleetResource)
+		saveErr    error
+		wantAttach bool
+	}{
+		{
+			name: "a pre-D-202 durable row whose protection CAN attach is enrolled and stamped",
+			seed: func(repo *fakeResourceRepo, host uuid.UUID) {
+				repo.seedBeat(domain.ProtectionComponentCadence, host.String(), time.Now().UTC())
+				repo.seedBeat(domain.ProtectionComponentOffsite, domain.ProtectionScopePlatform, time.Now().UTC())
+			},
+			wantAttach: true,
+		},
+		{
+			name: "protection that cannot attach leaves the row alone and NEVER refuses the recovery",
+			seed: func(repo *fakeResourceRepo, host uuid.UUID) {
+				// Cadence beats; the off-provider store does not — the live shape of
+				// this fleet, and the shape that must not take a database down.
+				repo.seedBeat(domain.ProtectionComponentCadence, host.String(), time.Now().UTC())
+			},
+		},
+		{
+			name: "an unreadable fact ledger is not a held fact — and still never refuses",
+			seed: func(repo *fakeResourceRepo, _ uuid.UUID) {
+				repo.beatErr = errors.New("control-plane db unreachable")
+			},
+		},
+		{
+			name: "an ALREADY-attached row is left exactly as it is",
+			seed: func(repo *fakeResourceRepo, host uuid.UUID) {
+				repo.seedBeat(domain.ProtectionComponentCadence, host.String(), time.Now().UTC())
+				repo.seedBeat(domain.ProtectionComponentOffsite, domain.ProtectionScopePlatform, time.Now().UTC())
+			},
+			mutate: func(r *domain.FleetResource) {
+				at := time.Now().UTC().Add(-24 * time.Hour)
+				r.ProtectionAttachedAt = &at
+			},
+		},
+		{
+			name: "a WAIVED row is never silently promoted to attached — the audit is the record",
+			seed: func(repo *fakeResourceRepo, host uuid.UUID) {
+				repo.seedBeat(domain.ProtectionComponentCadence, host.String(), time.Now().UTC())
+				repo.seedBeat(domain.ProtectionComponentOffsite, domain.ProtectionScopePlatform, time.Now().UTC())
+			},
+			mutate: func(r *domain.FleetResource) {
+				at := time.Now().UTC()
+				r.ProtectionWaivedBy = "user:ops-1"
+				r.ProtectionWaiverReason = "drill"
+				r.ProtectionWaivedAt = &at
+			},
+		},
+		{
+			name: "an EPHEMERAL row has no protection to attach",
+			seed: func(repo *fakeResourceRepo, host uuid.UUID) {
+				repo.seedBeat(domain.ProtectionComponentCadence, host.String(), time.Now().UTC())
+				repo.seedBeat(domain.ProtectionComponentOffsite, domain.ProtectionScopePlatform, time.Now().UTC())
+			},
+			mutate: func(r *domain.FleetResource) { r.Durability = domain.DurabilityEphemeral },
+		},
+		{
+			name: "a failed persist is logged and swallowed — the recovery still happens",
+			seed: func(repo *fakeResourceRepo, host uuid.UUID) {
+				repo.seedBeat(domain.ProtectionComponentCadence, host.String(), time.Now().UTC())
+				repo.seedBeat(domain.ProtectionComponentOffsite, domain.ProtectionScopePlatform, time.Now().UTC())
+			},
+			saveErr: errors.New("control-plane db unreachable"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host := uuid.New()
+			repo := newFakeResourceRepo()
+			tt.seed(repo, host)
+
+			in := validDedicatedInput()
+			appID := uuid.New()
+			res := &domain.FleetResource{
+				ID: uuid.New(), OwnerOrg: uuid.MustParse(in.OwnerOrg), ClaimKey: in.ClaimKey, Env: in.Env,
+				Revision: 1, Class: resourceClassPostgres, Tier: resourceTierDedicated,
+				Phase: domain.FleetResourcePhaseReady, AppID: &appID,
+				// The pre-D-202 shape: durable, never enrolled, never waived.
+				Durability: domain.DurabilityDurable,
+			}
+			if tt.mutate != nil {
+				tt.mutate(res)
+			}
+			repo.seed(res)
+			repo.saveErr = tt.saveErr
+
+			affinity := &fakeVolumeAffinity{byResource: map[uuid.UUID][]domain.Volume{
+				res.ID: {{ID: uuid.New(), ResourceID: &res.ID, HostAffinity: &host}},
+			}}
+			prov := &fakeFleetProvisioner{
+				healthOut:    FleetHealthOutput{Healthy: true},
+				provisionOut: FleetProvisionOutput{Handle: appID.String()},
+			}
+			uc := protectionUC(t, repo, prov, hostsWithIDs(host), affinity)
+
+			// ⚠ The regression guard: whatever the protection verdict is, a
+			// re-provision of an EXISTING claim never errors and always drives the
+			// recovery. A regressed platform must keep serving what it promised.
+			out, err := uc.ProvisionDedicated(context.Background(), in)
+			if err != nil {
+				t.Fatalf("a re-provision of an existing claim must never be refused by the attach attempt: %v", err)
+			}
+			if out.Handle != res.ID.String() {
+				t.Fatalf("handle = %q, want the existing claim %q", out.Handle, res.ID)
+			}
+			if prov.provisionCalls != 1 {
+				t.Fatalf("the recovery re-provision must still run (provision calls = %d)", prov.provisionCalls)
+			}
+
+			stored, gerr := repo.GetResourceByHandle(context.Background(), res.ID)
+			if gerr != nil {
+				t.Fatalf("GetResourceByHandle: %v", gerr)
+			}
+			if !tt.wantAttach {
+				if stored.ProtectionCadenceSeconds != nil {
+					t.Fatalf("nothing should have been enrolled, got cadence %v", *stored.ProtectionCadenceSeconds)
+				}
+				if tt.mutate == nil && stored.ProtectionAttachedAt != nil {
+					t.Fatal("an unprovable attach must never be stamped")
+				}
+				return
+			}
+			if stored.ProtectionCadenceSeconds == nil || *stored.ProtectionCadenceSeconds != testProtectionConfig().CadenceSeconds {
+				t.Fatalf("cadence enrolment = %v, want %d", stored.ProtectionCadenceSeconds, testProtectionConfig().CadenceSeconds)
+			}
+			if stored.ProtectionAttachedAt == nil {
+				t.Fatal("a fully-attached recover must stamp protection_attached_at")
+			}
+			if stored.ProtectionWaivedBy != "" {
+				t.Fatalf("an attach is not a waiver: %+v", stored)
+			}
+		})
+	}
+}
+
+// The status read judges the enrolment ON THE ROW, never the fleet's current
+// configured default. A cleared or changed config is a fact about the config, and
+// re-reading it here would silently re-classify enrolments nobody touched.
+func TestStatusOf_ProtectionEvaluatesThePersistedEnrolment(t *testing.T) {
+	host := uuid.New()
+	repo := newFakeResourceRepo()
+	repo.seedBeat(domain.ProtectionComponentCadence, host.String(), time.Now().UTC())
+	repo.seedBeat(domain.ProtectionComponentOffsite, domain.ProtectionScopePlatform, time.Now().UTC())
+
+	appID := uuid.New()
+	persisted := 3600
+	res := &domain.FleetResource{
+		ID: uuid.New(), OwnerOrg: uuid.New(), ClaimKey: "orders-db", Env: "prod",
+		Class: resourceClassPostgres, Tier: resourceTierDedicated,
+		Phase: domain.FleetResourcePhaseReady, AppID: &appID,
+		Durability: domain.DurabilityDurable, ProtectionCadenceSeconds: &persisted,
+	}
+	repo.seed(res)
+
+	affinity := &fakeVolumeAffinity{byResource: map[uuid.UUID][]domain.Volume{
+		res.ID: {{ID: uuid.New(), ResourceID: &res.ID, HostAffinity: &host}},
+	}}
+	prov := &fakeFleetProvisioner{healthOut: FleetHealthOutput{Healthy: true}}
+	replicas := newFakeResourceReplicaRepo()
+	replicas.byApp[appID] = []domain.Replica{{
+		ID: uuid.New(), AppID: appID, State: domain.ReplicaStateResident,
+		GuestIP: "10.10.0.2", Port: 5432,
+	}}
+	uc := protectionUCWithReplicas(t, repo, prov, hostsWithIDs(host), affinity, replicas)
+	uc.pgReady = func(context.Context, string, int) error { return nil }
+	// The ACCEPT-time cadence is zeroed: no NEW durable claim could be enrolled on
+	// this fleet right now. That must say nothing about a resource already enrolled.
+	uc.protection.CadenceSeconds = 0
+
+	status, err := uc.StatusOf(context.Background(), res.ID)
+	if err != nil {
+		t.Fatalf("StatusOf: %v", err)
+	}
+	for _, token := range []string{conditionProtectionCadenceUnattached, conditionProtectionCadenceStalled} {
+		if hasCondition(status.Conditions, token) {
+			t.Fatalf("conditions %v must not contain %q: the row IS enrolled and its host IS beating", status.Conditions, token)
+		}
 	}
 }
 

@@ -174,13 +174,24 @@ type cadenceScopes struct {
 }
 
 // evaluateProtection answers, from live facts only, whether each attachable
-// protection component can attach RIGHT NOW for the given cadence scope set.
+// protection component can attach RIGHT NOW for the given cadence scope set and
+// the given EFFECTIVE ENROLMENT.
+//
+// enrolledSeconds is the cadence this evaluation is about, and it differs by
+// consumer on purpose: an ACCEPT (or an attach-on-recover) is about the cadence
+// this fleet is configured to stamp, while a STATUS read is about the cadence the
+// resource's own row carries. Reading the configured value at status would let a
+// config change silently re-judge an enrolment nobody altered — a resource
+// enrolled at an hour would report unattachable the moment the fleet's default
+// were cleared, which is a statement about the config and not about that
+// database. One computation, two consumers, and the enrolment travels as a
+// parameter rather than as a second code path.
 //
 // It never short-circuits and it never returns an error of its own: the caller
 // gets the whole structured verdict and decides what to do with it.
-func (uc *FleetResourceProvisioner) evaluateProtection(ctx context.Context, scopes cadenceScopes) ProtectionEvaluation {
+func (uc *FleetResourceProvisioner) evaluateProtection(ctx context.Context, scopes cadenceScopes, enrolledSeconds int) ProtectionEvaluation {
 	return ProtectionEvaluation{
-		Cadence: uc.evaluateCadence(ctx, scopes),
+		Cadence: uc.evaluateCadence(ctx, scopes, enrolledSeconds),
 		Offsite: uc.evaluateOffsite(ctx),
 	}
 }
@@ -190,9 +201,9 @@ func (uc *FleetResourceProvisioner) evaluateProtection(ctx context.Context, scop
 // verdict that hid which host was dark would be unactionable, and accepting on
 // "some host beats" is the cross-host false positive migration 0025's scope-shape
 // CHECK exists to forbid at the storage layer.
-func (uc *FleetResourceProvisioner) evaluateCadence(ctx context.Context, scopes cadenceScopes) ProtectionComponentResult {
+func (uc *FleetResourceProvisioner) evaluateCadence(ctx context.Context, scopes cadenceScopes, enrolledSeconds int) ProtectionComponentResult {
 	res := ProtectionComponentResult{Component: domain.ProtectionComponentCadence}
-	if uc.protection.CadenceSeconds <= 0 {
+	if enrolledSeconds <= 0 {
 		res.Err = fmt.Errorf("%w: no snapshot cadence is configured, so there is no enrolment to attach", domain.ErrProtectionCadenceUnavailable)
 		return res
 	}
@@ -346,6 +357,23 @@ func resolveDedicatedDurability(requested string) (domain.Durability, error) {
 		return domain.DurabilityDurable, nil
 	default:
 		return "", fmt.Errorf("%w: the dedicated tier is durable, and %q is not", domain.ErrResourceDurabilityInvalid, requested)
+	}
+}
+
+// resolveSharedDurability resolves the wire durability claim for the SHARED
+// tier, which is the mirror image of the dedicated rule. "" and "ephemeral" both
+// mean ephemeral — a shared claim is a TTL-reaped logical database on a shared
+// engine, so an absent claim is the same promise, not a stronger one. "durable"
+// is REFUSED rather than honored or silently downgraded: honoring it would sell a
+// retention promise this tier cannot hold (I39), downgrading it would hand back
+// something weaker than what was asked for with nothing anywhere saying so, and
+// 0025's tier/durability CHECK cannot even represent a durable shared row.
+func resolveSharedDurability(requested string) (domain.Durability, error) {
+	switch requested {
+	case "", string(domain.DurabilityEphemeral):
+		return domain.DurabilityEphemeral, nil
+	default:
+		return "", fmt.Errorf("%w: the shared tier is ephemeral, and %q is not", domain.ErrResourceDurabilityInvalid, requested)
 	}
 }
 

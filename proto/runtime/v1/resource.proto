@@ -93,6 +93,16 @@ message ProvisionResourceRequest {
     // the fleet — NEVER persisted to a row, rootfs, or log. Mirrors
     // DeploymentDescriptor.vault_token (D-125).
     string vault_token = 15;
+    // protection_waiver_reason is WHY a durable database may be accepted even
+    // though the fleet cannot attach its protection (D-202/D-218). Non-empty
+    // requests the audited per-resource waiver.
+    //
+    // The REASON only. There is deliberately no actor field: the caller never
+    // writes the audit's subject — runtime derives it from the authenticated
+    // principal (a verified platform-admin JWT subject, or delivery's exact peer
+    // SVID restricted to the pinned D-205 drill orgs) and refuses anyone else. An
+    // audit field the caller fills in is not an audit.
+    string protection_waiver_reason = 16;
 }
 message ProvisionResourceResponse {
     string handle = 1;

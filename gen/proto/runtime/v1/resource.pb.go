@@ -305,9 +305,19 @@ type ProvisionResourceRequest struct {
 	// vault_token is the delivery-minted, org-scoped broker token. Memory-only on
 	// the fleet — NEVER persisted to a row, rootfs, or log. Mirrors
 	// DeploymentDescriptor.vault_token (D-125).
-	VaultToken    string `protobuf:"bytes,15,opt,name=vault_token,json=vaultToken,proto3" json:"vault_token,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	VaultToken string `protobuf:"bytes,15,opt,name=vault_token,json=vaultToken,proto3" json:"vault_token,omitempty"`
+	// protection_waiver_reason is WHY a durable database may be accepted even
+	// though the fleet cannot attach its protection (D-202/D-218). Non-empty
+	// requests the audited per-resource waiver.
+	//
+	// The REASON only. There is deliberately no actor field: the caller never
+	// writes the audit's subject — runtime derives it from the authenticated
+	// principal (a verified platform-admin JWT subject, or delivery's exact peer
+	// SVID restricted to the pinned D-205 drill orgs) and refuses anyone else. An
+	// audit field the caller fills in is not an audit.
+	ProtectionWaiverReason string `protobuf:"bytes,16,opt,name=protection_waiver_reason,json=protectionWaiverReason,proto3" json:"protection_waiver_reason,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *ProvisionResourceRequest) Reset() {
@@ -441,6 +451,13 @@ func (x *ProvisionResourceRequest) GetSecretRefs() []string {
 func (x *ProvisionResourceRequest) GetVaultToken() string {
 	if x != nil {
 		return x.VaultToken
+	}
+	return ""
+}
+
+func (x *ProvisionResourceRequest) GetProtectionWaiverReason() string {
+	if x != nil {
+		return x.ProtectionWaiverReason
 	}
 	return ""
 }
@@ -1134,7 +1151,7 @@ const file_proto_runtime_v1_resource_proto_rawDesc = "" +
 	"\x10supports_restore\x18\x05 \x01(\bR\x0fsupportsRestore\x12@\n" +
 	"\x1csupports_credential_rotation\x18\x06 \x01(\bR\x1asupportsCredentialRotation\"`\n" +
 	"\x1fGetResourceCapabilitiesResponse\x12=\n" +
-	"\aclasses\x18\x01 \x03(\v2#.runtime.v1.ResourceClassCapabilityR\aclasses\"\xb0\x04\n" +
+	"\aclasses\x18\x01 \x03(\v2#.runtime.v1.ResourceClassCapabilityR\aclasses\"\xea\x04\n" +
 	"\x18ProvisionResourceRequest\x12\x1b\n" +
 	"\tclaim_key\x18\x01 \x01(\tR\bclaimKey\x12\x1b\n" +
 	"\towner_org\x18\x02 \x01(\tR\bownerOrg\x12\x10\n" +
@@ -1156,7 +1173,8 @@ const file_proto_runtime_v1_resource_proto_rawDesc = "" +
 	"\vsecret_refs\x18\x0e \x03(\tR\n" +
 	"secretRefs\x12\x1f\n" +
 	"\vvault_token\x18\x0f \x01(\tR\n" +
-	"vaultToken\x1a9\n" +
+	"vaultToken\x128\n" +
+	"\x18protection_waiver_reason\x18\x10 \x01(\tR\x16protectionWaiverReason\x1a9\n" +
 	"\vParamsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"e\n" +

@@ -16,6 +16,8 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/sentiae/platform-kit/middleware"
+	"github.com/sentiae/platform-kit/tenant"
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/repository"
@@ -53,10 +55,12 @@ type fakeSharedProvisioner struct {
 	provisionCalled bool
 	out             usecase.ProvisionSharedOutput
 	err             error
+	lastInput       usecase.ProvisionSharedInput
 }
 
-func (f *fakeSharedProvisioner) ProvisionShared(context.Context, usecase.ProvisionSharedInput) (usecase.ProvisionSharedOutput, error) {
+func (f *fakeSharedProvisioner) ProvisionShared(_ context.Context, in usecase.ProvisionSharedInput) (usecase.ProvisionSharedOutput, error) {
 	f.provisionCalled = true
+	f.lastInput = in
 	return f.out, f.err
 }
 
@@ -719,5 +723,205 @@ func TestProvisionResource_DurabilityRefusalIsInvalidArgument(t *testing.T) {
 	})
 	if code := status.Code(err); code != codes.InvalidArgument {
 		t.Fatalf("code = %s, want InvalidArgument", code)
+	}
+}
+
+func TestProvisionResource_SharedTierPassesDurabilityThrough(t *testing.T) {
+	shared := &fakeSharedProvisioner{out: usecase.ProvisionSharedOutput{Handle: uuid.NewString(), Phase: "ready"}}
+	s := NewResourceServer(&fakeDedicatedProvisioner{}, shared, nil, nil, &fakeResourceRepo{})
+
+	if _, err := s.ProvisionResource(context.Background(), &runtimev1.ProvisionResourceRequest{
+		Tier: resourceTierShared, Class: resourceClassPostgres, ClaimKey: "cache-db", Env: "prod",
+		Durability: "ephemeral",
+	}); err != nil {
+		t.Fatalf("ProvisionResource: %v", err)
+	}
+	// The shared tier reads the SAME wire field the dedicated tier does. Dropping
+	// it here would let a caller ask for a durable shared database and be told
+	// nothing while getting a TTL-reaped one.
+	if shared.lastInput.Durability != "ephemeral" {
+		t.Fatalf("durability reached the shared use case as %q, want %q", shared.lastInput.Durability, "ephemeral")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// D-218 — the waiver's ACTOR is derived from the authenticated principal.
+//
+// The wire carries only a reason. These tests pin who may waive: exactly a
+// verified platform administrator, and delivery's exact SVID acting for one of
+// the two pinned D-205 drill orgs. Everything else is PermissionDenied, and an
+// EMPTY reason is not a waiver at all.
+// ─────────────────────────────────────────────────────────────────────
+
+// withClaims stamps a VERIFIED user token's claims the way the gRPC auth
+// interceptor would (tenant.FromContext reads the same field either way).
+func withClaims(c *middleware.Claims) context.Context {
+	return tenant.ContextWithPrincipal(context.Background(), tenant.Principal{Claims: c})
+}
+
+func TestProvisionResource_WaiverActorIsDerivedFromThePrincipal(t *testing.T) {
+	const reason = "D-205 fleetdrill run 2026-08-03T00:00:00Z"
+
+	tests := []struct {
+		name      string
+		ctx       context.Context
+		ownerOrg  string
+		reason    string
+		wantActor string
+		wantCode  codes.Code
+	}{
+		{
+			name:      "a verified platform admin waives as itself",
+			ctx:       withClaims(&middleware.Claims{Subject: "user-9", PlatformAdmin: true}),
+			ownerOrg:  uuid.NewString(),
+			reason:    reason,
+			wantActor: "user:user-9",
+		},
+		{
+			name:      "delivery may waive for the PRIMARY drill org",
+			ctx:       withPeerSVID(deliveryWaiverSVID),
+			ownerOrg:  drillOrgPrimary,
+			reason:    reason,
+			wantActor: deliveryWaiverSVID,
+		},
+		{
+			name:      "delivery may waive for the AUXILIARY (cross-tenant) drill org",
+			ctx:       withPeerSVID(deliveryWaiverSVID),
+			ownerOrg:  drillOrgAuxiliary,
+			reason:    reason,
+			wantActor: deliveryWaiverSVID,
+		},
+		{
+			name:     "delivery may NOT waive for a customer org — a machine must not create an unprotected customer database",
+			ctx:      withPeerSVID(deliveryWaiverSVID),
+			ownerOrg: uuid.NewString(),
+			reason:   reason,
+			wantCode: codes.PermissionDenied,
+		},
+		{
+			name:     "another service's SVID may not waive, even for a drill org",
+			ctx:      withPeerSVID("spiffe://sentiae.io/svc/ops"),
+			ownerOrg: drillOrgPrimary,
+			reason:   reason,
+			wantCode: codes.PermissionDenied,
+		},
+		{
+			name:     "a near-miss SVID is not delivery — the match is exact, never a prefix",
+			ctx:      withPeerSVID(deliveryWaiverSVID + "-canary"),
+			ownerOrg: drillOrgPrimary,
+			reason:   reason,
+			wantCode: codes.PermissionDenied,
+		},
+		{
+			name:     "an ordinary user token may not waive",
+			ctx:      withClaims(&middleware.Claims{Subject: "user-9"}),
+			ownerOrg: uuid.NewString(),
+			reason:   reason,
+			wantCode: codes.PermissionDenied,
+		},
+		{
+			name:     "a platform-admin token with NO subject is not attributable",
+			ctx:      withClaims(&middleware.Claims{PlatformAdmin: true}),
+			ownerOrg: uuid.NewString(),
+			reason:   reason,
+			wantCode: codes.PermissionDenied,
+		},
+		{
+			name: "a non-admin user token does NOT fall through to the service branch",
+			ctx: tenant.ContextWithPrincipal(context.Background(), tenant.Principal{
+				Claims: &middleware.Claims{Subject: "user-9"}, ServiceSVID: deliveryWaiverSVID,
+			}),
+			ownerOrg: drillOrgPrimary,
+			reason:   reason,
+			wantCode: codes.PermissionDenied,
+		},
+		{
+			name:     "a caller-labelled service identity never suffices — only the peer SVID does",
+			ctx:      tenant.ContextWithPrincipal(context.Background(), tenant.Principal{ServiceAuthed: true, Service: "delivery"}),
+			ownerOrg: drillOrgPrimary,
+			reason:   reason,
+			wantCode: codes.PermissionDenied,
+		},
+		{
+			name:     "an anonymous caller may not waive",
+			ctx:      context.Background(),
+			ownerOrg: drillOrgPrimary,
+			reason:   reason,
+			wantCode: codes.PermissionDenied,
+		},
+		{
+			name:     "a reason of pure whitespace is not a reason",
+			ctx:      withPeerSVID(deliveryWaiverSVID),
+			ownerOrg: drillOrgPrimary,
+			reason:   "   ",
+			wantCode: codes.OK, // no waiver, provision proceeds
+		},
+		{
+			name:     "an EMPTY reason from a principal that COULD waive is not a waiver",
+			ctx:      withClaims(&middleware.Claims{Subject: "user-9", PlatformAdmin: true}),
+			ownerOrg: uuid.NewString(),
+			reason:   "",
+			wantCode: codes.OK,
+		},
+		{
+			name:     "an empty reason from a principal that could NEVER waive still provisions normally",
+			ctx:      context.Background(),
+			ownerOrg: uuid.NewString(),
+			reason:   "",
+			wantCode: codes.OK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dedicated := &fakeDedicatedProvisioner{out: usecase.ProvisionDedicatedOutput{Handle: uuid.NewString(), Phase: "provisioning"}}
+			s := NewResourceServer(dedicated, &fakeSharedProvisioner{}, nil, nil, &fakeResourceRepo{})
+
+			_, err := s.ProvisionResource(tt.ctx, &runtimev1.ProvisionResourceRequest{
+				OwnerOrg: tt.ownerOrg, Tier: resourceTierDedicated, Class: resourceClassPostgres,
+				ClaimKey: "orders-db", Env: "prod", ProtectionWaiverReason: tt.reason,
+			})
+
+			if tt.wantCode == codes.PermissionDenied {
+				if code := status.Code(err); code != codes.PermissionDenied {
+					t.Fatalf("code = %s, want PermissionDenied", code)
+				}
+				// A denied waiver must not quietly become an UNWAIVED provision: the
+				// caller asked for an override it may not have, and the answer is no.
+				if dedicated.provisionCalled {
+					t.Fatal("a refused waiver must not reach the use case at all")
+				}
+				// The refusal must not become an oracle for who may waive.
+				msg := status.Convert(err).Message()
+				for _, leak := range []string{drillOrgPrimary, drillOrgAuxiliary, deliveryWaiverSVID} {
+					if strings.Contains(msg, leak) {
+						t.Fatalf("the refusal %q leaks %q", msg, leak)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ProvisionResource: %v", err)
+			}
+			if !dedicated.provisionCalled {
+				t.Fatal("the provision must have run")
+			}
+			if tt.wantActor == "" {
+				if dedicated.lastInput.Waiver != nil {
+					t.Fatalf("no waiver was requested, got %+v", dedicated.lastInput.Waiver)
+				}
+				return
+			}
+			w := dedicated.lastInput.Waiver
+			if w == nil {
+				t.Fatal("the waiver must reach the use case")
+			}
+			if w.Actor != tt.wantActor {
+				t.Fatalf("actor = %q, want %q — the actor is DERIVED, never carried", w.Actor, tt.wantActor)
+			}
+			if w.Reason != strings.TrimSpace(tt.reason) {
+				t.Fatalf("reason = %q, want %q", w.Reason, strings.TrimSpace(tt.reason))
+			}
+		})
 	}
 }

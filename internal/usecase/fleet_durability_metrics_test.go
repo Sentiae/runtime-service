@@ -340,3 +340,32 @@ func TestPublishLedgerReportCountsEachKind(t *testing.T) {
 		t.Errorf("ledger last success = %v, want %v", got, at.Unix())
 	}
 }
+
+// The §22 outcome label separates a CALLER bug from a PLATFORM fault. Getting it
+// wrong blunts the one signal the `error` label carries: a client sending bad
+// claims would read as a fleet that is failing.
+func TestOutcomeForSeparatesCallerBugsFromPlatformFaults(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"success", nil, outcomeOK},
+		{"an unsupported tier is a caller bug", domain.ErrResourceTierUnsupported, outcomeInvalid},
+		// D-202 — both of these are InvalidArgument at the boundary.
+		{"a durability the tier cannot hold is a caller bug", domain.ErrResourceDurabilityInvalid, outcomeInvalid},
+		{"a half-written waiver is a caller bug", domain.ErrProtectionWaiverIncomplete, outcomeInvalid},
+		{"a wrapped caller bug is still a caller bug", errors.Join(errors.New("provision: "), domain.ErrResourceDurabilityInvalid), outcomeInvalid},
+		// ⚠ NOT invalid: the protection refusal is a true statement about the
+		// platform's own state, and it must keep showing up as one.
+		{"the protection refusal is a PLATFORM fact, not a caller bug", domain.ErrProtectionUnattachable, outcomeError},
+		{"anything unrecognised is a platform fault", errors.New("boom"), outcomeError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := outcomeFor(tt.err); got != tt.want {
+				t.Fatalf("outcomeFor(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
