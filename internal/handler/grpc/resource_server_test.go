@@ -780,14 +780,14 @@ func TestProvisionResource_WaiverActorIsDerivedFromThePrincipal(t *testing.T) {
 		{
 			name:      "delivery may waive for the PRIMARY drill org",
 			ctx:       withPeerSVID(deliveryWaiverSVID),
-			ownerOrg:  drillOrgPrimary,
+			ownerOrg:  drillOrgPrimary.String(),
 			reason:    reason,
 			wantActor: deliveryWaiverSVID,
 		},
 		{
 			name:      "delivery may waive for the AUXILIARY (cross-tenant) drill org",
 			ctx:       withPeerSVID(deliveryWaiverSVID),
-			ownerOrg:  drillOrgAuxiliary,
+			ownerOrg:  drillOrgAuxiliary.String(),
 			reason:    reason,
 			wantActor: deliveryWaiverSVID,
 		},
@@ -801,14 +801,14 @@ func TestProvisionResource_WaiverActorIsDerivedFromThePrincipal(t *testing.T) {
 		{
 			name:     "another service's SVID may not waive, even for a drill org",
 			ctx:      withPeerSVID("spiffe://sentiae.io/svc/ops"),
-			ownerOrg: drillOrgPrimary,
+			ownerOrg: drillOrgPrimary.String(),
 			reason:   reason,
 			wantCode: codes.PermissionDenied,
 		},
 		{
 			name:     "a near-miss SVID is not delivery — the match is exact, never a prefix",
 			ctx:      withPeerSVID(deliveryWaiverSVID + "-canary"),
-			ownerOrg: drillOrgPrimary,
+			ownerOrg: drillOrgPrimary.String(),
 			reason:   reason,
 			wantCode: codes.PermissionDenied,
 		},
@@ -831,28 +831,45 @@ func TestProvisionResource_WaiverActorIsDerivedFromThePrincipal(t *testing.T) {
 			ctx: tenant.ContextWithPrincipal(context.Background(), tenant.Principal{
 				Claims: &middleware.Claims{Subject: "user-9"}, ServiceSVID: deliveryWaiverSVID,
 			}),
-			ownerOrg: drillOrgPrimary,
+			ownerOrg: drillOrgPrimary.String(),
 			reason:   reason,
 			wantCode: codes.PermissionDenied,
 		},
 		{
 			name:     "a caller-labelled service identity never suffices — only the peer SVID does",
 			ctx:      tenant.ContextWithPrincipal(context.Background(), tenant.Principal{ServiceAuthed: true, Service: "delivery"}),
-			ownerOrg: drillOrgPrimary,
+			ownerOrg: drillOrgPrimary.String(),
 			reason:   reason,
 			wantCode: codes.PermissionDenied,
 		},
 		{
 			name:     "an anonymous caller may not waive",
 			ctx:      context.Background(),
-			ownerOrg: drillOrgPrimary,
+			ownerOrg: drillOrgPrimary.String(),
+			reason:   reason,
+			wantCode: codes.PermissionDenied,
+		},
+		{
+			// ⚠ The SAME org in a different SPELLING is the same org. Authorization
+			// compares parsed UUIDs, never text: a string compare would deny this, and
+			// the same habit lets the inverse mistake through elsewhere.
+			name:      "an UPPERCASE rendering of a drill org is the same org and is granted",
+			ctx:       withPeerSVID(deliveryWaiverSVID),
+			ownerOrg:  strings.ToUpper(drillOrgPrimary.String()),
+			reason:    reason,
+			wantActor: deliveryWaiverSVID,
+		},
+		{
+			name:     "an UPPERCASE rendering of a FOREIGN org is still foreign",
+			ctx:      withPeerSVID(deliveryWaiverSVID),
+			ownerOrg: strings.ToUpper(uuid.NewString()),
 			reason:   reason,
 			wantCode: codes.PermissionDenied,
 		},
 		{
 			name:     "a reason of pure whitespace is not a reason",
 			ctx:      withPeerSVID(deliveryWaiverSVID),
-			ownerOrg: drillOrgPrimary,
+			ownerOrg: drillOrgPrimary.String(),
 			reason:   "   ",
 			wantCode: codes.OK, // no waiver, provision proceeds
 		},
@@ -893,7 +910,7 @@ func TestProvisionResource_WaiverActorIsDerivedFromThePrincipal(t *testing.T) {
 				}
 				// The refusal must not become an oracle for who may waive.
 				msg := status.Convert(err).Message()
-				for _, leak := range []string{drillOrgPrimary, drillOrgAuxiliary, deliveryWaiverSVID} {
+				for _, leak := range []string{drillOrgPrimary.String(), drillOrgAuxiliary.String(), deliveryWaiverSVID} {
 					if strings.Contains(msg, leak) {
 						t.Fatalf("the refusal %q leaks %q", msg, leak)
 					}
@@ -923,5 +940,63 @@ func TestProvisionResource_WaiverActorIsDerivedFromThePrincipal(t *testing.T) {
 				t.Fatalf("reason = %q, want %q", w.Reason, strings.TrimSpace(tt.reason))
 			}
 		})
+	}
+}
+
+// The unparseable-org branch of the derivation itself. The RPC parses owner_org
+// earlier and answers InvalidArgument, so this is only reachable directly — and
+// it must stay fail-closed: on the waiver path the answer is "no", never a
+// different code that tells an unauthorized caller how far it got.
+func TestResolveProtectionWaiver_UnparseableOrgIsDenied(t *testing.T) {
+	w, err := resolveProtectionWaiver(withPeerSVID(deliveryWaiverSVID), "a reason", "not-a-uuid")
+	if w != nil {
+		t.Fatalf("no waiver may be derived, got %+v", w)
+	}
+	if code := status.Code(err); code != codes.PermissionDenied {
+		t.Fatalf("code = %s, want PermissionDenied", code)
+	}
+}
+
+// D-202/D-218 — the shared tier has no protection requirement, so it has nothing
+// to waive. A reason on a shared claim is REFUSED rather than silently dropped:
+// a caller that asked for an audited override and got a plain success would
+// believe an override exists on a row that carries no audit at all.
+func TestProvisionResource_SharedTierRefusesAWaiverReason(t *testing.T) {
+	shared := &fakeSharedProvisioner{out: usecase.ProvisionSharedOutput{Handle: uuid.NewString(), Phase: "ready"}}
+	s := NewResourceServer(&fakeDedicatedProvisioner{}, shared, nil, nil, &fakeResourceRepo{})
+
+	_, err := s.ProvisionResource(withClaims(&middleware.Claims{Subject: "user-9", PlatformAdmin: true}),
+		&runtimev1.ProvisionResourceRequest{
+			Tier: resourceTierShared, Class: resourceClassPostgres, ClaimKey: "cache-db", Env: "prod",
+			ProtectionWaiverReason: "D-205 fleetdrill run 2026-08-03T00:00:00Z",
+		})
+	if code := status.Code(err); code != codes.InvalidArgument {
+		t.Fatalf("code = %s, want InvalidArgument (%v)", code, err)
+	}
+	// ⚠ The regression: the claim must not have been provisioned anyway.
+	if shared.provisionCalled {
+		t.Fatal("a shared claim carrying a waiver reason must not reach the shared provisioner")
+	}
+	// Even a principal that COULD waive on the dedicated tier gets the same answer:
+	// the refusal is about the tier, not about who is asking.
+	_, err = s.ProvisionResource(withPeerSVID(deliveryWaiverSVID), &runtimev1.ProvisionResourceRequest{
+		OwnerOrg: drillOrgPrimary.String(),
+		Tier:     resourceTierShared, Class: resourceClassPostgres, ClaimKey: "cache-db", Env: "prod",
+		ProtectionWaiverReason: "drill",
+	})
+	if code := status.Code(err); code != codes.InvalidArgument {
+		t.Fatalf("code = %s, want InvalidArgument for the drill principal too (%v)", code, err)
+	}
+	if shared.provisionCalled {
+		t.Fatal("a shared claim carrying a waiver reason must not reach the shared provisioner")
+	}
+	// A shared claim with NO reason still provisions normally (the control).
+	if _, err := s.ProvisionResource(context.Background(), &runtimev1.ProvisionResourceRequest{
+		Tier: resourceTierShared, Class: resourceClassPostgres, ClaimKey: "cache-db", Env: "prod",
+	}); err != nil {
+		t.Fatalf("an ordinary shared claim must still provision: %v", err)
+	}
+	if !shared.provisionCalled {
+		t.Fatal("the control claim must have reached the shared provisioner")
 	}
 }

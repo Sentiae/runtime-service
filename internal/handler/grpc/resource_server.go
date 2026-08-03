@@ -138,16 +138,29 @@ const (
 	// about the caller the caller cannot write, and a prefix match would admit
 	// `…/svc/delivery-something`.
 	deliveryWaiverSVID = "spiffe://sentiae.io/svc/delivery"
-	// drillOrgPrimary and drillOrgAuxiliary are the two pinned D-205 fleet-drill
-	// organizations (locked.md D-205 amendment 2026-08-02: an EXACT allowlist of
-	// two v5 literals, permanently reserved and never identity-minted, which only
-	// mints v4). Delivery may waive for these and ONLY these: a drill is the one
-	// automated caller that legitimately creates a durable database on a fleet that
-	// cannot yet protect it, and letting that authority reach a customer org would
-	// make an unprotected customer database creatable by a machine. Compared
-	// against the canonical lowercase form the drill emits.
-	drillOrgPrimary   = "909e8c2f-4dad-50e4-b49a-b2eafa846415"
-	drillOrgAuxiliary = "ee0ad5dd-926b-5a83-86cb-775da4683c64"
+	// drillOrgPrimaryLiteral and drillOrgAuxiliaryLiteral are the two pinned D-205
+	// fleet-drill organizations (locked.md D-205 amendment 2026-08-02: an EXACT
+	// allowlist of two v5 literals, permanently reserved and never identity-minted,
+	// which only mints v4). Delivery may waive for these and ONLY these: a drill is
+	// the one automated caller that legitimately creates a durable database on a
+	// fleet that cannot yet protect it, and letting that authority reach a customer
+	// org would make an unprotected customer database creatable by a machine.
+	drillOrgPrimaryLiteral   = "909e8c2f-4dad-50e4-b49a-b2eafa846415"
+	drillOrgAuxiliaryLiteral = "ee0ad5dd-926b-5a83-86cb-775da4683c64"
+)
+
+// drillOrgPrimary / drillOrgAuxiliary are the parsed forms, and the comparison is
+// made on THESE.
+//
+// ⚠ An authorization decision must never depend on how a UUID happens to be
+// SPELLED. The same org rendered in uppercase is the same org; a string compare
+// would deny it, and — worse — the habit invites the inverse mistake elsewhere,
+// where two different texts of the same id let a check be bypassed by
+// re-formatting. Parsed once at package scope: a malformed literal here is a
+// programming error that must not be discovered on a live waiver.
+var (
+	drillOrgPrimary   = uuid.MustParse(drillOrgPrimaryLiteral)
+	drillOrgAuxiliary = uuid.MustParse(drillOrgAuxiliaryLiteral)
 )
 
 // resolveProtectionWaiver turns a wire reason into the typed, server-attributed
@@ -190,10 +203,21 @@ func resolveProtectionWaiver(ctx context.Context, reason, ownerOrg string) (*use
 		}
 		return nil, denied
 	}
-	if p.ServiceSVID == deliveryWaiverSVID && (ownerOrg == drillOrgPrimary || ownerOrg == drillOrgAuxiliary) {
-		return &usecase.ProtectionWaiver{Actor: p.ServiceSVID, Reason: reason}, nil
+	if p.ServiceSVID != deliveryWaiverSVID {
+		return nil, denied
 	}
-	return nil, denied
+	// Compared as PARSED UUIDs, never as text. An unparseable owner_org is denied
+	// here rather than reported as a bad request: on the waiver path the answer to
+	// "may you waive" is no, and a distinct code would tell an unauthorized caller
+	// something about how far it got.
+	org, perr := uuid.Parse(ownerOrg)
+	if perr != nil {
+		return nil, denied
+	}
+	if org != drillOrgPrimary && org != drillOrgAuxiliary {
+		return nil, denied
+	}
+	return &usecase.ProtectionWaiver{Actor: p.ServiceSVID, Reason: reason}, nil
 }
 
 // ProvisionResource claims a managed resource. It runs the D-061 owner-org
@@ -257,6 +281,16 @@ func (s *ResourceServer) ProvisionResource(ctx context.Context, req *runtimev1.P
 	case resourceTierShared:
 		if s.shared == nil {
 			return nil, status.Error(codes.Unavailable, "shared resource provisioner not configured")
+		}
+		// D-202/D-218 — a waiver reason on a SHARED claim is refused, not ignored.
+		// The shared tier is ephemeral by construction: it makes no retention promise,
+		// so it has no protection requirement, so there is nothing here to override. A
+		// caller that asked for an audited override and got a silent success would
+		// believe an override exists on a resource whose row carries no audit at all —
+		// and a wire field the server drops is a promise the caller thinks it made.
+		if strings.TrimSpace(req.GetProtectionWaiverReason()) != "" {
+			return nil, status.Error(codes.InvalidArgument,
+				"the shared tier has no protection to waive: a shared database is ephemeral and makes no retention promise, so a protection waiver is not applicable to it")
 		}
 		out, err := s.shared.ProvisionShared(ctx, usecase.ProvisionSharedInput{
 			OwnerOrg:     ownerOrgRaw,
