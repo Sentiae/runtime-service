@@ -156,6 +156,27 @@ var (
 		Help: "Unix time of the last second-domain mirror pass that completed with NO failures; -1 when none has completed in this process (which is every instance that is not the control plane).",
 	})
 
+	// protectionHeartbeatAge is how a STOPPED protection worker becomes visible
+	// (D-202): the age of each component's newest beat IN THIS LEDGER.
+	//
+	// An AGE, and MetricUnknown (-1) when the component has never beaten here —
+	// which is not an edge case but the DESIGNED state of the `offsite` component
+	// until D-212's writer lands, and the state of `cadence` on every host with no
+	// snapshotter. 0 would read as "beaten a moment ago", the healthiest possible
+	// number for the least protected possible state, and an omitted series would
+	// leave the alert with nothing to evaluate.
+	//
+	// scope is the fleet host UUID for `cadence` and `platform` for `offsite` —
+	// the same distinction migration 0025's scope-shape CHECK enforces, because a
+	// per-host fact and a platform-wide one must never be aggregated together.
+	// There is deliberately NO per-resource gauge and NO owner_org label here: the
+	// facts are per-worker, and adding a tenant label would widen
+	// #metrics-expose-tenant-org-ids-unauthenticated.
+	protectionHeartbeatAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sentiae_fleet_protection_heartbeat_age_seconds",
+		Help: "Age in seconds of a protection worker's newest heartbeat in this ledger; -1 when the component has never beaten here (or could not be read).",
+	}, []string{"component", "scope"})
+
 	// snapshotFailures surfaces migration 0018's consecutive_snapshot_failures.
 	// A count, not a flag: a blip and a week-long protection outage must not look
 	// alike.
@@ -267,6 +288,12 @@ const (
 	outcomeInvalid = "invalid"
 	outcomeError   = "error"
 )
+
+// ProtectionScopePlatformLabel is the METRIC label for a platform-wide
+// protection component. The ledger stores that scope as ” (0025's CHECK admits
+// ” only for `offsite`); an empty label value is indistinguishable from an
+// absent one on a dashboard, so the metric names it.
+const ProtectionScopePlatformLabel = "platform"
 
 // Second-domain mirror outcome labels.
 const (
@@ -383,6 +410,8 @@ type DurabilityResourceReader interface {
 	ListResourceDurability(ctx context.Context) ([]repository.ResourceDurability, error)
 	// ListRecoveryPointLocations is the failure-domain census (migration 0023).
 	ListRecoveryPointLocations(ctx context.Context) ([]repository.RecoveryPointLocationFacts, error)
+	// GetProtectionHeartbeat is the D-202 worker-liveness fact.
+	GetProtectionHeartbeat(ctx context.Context, component, scope string) (*domain.ProtectionHeartbeat, error)
 }
 
 // DurabilityHostReader lists the host registry.
@@ -407,6 +436,11 @@ type FleetDurabilityCollector struct {
 	resources DurabilityResourceReader
 	hosts     DurabilityHostReader
 	leases    DurabilityLeaseReader
+	// selfHost is this instance's fleet identity, set only on a host that runs a
+	// cadence worker. Nil elsewhere: an instance that takes no scheduled snapshots
+	// has no per-host cadence fact to report, and publishing one under a guessed
+	// scope would be worse than publishing none.
+	selfHost *uuid.UUID
 	// now is injected so the age computation is testable without sleeping (§30.6).
 	now func() time.Time
 
@@ -432,6 +466,12 @@ func NewFleetDurabilityCollector(
 		doneCh:    make(chan struct{}),
 	}
 }
+
+// SetHostScope pins this collector to the fleet host it runs on, so the per-host
+// `cadence` heartbeat age is published under the right scope. Called only after
+// self-registration (the id does not exist before it); without it the collector
+// publishes the platform-wide component only.
+func (c *FleetDurabilityCollector) SetHostScope(hostID uuid.UUID) { c.selfHost = &hostID }
 
 // Start runs the collection loop. The first pass fires immediately so the gauges
 // are true within a second of boot instead of after a full interval.
@@ -490,6 +530,9 @@ func (c *FleetDurabilityCollector) Collect(ctx context.Context) error {
 	if err := c.collectHosts(ctx); err != nil {
 		errs = append(errs, err)
 	}
+	if err := c.collectProtection(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	if len(errs) > 0 {
 		durabilityCollectionErrors.Inc()
 		return errors.Join(errs...)
@@ -524,6 +567,42 @@ func (c *FleetDurabilityCollector) collectRecoveryPointLocations(ctx context.Con
 	}
 	publishRecoveryPointLocations(ComputeRecoveryPointLocations(facts, c.now()))
 	return nil
+}
+
+// collectProtection publishes the age of each D-202 protection heartbeat.
+//
+// ⚠ A read error and a never-beaten component BOTH publish MetricUnknown, and the
+// section still reports the read error to the pass. Those two are different
+// causes with the same consequence — nothing here can prove the worker is running
+// — and the gauge must show the pessimistic value for both, while the pass's
+// error counter is what distinguishes an absent fact from an unreadable ledger.
+func (c *FleetDurabilityCollector) collectProtection(ctx context.Context) error {
+	if c.resources == nil {
+		return errors.New("durability collect: no resource ledger wired")
+	}
+	// Reset so a scope that no longer applies (a host this process stopped being)
+	// disappears rather than freezing at its last age forever.
+	protectionHeartbeatAge.Reset()
+
+	var errs []error
+	publish := func(component, scope, label string) {
+		beat, err := c.resources.GetProtectionHeartbeat(ctx, component, scope)
+		switch {
+		case errors.Is(err, domain.ErrProtectionHeartbeatNotFound):
+			protectionHeartbeatAge.WithLabelValues(component, label).Set(MetricUnknown)
+		case err != nil:
+			protectionHeartbeatAge.WithLabelValues(component, label).Set(MetricUnknown)
+			errs = append(errs, fmt.Errorf("read %s protection heartbeat: %w", component, err))
+		default:
+			at := beat.BeatenAt
+			protectionHeartbeatAge.WithLabelValues(component, label).Set(ageSeconds(&at, c.now()))
+		}
+	}
+	publish(domain.ProtectionComponentOffsite, domain.ProtectionScopePlatform, ProtectionScopePlatformLabel)
+	if c.selfHost != nil {
+		publish(domain.ProtectionComponentCadence, c.selfHost.String(), c.selfHost.String())
+	}
+	return errors.Join(errs...)
 }
 
 func (c *FleetDurabilityCollector) collectHosts(ctx context.Context) error {

@@ -55,6 +55,73 @@ func (p FleetResourcePhase) IsValid() bool {
 // FleetResource.Generation — it must be set explicitly on every insert.
 const FleetResourceInitialGeneration = 1
 
+// Durability is the retention promise a resource was ACCEPTED under (D-202).
+// Stored and enforced, never inferred from tier after acceptance: tier is
+// ISOLATION and availability_class is REPLICATION, and a promise a customer is
+// sold must be recorded rather than read off a column that means something else.
+//
+// Migration 0025 fences the two combinations the platform cannot hold —
+// dedicated is durable (not disableable), shared is TTL-reaped and therefore
+// ephemeral.
+type Durability string
+
+const (
+	// DurabilityDurable — the resource's data is protected: it is enrolled in a
+	// snapshot cadence and its artifacts reach the durability store of record.
+	DurabilityDurable Durability = "durable"
+	// DurabilityEphemeral — the resource is reclaimable and nothing promises its
+	// data survives it (the shared logical-database tier).
+	DurabilityEphemeral Durability = "ephemeral"
+)
+
+// IsValid reports whether the durability is one the fleet recognizes.
+func (d Durability) IsValid() bool {
+	return d == DurabilityDurable || d == DurabilityEphemeral
+}
+
+// Protection component names (migration 0025's CHECK vocabulary, D-202/J1).
+const (
+	// ProtectionComponentOffsite is a PLATFORM-wide fact (scope ""): every
+	// artifact a resource produces reaches the off-provider durability store of
+	// record. D-212 is its sole writer; nothing in this service beats it.
+	ProtectionComponentOffsite = "offsite"
+	// ProtectionComponentCadence is a PER-HOST fact (scope = the fleet host's
+	// UUID): the snapshot-cadence worker on that host is provably passing.
+	ProtectionComponentCadence = "cadence"
+)
+
+// ProtectionScopePlatform is the scope of a platform-wide component. It is the
+// EMPTY string by construction: 0025's scope-shape CHECK admits an empty scope
+// only for `offsite`, which is what forbids a per-host beat from impersonating a
+// platform-wide capability.
+const ProtectionScopePlatform = ""
+
+// ProtectionHeartbeat is a protection worker's liveness FACT (D-202): the accept
+// gate reads it, and configuration is never consulted. A worker that died, was
+// never started, or beats into a different database all present identically —
+// the fact is absent and the accept refuses.
+//
+// It doubles as the GORM model, matching FleetResource above. ⚠ The tags must
+// match migration 0025 exactly (the D-187 lesson).
+type ProtectionHeartbeat struct {
+	Component string    `json:"component" gorm:"column:component;type:text;primaryKey"`
+	Scope     string    `json:"scope" gorm:"column:scope;type:text;primaryKey;default:''"`
+	BeatenAt  time.Time `json:"beaten_at" gorm:"column:beaten_at;not null"`
+	Detail    string    `json:"detail" gorm:"column:detail;type:text;not null;default:''"`
+}
+
+// TableName specifies the GORM table name.
+func (ProtectionHeartbeat) TableName() string { return "fleet_protection_heartbeats" }
+
+// IsFreshAt reports whether the beat is no older than staleness at `now`. A beat
+// from the FUTURE counts as fresh: clock skew between the writer and the reader
+// must not make a live worker read as dead, and the failure it would cause
+// (refusing an accept) is not the safe direction of that particular unknown —
+// absence already covers the dangerous one.
+func (h ProtectionHeartbeat) IsFreshAt(now time.Time, staleness time.Duration) bool {
+	return now.Sub(h.BeatenAt) <= staleness
+}
+
 // FleetResource is a durable P19 resource claim (a database, cache, or queue
 // backing a resident system). It doubles as the GORM model (see Volume). DDL is
 // owned by golang-migrate (migrations/), not AutoMigrate. Idempotency is
@@ -135,6 +202,38 @@ type FleetResource struct {
 	// SyncDegradePolicy is what an `ha` resource does when its synchronous standby
 	// is gone. Same explicit-stamping rule as AvailabilityClass.
 	SyncDegradePolicy SyncDegradePolicy `json:"sync_degrade_policy" gorm:"column:sync_degrade_policy;type:text;not null;default:'fail_closed'"`
+	// Durability is the retention promise this resource was ACCEPTED under
+	// (D-202, migration 0025). Stored, never inferred from Tier afterwards.
+	//
+	// ⚠ Set EXPLICITLY at creation, for the same reason as Generation and
+	// AvailabilityClass: GORM writes every field of a struct it saves, so a zero
+	// value would be written as '' and refused by the 0025 CHECKs — loudly, which
+	// is the point.
+	Durability Durability `json:"durability" gorm:"column:durability;type:text;not null"`
+	// ProtectionCadenceSeconds is this resource's snapshot-cadence ENROLMENT: the
+	// period the cadence worker on its host snapshots it on. NULL means cadence is
+	// not attached at all (a pre-D-202 row, an ephemeral row, or a waived row where
+	// it could not attach) — never 0, which the 0025 CHECK refuses because a zero
+	// cadence is "no cadence" wearing a number.
+	//
+	// Stamped at accept from configuration, so a later config change does NOT
+	// retro-apply to existing rows: per-resource enrolment is the D-202 point, and
+	// a converge verb for it is a later slice.
+	ProtectionCadenceSeconds *int `json:"protection_cadence_seconds,omitempty" gorm:"column:protection_cadence_seconds"`
+	// ProtectionAttachedAt is when the FULL protection component set attached, in
+	// the same INSERT that created the claim. NULL on waived rows and on rows that
+	// predate D-202; the status path turns NULL-on-durable into a condition rather
+	// than into silence.
+	ProtectionAttachedAt *time.Time `json:"protection_attached_at,omitempty" gorm:"column:protection_attached_at"`
+	// ProtectionWaivedBy / ProtectionWaiverReason / ProtectionWaivedAt are the
+	// D-202 per-resource audited override: the ONLY way a durable resource is
+	// accepted while a protection component cannot attach. All three or none (0025
+	// CHECK) — a bare name is not an audit record and a bare reason is not
+	// attributable. There is no configuration path to a waiver, and placement is
+	// never waivable.
+	ProtectionWaivedBy     string     `json:"protection_waived_by" gorm:"column:protection_waived_by;type:text;not null;default:''"`
+	ProtectionWaiverReason string     `json:"protection_waiver_reason" gorm:"column:protection_waiver_reason;type:text;not null;default:''"`
+	ProtectionWaivedAt     *time.Time `json:"protection_waived_at,omitempty" gorm:"column:protection_waived_at"`
 	// SecretRefs are the resolver-resolvable engine credential refs — references
 	// ONLY, never a credential value.
 	SecretRefs pq.StringArray `json:"secret_refs,omitempty" gorm:"type:text[];not null;default:'{}'"`

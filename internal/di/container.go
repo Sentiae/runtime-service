@@ -264,6 +264,12 @@ type Container struct {
 	// off-chassis object-store credential at all, which is the point of the
 	// decision. Stopped by Close.
 	RecoveryPointMirror *usecase.RecoveryPointMirrorWorker
+	// ProtectionCadence is the D-202 snapshot-cadence worker. Non-nil ONLY on an
+	// instance that carries the volume snapshotter AND knows its own fleet host
+	// identity — i.e. the firecracker fleet host. Everywhere else it is nil and
+	// this ledger records no `cadence` beat for this host, which is the truth and
+	// which makes durable accepts refuse rather than pass on configuration.
+	ProtectionCadence *usecase.FleetProtectionCadenceWorker
 
 	// runtime-fleet P3.4 — the Vault client backing the per-tenant secret
 	// resolver on the fleet host. Non-nil only when the firecracker executor is
@@ -699,6 +705,15 @@ func (c *Container) initFleet(cfg *config.Config) error {
 	if c.FleetLedgerReconciler != nil && c.fleetSelf != nil {
 		c.FleetLedgerReconciler.SetHostScope(c.fleetSelf.ID)
 	}
+
+	// D-202 — publish the per-host `cadence` heartbeat age under THIS host's scope.
+	// Off a fleet host the collector reports the platform-wide `offsite` component
+	// only: an instance that takes no scheduled snapshots has no per-host cadence
+	// fact, and inventing a scope for it would report another host's silence as
+	// this one's.
+	if c.FleetDurabilityMetrics != nil && c.fleetSelf != nil {
+		c.FleetDurabilityMetrics.SetHostScope(c.fleetSelf.ID)
+	}
 	return nil
 }
 
@@ -799,7 +814,29 @@ func (c *Container) initResourceControlPlane(cfg *config.Config) {
 		// the gate can never admit a claim over a host set placement would reject.
 		c.FleetHostRegistry,
 		fleetHostStaleness(cfg),
+		// D-202 — the protection FACT ledger (worker heartbeats), the claim-owned
+		// volume affinity that says which host protects a resource, and the tunable
+		// numbers of the gate. Passing the repository here is what makes the gate
+		// read whatever database THIS process reads: a worker beating into a
+		// different ledger is invisible, and the accept refuses.
+		c.FleetResourceRepo,
+		c.VolumeRepo,
+		usecase.ProtectionConfig{
+			CadenceSeconds:   int(cfg.Resource.ProtectionCadence.Seconds()),
+			CadenceStaleness: cfg.Resource.ProtectionCadenceStaleness,
+			OffsiteStaleness: cfg.Resource.ProtectionOffsiteStaleness,
+		},
 	)
+
+	// D-202 — the snapshot-cadence worker. Gated on the FACTS that make it
+	// meaningful, never on a config name: it needs the snapshotter (the capture is
+	// host-local — it freezes a guest on this filesystem) and this host's own fleet
+	// identity (its heartbeat is per-host by construction; migration 0025's
+	// scope-shape CHECK forbids a global cadence row precisely so one host's
+	// liveness can never green another host's accepts). Both hold only on the
+	// firecracker fleet host. A nil worker leaves this host's `cadence` fact absent
+	// — which is exactly what it is.
+	c.ProtectionCadence = c.newProtectionCadenceWorker()
 
 	// D-200 — the CONTROL-PLANE recovery-point mirror. Nil on every fleet host and
 	// whenever no second domain is configured, which leaves recovery points recorded
@@ -1042,6 +1079,37 @@ func (c *Container) newRecoveryPointMirrorWorker(cfg *config.Config) *usecase.Re
 // A pure function so the D-200 gate is assertable without a live container — the
 // failure this guards against is a wiring miss, and a wiring miss is exactly what
 // unit tests of the surrounding code never see.
+// newProtectionCadenceWorker builds the D-202 cadence worker for THIS host, or
+// nil with a one-line reason when this instance is not one that can take
+// scheduled snapshots.
+//
+// ⚠ The snapshotter is passed through the typed adapter and only when genuinely
+// non-nil: a nil *FleetVolumeSnapshotter wrapped in a non-nil interface would
+// defeat the constructor's own guard and produce a worker that beats `cadence`
+// while capturing nothing — protection advertised but not held, the one outcome
+// this component exists to prevent.
+func (c *Container) newProtectionCadenceWorker() *usecase.FleetProtectionCadenceWorker {
+	if c.ResourceSnapshotter == nil {
+		log.Println("Fleet protection cadence worker DISABLED: no volume snapshotter on this instance — no `cadence` heartbeat is written here, so durable provisions refuse until a host that can capture proves it does")
+		return nil
+	}
+	if c.fleetSelf == nil {
+		log.Println("Fleet protection cadence worker DISABLED: this instance has no fleet host identity — a worker that cannot name its own host must never beat a cadence fact")
+		return nil
+	}
+	capture, err := usecase.NewVolumeSnapshotCapture(c.ResourceSnapshotter)
+	if err != nil {
+		log.Printf("Fleet protection cadence worker DISABLED: %v", err)
+		return nil
+	}
+	worker, err := usecase.NewFleetProtectionCadenceWorker(c.FleetResourceRepo, capture, c.fleetSelf.ID)
+	if err != nil {
+		log.Printf("Fleet protection cadence worker DISABLED: %v", err)
+		return nil
+	}
+	return worker
+}
+
 func isControlPlaneInstance(executorType string) bool { return executorType != "firecracker" }
 
 // s3EndpointHost splits an S3 endpoint into the host:port minio-go wants and
@@ -2152,6 +2220,14 @@ func (c *Container) StartBackgroundControllers(ctx context.Context) {
 		log.Printf("Recovery-point second-domain mirror started (interval=%s, batch=%d, domain=%s)",
 			usecase.RecoveryPointMirrorEvery, usecase.RecoveryPointMirrorBatch, c.RecoveryPointMirror.Domain())
 	}
+	// D-202 — the snapshot cadence. Start() writes the first heartbeat
+	// SYNCHRONOUSLY before the loop spawns, so an accept arriving in the first
+	// seconds of this process's life sees a live fact rather than refusing a worker
+	// that is running perfectly.
+	if c.ProtectionCadence != nil {
+		c.ProtectionCadence.Start(ctx)
+		log.Printf("Fleet protection cadence worker started (tick=%s, host=%s)", usecase.ProtectionCadenceTickEvery, c.fleetSelf.ID)
+	}
 	c.startFleetReconciler(ctx)
 	// CP4.5 §9#3 (D-183) — shared-tier TTL reaper. Nil until the shared engine is
 	// wired (NEEDS-DECISION on shared-engine admin credentials); the loop is
@@ -2462,6 +2538,14 @@ func (c *Container) Close() error {
 	// ledger write raced shutdown.
 	if c.RecoveryPointMirror != nil {
 		c.RecoveryPointMirror.Stop()
+	}
+
+	// D-202 — stop the cadence worker (waits for the in-flight pass) BEFORE the DB
+	// pool closes. Waiting matters here specifically: a pass killed mid-capture
+	// would leave a customer's guest filesystem FROZEN, and only the snapshotter's
+	// own deferred thaw undoes that.
+	if c.ProtectionCadence != nil {
+		c.ProtectionCadence.Stop()
 	}
 
 	// CP4.5 §9#3 (D-183) — stop the shared-tier TTL reaper (waits for the loop).

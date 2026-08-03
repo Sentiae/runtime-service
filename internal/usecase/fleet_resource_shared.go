@@ -225,6 +225,11 @@ func (uc *FleetResourceSharedProvisioner) ProvisionShared(ctx context.Context, i
 		// database on a shared engine: it has no members of its own to replicate, so
 		// `single` is the true value here, not a placeholder.
 		AvailabilityClass: domain.AvailabilityClassSingle,
+		// Stamped explicitly for the same reason (D-202, migration 0025): the shared
+		// tier is born with expires_at set and is TTL-reaped, so `ephemeral` is what
+		// it IS — and 0025's tier/durability CHECK refuses both '' and any claim that
+		// this logical database is durable.
+		Durability:        domain.DurabilityEphemeral,
 		SyncDegradePolicy: domain.SyncDegradePolicyFailClosed,
 		Phase:             domain.FleetResourcePhaseReady,
 		DBName:            lease.DBName,

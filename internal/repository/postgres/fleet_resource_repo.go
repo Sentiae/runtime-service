@@ -11,6 +11,7 @@ import (
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/repository"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // fleetResourceRepository is the GORM-backed FleetResourceRepository.
@@ -402,4 +403,102 @@ func (r *fleetResourceRepository) MarkRecoveryPointRestoredInPlace(ctx context.C
 		return domain.ErrRecoveryPointNotFound
 	}
 	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// D-202 — protection facts and the cadence work list (migration 0025).
+// ─────────────────────────────────────────────────────────────────────
+
+// GetProtectionHeartbeat resolves ONE component's liveness fact in THIS database.
+//
+// ⚠ Whichever database this repository is pointed at IS the answer, and that is
+// the point of the whole mechanism: a worker that beats into a different ledger
+// than the one an accept reads is INVISIBLE here, so the accept refuses. The
+// deployed D-200 mirror was found doing exactly that while its configuration said
+// it was enabled — the refusal is the truth, and special-casing it would restore
+// the lie.
+func (r *fleetResourceRepository) GetProtectionHeartbeat(ctx context.Context, component, scope string) (*domain.ProtectionHeartbeat, error) {
+	var beat domain.ProtectionHeartbeat
+	err := r.db.WithContext(ctx).
+		Where("component = ? AND scope = ?", component, scope).
+		First(&beat).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, domain.ErrProtectionHeartbeatNotFound
+		}
+		return nil, err
+	}
+	return &beat, nil
+}
+
+// UpsertProtectionHeartbeat replaces a (component, scope)'s beat.
+//
+// ON CONFLICT on the composite primary key, so two passes of the same worker
+// never accumulate rows and a restart never needs to know whether it has beaten
+// before. The 0025 CHECKs remain the arbiter of the vocabulary and of the
+// scope shape: a caller that tried to write a global `cadence` row — one host's
+// liveness greening every host — is refused by the database, not by this method.
+func (r *fleetResourceRepository) UpsertProtectionHeartbeat(ctx context.Context, component, scope string, at time.Time, detail string) error {
+	return r.db.WithContext(ctx).
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "component"}, {Name: "scope"}},
+			DoUpdates: clause.AssignmentColumns([]string{"beaten_at", "detail"}),
+		}).
+		Create(&domain.ProtectionHeartbeat{
+			Component: component,
+			Scope:     scope,
+			BeatenAt:  at.UTC(),
+			Detail:    detail,
+		}).Error
+}
+
+// ListResourcesDueSnapshot is the cadence worker's work list for ONE host.
+//
+// Raw SQL rather than the GORM builder because two of the predicates cannot be
+// expressed without it: the due-time compares a column against an interval BUILT
+// FROM ANOTHER COLUMN (each resource's own cadence, not one fleet-wide number),
+// and the host scoping is a pair of EXISTS/NOT EXISTS over the volume ledger.
+//
+// The host scoping is the D-203 ownership join and nothing else: the resource must
+// own at least one volume, and NO owned volume may be unpinned or pinned
+// elsewhere. Absent or conflicting affinity EXCLUDES the resource rather than
+// including it optimistically — a host cannot freeze and copy a backing file that
+// is not on its filesystem, so attempting it would only manufacture failure
+// streaks about the ledger. Those rows are surfaced by the status conditions and
+// the metrics instead.
+//
+// `phase <> 'restoring'` because a snapshot mid-restore would freeze the very
+// volume the restore is swapping underneath it — the same stand-off the
+// `restoring` phase exists for.
+func (r *fleetResourceRepository) ListResourcesDueSnapshot(ctx context.Context, selfHost uuid.UUID, now time.Time, retryCooldown time.Duration, limit int) ([]domain.FleetResource, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var out []domain.FleetResource
+	err := r.db.WithContext(ctx).Raw(`
+		SELECT r.*
+		  FROM fleet_resources r
+		 WHERE r.durability = 'durable'
+		   AND r.tier = 'dedicated'
+		   AND r.protection_cadence_seconds IS NOT NULL
+		   AND r.app_id IS NOT NULL
+		   AND r.decommissioned_at IS NULL
+		   AND r.phase NOT IN ('decommissioned', 'restoring')
+		   AND (r.last_snapshot_success_at IS NULL
+		        OR r.last_snapshot_success_at < ?::timestamptz - make_interval(secs => r.protection_cadence_seconds))
+		   AND (r.last_snapshot_failure_at IS NULL OR r.last_snapshot_failure_at < ?::timestamptz)
+		   AND EXISTS (
+		        SELECT 1 FROM fleet_volumes v WHERE v.resource_id = r.id)
+		   AND NOT EXISTS (
+		        SELECT 1 FROM fleet_volumes v
+		         WHERE v.resource_id = r.id
+		           AND (v.host_affinity IS NULL OR v.host_affinity <> ?))
+		 ORDER BY r.last_snapshot_success_at ASC NULLS FIRST
+		 LIMIT ?`,
+		now.UTC(), now.UTC().Add(-retryCooldown), selfHost, limit).
+		Scan(&out).Error
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }

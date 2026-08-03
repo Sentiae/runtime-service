@@ -126,6 +126,9 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 		Class:             resourceClassPostgres,
 		Tier:              resourceTierDedicated,
 		AvailabilityClass: domain.AvailabilityClassSingle,
+		// D-202/0025: the retention promise is stored and every writer states it —
+		// the fixture must carry the production shape (there is no column default).
+		Durability:        domain.DurabilityDurable,
 		SyncDegradePolicy: domain.SyncDegradePolicyFailClosed,
 		Phase:             domain.FleetResourcePhaseReady,
 		AppID:             &app.ID,
@@ -217,7 +220,7 @@ func TestFleetAppCascadeStrandsAResourceThatMustStillRetire(t *testing.T) {
 	// nothing, so guest control and the artifact store are never reached.
 	snapshotter := NewFleetVolumeSnapshotter(nil, nil, volumes, replicas, resources)
 
-	uc := NewFleetResourceProvisioner(prov, resources, replicas, snapshotter, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
+	uc := newTestResourceProvisioner(prov, resources, replicas, snapshotter, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
 	final, err := uc.DecommissionDedicated(ctx, res.ID, true)
 	if err != nil {

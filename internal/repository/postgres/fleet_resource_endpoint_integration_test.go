@@ -31,6 +31,10 @@ func newResource(endpointID *string, region string) *domain.FleetResource {
 		Generation: domain.FleetResourceInitialGeneration,
 		Class:      "postgres",
 		Tier:       "dedicated",
+		// D-202/0025: the retention promise is stored, and every writer states it —
+		// there is no column default to fall back on, so an unstamped write is
+		// refused by the database rather than silently stored as ''.
+		Durability: domain.DurabilityDurable,
 		Phase:      domain.FleetResourcePhaseProvisioning,
 		EndpointID: endpointID,
 		Region:     region,
@@ -183,8 +187,11 @@ func TestEndpointIdentityRoundTrips(t *testing.T) {
 func TestStoreFencesRefuseMalformedIdentity(t *testing.T) {
 	db := migratedDB(t)
 
-	base := `INSERT INTO fleet_resources (id, owner_org, claim_key, env, class, tier, phase, endpoint_id, generation)
-	         VALUES (?, ?, ?, 'prod', 'postgres', 'dedicated', 'provisioning', ?, ?)`
+	// durability is stated explicitly (D-202/0025: NOT NULL, no default) so each
+	// insert below is refused for the reason under test — the endpoint-shape or
+	// generation fence — and never for a missing column.
+	base := `INSERT INTO fleet_resources (id, owner_org, claim_key, env, class, tier, phase, endpoint_id, generation, durability)
+	         VALUES (?, ?, ?, 'prod', 'postgres', 'dedicated', 'provisioning', ?, ?, 'durable')`
 	tests := []struct {
 		name       string
 		endpointID any

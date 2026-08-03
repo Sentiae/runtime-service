@@ -67,6 +67,21 @@ func (f *volRepoFake) Delete(_ context.Context, id uuid.UUID) error {
 	delete(f.store, id)
 	return nil
 }
+
+// ListByResource mirrors the postgres filter: the claim's OWNERSHIP stamp
+// (resource_id), never the current app attachment.
+func (f *volRepoFake) ListByResource(_ context.Context, resourceID uuid.UUID) ([]domain.Volume, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []domain.Volume
+	for _, v := range f.store {
+		if v.ResourceID != nil && *v.ResourceID == resourceID {
+			out = append(out, *v)
+		}
+	}
+	return out, nil
+}
+
 func (f *volRepoFake) ListByHost(_ context.Context, hostID uuid.UUID) ([]domain.Volume, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

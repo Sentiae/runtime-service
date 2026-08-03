@@ -245,6 +245,10 @@ func (f *fakeVolumeRepo) ListByHost(context.Context, uuid.UUID) ([]domain.Volume
 	return nil, nil
 }
 
+func (f *fakeVolumeRepo) ListByResource(context.Context, uuid.UUID) ([]domain.Volume, error) {
+	return nil, nil
+}
+
 // The snapshotter never binds claims; the stubs exist only to satisfy the port.
 func (f *fakeVolumeRepo) BindVolumesToResource(context.Context, uuid.UUID, uuid.UUID) (repository.VolumeBindResult, error) {
 	return repository.VolumeBindResult{}, errors.New("not implemented")

@@ -34,10 +34,12 @@ type fakeDedicatedProvisioner struct {
 	status          usecase.ResourceStatus
 	finalRP         *domain.FleetResourceRecoveryPoint
 	err             error
+	lastInput       usecase.ProvisionDedicatedInput
 }
 
-func (f *fakeDedicatedProvisioner) ProvisionDedicated(context.Context, usecase.ProvisionDedicatedInput) (usecase.ProvisionDedicatedOutput, error) {
+func (f *fakeDedicatedProvisioner) ProvisionDedicated(_ context.Context, in usecase.ProvisionDedicatedInput) (usecase.ProvisionDedicatedOutput, error) {
 	f.provisionCalled = true
+	f.lastInput = in
 	return f.out, f.err
 }
 func (f *fakeDedicatedProvisioner) StatusOf(context.Context, uuid.UUID) (usecase.ResourceStatus, error) {
@@ -154,6 +156,20 @@ func (f *fakeResourceRepo) FindLiveResourceByApp(_ context.Context, appID uuid.U
 	}
 	cp := *f.res
 	return &cp, nil
+}
+
+// The D-202 protection facts and cadence work list are unused by the handler —
+// they belong to the accept gate, the status path and the cadence worker.
+func (f *fakeResourceRepo) GetProtectionHeartbeat(context.Context, string, string) (*domain.ProtectionHeartbeat, error) {
+	return nil, domain.ErrProtectionHeartbeatNotFound
+}
+
+func (f *fakeResourceRepo) UpsertProtectionHeartbeat(context.Context, string, string, time.Time, string) error {
+	return nil
+}
+
+func (f *fakeResourceRepo) ListResourcesDueSnapshot(context.Context, uuid.UUID, time.Time, time.Duration, int) ([]domain.FleetResource, error) {
+	return nil, nil
 }
 
 var _ repository.FleetResourceRepository = (*fakeResourceRepo)(nil)
@@ -422,10 +438,10 @@ func TestDecommissionResource_ErrorMapping(t *testing.T) {
 	resID := uuid.New()
 
 	tests := []struct {
-		name        string
-		err         error
-		wantCode    codes.Code
-		wantMsg     string
+		name            string
+		err             error
+		wantCode        codes.Code
+		wantMsg         string
 		wantUnmappedLog bool
 	}{
 		{
@@ -454,9 +470,9 @@ func TestDecommissionResource_ErrorMapping(t *testing.T) {
 			wantMsg:  "a durable resource requires a final snapshot to decommission",
 		},
 		{
-			name:           "a genuinely unmapped error is still Internal and still logged",
-			err:            errors.New("some brand new fleet failure"),
-			wantCode:       codes.Internal,
+			name:            "a genuinely unmapped error is still Internal and still logged",
+			err:             errors.New("some brand new fleet failure"),
+			wantCode:        codes.Internal,
 			wantUnmappedLog: true,
 		},
 	}
@@ -645,4 +661,63 @@ func TestGetResourceCapabilities_Honest(t *testing.T) {
 			t.Fatal("restore must be true once the restorer is wired")
 		}
 	})
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// D-202 — the refusal must NAME which part of the protection failed, and the
+// wire durability claim must reach the use case.
+// ─────────────────────────────────────────────────────────────────────
+
+func TestProvisionResource_ProtectionRefusalNamesTheFailingComponents(t *testing.T) {
+	refusal := fmt.Errorf("%w: %w", domain.ErrProtectionUnattachable,
+		errors.Join(
+			fmt.Errorf("%w: host 0f0e host-detail /var/lib/fleet/volumes", domain.ErrProtectionCadenceUnavailable),
+			fmt.Errorf("%w: bucket r2://tenant-artifacts", domain.ErrProtectionOffsiteUnproven),
+		))
+	s := NewResourceServer(&fakeDedicatedProvisioner{err: refusal}, &fakeSharedProvisioner{}, nil, nil, &fakeResourceRepo{})
+
+	_, err := s.ProvisionResource(context.Background(), &runtimev1.ProvisionResourceRequest{
+		Tier: resourceTierDedicated, Class: resourceClassPostgres, ClaimKey: "orders-db", Env: "prod",
+	})
+	if code := status.Code(err); code != codes.FailedPrecondition {
+		t.Fatalf("code = %s, want FailedPrecondition (the claim is legitimate; the platform is not ready)", code)
+	}
+	msg := status.Convert(err).Message()
+	for _, token := range []string{"snapshot-cadence", "offsite-durability-store"} {
+		if !strings.Contains(msg, token) {
+			t.Fatalf("the refusal %q must name the failing component %q", msg, token)
+		}
+	}
+	// Tenant-visible: operator detail (hosts, paths, buckets) stays in the log.
+	for _, leak := range []string{"host-detail", "/var/lib/fleet/volumes", "r2://tenant-artifacts"} {
+		if strings.Contains(msg, leak) {
+			t.Fatalf("the refusal %q leaks server detail %q", msg, leak)
+		}
+	}
+}
+
+func TestProvisionResource_PassesDurabilityThrough(t *testing.T) {
+	dedicated := &fakeDedicatedProvisioner{out: usecase.ProvisionDedicatedOutput{Handle: uuid.NewString(), Phase: "provisioning"}}
+	s := NewResourceServer(dedicated, &fakeSharedProvisioner{}, nil, nil, &fakeResourceRepo{})
+
+	if _, err := s.ProvisionResource(context.Background(), &runtimev1.ProvisionResourceRequest{
+		Tier: resourceTierDedicated, Class: resourceClassPostgres, ClaimKey: "orders-db", Env: "prod",
+		Durability: "durable",
+	}); err != nil {
+		t.Fatalf("ProvisionResource: %v", err)
+	}
+	if dedicated.lastInput.Durability != "durable" {
+		t.Fatalf("durability reached the use case as %q, want %q — the wire field must have a reader", dedicated.lastInput.Durability, "durable")
+	}
+}
+
+func TestProvisionResource_DurabilityRefusalIsInvalidArgument(t *testing.T) {
+	s := NewResourceServer(&fakeDedicatedProvisioner{err: domain.ErrResourceDurabilityInvalid}, &fakeSharedProvisioner{}, nil, nil, &fakeResourceRepo{})
+	_, err := s.ProvisionResource(context.Background(), &runtimev1.ProvisionResourceRequest{
+		Tier: resourceTierDedicated, Class: resourceClassPostgres, ClaimKey: "orders-db", Env: "prod",
+		Durability: "ephemeral",
+	})
+	if code := status.Code(err); code != codes.InvalidArgument {
+		t.Fatalf("code = %s, want InvalidArgument", code)
+	}
 }

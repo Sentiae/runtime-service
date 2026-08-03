@@ -22,10 +22,17 @@ func seedResource(t *testing.T, db *gorm.DB) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
 	now := time.Now().UTC()
-	err := db.Exec(`INSERT INTO fleet_resources
+	stmt := `INSERT INTO fleet_resources
 		(id, owner_org, claim_key, env, revision, class, tier, phase, generation, created_at, updated_at)
-		VALUES (?, ?, ?, 'prod', 1, 'postgres', 'dedicated', 'provisioning', 1, ?, ?)`,
-		id, uuid.New(), "claim-"+uuid.NewString(), now, now).Error
+		VALUES (?, ?, ?, 'prod', 1, 'postgres', 'dedicated', 'provisioning', 1, ?, ?)`
+	// D-202/0025: durability is NOT NULL with no default — a dedicated claim is
+	// durable, and every writer must say so.
+	if hasResourceDurability(t, db) {
+		stmt = `INSERT INTO fleet_resources
+		(id, owner_org, claim_key, env, revision, class, tier, phase, generation, durability, created_at, updated_at)
+		VALUES (?, ?, ?, 'prod', 1, 'postgres', 'dedicated', 'provisioning', 1, 'durable', ?, ?)`
+	}
+	err := db.Exec(stmt, id, uuid.New(), "claim-"+uuid.NewString(), now, now).Error
 	if err != nil {
 		t.Fatalf("seed resource: %v", err)
 	}

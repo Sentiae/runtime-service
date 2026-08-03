@@ -137,22 +137,35 @@ func TestProvisionDedicated_AvailabilityGate(t *testing.T) {
 			hosts:        twoSameDomain,
 			wantClass:    domain.AvailabilityClassSingle,
 		},
+		// ⚠ The three cases below changed meaning under D-202. PLACEMENT still asks
+		// nothing of the host set for a `single` claim — but the dedicated tier is
+		// DURABLE, and D-202's cadence component requires a fresh beat from every
+		// host that could hold the resource. An unreadable or unwired inventory
+		// therefore means nothing can be proven to protect it, and the claim is
+		// refused before anything is created. That is the fail-closed direction and
+		// it is the ruling, not a regression of the placement gate.
 		{
-			name:         "single with an unreadable inventory is unaffected — it asks nothing of placement",
+			name:         "single with an unreadable inventory is refused by the PROTECTION gate, not the placement one",
 			availability: "single",
 			hostsErr:     errors.New("control-plane db unreachable"),
-			wantClass:    domain.AvailabilityClassSingle,
+			wantErr:      domain.ErrProtectionCadenceUnavailable,
 		},
 		{
-			name:         "single with no inventory wired is unaffected",
+			name:         "single with no inventory wired is refused by the PROTECTION gate",
 			availability: "single",
 			noLister:     true,
-			wantClass:    domain.AvailabilityClassSingle,
+			wantErr:      domain.ErrProtectionCadenceUnavailable,
 		},
 		{
-			name:         "an UNSET class means single — the wire cannot express this field yet",
+			name:         "an UNSET class means single, and is still protection-gated",
 			availability: "",
 			noLister:     true,
+			wantErr:      domain.ErrProtectionCadenceUnavailable,
+		},
+		{
+			name:         "an UNSET class on a live, beating fleet is accepted as single",
+			availability: "",
+			hosts:        oneHost,
 			wantClass:    domain.AvailabilityClassSingle,
 		},
 	}
@@ -168,7 +181,14 @@ func TestProvisionDedicated_AvailabilityGate(t *testing.T) {
 			if !tt.noLister {
 				hosts = fake
 			}
-			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), hosts, 90*time.Second)
+			// The D-202 attach gate is held OPEN here (fresh beats for whatever is
+			// asked about) so this table keeps testing PLACEMENT. The one thing it
+			// cannot hold open is the host set itself: D-202's cadence component
+			// requires a beat from every eligible host, so an unknowable host set
+			// now refuses a `single` claim too — the two cases below say so.
+			repo.beatsDefaultFresh = true
+			uc := NewFleetResourceProvisioner(prov, repo, nil, &fakeSnapshotter{}, &fakeVolumeBinder{}, testEngine(), testEndpointNaming(), hosts, 90*time.Second,
+				repo, testProtectionAffinity(), testProtectionConfig())
 
 			in := validDedicatedInput()
 			in.AvailabilityClass = tt.availability
@@ -210,18 +230,22 @@ func TestProvisionDedicated_AvailabilityGate(t *testing.T) {
 			if res.SyncDegradePolicy != domain.SyncDegradePolicyFailClosed {
 				t.Fatalf("persisted sync_degrade_policy = %q, want fail_closed", res.SyncDegradePolicy)
 			}
-			// `single` must not even look at the inventory — no new failure mode on
-			// the path every existing database uses.
-			if tt.wantClass == domain.AvailabilityClassSingle && fake.calls != 0 {
-				t.Fatalf("a single claim consulted the host inventory %d times, want 0", fake.calls)
-			}
+			// ⚠ The PLACEMENT gate still asks nothing of the inventory for a
+			// `single` claim — but D-202's protection gate asks for EVERY durable
+			// claim, so a `single` accept reads it exactly once (the protection
+			// read) and an `ha` accept exactly twice (placement, then protection).
+			// What must never change is the QUESTION: both reads use the
+			// scheduler's staleness, so no gate can admit a claim over a host set
+			// placement would reject.
+			wantReads := 1
 			if tt.wantClass == domain.AvailabilityClassHA {
-				if fake.calls != 1 {
-					t.Fatalf("an ha claim read the host inventory %d times, want exactly 1", fake.calls)
-				}
-				if fake.lastStaleness != 90*time.Second {
-					t.Fatalf("the gate asked for staleness %v, want the scheduler's 90s — the two must agree on which hosts are live", fake.lastStaleness)
-				}
+				wantReads = 2
+			}
+			if fake.calls != wantReads {
+				t.Fatalf("the accept read the host inventory %d times, want %d (protection always; placement additionally for ha)", fake.calls, wantReads)
+			}
+			if fake.lastStaleness != 90*time.Second {
+				t.Fatalf("the gate asked for staleness %v, want the scheduler's 90s — every gate must agree on which hosts are live", fake.lastStaleness)
 			}
 		})
 	}

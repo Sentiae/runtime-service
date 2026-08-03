@@ -66,6 +66,10 @@ func (f *restoreVolumeRepo) ListByHost(context.Context, uuid.UUID) ([]domain.Vol
 	return nil, nil
 }
 
+func (f *restoreVolumeRepo) ListByResource(context.Context, uuid.UUID) ([]domain.Volume, error) {
+	return nil, nil
+}
+
 // The restorer never binds claims; the stubs exist only to satisfy the port.
 func (f *restoreVolumeRepo) BindVolumesToResource(context.Context, uuid.UUID, uuid.UUID) (repository.VolumeBindResult, error) {
 	return repository.VolumeBindResult{}, errors.New("not implemented")

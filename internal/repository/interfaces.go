@@ -444,6 +444,30 @@ type FleetResourceRepository interface {
 	// client. It is not a verification drill and must never be reported as one
 	// (see domain.FleetResourceRecoveryPoint.RestoredInPlaceOK).
 	MarkRecoveryPointRestoredInPlace(ctx context.Context, id uuid.UUID) error
+	// GetProtectionHeartbeat resolves a protection worker's newest liveness FACT
+	// in THIS ledger (D-202, migration 0025). scope is the fleet host UUID for
+	// `cadence` and "" for the platform-wide `offsite` component. Returns
+	// domain.ErrProtectionHeartbeatNotFound when the component has never beaten
+	// here — the ordinary state of a worker that does not run against this
+	// database, and what makes a mis-wired worker fail CLOSED rather than pass on
+	// configuration.
+	GetProtectionHeartbeat(ctx context.Context, component, scope string) (*domain.ProtectionHeartbeat, error)
+	// UpsertProtectionHeartbeat records that a component completed the start of a
+	// pass, replacing that (component, scope)'s previous beat.
+	UpsertProtectionHeartbeat(ctx context.Context, component, scope string, at time.Time, detail string) error
+	// ListResourcesDueSnapshot returns the cadence worker's work list for ONE
+	// host: durable, cadence-enrolled, live dedicated resources whose newest
+	// successful snapshot is older than their OWN per-row cadence and whose last
+	// FAILED attempt is outside the retry cooldown, oldest-due first.
+	//
+	// ⚠ Host scoping is by the CLAIM-OWNED volumes' host_affinity (D-203) and by
+	// nothing else: a resource is returned only when it owns at least one volume
+	// and EVERY one of them is pinned to selfHost. A resource with absent or
+	// conflicting affinity is excluded — status and metrics surface it — because
+	// a host cannot snapshot a backing file that is not on its filesystem, and
+	// attempting it would produce failure streaks that describe the ledger rather
+	// than the data.
+	ListResourcesDueSnapshot(ctx context.Context, selfHost uuid.UUID, now time.Time, retryCooldown time.Duration, limit int) ([]domain.FleetResource, error)
 }
 
 // VolumeBindOutcome is the typed result of a claim-ownership bind. The bind is
@@ -483,6 +507,11 @@ type VolumeRepository interface {
 	Update(ctx context.Context, volume *domain.Volume) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	ListByHost(ctx context.Context, hostID uuid.UUID) ([]domain.Volume, error)
+	// ListByResource returns the volumes a durable claim OWNS (D-203's
+	// resource_id), which is what answers "on which host does this resource's
+	// protection have to run" — the bytes' own affinity, never a guest IP, a PID
+	// or the host that happens to be asking.
+	ListByResource(ctx context.Context, resourceID uuid.UUID) ([]domain.Volume, error)
 	// BindVolumesToResource stamps claim ownership onto every unowned volume of
 	// an app in ONE transaction (row locks held across the check and the write),
 	// all-or-nothing: a read-then-Save loop let two concurrent provisions each

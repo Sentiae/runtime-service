@@ -115,6 +115,21 @@ type FleetResourceProvisioner struct {
 	hosts         HAPlacementHosts
 	hostStaleness time.Duration
 
+	// facts + affinity + protection back the D-202 attach gate. facts is the
+	// worker-liveness ledger (never configuration); affinity resolves which host a
+	// resource's claim-owned volumes live on; protection carries the tunable
+	// numbers. A nil facts reader makes every durable provision REFUSE — an
+	// evaluation that cannot be performed is a protection that is not held, the
+	// same stance the HA placement gate takes on an unreadable host inventory.
+	facts      ProtectionFactsReader
+	affinity   ProtectionAffinityReader
+	protection ProtectionConfig
+
+	// now is injected so the heartbeat-staleness windows are testable without
+	// sleeping (§30.6). Same seam shape as the mirror worker and the durability
+	// collector.
+	now func() time.Time
+
 	// pgReady decides whether the provisioned engine ADMITS clients, over and
 	// above the app health probe's process-alive + TCP-dial (see engineAdmits). A
 	// field rather than a direct call so tests drive both verdicts without a live
@@ -137,6 +152,9 @@ func NewFleetResourceProvisioner(
 	naming domain.EndpointNaming,
 	hosts HAPlacementHosts,
 	hostStaleness time.Duration,
+	facts ProtectionFactsReader,
+	affinity ProtectionAffinityReader,
+	protection ProtectionConfig,
 ) *FleetResourceProvisioner {
 	return &FleetResourceProvisioner{
 		provisioner:   provisioner,
@@ -148,6 +166,10 @@ func NewFleetResourceProvisioner(
 		naming:        naming,
 		hosts:         hosts,
 		hostStaleness: hostStaleness,
+		facts:         facts,
+		affinity:      affinity,
+		protection:    protection,
+		now:           func() time.Time { return time.Now().UTC() },
 		pgReady:       probePostgresReady,
 	}
 }
@@ -175,6 +197,20 @@ type ProvisionDedicatedInput struct {
 	// can only come from a caller inside this process until that contract is
 	// extended, which is a proto change and therefore not this slice's to make.
 	AvailabilityClass string
+	// Durability is the retention promise claimed for this resource (D-202).
+	// ""/"durable" ⇒ durable; "ephemeral" is REFUSED on the dedicated tier, which
+	// is durable by construction.
+	Durability string
+	// Waiver, when non-nil, is the D-202 per-resource AUDITED override of the
+	// attach requirement: the resource is provisioned even though a protection
+	// component could not attach, and it reports that fact permanently.
+	//
+	// Typed and wire-agnostic on purpose. The actor is derived server-side from
+	// the authenticated principal, never taken from a caller-supplied label — this
+	// struct is the seam that keeps that derivation out of the use case, and it is
+	// why there is no configuration path to a waiver anywhere. Placement is never
+	// waivable.
+	Waiver *ProtectionWaiver
 }
 
 // ProvisionDedicatedOutput is the claim result: the resource handle + phase.
@@ -275,6 +311,17 @@ func (uc *FleetResourceProvisioner) provisionDedicated(ctx context.Context, in P
 	if uc.binder == nil {
 		return ProvisionDedicatedOutput{}, fmt.Errorf("no volume binder wired to stamp claim ownership (D-203): refusing dedicated provision")
 	}
+	// D-202 — the retention promise is READ from the claim and stored, never
+	// inferred from tier afterwards, and the two half-waiver shapes are refused
+	// here (one owner for the rule) before anything else is evaluated.
+	durability, err := resolveDedicatedDurability(in.Durability)
+	if err != nil {
+		return ProvisionDedicatedOutput{}, err
+	}
+	waiver, err := normalizeWaiver(in.Waiver)
+	if err != nil {
+		return ProvisionDedicatedOutput{}, err
+	}
 	if in.OwnerOrg == "" {
 		return ProvisionDedicatedOutput{}, domain.ErrResourceOwnerOrgRequired
 	}
@@ -341,6 +388,26 @@ func (uc *FleetResourceProvisioner) provisionDedicated(ctx context.Context, in P
 		return ProvisionDedicatedOutput{}, fmt.Errorf("lookup resource claim: %w", err)
 	}
 
+	// ── The D-202 attach gate ────────────────────────────────────────────────
+	//
+	// Creating a durable database is ONE operation: create the engine AND attach
+	// its protection. They succeed together or the provision fails. Evaluated HERE
+	// — before the engine boots and before a volume materializes — so a refusal
+	// leaves NO claim row and NO VM behind; and the result is stamped into the same
+	// INSERT that creates the claim, which is what makes an unprotected durable
+	// acceptance unrepresentable rather than merely checked.
+	//
+	// ⚠ AFTER the idempotency lookup, and that ordering is binding. A repeat call
+	// for an EXISTING claim returns from inside the lookup branch above, so a fleet
+	// whose protection has REGRESSED must still be able to recover the databases it
+	// already accepted (the token-re-hand path,
+	// #p19-handed-token-not-rehandable). A regressed platform refuses NEW
+	// acceptances; it never refuses to serve what it already promised.
+	cadenceSeconds, gateErr := uc.attachProtection(ctx, durability, waiver, in.ClaimKey)
+	if gateErr != nil {
+		return ProvisionDedicatedOutput{}, gateErr
+	}
+
 	// Compose FleetProvision: a resident, single-replica, volume-bearing app.
 	provOut, err := uc.provisioner.Provision(ctx, uc.dedicatedDescriptor(in))
 	if err != nil {
@@ -376,8 +443,26 @@ func (uc *FleetResourceProvisioner) provisionDedicated(ctx context.Context, in P
 		AppID:             &appHandle,
 		SecretRefs:        in.SecretRefs,
 		SystemID:          in.SystemID,
-		CreatedAt:         now,
-		UpdatedAt:         now,
+		// D-202 — the protection attachment is written in the SAME INSERT that
+		// creates the claim. Stamped explicitly for the same reason as Generation
+		// and AvailabilityClass: GORM writes every field it saves, and '' is refused
+		// by the 0025 CHECKs rather than silently stored.
+		Durability:               durability,
+		ProtectionCadenceSeconds: cadenceSeconds,
+		CreatedAt:                now,
+		UpdatedAt:                now,
+	}
+	if durability == domain.DurabilityDurable {
+		if waiver != nil {
+			// A waived acceptance carries the audit and NOT an attached-at stamp:
+			// attached-at means the full component set attached, and here it did not.
+			// The pair is what makes the row self-describing forever.
+			res.ProtectionWaivedBy = waiver.Actor
+			res.ProtectionWaiverReason = waiver.Reason
+			res.ProtectionWaivedAt = &now
+		} else {
+			res.ProtectionAttachedAt = &now
+		}
 	}
 
 	// The endpoint identity is minted HERE — at birth, in the same INSERT that
@@ -433,6 +518,44 @@ func (uc *FleetResourceProvisioner) provisionDedicated(ctx context.Context, in P
 		return ProvisionDedicatedOutput{Handle: winner.ID.String(), Phase: string(winner.Phase)}, nil
 	}
 	return ProvisionDedicatedOutput{}, fmt.Errorf("persist resource: %w", saveErr)
+}
+
+// attachProtection is the D-202 accept gate. It returns the cadence enrolment to
+// stamp on the claim (nil when cadence could not attach) and, when the provision
+// must be REFUSED, the error naming every component that could not attach.
+//
+// Three outcomes, and only three:
+//
+//   - everything attaches ⇒ the resource is enrolled at the configured cadence;
+//   - a component cannot attach and NO waiver was supplied ⇒ refused, naming
+//     every failed component. Nothing is created;
+//   - a component cannot attach and a waiver WAS supplied ⇒ the provision
+//     proceeds, attaching whatever CAN attach (a resource that could still be
+//     enrolled in a cadence IS enrolled — a waiver forgives the requirement, it
+//     does not forgo the protection), and the caller records the audit.
+//
+// An ephemeral resource has no protection to attach: it is not a promise the
+// platform made.
+func (uc *FleetResourceProvisioner) attachProtection(ctx context.Context, durability domain.Durability, waiver *ProtectionWaiver, claimKey string) (*int, error) {
+	if durability != domain.DurabilityDurable {
+		return nil, nil
+	}
+	eval := uc.evaluateProtection(ctx, uc.acceptScopes(ctx))
+	var cadenceSeconds *int
+	if eval.Cadence.Attached {
+		cs := uc.protection.CadenceSeconds
+		cadenceSeconds = &cs
+	}
+	if err := eval.Err(); err != nil {
+		if waiver == nil {
+			return nil, err
+		}
+		logger.FromContext(ctx).Warn("fleet resource: durable provision proceeding under a protection WAIVER — this database is being accepted with protection the fleet cannot attach",
+			"claim_key", claimKey, "waived_by", waiver.Actor, "reason", waiver.Reason,
+			"cadence_attached", eval.Cadence.Attached, "offsite_attached", eval.Offsite.Attached,
+			"unattachable", err)
+	}
+	return cadenceSeconds, nil
 }
 
 // resolveAvailability validates the requested availability class and, for `ha`,
@@ -674,6 +797,16 @@ func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uui
 		status.Conditions = append(status.Conditions, conditionSnapshotFailing)
 	}
 
+	// D-202 — protection REGRESSION alarms; it never blocks. The conditions below
+	// are the customer-visible half of the same evaluation the accept gate reads,
+	// which is what keeps the gate and the report from ever telling different
+	// stories. They deliberately touch NEITHER the reported nor the persisted
+	// phase: a resource whose protection has stopped is still serving, callers gate
+	// on phase, and demoting it would break something that works today in order to
+	// report something that is already reported here. A tombstone is exempt — a
+	// torn-down resource's protection is history.
+	status.Conditions = append(status.Conditions, uc.protectionConditions(ctx, res)...)
+
 	if rps, rerr := uc.resources.ListRecoveryPoints(ctx, res.ID); rerr != nil {
 		logger.FromContext(ctx).Warn("fleet resource: list recovery points", "resource_id", res.ID, "err", rerr)
 	} else if len(rps) > 0 {
@@ -688,6 +821,42 @@ func (uc *FleetResourceProvisioner) StatusOf(ctx context.Context, resourceID uui
 		}
 	}
 	return status, nil
+}
+
+// protectionConditions turns the D-202 evaluation over ONE resource's live facts
+// into stable condition tokens.
+//
+// Host-aware at this end too (J3): the resource's protecting host is resolved
+// from its OWN claim-owned volumes' affinity, and only that host's cadence worker
+// is evaluated. A resource whose bytes are on another host is not protected by a
+// worker here, and an unresolvable affinity reports the pessimistic value rather
+// than this process's own identity.
+func (uc *FleetResourceProvisioner) protectionConditions(ctx context.Context, res *domain.FleetResource) []string {
+	if res.Durability != domain.DurabilityDurable || res.Phase == domain.FleetResourcePhaseDecommissioned {
+		return nil
+	}
+	var conditions []string
+	// Permanent and first: a waiver is the whole reason the other conditions may
+	// legitimately hold, and it must never be inferred from their absence.
+	if res.ProtectionWaivedBy != "" {
+		conditions = append(conditions, conditionProtectionWaived)
+	}
+	eval := uc.evaluateProtection(ctx, uc.statusScopes(ctx, res))
+	if !eval.Offsite.Attached {
+		conditions = append(conditions, conditionProtectionOffsiteUnavailable)
+	}
+	switch {
+	case res.ProtectionCadenceSeconds == nil:
+		// Never enrolled. Its data is captured only by a manual RPC or by teardown —
+		// a different thing from an enrolment whose worker has stopped, which is why
+		// this is a different token.
+		conditions = append(conditions, conditionProtectionCadenceUnattached)
+	case !eval.Cadence.Attached:
+		logger.FromContext(ctx).Warn("fleet resource: enrolled in a snapshot cadence, but no cadence worker is provably serving it",
+			"resource_id", res.ID, "err", eval.Cadence.Err)
+		conditions = append(conditions, conditionProtectionCadenceStalled)
+	}
+	return conditions
 }
 
 // volumeOwnershipUnstamped reports whether the resource's backing app still holds

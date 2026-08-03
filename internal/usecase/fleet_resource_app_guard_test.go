@@ -219,7 +219,7 @@ func TestDecommissionDedicated_LegitimatePathStillTearsDownEndToEnd(t *testing.T
 	g.orch.resources.seed(res)
 
 	snap := &fakeSnapshotter{}
-	uc := NewFleetResourceProvisioner(
+	uc := newTestResourceProvisioner(
 		orchProvisioner{orch: g.orch.orch}, g.orch.resources, g.orch.replicas, snap,
 		&fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 
@@ -267,7 +267,7 @@ func TestDecommissionDedicated_FailedTeardownLeavesTheAppGuarded(t *testing.T) {
 	repo.seed(res)
 
 	boom := errors.New("host unreachable")
-	uc := NewFleetResourceProvisioner(
+	uc := newTestResourceProvisioner(
 		&fakeFleetProvisioner{decommissionErr: boom}, repo, nil, &fakeSnapshotter{},
 		&fakeVolumeBinder{}, testEngine(), testEndpointNaming(), nil, 0)
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strings"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -159,6 +160,10 @@ func (s *ResourceServer) ProvisionResource(ctx context.Context, req *runtimev1.P
 			SecretRefs: req.GetSecretRefs(),
 			VaultToken: req.GetVaultToken(),
 			SizeMB:     req.GetSizeMb(),
+			// D-202 — the wire durability claim (proto field 10) finally has a
+			// reader. Empty and "durable" both mean durable on this tier; "ephemeral"
+			// is refused by the use case, which owns the rule.
+			Durability: req.GetDurability(),
 		})
 		if err != nil {
 			return nil, resourceError(err)
@@ -369,6 +374,23 @@ func (s *ResourceServer) authorizeHandleOrg(ctx context.Context, handle string) 
 // it does not own — notably the composed FleetProvision sentinels the dedicated
 // path surfaces (image-boot, secret, volume) — fall through to fleetError, which
 // consults the platform error registry and curates a leak-free Internal default.
+// protectionRefusalMessage names EVERY protection component that could not
+// attach. D-202's refusal must tell the caller WHICH part failed — a bare "not
+// available" is unactionable — in STABLE tokens rather than in the underlying
+// error text, which carries host ids and window sizes that are operator-facing
+// and belong in the log.
+func protectionRefusalMessage(err error) string {
+	parts := make([]string, 0, 2)
+	if errors.Is(err, domain.ErrProtectionCadenceUnavailable) {
+		parts = append(parts, "snapshot-cadence")
+	}
+	if errors.Is(err, domain.ErrProtectionOffsiteUnproven) {
+		parts = append(parts, "offsite-durability-store")
+	}
+	return "durable database refused: its protection could not attach (" + strings.Join(parts, ", ") +
+		"); the durable tier is not available until the platform can protect it, or an audited per-resource waiver is provided"
+}
+
 func resourceError(err error) error {
 	switch {
 	case errors.Is(err, domain.ErrResourceNotFound):
@@ -420,6 +442,18 @@ func resourceError(err error) error {
 		return status.Error(codes.FailedPrecondition, "this fleet host's configured database zone is not a delegable multi-label DNS zone, so a permanent hostname minted under it would be unresolvable")
 	case errors.Is(err, domain.ErrEndpointRegionInvalid):
 		return status.Error(codes.FailedPrecondition, "this fleet host's configured database region is not a legal DNS label, so a permanent hostname minted under it would be unresolvable")
+	// D-202 — the durability and protection refusals. Curated by hand like every
+	// other runtime-local sentinel (this service's §16.3 deviation): these messages
+	// are tenant-visible, so they name the CONDITION and the failing COMPONENT and
+	// leak no host, path or DSN detail.
+	case errors.Is(err, domain.ErrResourceDurabilityInvalid):
+		return status.Error(codes.InvalidArgument, "requested durability is not valid for this tier (dedicated is durable; shared is ephemeral)")
+	case errors.Is(err, domain.ErrProtectionWaiverIncomplete):
+		return status.Error(codes.InvalidArgument, "a protection waiver requires both an actor and a reason")
+	case errors.Is(err, domain.ErrProtectionUnattachable):
+		// FailedPrecondition, not Internal: the claim is legitimate and retrying it
+		// unchanged succeeds the moment the platform can protect it.
+		return status.Error(codes.FailedPrecondition, protectionRefusalMessage(err))
 	case errors.Is(err, domain.ErrVolumeBackingFileMissing):
 		// The refusal is correct — a durable resource whose data cannot be
 		// snapshotted must not be torn down — but it used to reach the caller as a

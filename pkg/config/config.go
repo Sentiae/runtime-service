@@ -70,6 +70,24 @@ type ResourceConfig struct {
 	// must never inherit. An operator sets both, and they should agree.
 	EndpointZone   string `mapstructure:"endpoint_zone"`
 	EndpointRegion string `mapstructure:"endpoint_region"`
+	// ProtectionCadence is the snapshot cadence stamped onto every durable
+	// dedicated resource at accept (D-202). It tunes the NUMBER; it can never
+	// disable the gate — <= 0 makes the cadence component UNATTACHABLE, i.e.
+	// durable provisions REFUSE, which is the fail-safe direction of a config miss.
+	//
+	// ⚠ Stamped per resource at accept, so changing it does NOT retro-apply to
+	// existing rows: per-resource enrolment is the D-202 point, and a converge verb
+	// is a later slice.
+	ProtectionCadence time.Duration `mapstructure:"protection_cadence"`
+	// ProtectionCadenceStaleness / ProtectionOffsiteStaleness bound how old a
+	// worker's heartbeat may be while still counting as "provably running".
+	//
+	// ⚠ EVERY KEY IN THIS GROUP IS A DURATION, BY CONSTRUCTION. D-202 bans a
+	// configuration path to acceptance, so there is deliberately no boolean here to
+	// typo into the permissive branch — the only thing an operator can move is how
+	// fresh a FACT has to be, never whether a fact is required.
+	ProtectionCadenceStaleness time.Duration `mapstructure:"protection_cadence_staleness"`
+	ProtectionOffsiteStaleness time.Duration `mapstructure:"protection_offsite_staleness"`
 }
 
 // TelemetryConfig configures the OTLP export path (traces/metrics/logs → the
@@ -666,6 +684,16 @@ func Load() (*Config, error) {
 			// provision; it must never fall back to a plausible-looking name.
 			"resource.endpoint_zone":   "",
 			"resource.endpoint_region": "",
+
+			// D-202 protection gate — durations only, never a boolean.
+			// 1h is the platform's de-facto RPO floor until WAL archiving lands
+			// (owner gate #d202-cadence-rpo-default). 15m offsite staleness is far
+			// longer than a capture pass and far shorter than a useful reaction
+			// time; 5m cadence staleness is 5x the worker's 1-minute tick, so a
+			// single slow pass cannot flap the accept gate.
+			"resource.protection_cadence":           "1h",
+			"resource.protection_cadence_staleness": "5m",
+			"resource.protection_offsite_staleness": "15m",
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -837,6 +865,9 @@ func Load() (*Config, error) {
 			{"resource.shared_seed_templates", "APP_RESOURCE_SHARED_SEED_TEMPLATES"},
 			{"resource.endpoint_zone", "APP_RESOURCE_ENDPOINT_ZONE"},
 			{"resource.endpoint_region", "APP_RESOURCE_ENDPOINT_REGION"},
+			{"resource.protection_cadence", "APP_RESOURCE_PROTECTION_CADENCE"},
+			{"resource.protection_cadence_staleness", "APP_RESOURCE_PROTECTION_CADENCE_STALENESS"},
+			{"resource.protection_offsite_staleness", "APP_RESOURCE_PROTECTION_OFFSITE_STALENESS"},
 		},
 	})
 	if err != nil {

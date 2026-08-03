@@ -113,6 +113,19 @@ func (r *volumeRepository) HasUnstampedVolumes(ctx context.Context, appID uuid.U
 	return exists, nil
 }
 
+// ListByResource returns the volumes a durable claim OWNS (D-203). Filtered on
+// resource_id alone — never on app_id — because the claim's ownership is what
+// survives an app rebuild, and it is the ownership, not the current attachment,
+// that says where the resource's bytes live.
+func (r *volumeRepository) ListByResource(ctx context.Context, resourceID uuid.UUID) ([]domain.Volume, error) {
+	var volumes []domain.Volume
+	err := r.db.WithContext(ctx).
+		Where("resource_id = ?", resourceID).
+		Order("created_at ASC").
+		Find(&volumes).Error
+	return volumes, err
+}
+
 func (r *volumeRepository) ListByHost(ctx context.Context, hostID uuid.UUID) ([]domain.Volume, error) {
 	var volumes []domain.Volume
 	err := r.db.WithContext(ctx).

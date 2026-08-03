@@ -123,6 +123,42 @@ var (
 	// effect of an attach.
 	ErrVolumeBackingFileUndersized = errors.New("fleet volume backing file is smaller than its recorded size")
 
+	// ── Protection attaches or the provision fails (D-202) ──────────────────
+	// A durable database and its protection are ONE operation: they succeed
+	// together or the provision is refused. These are the refusals.
+
+	// ErrResourceDurabilityInvalid is returned when the requested durability is
+	// not a value the invoked tier can honestly hold: `ephemeral` on the dedicated
+	// tier, `durable` on the shared tier, or a value outside the vocabulary. The
+	// two cross combinations are unrepresentable in the ledger too (0025's
+	// tier/durability CHECK) — this sentinel is what names the refusal to a caller.
+	ErrResourceDurabilityInvalid = errors.New("requested durability is not valid for this tier")
+	// ErrProtectionUnattachable is the D-202 umbrella: one or more protection
+	// components could not attach, so the durable provision is refused. It always
+	// wraps at least one component sentinel below, because a refusal that does not
+	// say WHICH part failed is not actionable.
+	ErrProtectionUnattachable = errors.New("protection could not attach")
+	// ErrProtectionCadenceUnavailable — the snapshot-cadence component cannot
+	// attach: no cadence is configured to enrol the resource in, or a host that
+	// could hold the resource has no fresh `cadence` heartbeat, so nothing is
+	// provably taking its scheduled recovery points.
+	ErrProtectionCadenceUnavailable = errors.New("snapshot-cadence protection unavailable")
+	// ErrProtectionOffsiteUnproven — no fresh `offsite` heartbeat exists in THIS
+	// ledger, so the off-provider durability store of record is not provably
+	// receiving this resource's artifacts (D-202/J1, D-213). D-212 owns the writer;
+	// until it beats, every non-waived durable provision refuses naming it — the
+	// truth of the fleet, not a defect of this gate.
+	ErrProtectionOffsiteUnproven = errors.New("off-provider durability store not provably receiving artifacts")
+	// ErrProtectionWaiverIncomplete — a waiver must carry BOTH an actor and a
+	// reason. Half a waiver is not an audit record, and the 0025 CHECK refuses to
+	// store one.
+	ErrProtectionWaiverIncomplete = errors.New("protection waiver requires both an actor and a reason")
+	// ErrProtectionHeartbeatNotFound is returned by the ledger when a protection
+	// component has never beaten in this database. It is the ORDINARY state of a
+	// component whose worker is not running here, and it is what makes a
+	// mis-wired worker fail closed instead of passing on configuration.
+	ErrProtectionHeartbeatNotFound = errors.New("protection heartbeat not found")
+
 	// ── Customer-facing endpoint identity (D-190) ───────────────────────────
 	// These are all REFUSALS by design. A resource's hostname is permanent, so
 	// there is no repair, no fallback and no plausible default: a host that
