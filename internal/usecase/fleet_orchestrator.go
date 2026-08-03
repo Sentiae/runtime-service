@@ -87,6 +87,12 @@ type FleetOrchestrator struct {
 	// GLOBAL desired-state table and may only ACTUATE the rows stamped with this
 	// id. Immutable and constructor-required.
 	selfHost uuid.UUID
+
+	// actuateMu serializes actuateScheduledOwned within this process. See the
+	// method comment: the pass now has TWO concurrent callers (the reconcile tick
+	// and the activator's wake path) and the state machine underneath it is NOT a
+	// compare-and-set, so overlapping passes can both boot one row.
+	actuateMu sync.Mutex
 }
 
 // ActivityFeed reports per-host request activity observed at the ingress gateway
@@ -600,15 +606,34 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 		}
 	}
 
+	// teardownErr carries the FIRST failed local teardown of this pass.
+	//
+	// It is recorded rather than logged-and-forgotten because a teardown that did
+	// not complete is not a per-row nuisance: it means a VMM may still be running,
+	// still holding its TAP, its jail slot and — the part that matters — the
+	// app's single-writer volume. Per-row and per-app isolation are unchanged
+	// (every loop below still visits every row, and ReconcileAll still continues
+	// to the next app), but the pass no longer reports success, and it does not
+	// place a REPLACEMENT while the thing being replaced cannot be proven gone.
+	var teardownErr error
+	recordTeardown := func(replicaID uuid.UUID, err error) {
+		if err == nil {
+			return
+		}
+		logger.FromContext(ctx).Error("fleet reconcile: teardown did not complete; this app's placement is held until it does",
+			"app_id", app.ID, "replica_id", replicaID, "err", err)
+		if teardownErr == nil {
+			teardownErr = err
+		}
+	}
+
 	// Dead replicas → decommission (frees the handle + deletes the row). With
 	// restart_policy=always the shortfall step below re-creates them. Only the
 	// OWNING host may do this: a dead row's VMM may still be running, and its TAP,
 	// jail and lease are on the machine the row names.
 	for i := range replicas {
 		if replicas[i].State == domain.ReplicaStateDead && uc.ownsReplica(&replicas[i]) {
-			if derr := uc.runtime.DecommissionReplica(ctx, replicas[i].ID); derr != nil {
-				logger.FromContext(ctx).Warn("fleet reconcile: decommission dead replica", "replica_id", replicas[i].ID, "err", derr)
-			}
+			recordTeardown(replicas[i].ID, uc.runtime.DecommissionReplica(ctx, replicas[i].ID))
 		}
 	}
 
@@ -626,9 +651,7 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 			continue
 		}
 		if !healthy {
-			if derr := uc.runtime.DecommissionReplica(ctx, replicas[i].ID); derr != nil {
-				logger.FromContext(ctx).Warn("fleet reconcile: decommission dead resident", "replica_id", replicas[i].ID, "err", derr)
-			}
+			recordTeardown(replicas[i].ID, uc.runtime.DecommissionReplica(ctx, replicas[i].ID))
 		}
 	}
 
@@ -646,6 +669,18 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 		case domain.ReplicaStateScheduled, domain.ReplicaStateBooting, domain.ReplicaStateResident:
 			occupying = append(occupying, replicas[i])
 		}
+	}
+
+	// ⚠ A FAILED TEARDOWN BLOCKS THE REPLACEMENT, and this is the whole reason the
+	// error is carried rather than logged. A retained `dead` row does not count as
+	// occupying, so without this guard the shortfall branch below would place and
+	// boot a fresh replica while the previous VMM — which teardown could not prove
+	// had exited — may still be running and still holding the app's single-writer
+	// backing file. Two Firecrackers writing one ext4 is the one outcome no
+	// availability argument justifies. The app is left short for this pass; the
+	// next tick retries the teardown and converges the instant it succeeds.
+	if teardownErr != nil {
+		return teardownErr
 	}
 
 	switch {
@@ -756,9 +791,7 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 		surplus := surplusOrder(local)
 		drain := len(occupying) - app.DesiredReplicas
 		for i := 0; i < drain && i < len(surplus); i++ {
-			if derr := uc.runtime.DecommissionReplica(ctx, surplus[i].ID); derr != nil {
-				logger.FromContext(ctx).Warn("fleet reconcile: decommission surplus replica", "replica_id", surplus[i].ID, "err", derr)
-			}
+			recordTeardown(surplus[i].ID, uc.runtime.DecommissionReplica(ctx, surplus[i].ID))
 		}
 	}
 
@@ -775,7 +808,10 @@ func (uc *FleetOrchestrator) ReconcileApp(ctx context.Context, appID uuid.UUID) 
 		}
 	}
 
-	return nil
+	// A surplus drain that failed is still a teardown that did not complete; the
+	// pass reports it so DecommissionApp propagates the REAL cause rather than
+	// inferring one from a row that merely survived.
+	return teardownErr
 }
 
 // Condition tokens recorded when a volume-bearing app cannot be placed on this
@@ -968,17 +1004,33 @@ func (uc *FleetOrchestrator) ReconcileAll(ctx context.Context) error {
 // ListByHost(selfHost), so a row placed elsewhere is not merely skipped — it is
 // invisible here, and there is no branch that could act on one.
 //
-// Idempotence comes from the state machine, not from bookkeeping: only
+// SEQUENTIAL passes are idempotent because of the state machine: only
 // `scheduled` rows enter, and BootReplica persists `booting` before any host
 // side effect, then `resident` on success or `dead` on a handled failure. So a
-// repeated pass finds nothing to redo, and a pass that crosses a boot sees a row
-// that has already left `scheduled`.
+// later pass finds nothing to redo.
+//
+// ⚠ CONCURRENT passes are NOT, which is why this method holds a mutex. It has
+// two callers by design — the reconcile tick and the activator's wake path — and
+// the transition they race on is a plain read-then-write, not a
+// compare-and-set: BootReplica does FindByID and then unconditionally persists
+// `booting`, so two overlapping passes can both observe `scheduled` and both
+// boot the same row. The consequence is not a wasted VM. The second boot
+// re-derives the SAME jail slot from the row's lease and startVM's jail
+// prepare() begins with os.RemoveAll(jailDir) — so it would delete the live
+// first VM's chroot, including the device nodes it is running on, and then hand
+// its uid and /30 to a second Firecracker. One in-process mutex closes it: both
+// callers are in this process, the pass is bounded by one host's scheduled rows,
+// and the alternative (a durable claim column) is a schema change this item
+// explicitly may not make.
 //
 // Per-row failures are isolated exactly like per-app failures in ReconcileAll —
 // one app's bad image must not stop every other placement on the host. Only the
 // host-list query itself is fatal: without it the pass has no work list at all
 // and reporting success would hide a broken tick.
 func (uc *FleetOrchestrator) actuateScheduledOwned(ctx context.Context) error {
+	uc.actuateMu.Lock()
+	defer uc.actuateMu.Unlock()
+
 	rows, err := uc.replicas.ListByHost(ctx, uc.selfHost)
 	if err != nil {
 		return fmt.Errorf("list replicas placed on this host: %w", err)
@@ -1305,9 +1357,12 @@ func (uc *FleetOrchestrator) DecommissionApp(ctx context.Context, appID uuid.UUI
 	if err := uc.apps.Update(ctx, app); err != nil {
 		return true, fmt.Errorf("update fleet app: %w", err)
 	}
-	if err := uc.ReconcileApp(ctx, app.ID); err != nil {
-		return true, err
-	}
+	// The drain's own error is CARRIED, not returned yet: the re-list below decides
+	// what it means, and a teardown failure with no surviving row (a surplus drain
+	// on another app's row, say) must not block a finalization that is otherwise
+	// complete.
+	drainErr := uc.ReconcileApp(ctx, app.ID)
+
 	// The app-row cascade is the obvious way AROUND the replica fence, so it is
 	// closed here: DecommissionApp deletes backing FILES, routes and the app row,
 	// and doing any of that while a replica still exists would strand a live VM
@@ -1321,12 +1376,26 @@ func (uc *FleetOrchestrator) DecommissionApp(ctx context.Context, appID uuid.UUI
 	// actionable of the two.
 	for i := range remaining {
 		if uc.ownsReplica(&remaining[i]) {
-			// Our own teardown returned an error (ErrVMTerminationUnproven or worse) and
-			// the row is still here. Preserve EVERYTHING after this point and surface it:
-			// a retry of the same call finishes the job once the VM can be proven gone.
-			return true, fmt.Errorf("replica %s of app %s is still present after the drain, so its volumes, routes and app row are preserved: %w",
+			// Preserve EVERYTHING after this point and surface the REAL cause: a retry
+			// of the same call finishes the job once the VM can be proven gone.
+			//
+			// ⚠ The drain's own error is propagated verbatim when there is one.
+			// Substituting ErrVMTerminationUnproven here would overwrite the actual
+			// diagnosis — a TAP that would not delete, a lease the ledger refused to
+			// release, a repository failure — with a claim about the VMM that this
+			// path never established. The sentinel is used ONLY when the row survived
+			// with no error to explain it, which is the one case where "nothing proved
+			// this VM is gone" is precisely what is known.
+			if drainErr != nil {
+				return true, fmt.Errorf("replica %s of app %s is still present after the drain, so its volumes, routes and app row are preserved: %w",
+					remaining[i].ID, app.ID, drainErr)
+			}
+			return true, fmt.Errorf("replica %s of app %s survived the drain with no reported cause, so its volumes, routes and app row are preserved: %w",
 				remaining[i].ID, app.ID, domain.ErrVMTerminationUnproven)
 		}
+	}
+	if drainErr != nil {
+		return true, drainErr
 	}
 	if len(remaining) > 0 {
 		// Only foreign or nil-host rows are left: their owner drains them on its next

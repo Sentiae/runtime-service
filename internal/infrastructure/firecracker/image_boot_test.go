@@ -516,6 +516,32 @@ func TestDecommissionStopsGuestBeforeSignallingVMM(t *testing.T) {
 	}
 }
 
+// TestDecommissionWaitsOutThePowerOffWindowAfterAShutdownError.
+//
+// A failed Shutdown CALL does not mean the guest did not receive it: a timeout, a
+// lost ack, and a reply that arrived late are indistinguishable from here, and in
+// every one of them the guest may be part-way through the clean stop this path
+// exists to allow — Postgres running its fast-shutdown checkpoint, image-init
+// syncing and issuing its power-off. Signalling at that moment crash-stops a
+// customer's database mid-flush, which is the exact failure the control channel
+// was added to remove. So the power-off window is waited out on BOTH branches.
+func TestDecommissionWaitsOutThePowerOffWindowAfterAShutdownError(t *testing.T) {
+	rec := &stopRecorder{}
+	// The guest errors on the call but powers itself off during the window: probe
+	// #1 is admission (alive), and it disappears on the next poll.
+	proc := newFakeProcess(rec, 2, true)
+	f := newStopFixture(t, &fakeGuestControl{rec: rec, err: errors.New("guest control shutdown: context deadline exceeded")}, proc)
+
+	if err := f.b.Decommission(context.Background(), f.in); err != nil {
+		t.Fatalf("Decommission: %v", err)
+	}
+	want := []string{"shutdown"}
+	if got := rec.got(); !slices.Equal(got, want) {
+		t.Fatalf("stop sequence = %v, want %v — no signal may be sent while the guest is still powering off", got, want)
+	}
+	f.assertEverythingReclaimed(t)
+}
+
 // TestDecommissionKillLadderProvesExit walks the full TERM→KILL ladder for a
 // guest that ignores everything until SIGKILL.
 func TestDecommissionKillLadderProvesExit(t *testing.T) {

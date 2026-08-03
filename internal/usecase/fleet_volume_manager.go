@@ -275,13 +275,24 @@ func (m *FleetVolumeManager) EnsureAppVolumes(ctx context.Context, appID uuid.UU
 			CreatedAt:    now,
 			UpdatedAt:    now,
 		}
-		if err := m.volumes.Create(ctx, vol); err != nil {
+		if cerr := m.volumes.Create(ctx, vol); cerr != nil {
 			// A filesystem/DB saga, not a transaction: the bytes exist and the row does
 			// not. Every branch below is decided by AUTHORITATIVE evidence, and every
 			// uncertainty resolves toward keeping the file — an unattributed file is a
 			// report-only ledger-reconciler finding, whereas a wrongly deleted one is a
 			// customer's data.
-			return nil, m.compensateCreate(ctx, appID, mount, vol, out, err)
+			//
+			// The lost-ack branch returns the COMMITTED winner, which then flows into
+			// the result set exactly like a normal insert would. Returning early with
+			// (nil, nil) instead would hand the caller an empty slice for an app that
+			// definitely has a volume — dropping this spec's volume AND every earlier
+			// one — and ProvisionApp reads that length to enforce the single-writer
+			// scale guard, so a volume-bearing app would have looked stateless.
+			adopted, aerr := m.compensateCreate(ctx, appID, mount, vol, out, cerr)
+			if aerr != nil {
+				return nil, aerr
+			}
+			vol = adopted
 		}
 		byMount[mount] = vol
 		result = append(result, *vol)
@@ -290,7 +301,12 @@ func (m *FleetVolumeManager) EnsureAppVolumes(ctx context.Context, appID uuid.UU
 }
 
 // compensateCreate decides what to do with the file a failed volume-row insert
-// left behind, and returns the error EnsureAppVolumes reports.
+// left behind.
+//
+// It returns a non-nil VOLUME only on the lost-ack branch, where an
+// authoritative re-read proves the committed row IS this attempt; the caller
+// then carries that row forward exactly as if the insert had acked. Every other
+// branch returns the error EnsureAppVolumes reports.
 //
 // It never deletes a file this attempt did not create (out.Created == false),
 // and it never deletes on an uncertain read: the re-list is the only authority
@@ -298,7 +314,7 @@ func (m *FleetVolumeManager) EnsureAppVolumes(ctx context.Context, appID uuid.UU
 // unknown, and unknown ownership is never permission to unlink possible customer
 // bytes.
 func (m *FleetVolumeManager) compensateCreate(ctx context.Context, appID uuid.UUID, mount string,
-	attempt *domain.Volume, out VolumeEnsureOutput, cause error) error {
+	attempt *domain.Volume, out VolumeEnsureOutput, cause error) (*domain.Volume, error) {
 	// Authoritative re-read: did a concurrent provision commit a row for this
 	// (app, mount) while this attempt was losing?
 	after, lerr := m.volumes.ListByApp(ctx, appID)
@@ -306,9 +322,16 @@ func (m *FleetVolumeManager) compensateCreate(ctx context.Context, appID uuid.UU
 		// Ownership is now UNKNOWN. Retain the file and report; the report-only
 		// ledger reconciler surfaces an unattributed file, and no path here may
 		// trade that for a possible deletion of live data.
+		//
+		// The RE-READ error is what is returned and wrapped, not the original insert
+		// error: the insert failure is a fact already established, whereas the thing
+		// that made this outcome undecidable — and that a caller must be able to
+		// match on and retry — is the read that could not answer. Rendering it as %v
+		// text inside the create error would have hidden it from errors.Is entirely.
 		logger.FromContext(ctx).Error("fleet volume: create failed and the authoritative re-read failed too — the materialized backing file is RETAINED because nothing can prove who owns it",
-			"app_id", appID, "volume_id", attempt.ID, "backing_path", attempt.BackingPath, "err", cause, "reread_err", lerr)
-		return fmt.Errorf("create volume: %w (ownership of %s could not be re-read: %v)", cause, attempt.BackingPath, lerr)
+			"app_id", appID, "volume_id", attempt.ID, "backing_path", attempt.BackingPath, "create_err", cause, "err", lerr)
+		return nil, fmt.Errorf("volume %s at %s was materialized and its row insert failed (%v), and ownership of the file could not be re-read, so it is retained: %w",
+			attempt.ID, attempt.BackingPath, cause, lerr)
 	}
 	var winner *domain.Volume
 	for i := range after {
@@ -322,16 +345,19 @@ func (m *FleetVolumeManager) compensateCreate(ctx context.Context, appID uuid.UU
 		// Proven: no row owns this path. The file is this attempt's residue and may
 		// be reclaimed — but only if this attempt is what created it.
 		m.deleteOwnAttempt(ctx, attempt, out)
-		return fmt.Errorf("create volume: %w", cause)
+		return nil, fmt.Errorf("create volume: %w", cause)
 
 	case winner.ID == attempt.ID && winner.BackingPath == attempt.BackingPath &&
 		winner.HostAffinity != nil && *winner.HostAffinity == m.selfHost:
 		// The insert actually landed (a lost ack, a retried write): the committed row
 		// IS this attempt. Adopting it is correct and deleting the file would destroy
-		// the volume the ledger now promises.
+		// the volume the ledger now promises. The COMMITTED row is returned — not the
+		// in-memory attempt — so the caller carries whatever the database actually
+		// holds.
 		logger.FromContext(ctx).Warn("fleet volume: create reported an error but the committed row is this attempt's — adopting it and keeping the backing file",
 			"app_id", appID, "volume_id", winner.ID, "backing_path", winner.BackingPath, "err", cause)
-		return nil
+		adopted := *winner
+		return &adopted, nil
 
 	default:
 		// Someone else owns this mount, or owns it on another host. This attempt's
@@ -339,10 +365,10 @@ func (m *FleetVolumeManager) compensateCreate(ctx context.Context, appID uuid.UU
 		// attempt created it.
 		m.deleteOwnAttempt(ctx, attempt, out)
 		if winner.HostAffinity == nil || *winner.HostAffinity != m.selfHost {
-			return fmt.Errorf("%w: volume %s at %s was committed on another fleet host while this host was materializing it",
+			return nil, fmt.Errorf("%w: volume %s at %s was committed on another fleet host while this host was materializing it",
 				domain.ErrVolumeHostMismatch, winner.ID, mount)
 		}
-		return fmt.Errorf("create volume: %w (volume %s already holds mount %s)", cause, winner.ID, mount)
+		return nil, fmt.Errorf("create volume: %w (volume %s already holds mount %s)", cause, winner.ID, mount)
 	}
 }
 

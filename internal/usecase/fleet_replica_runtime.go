@@ -363,10 +363,23 @@ func (uc *FleetReplicaRuntime) BootReplica(ctx context.Context, replicaID uuid.U
 	replica.Message = ""
 	replica.UpdatedAt = time.Now().UTC()
 	if err := uc.replicas.Update(ctx, replica); err != nil {
-		// The VM is up; tear it down so we don't leak an untracked resident.
-		_ = uc.booter.Decommission(ctx, replicaDecommissionInput(replica))
-		// Decommission unlinks only the rootfs FILE — the staging directory it
-		// sits in is this boot's to reclaim, and this boot has just failed.
+		// The VM is UP and the row that describes it could not be written. Tear it
+		// down so we do not leak an untracked resident — but the teardown's verdict
+		// is now load-bearing, not decoration.
+		if derr := uc.booter.Decommission(ctx, replicaDecommissionInput(replica)); derr != nil {
+			// ⚠ NOTHING IS RECLAIMED HERE. Discarding this error and unlinking the
+			// staging tree anyway is exactly the shape that produced the live orphans:
+			// a VMM that could not be proven dead, with its rootfs removed out from
+			// under it and no row naming it. The staging directory is the last on-disk
+			// evidence of what that pid is running, so it is KEPT and both causes are
+			// reported — the persist failure that started this, and the teardown that
+			// could not finish it.
+			logger.FromContext(ctx).Error("fleet replica: the boot could not be persisted AND its VM could not be torn down — the staging tree is retained as the only remaining evidence of the running VMM",
+				"replica_id", replica.ID, "pid", res.PID, "persist_err", err, "err", derr)
+			return fmt.Errorf("persist resident replica %s failed (%v) and its VM could not be torn down: %w", replica.ID, err, derr)
+		}
+		// Proven torn down. Decommission unlinks only the rootfs FILE — the staging
+		// directory it sits in is this boot's to reclaim, and this boot has failed.
 		uc.reclaimStagingDir(ctx, replica.ID)
 		return fmt.Errorf("persist resident replica: %w", err)
 	}
@@ -405,7 +418,15 @@ func (uc *FleetReplicaRuntime) DecommissionReplica(ctx context.Context, replicaI
 	if err := uc.requireOwnedReplica(replica); err != nil {
 		return err
 	}
-	if replica.PID != nil || replica.SocketPath != "" || replica.TapName != "" {
+	// NetIndex is part of the admission test, and its absence was a hole: a row
+	// whose only artifact is a net coordinate — the lease is taken BEFORE the TAP
+	// and the VM exist, so a boot that died in that window records exactly that —
+	// skipped the booter entirely and went straight to deleting the row. The lease
+	// then outlived every record of its owner, holding a /30, a uid and a jail slot
+	// that nothing would ever release. The booter's own never-booted rule (no pid
+	// AND no artifacts at all) is what decides that a row genuinely needs no
+	// teardown; this seam must not pre-empt it.
+	if replica.PID != nil || replica.SocketPath != "" || replica.TapName != "" || replica.NetIndex > 0 {
 		if err := uc.booter.Decommission(ctx, replicaDecommissionInput(replica)); err != nil {
 			// STOP. Detaching the volume, reclaiming the staging directory or deleting
 			// the row here would each erase a fact the retry needs, for a VM that may

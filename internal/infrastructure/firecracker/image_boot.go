@@ -821,16 +821,25 @@ func (b *ImageBooter) stopAndProve(ctx context.Context, in usecase.ImageDecommis
 		err := b.guestControl.Shutdown(shutdownCtx, in.SocketPath)
 		cancel()
 		if err != nil {
-			log.Warn("image-boot: guest shutdown failed, falling back to signalling the vmm",
+			log.Warn("image-boot: guest shutdown returned an error; still waiting out the power-off window before signalling",
 				"socket_path", in.SocketPath, "err", err)
-		} else {
-			gone, werr := waitProcessGone(ctx, proc, b.stop.powerOff, b.stop.exitPoll)
-			if gone {
-				return nil
-			}
-			log.Warn("image-boot: vmm still alive after guest shutdown, falling back to signalling",
-				"socket_path", in.SocketPath, "pid", in.PID, "err", werr)
 		}
+		// ⚠ THE POWER-OFF WINDOW IS WAITED OUT ON BOTH BRANCHES, INCLUDING THE ERROR
+		// ONE. A failed Shutdown call does not mean the guest did not receive it: a
+		// timeout, a lost ack, or a reply that arrived late all look identical from
+		// here, and in every one of them the guest may be part-way through the exact
+		// clean stop this path exists to allow — Postgres running its fast shutdown
+		// checkpoint, image-init syncing and issuing its power-off. Sending SIGTERM at
+		// that moment crash-stops a customer's database mid-flush, which is the
+		// failure mode the control channel was added to remove. Waiting costs at most
+		// the power-off budget on a guest that really is wedged, and that guest still
+		// gets TERM and KILL below.
+		gone, werr := waitProcessGone(ctx, proc, b.stop.powerOff, b.stop.exitPoll)
+		if gone {
+			return nil
+		}
+		log.Warn("image-boot: vmm still alive after the guest shutdown window, falling back to signalling",
+			"socket_path", in.SocketPath, "pid", in.PID, "shutdown_err", err, "err", werr)
 	}
 
 	// The fallback. Its own timers bound it; the caller's cancellation does not.

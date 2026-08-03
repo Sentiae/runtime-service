@@ -13,6 +13,12 @@ import (
 type fakeWorkloadRepo struct {
 	mu    sync.Mutex
 	store map[uuid.UUID]*domain.ImageWorkload
+	// updateErr / updateErrAfter fail the Nth and later Update calls, so a test can
+	// let the early writes through and fail the one that persists the RUNNING
+	// resident — the rollback path where the VM is already up.
+	updates        int
+	updateErr      error
+	updateErrAfter int
 }
 
 func newFakeWorkloadRepo() *fakeWorkloadRepo {
@@ -57,6 +63,10 @@ func (f *fakeWorkloadRepo) IsDuplicateKey(err error) bool {
 func (f *fakeWorkloadRepo) Update(_ context.Context, w *domain.ImageWorkload) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.updates++
+	if f.updateErr != nil && f.updates >= f.updateErrAfter {
+		return f.updateErr
+	}
 	cp := *w
 	f.store[w.ID] = &cp
 	return nil

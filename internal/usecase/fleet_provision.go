@@ -990,8 +990,15 @@ func (uc *FleetProvision) runResident(ctx context.Context, wl *domain.ImageWorkl
 	wl.State = domain.ImageWorkloadStateRunning
 	wl.UpdatedAt = time.Now().UTC()
 	if err := uc.repo.Update(ctx, wl); err != nil {
-		// The VM is up; decommission it so we don't leak an untracked workload.
-		_ = uc.booter.Decommission(ctx, decommissionInput(wl))
+		// The VM is up and its row could not be written; decommission it so we do not
+		// leak an untracked workload. The teardown's verdict is propagated rather
+		// than discarded: an unproven stop here means a live VMM with no row at all,
+		// and the caller must see that rather than only the persist failure.
+		if derr := uc.booter.Decommission(ctx, decommissionInput(wl)); derr != nil {
+			logger.FromContext(ctx).Error("fleet: the resident boot could not be persisted AND its VM could not be torn down",
+				"workload_id", wl.ID, "pid", pid, "net_index", res.NetIndex, "persist_err", err, "err", derr)
+			return "", fmt.Errorf("persist resident workload %s failed (%v) and its VM could not be torn down: %w", wl.ID, err, derr)
+		}
 		return "", fmt.Errorf("persist resident workload: %w", err)
 	}
 	return url, nil
@@ -1041,12 +1048,27 @@ func (uc *FleetProvision) Health(ctx context.Context, handle string) (FleetHealt
 					wl.StderrTail = tail
 				}
 			}
-			// Tear down the leaked net plumbing (TAP/DNAT/port/index) — a dead
-			// resident otherwise blocks its index for every later workload.
-			deadWl := *wl
-			deadWl.PID = nil // process already gone; skip the kill path
-			if err := uc.booter.Decommission(ctx, decommissionInput(&deadWl)); err != nil {
-				logger.FromContext(ctx).Warn("fleet: dead-resident teardown", "workload_id", wl.ID, "err", err)
+			// Tear down the leaked net plumbing (TAP/lease/jail) — a dead resident
+			// otherwise blocks its slot for every later workload.
+			//
+			// ⚠ THE RECORDED PID IS PASSED THROUGH, not cleared. It used to be nilled
+			// "because the process is already gone", which threw away the one thing
+			// that can PROVE it: the booter's signal-0 probe reads a positive pid and
+			// returns ESRCH as termination proof, whereas a zero pid with live
+			// artifacts is (correctly) unprovable and refuses. So the shortcut turned a
+			// provable teardown into a refused one — and processAlive above is a probe
+			// this path already ran, not a proof it can hand on.
+			if derr := uc.booter.Decommission(ctx, decommissionInput(wl)); derr != nil {
+				// Do NOT commit the terminal state: `failed` is terminal for this branch
+				// (it only fires from `running`), so persisting it here would make every
+				// later Health walk past a VMM that was never proven dead and a lease that
+				// was never released. The row stays `running` and the NEXT Health retries
+				// the teardown; only the report is adjusted.
+				logger.FromContext(ctx).Error("fleet: dead-resident teardown did not complete — the workload row stays RUNNING so a later health check retries it",
+					"workload_id", wl.ID, "pid", wl.PID, "net_index", wl.NetIndex, "err", derr)
+				out.Message = "vm process exited; teardown incomplete and will be retried"
+				out.StderrTail = wl.StderrTail
+				return out, nil
 			}
 			if err := uc.repo.Update(ctx, wl); err != nil {
 				logger.FromContext(ctx).Warn("fleet: persist dead-resident state", "err", err)
@@ -1100,7 +1122,16 @@ func (uc *FleetProvision) Decommission(ctx context.Context, handle string) error
 	}
 	if wl.Class == domain.ImageWorkloadClassResident && wl.State == domain.ImageWorkloadStateRunning {
 		if err := uc.booter.Decommission(ctx, decommissionInput(wl)); err != nil && !errors.Is(err, domain.ErrImageBootUnavailable) {
-			logger.FromContext(ctx).Error("fleet decommission teardown failed", "workload_id", wl.ID, "err", err)
+			// ⚠ RETURN, do not log-and-mark-exited. Swallowing this was the same
+			// proof-discard as the replica path: the row went to `exited` while the VMM
+			// may still have been running, and `exited` is terminal — the branch above
+			// only tears down a workload in state `running`, so every later retry would
+			// walk straight past the VM and its lease, TAP and jail would be held with
+			// nothing left pointing at them. Keeping the row `running` is what keeps
+			// the retry path alive.
+			logger.FromContext(ctx).Error("fleet decommission: teardown did not complete — the workload row stays RUNNING so a retry still tears it down",
+				"workload_id", wl.ID, "pid", wl.PID, "net_index", wl.NetIndex, "err", err)
+			return err
 		}
 	}
 	wl.State = domain.ImageWorkloadStateExited

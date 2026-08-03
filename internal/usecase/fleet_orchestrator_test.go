@@ -273,7 +273,15 @@ func (f orchHostLister) ListLive(context.Context, time.Duration) ([]domain.Host,
 }
 
 // orchBooter returns a resident boot result per call. It never fails.
-type orchBooter struct{ mu sync.Mutex }
+type orchBooter struct {
+	mu sync.Mutex
+	// boots counts BootResident calls. It is the assertion the concurrency test
+	// rests on: "the row ended up resident" is satisfied by a double boot too, and
+	// only the COUNT distinguishes one boot from two.
+	boots int
+	// decommErr scripts a teardown that does not complete.
+	decommErr error
+}
 
 func (b *orchBooter) BootTest(context.Context, ImageBootInput) (ImageTestResult, error) {
 	return ImageTestResult{}, nil
@@ -281,9 +289,20 @@ func (b *orchBooter) BootTest(context.Context, ImageBootInput) (ImageTestResult,
 func (b *orchBooter) BootResident(context.Context, ImageBootInput) (ImageResidentResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.boots++
 	return ImageResidentResult{PID: 4000, GuestIP: "", HostPort: 21000, NetIndex: 1, TapName: "t1", SocketPath: "/run/s1.sock"}, nil
 }
-func (b *orchBooter) Decommission(context.Context, ImageDecommissionInput) error { return nil }
+func (b *orchBooter) Decommission(context.Context, ImageDecommissionInput) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.decommErr
+}
+
+func (b *orchBooter) bootCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.boots
+}
 
 // orchHarness bundles a wired orchestrator over fakes.
 type orchHarness struct {
@@ -293,7 +312,13 @@ type orchHarness struct {
 	// resources is the P19 claim ledger the app-seam guard reads. Empty by
 	// default: an ordinary component deploy is claimed by nothing.
 	resources *fakeResourceRepo
+	// boot is the shared booter fake, so a test can count boots and script a
+	// teardown failure.
+	boot *orchBooter
 }
+
+// booter exposes the harness's shared booter fake.
+func (h orchHarness) booter() *orchBooter { return h.boot }
 
 func newOrchHarness(t *testing.T, hosts []domain.Host, apps ...*domain.FleetApp) orchHarness {
 	t.Helper()
@@ -301,9 +326,10 @@ func newOrchHarness(t *testing.T, hosts []domain.Host, apps ...*domain.FleetApp)
 	repRepo := newOrchReplicaRepo()
 	resRepo := newFakeResourceRepo()
 	sched := NewFleetScheduler(orchHostLister{hosts: hosts}, repRepo, appRepo, time.Minute)
-	runtime := newTestReplicaRuntime(t, fakeMaterializer{rootfs: "/work/r.ext4"}, &orchBooter{}, repRepo, appRepo, "/tmp/imgwork", "10.0.0.9")
+	booter := &orchBooter{}
+	runtime := newTestReplicaRuntime(t, fakeMaterializer{rootfs: "/work/r.ext4"}, booter, repRepo, appRepo, "/tmp/imgwork", "10.0.0.9")
 	orch := newTestOrchestrator(t, appRepo, repRepo, sched, runtime, resRepo)
-	return orchHarness{orch: orch, apps: appRepo, replicas: repRepo, resources: resRepo}
+	return orchHarness{orch: orch, apps: appRepo, replicas: repRepo, resources: resRepo, boot: booter}
 }
 
 // oneLiveHost is THIS host. The orchestrator is constructed with testSelfHost,

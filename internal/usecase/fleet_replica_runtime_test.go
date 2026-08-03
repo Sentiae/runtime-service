@@ -22,6 +22,11 @@ type rtReplicaRepo struct {
 	// that returned the right error after stamping `booting` on a globally visible
 	// row has still told the owning host a boot is in flight that never was.
 	updates int
+	// updateErr / updateErrAfter fail the Nth and later Update calls, so a test can
+	// let the `booting` write through and fail the `resident` one — the rollback
+	// path where the VM is already up.
+	updateErr      error
+	updateErrAfter int
 }
 
 func newRTReplicaRepo() *rtReplicaRepo {
@@ -38,6 +43,9 @@ func (f *rtReplicaRepo) Update(_ context.Context, r *domain.Replica) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updates++
+	if f.updateErr != nil && f.updates >= f.updateErrAfter {
+		return f.updateErr
+	}
 	cp := *r
 	f.store[r.ID] = &cp
 	return nil

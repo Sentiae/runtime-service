@@ -33,6 +33,10 @@ type volRepoFake struct {
 	// beforeHostBind runs inside BindHostAffinity, so a test can make another host
 	// win the CAS in the window this one is adopting.
 	beforeHostBind func()
+	// beforeCreate decides, per call, whether THIS insert succeeds despite
+	// createErr — so one EnsureAppVolumes call can mix a normal insert with an
+	// ack-losing one.
+	beforeCreate func() bool
 }
 
 // put installs a row directly (the committed winner of a race).
@@ -58,7 +62,11 @@ func (f *volRepoFake) Create(_ context.Context, v *domain.Volume) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.creates++
-	if f.createErr != nil {
+	letThrough := false
+	if f.beforeCreate != nil {
+		letThrough = f.beforeCreate()
+	}
+	if f.createErr != nil && !letThrough {
 		if f.onCreate != nil {
 			f.mu.Unlock()
 			f.onCreate(v)

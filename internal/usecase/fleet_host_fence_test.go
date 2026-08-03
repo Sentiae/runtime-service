@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -705,6 +706,10 @@ func TestEnsureAppVolumes_LegacyNilAffinityAdoptsBeforeItBinds(t *testing.T) {
 // filesystem/DB saga. The rule that decides all of them: a file is deleted only
 // when THIS attempt created it AND an authoritative re-read proves no row owns
 // it. Uncertainty always keeps the bytes.
+// errRereadUnavailable is the AUTHORITATIVE re-read's failure, distinct from the
+// insert's, so the matrix can prove which of the two a caller can match on.
+var errRereadUnavailable = errors.New("ledger unavailable")
+
 func TestEnsureAppVolumes_CreateCompensationMatrix(t *testing.T) {
 	createErr := errors.New("insert violates a unique index")
 	tests := []struct {
@@ -717,7 +722,9 @@ func TestEnsureAppVolumes_CreateCompensationMatrix(t *testing.T) {
 		relistErr  bool
 		wantDelete bool
 		wantErrIs  error
-		wantOK     bool
+		// wantVolume asserts the call RETURNED the committed volume rather than an
+		// empty set — the lost-ack branch must not drop it.
+		wantVolume bool
 	}{
 		{
 			name:       "created, proven no winner: this attempt's file is residue",
@@ -732,13 +739,15 @@ func TestEnsureAppVolumes_CreateCompensationMatrix(t *testing.T) {
 			wantErrIs:  createErr,
 		},
 		{
-			name: "the committed winner IS this attempt: adopt it, delete nothing",
+			name: "the committed winner IS this attempt: adopt it, return it, delete nothing",
 			// A lost ack / retried write. Deleting the file would destroy the volume
-			// the ledger now promises.
+			// the ledger now promises — and DROPPING it from the result set would tell
+			// ProvisionApp the app is stateless, which is what enforces the
+			// single-writer scale guard.
 			created:    true,
 			winner:     sameAttemptWinner,
 			wantDelete: false,
-			wantOK:     true,
+			wantVolume: true,
 		},
 		{
 			name:       "a DIFFERENT winner holds the mount: reclaim only our own file",
@@ -758,10 +767,13 @@ func TestEnsureAppVolumes_CreateCompensationMatrix(t *testing.T) {
 			name: "the re-read itself fails: ownership is unknown, keep the bytes",
 			// Uncertain ownership is never permission to delete possible customer
 			// data; the report-only ledger reconciler surfaces the unattributed file.
+			// The RE-READ error is what is returned and matchable — it is the thing
+			// that made the outcome undecidable, and rendering it as %v text inside
+			// the create error would hide it from errors.Is.
 			created:    true,
 			relistErr:  true,
 			wantDelete: false,
-			wantErrIs:  createErr,
+			wantErrIs:  errRereadUnavailable,
 		},
 	}
 	for _, tt := range tests {
@@ -774,7 +786,7 @@ func TestEnsureAppVolumes_CreateCompensationMatrix(t *testing.T) {
 			repo.createErr = createErr
 			repo.onCreate = func(attempt *domain.Volume) {
 				if tt.relistErr {
-					repo.listErr = errors.New("ledger unavailable")
+					repo.listErr = errRereadUnavailable
 					return
 				}
 				if tt.winner == nil {
@@ -787,18 +799,80 @@ func TestEnsureAppVolumes_CreateCompensationMatrix(t *testing.T) {
 				repo.put(w)
 			}
 
-			_, err := m.EnsureAppVolumes(context.Background(), appID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}})
-			if tt.wantOK {
+			out, err := m.EnsureAppVolumes(context.Background(), appID, []VolumeSpecInput{{SizeMB: 64, MountPath: "/data"}})
+			if tt.wantVolume {
 				if err != nil {
 					t.Fatalf("EnsureAppVolumes = %v, want nil (the committed row is this attempt)", err)
 				}
-			} else if !errors.Is(err, tt.wantErrIs) {
-				t.Fatalf("EnsureAppVolumes = %v, want %v", err, tt.wantErrIs)
+				if len(out) != 1 {
+					t.Fatalf("returned %d volumes, want 1 — the committed winner must flow into the result set", len(out))
+				}
+				if out[0].MountPath != "/data" || out[0].BackingPath == "" {
+					t.Fatalf("returned volume = %+v, want the committed row for /data", out[0])
+				}
+				if out[0].HostAffinity == nil || *out[0].HostAffinity != testSelfHost {
+					t.Fatalf("returned volume affinity = %v, want this host", out[0].HostAffinity)
+				}
+			} else {
+				if !errors.Is(err, tt.wantErrIs) {
+					t.Fatalf("EnsureAppVolumes = %v, want errors.Is(_, %v)", err, tt.wantErrIs)
+				}
+				if len(out) != 0 {
+					t.Fatalf("returned %d volumes on a failed ensure, want 0", len(out))
+				}
 			}
 			if got := len(backend.deleted) > 0; got != tt.wantDelete {
 				t.Fatalf("deleted = %v (%v), want %v", got, backend.deleted, tt.wantDelete)
 			}
 		})
+	}
+}
+
+// TestEnsureAppVolumes_LostAckKeepsEarlierSpecVolumes: the lost-ack branch used
+// to return (nil, nil), which dropped not only the winner but every volume
+// already ensured in this call. ProvisionApp reads that length to decide whether
+// the app is volume-bearing, so a stateful app would have passed the
+// single-writer scale guard as if it were stateless.
+func TestEnsureAppVolumes_LostAckKeepsEarlierSpecVolumes(t *testing.T) {
+	appID := uuid.New()
+	repo := newVolRepoFake()
+	backend := &recordingModeBackend{created: true}
+	m := newTestVolumeManager(t, repo, backend, "/vol", nil)
+
+	// The FIRST spec inserts normally; the SECOND loses its ack and is adopted.
+	first := true
+	repo.createErr = errors.New("insert violates a unique index")
+	repo.onCreate = func(attempt *domain.Volume) {
+		// The committed winner IS this attempt (a lost ack): same id, same path.
+		w := sameAttemptWinner(appID, attempt.BackingPath)
+		w.ID = attempt.ID
+		w.MountPath = attempt.MountPath
+		repo.put(w)
+	}
+	repo.beforeCreate = func() bool {
+		if first {
+			first = false
+			return true // let the first insert through
+		}
+		return false
+	}
+
+	out, err := m.EnsureAppVolumes(context.Background(), appID, []VolumeSpecInput{
+		{SizeMB: 64, MountPath: "/data"},
+		{SizeMB: 64, MountPath: "/wal"},
+	})
+	if err != nil {
+		t.Fatalf("EnsureAppVolumes: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("returned %d volumes, want 2 (the ack-losing spec AND the one before it)", len(out))
+	}
+	mounts := map[string]bool{out[0].MountPath: true, out[1].MountPath: true}
+	if !mounts["/data"] || !mounts["/wal"] {
+		t.Fatalf("returned mounts = %v, want both /data and /wal", mounts)
+	}
+	if len(backend.deleted) != 0 {
+		t.Fatalf("deleted %v — the adopted winner's bytes are the ledger's promise", backend.deleted)
 	}
 }
 
@@ -1188,5 +1262,373 @@ func TestRestore_ReReadsOwnershipBeforeTouchingBytes(t *testing.T) {
 	}
 	if h.scaler.count() != 0 {
 		t.Fatalf("drained the app (%d scale calls) after ownership was lost", h.scaler.count())
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Architect review of 6a3fe1c — the six agreed corrections.
+// ─────────────────────────────────────────────────────────────────────
+
+// TestActuateScheduledOwned_ConcurrentCallersBootExactlyOnce.
+//
+// The pass has TWO callers by design (the reconcile tick and the activator's
+// wake path) and the transition underneath it is a read-then-write, not a
+// compare-and-set: BootReplica does FindByID and then unconditionally persists
+// `booting`. Without serialization both callers observe `scheduled` and both
+// boot the SAME row — and the second boot re-derives the same jail slot, whose
+// prepare() begins with os.RemoveAll(jailDir), so it deletes the live first VM's
+// chroot and hands its uid and /30 to a second Firecracker.
+func TestActuateScheduledOwned_ConcurrentCallersBootExactlyOnce(t *testing.T) {
+	app := testFleetApp(0)
+	h := newOrchHarness(t, oneLiveHost(), app)
+	row := &domain.Replica{
+		ID: uuid.New(), AppID: app.ID, HostID: hostPtr(testSelfHost),
+		State: domain.ReplicaStateScheduled, CreatedAt: time.Now().UTC(),
+	}
+	if err := h.replicas.Create(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = h.orch.actuateScheduledOwned(context.Background())
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("actuateScheduledOwned[%d]: %v", i, err)
+		}
+	}
+	booter := h.booter()
+	if n := booter.bootCount(); n != 1 {
+		t.Fatalf("BootResident called %d times for ONE scheduled row, want exactly 1 — a second boot would RemoveAll the first VM's live jail", n)
+	}
+	got, _ := h.replicas.FindByID(context.Background(), row.ID)
+	if got.State != domain.ReplicaStateResident {
+		t.Fatalf("state = %q, want resident", got.State)
+	}
+}
+
+// TestReconcileApp_PropagatesTheFirstLocalTeardownErrorAndHoldsPlacement.
+//
+// Two properties in one pass, and the second is the safety one: a retained
+// `dead` row does not count as occupying, so a shortfall replacement would boot
+// while the unproven VMM may still hold the app's single-writer volume.
+func TestReconcileApp_PropagatesTheFirstLocalTeardownErrorAndHoldsPlacement(t *testing.T) {
+	tests := []struct {
+		name  string
+		cause error
+	}{
+		{"an arbitrary teardown failure", errors.New("tap delete failed")},
+		{"an unproven termination", domain.ErrVMTerminationUnproven},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := testFleetApp(1)
+			h := newOrchHarness(t, oneLiveHost(), app)
+			h.booter().decommErr = tt.cause
+			dead := &domain.Replica{
+				ID: uuid.New(), AppID: app.ID, HostID: hostPtr(testSelfHost),
+				State: domain.ReplicaStateDead, RestartPolicy: domain.RestartPolicyAlways,
+				CreatedAt: time.Now().UTC(),
+			}
+			pid := 4242
+			dead.PID = &pid
+			if err := h.replicas.Create(context.Background(), dead); err != nil {
+				t.Fatal(err)
+			}
+
+			err := h.orch.ReconcileApp(context.Background(), app.ID)
+			if !errors.Is(err, tt.cause) {
+				t.Fatalf("ReconcileApp = %v, want errors.Is(_, %v) — the REAL cause, not a substitute", err, tt.cause)
+			}
+			if _, ferr := h.replicas.FindByID(context.Background(), dead.ID); ferr != nil {
+				t.Fatalf("the undrained row was deleted: %v", ferr)
+			}
+			if n := h.replicas.count(); n != 1 {
+				t.Fatalf("replicas = %d, want 1 — no REPLACEMENT may be placed while the previous VMM cannot be proven gone", n)
+			}
+			// And nothing was booted either, on this pass or by the actuation pass.
+			h.actuate(t)
+			if n := h.booter().bootCount(); n != 0 {
+				t.Fatalf("booted %d replicas while a teardown was unproven, want 0", n)
+			}
+		})
+	}
+}
+
+// TestDecommissionApp_PropagatesTheRealTeardownCause. Substituting
+// ErrVMTerminationUnproven would overwrite the actual diagnosis — a TAP that
+// would not delete, a lease the ledger refused — with a claim about the VMM this
+// path never established.
+func TestDecommissionApp_PropagatesTheRealTeardownCause(t *testing.T) {
+	cause := errors.New("release microVM addressing lease: ledger unavailable")
+	app := testFleetApp(1)
+	h := newOrchHarness(t, oneLiveHost(), app)
+	h.booter().decommErr = cause
+	vols := newVolRepoFake(volWithBacking(app.ID, "/vol/data.ext4"))
+	h.orch.SetVolumeManager(newTestVolumeManager(t, vols, &recordingBackend{}, "/vol", nil))
+
+	pid := 4242
+	local := &domain.Replica{
+		ID: uuid.New(), AppID: app.ID, HostID: hostPtr(testSelfHost),
+		State: domain.ReplicaStateResident, PID: &pid, CreatedAt: time.Now().UTC(),
+	}
+	if err := h.replicas.Create(context.Background(), local); err != nil {
+		t.Fatal(err)
+	}
+	origAlive := processAlive
+	processAlive = func(int) bool { return false } // health marks it dead → teardown → fails
+	defer func() { processAlive = origAlive }()
+
+	known, err := h.orch.DecommissionApp(context.Background(), app.ID)
+	if !known {
+		t.Fatal("known = false, want true")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("DecommissionApp = %v, want errors.Is(_, %v)", err, cause)
+	}
+	if errors.Is(err, domain.ErrVMTerminationUnproven) {
+		t.Fatal("the real cause was replaced by ErrVMTerminationUnproven")
+	}
+	if vols.count() != 1 || !h.apps.has(app.ID) {
+		t.Fatal("volumes or the app row were reclaimed while a replica survived")
+	}
+}
+
+// TestDecommissionReplica_NetCoordinateOnlyRowStillReachesTheBooter. The lease is
+// taken BEFORE the TAP and the VM exist, so a boot that died in that window
+// records a net index and nothing else. Skipping the booter for such a row
+// deleted it and orphaned the live lease — a /30, a uid and a jail slot nothing
+// would ever release.
+func TestDecommissionReplica_NetCoordinateOnlyRowStillReachesTheBooter(t *testing.T) {
+	app := newTestApp()
+	rep := newTestReplica(app.ID)
+	rep.NetIndex = 7 // the ONLY artifact: no pid, no socket, no tap
+	replicas := newRTReplicaRepo()
+	if err := replicas.Create(context.Background(), rep); err != nil {
+		t.Fatal(err)
+	}
+	booter := &recordingBooter{decommErr: domain.ErrVMTerminationUnproven}
+	uc := newTestReplicaRuntime(t, fakeMaterializer{}, booter, replicas, &rtAppRepo{app: app}, t.TempDir(), "10.0.0.9")
+
+	err := uc.DecommissionReplica(context.Background(), rep.ID)
+	if booter.decommN != 1 {
+		t.Fatalf("booter Decommission called %d times, want 1 — a net coordinate is a live lease", booter.decommN)
+	}
+	if !errors.Is(err, domain.ErrVMTerminationUnproven) {
+		t.Fatalf("DecommissionReplica = %v, want the booter's verdict", err)
+	}
+	if _, ferr := replicas.FindByID(context.Background(), rep.ID); ferr != nil {
+		t.Fatalf("the row was deleted while its lease was unreleased: %v", ferr)
+	}
+}
+
+// TestBootReplica_UnprovenRollbackRetainsTheStagingTree. When the row cannot be
+// persisted AND the VM cannot be torn down, the staging tree is the last on-disk
+// evidence of what that pid is running. Reclaiming it anyway is precisely the
+// shape that produced the live orphans.
+func TestBootReplica_UnprovenRollbackRetainsTheStagingTree(t *testing.T) {
+	app := newTestApp()
+	rep := newTestReplica(app.ID)
+	replicas := newRTReplicaRepo()
+	if err := replicas.Create(context.Background(), rep); err != nil {
+		t.Fatal(err)
+	}
+	persistErr := errors.New("ledger unavailable")
+	replicas.updateErrAfter = 2 // let `booting` through, fail the `resident` write
+
+	workDir := t.TempDir()
+	staging := filepath.Join(workDir, rep.ID.String())
+	if err := mkdirAllForTest(staging); err != nil {
+		t.Fatal(err)
+	}
+	replicas.updateErr = persistErr
+	booter := &recordingBooter{
+		resident:  ImageResidentResult{PID: 4242, GuestIP: "10.201.0.6"},
+		decommErr: domain.ErrVMTerminationUnproven,
+	}
+	uc := newTestReplicaRuntime(t, fakeMaterializer{rootfs: "/work/r.ext4"}, booter, replicas,
+		&rtAppRepo{app: app}, workDir, "10.0.0.9")
+
+	err := uc.BootReplica(context.Background(), rep.ID)
+	if !errors.Is(err, domain.ErrVMTerminationUnproven) {
+		t.Fatalf("BootReplica = %v, want the teardown's unproven verdict to propagate", err)
+	}
+	if !dirExistsForTest(staging) {
+		t.Fatal("the staging tree was reclaimed although the VM was never proven gone")
+	}
+}
+
+// ── FleetProvision: the same proof-discard bypasses ───────────────────
+//
+// The workload seam had the identical shape as the replica seam: a teardown
+// whose verdict was logged and dropped, followed by a terminal state write. The
+// state is what makes it unrecoverable — `exited`/`failed` are terminal, and the
+// teardown branch only fires from `running`, so a later retry walks straight
+// past a VMM that was never proven dead and a lease that was never released.
+
+// provisionBooter records teardown calls and can script their outcome.
+type provisionBooter struct {
+	mu        sync.Mutex
+	resident  ImageResidentResult
+	resErr    error
+	decommErr error
+	decommN   int
+	lastPID   int
+}
+
+func (b *provisionBooter) BootTest(context.Context, ImageBootInput) (ImageTestResult, error) {
+	return ImageTestResult{}, nil
+}
+func (b *provisionBooter) BootResident(context.Context, ImageBootInput) (ImageResidentResult, error) {
+	return b.resident, b.resErr
+}
+func (b *provisionBooter) Decommission(_ context.Context, in ImageDecommissionInput) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.decommN++
+	b.lastPID = in.PID
+	return b.decommErr
+}
+
+func seedRunningResident(t *testing.T, repo *fakeWorkloadRepo) *domain.ImageWorkload {
+	t.Helper()
+	pid := 4242
+	now := time.Now().UTC()
+	wl := &domain.ImageWorkload{
+		ID: uuid.New(), Class: domain.ImageWorkloadClassResident,
+		State: domain.ImageWorkloadStateRunning, PID: &pid,
+		GuestIP: "10.201.0.6", Port: 8080, NetIndex: 7, TapName: "img7",
+		SocketPath: "/run/x.sock", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := repo.Create(context.Background(), wl); err != nil {
+		t.Fatal(err)
+	}
+	return wl
+}
+
+// (6b) Decommission must not swallow a teardown error into marked-Exited.
+func TestFleetProvisionDecommission_KeepsTheRetryPathOnAnUnprovenTeardown(t *testing.T) {
+	repo := newFakeWorkloadRepo()
+	wl := seedRunningResident(t, repo)
+	booter := &provisionBooter{decommErr: domain.ErrVMTerminationUnproven}
+	uc := newUC(repo, fakeMaterializer{}, booter)
+
+	err := uc.Decommission(context.Background(), wl.ID.String())
+	if !errors.Is(err, domain.ErrVMTerminationUnproven) {
+		t.Fatalf("Decommission = %v, want the booter's unproven verdict", err)
+	}
+	got, ferr := repo.FindByID(context.Background(), wl.ID)
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	if got.State != domain.ImageWorkloadStateRunning {
+		t.Fatalf("state = %q, want it left at %q — `exited` is terminal and the retry would then skip teardown entirely",
+			got.State, domain.ImageWorkloadStateRunning)
+	}
+	// And the retry does reach the booter again.
+	booter.decommErr = nil
+	if rerr := uc.Decommission(context.Background(), wl.ID.String()); rerr != nil {
+		t.Fatalf("retry: %v", rerr)
+	}
+	if booter.decommN != 2 {
+		t.Fatalf("booter Decommission called %d times, want 2 (the retry must re-attempt it)", booter.decommN)
+	}
+	got, _ = repo.FindByID(context.Background(), wl.ID)
+	if got.State != domain.ImageWorkloadStateExited {
+		t.Fatalf("state after a PROVEN teardown = %q, want exited", got.State)
+	}
+}
+
+// (6c) Health's dead-resident path must keep the recorded PID and must not
+// commit the terminal state when teardown failed.
+func TestFleetProvisionHealth_DeadResidentKeepsItsPIDAndItsRetry(t *testing.T) {
+	origAlive := processAlive
+	processAlive = func(int) bool { return false } // the VM process is gone
+	defer func() { processAlive = origAlive }()
+
+	t.Run("the recorded pid is handed to the teardown as its proof", func(t *testing.T) {
+		repo := newFakeWorkloadRepo()
+		wl := seedRunningResident(t, repo)
+		booter := &provisionBooter{}
+		uc := newUC(repo, fakeMaterializer{}, booter)
+
+		if _, err := uc.Health(context.Background(), wl.ID.String()); err != nil {
+			t.Fatalf("Health: %v", err)
+		}
+		if booter.lastPID != *wl.PID {
+			t.Fatalf("teardown was given pid %d, want the recorded %d — a zero pid with live artifacts is UNPROVABLE and refuses, so clearing it turns a provable teardown into a refused one",
+				booter.lastPID, *wl.PID)
+		}
+	})
+
+	t.Run("a failed teardown leaves the row running so a later health retries it", func(t *testing.T) {
+		repo := newFakeWorkloadRepo()
+		wl := seedRunningResident(t, repo)
+		booter := &provisionBooter{decommErr: domain.ErrVMTerminationUnproven}
+		uc := newUC(repo, fakeMaterializer{}, booter)
+
+		if _, err := uc.Health(context.Background(), wl.ID.String()); err != nil {
+			t.Fatalf("Health: %v", err)
+		}
+		got, _ := repo.FindByID(context.Background(), wl.ID)
+		if got.State != domain.ImageWorkloadStateRunning {
+			t.Fatalf("state = %q, want it left at %q — `failed` is terminal for this branch and the retry would never tear down again",
+				got.State, domain.ImageWorkloadStateRunning)
+		}
+		if got.PID == nil {
+			t.Fatal("the recorded pid was cleared, so no later teardown can prove the process gone")
+		}
+		// The later Health retries and, once it succeeds, commits the terminal state.
+		booter.decommErr = nil
+		if _, err := uc.Health(context.Background(), wl.ID.String()); err != nil {
+			t.Fatalf("Health retry: %v", err)
+		}
+		if booter.decommN != 2 {
+			t.Fatalf("booter Decommission called %d times, want 2", booter.decommN)
+		}
+		got, _ = repo.FindByID(context.Background(), wl.ID)
+		if got.State != domain.ImageWorkloadStateFailed {
+			t.Fatalf("state after a PROVEN teardown = %q, want failed", got.State)
+		}
+	})
+}
+
+// (6d) runResident's persist rollback: the VM is up, the row could not be
+// written, and the teardown could not prove the VM gone. The proof-bearing error
+// must reach the caller — a bare "persist failed" reads as a database problem
+// while a live untracked VMM is holding a lease, a TAP and a jail slot.
+func TestFleetProvisionRunResident_PersistRollbackPropagatesAnUnprovenTeardown(t *testing.T) {
+	repo := newFakeWorkloadRepo()
+	persistErr := errors.New("ledger unavailable")
+	// Let the early writes through (create + the rootfs stamp) and fail the write
+	// that persists the RUNNING resident.
+	repo.updateErr = persistErr
+	repo.updateErrAfter = 2
+	booter := &provisionBooter{
+		resident:  ImageResidentResult{PID: 4242, GuestIP: "10.201.0.6", HostPort: 21000, NetIndex: 7, TapName: "img7", SocketPath: "/run/x.sock"},
+		decommErr: domain.ErrVMTerminationUnproven,
+	}
+	uc := newUC(repo, fakeMaterializer{rootfs: "/work/r.ext4"}, booter)
+
+	_, err := uc.Provision(context.Background(), FleetProvisionInput{
+		Registry: "reg:8089", Repository: "org/app", Digest: "sha256:abc",
+		WorkloadClass: "resident", Port: 8080,
+	})
+	if !errors.Is(err, domain.ErrVMTerminationUnproven) {
+		t.Fatalf("Provision = %v, want the teardown's unproven verdict to propagate", err)
+	}
+	if booter.decommN != 1 {
+		t.Fatalf("booter Decommission called %d times, want 1", booter.decommN)
 	}
 }
