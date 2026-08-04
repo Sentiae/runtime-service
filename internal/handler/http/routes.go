@@ -5,13 +5,13 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sentiae/platform-kit/buildinfo"
 	kafka "github.com/sentiae/platform-kit/kafka"
 	"github.com/sentiae/platform-kit/opshttp"
 	"github.com/sentiae/platform-kit/posture"
 	"github.com/sentiae/runtime-service/internal/infrastructure/canvasservice"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
 	"github.com/sentiae/runtime-service/internal/usecase"
-	"github.com/sentiae/runtime-service/internal/version"
 )
 
 // Server represents the HTTP server with all handlers
@@ -328,10 +328,13 @@ func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 		"status":  "healthy",
 		"service": "runtime-service",
 		"version": "1.0.0",
-		// Deploy provenance: the commit this image was built from, identical to
-		// the image's org.opencontainers.image.revision label (same build arg).
-		"vcs.revision": version.Revision,
-		"vcs.modified": version.Modified,
+		// Build identity: the commit this binary was built from (identical to
+		// the image's org.opencontainers.image.revision label — same build arg),
+		// whether that source was modified, and the digest of the manifest
+		// naming its full source closure. Emitted as the buildinfo.Info value so
+		// the field names live in exactly one place (platform-kit pins them);
+		// re-spelling them here would be a second copy of the contract.
+		"build": buildinfo.Get(),
 	})
 }
 

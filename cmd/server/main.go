@@ -13,13 +13,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sentiae/platform-kit/buildinfo"
 	pkdebug "github.com/sentiae/platform-kit/debug"
 	pkkafka "github.com/sentiae/platform-kit/kafka"
 	pklogger "github.com/sentiae/platform-kit/logger"
 	otelkit "github.com/sentiae/platform-kit/otel"
 	"github.com/sentiae/runtime-service/internal/app"
 	"github.com/sentiae/runtime-service/internal/di"
-	"github.com/sentiae/runtime-service/internal/version"
 	"github.com/sentiae/runtime-service/pkg/config"
 	"github.com/sentiae/runtime-service/pkg/logger"
 )
@@ -123,13 +123,18 @@ func main() {
 	// sentinel silently degrades to codes.Internal at the boundary.
 	app.RegisterErrors()
 
-	// Deploy provenance, structured so it is queryable in the log plane. The
-	// same VCS_REVISION build arg labels the image
+	// Build identity, structured so it is queryable in the log plane. The same
+	// VCS_REVISION build arg labels the image
 	// (org.opencontainers.image.revision), so this line and `docker inspect`
-	// cannot disagree about what source is running.
-	pklogger.FromContext(context.Background()).Info("runtime-service build provenance",
-		"vcs.revision", version.Revision,
-		"vcs.modified", version.Modified,
+	// cannot disagree about what source is running. A build path that passes no
+	// ldflags (the fleet bake) falls back to the toolchain's own vcs settings
+	// inside buildinfo, so this never reports an empty revision from a git
+	// checkout build.
+	bi := buildinfo.Get()
+	pklogger.FromContext(context.Background()).Info("runtime-service build identity",
+		"primary_revision", bi.PrimaryRevision,
+		"modified", bi.Modified,
+		"source_manifest_digest", bi.SourceManifestDigest,
 		"version", Version,
 		"build_time", BuildTime,
 	)

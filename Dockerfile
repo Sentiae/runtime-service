@@ -66,7 +66,7 @@ ARG BUILD_TIME
 RUN CGO_ENABLED=0 go build \
     -a \
     -installsuffix cgo \
-    -ldflags="-w -s -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X github.com/sentiae/runtime-service/internal/version.Revision=${VCS_REVISION} -X github.com/sentiae/runtime-service/internal/version.Modified=${VCS_MODIFIED}" \
+    -ldflags="-w -s -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X github.com/sentiae/platform-kit/buildinfo.Revision=${VCS_REVISION} -X github.com/sentiae/platform-kit/buildinfo.Modified=${VCS_MODIFIED}" \
     -o /build/bin/runtime-service \
     ./cmd/server/
 

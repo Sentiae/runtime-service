@@ -1,7 +1,12 @@
-// fleetctl — throwaway mTLS client to drive runtime.v1.FleetOrchestration on the
-// KVM fleet host for the rt#9 durable-volume verification. NOT production code;
-// keep untracked. Dials :50061 over mTLS with an SVID from the workload API and
-// attaches the shared api-key as authz metadata.
+// fleetctl — mTLS client that drives runtime.v1.FleetOrchestration on the KVM
+// fleet host: it is how provision/status/decommission are exercised against a
+// real host (originally the rt#9 durable-volume verification, now the I27
+// verification path for the fleet). Dials :50061 over mTLS with an SVID from
+// the workload API and attaches the shared api-key as authz metadata.
+//
+// It is TRACKED AND SHIPPED, not throwaway: infrastructure b61ccfa put it in
+// the fleet-host deploy set, so it is an operational tool that lands on the
+// host. Changes here reach a production host — treat it as production code.
 package main
 
 import (
