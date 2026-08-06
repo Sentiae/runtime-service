@@ -83,7 +83,8 @@ func TestStampProbe(t *testing.T) {
 		t.Skip("probe body: driven by TestStampIsReadableFromLinkedBinary")
 	}
 	info := buildinfo.Get()
-	fmt.Printf("PROBE primary_revision=%s modified=%t\n", info.PrimaryRevision, info.Modified)
+	fmt.Printf("PROBE primary_revision=%s modified=%t source_manifest_digest=%s\n",
+		info.PrimaryRevision, info.Modified, info.SourceManifestDigest)
 }
 
 // stampFlagRx matches a linker -X argument whose value comes from one of the
