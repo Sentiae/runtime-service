@@ -31,6 +31,10 @@ const (
 	EventNodeExecStarted   = "sentiae.runtime.node.execution.started"
 	EventNodeExecCompleted = "sentiae.runtime.node.execution.completed"
 	EventNodeExecFailed    = "sentiae.runtime.node.execution.failed"
+	// EventNodeExecSkipped is emitted for a node the plan did not fire. A skip
+	// is a recorded outcome, not an absence — a run whose node rows do not
+	// account for every node in the plan cannot be reasoned about afterwards.
+	EventNodeExecSkipped = "sentiae.runtime.node.execution.skipped"
 
 	// Debug events
 	EventGraphDebugCreated   = "sentiae.runtime.graph.debug.created"

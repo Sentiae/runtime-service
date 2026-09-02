@@ -100,6 +100,12 @@ RUN apk --no-cache add \
 RUN addgroup -g 1000 runtime && \
     adduser -D -u 1000 -G runtime runtime
 
+# Per-invocation broker sockets live here, on the tmpfs volume compose mounts at
+# this path. The directory must exist and be owned by the runtime user BEFORE
+# the volume is mounted, because the mount inherits the mount point's ownership
+# and the process creating per-invocation subdirectories runs as uid 1000.
+RUN mkdir -p /var/lib/sentiae/node-runs && chown runtime:runtime /var/lib/sentiae/node-runs
+
 # Set working directory
 WORKDIR /app
 

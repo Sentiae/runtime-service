@@ -1,0 +1,121 @@
+{
+  "edges": [
+    {
+      "from": "echo",
+      "from_port": "data",
+      "to": "reply",
+      "to_port": "body"
+    },
+    {
+      "from": "greet",
+      "from_port": "out",
+      "to": "echo",
+      "to_port": "body"
+    },
+    {
+      "from": "intake",
+      "from_port": "body",
+      "to": "pick",
+      "to_port": "body"
+    },
+    {
+      "from": "pick",
+      "from_port": "name",
+      "to": "greet",
+      "to_port": "name"
+    }
+  ],
+  "nodes": [
+    {
+      "alias": "webhook_trigger",
+      "outputs": [
+        "body",
+        "headers",
+        "query",
+        "method",
+        "path"
+      ],
+      "pin": "@sentiae/webhook-trigger@1.0.0",
+      "promoted": {},
+      "required": [],
+      "role": "trigger",
+      "slug": "intake",
+      "upstream": []
+    },
+    {
+      "alias": "pick_name",
+      "outputs": [
+        "name"
+      ],
+      "pin": "@acme/pick-name@1.0.0",
+      "promoted": {},
+      "required": [
+        "body"
+      ],
+      "role": "",
+      "slug": "pick",
+      "upstream": [
+        "intake"
+      ]
+    },
+    {
+      "alias": "hello",
+      "outputs": [
+        "out"
+      ],
+      "pin": "@acme/hello@1.0.9",
+      "promoted": {},
+      "required": [
+        "name"
+      ],
+      "role": "",
+      "slug": "greet",
+      "upstream": [
+        "pick"
+      ]
+    },
+    {
+      "alias": "http_request",
+      "outputs": [
+        "status_code",
+        "body",
+        "data"
+      ],
+      "pin": "@sentiae/http-request@1.0.0",
+      "promoted": {},
+      "required": [],
+      "role": "",
+      "slug": "echo",
+      "upstream": [
+        "greet"
+      ]
+    },
+    {
+      "alias": "respond",
+      "outputs": [
+        "response"
+      ],
+      "pin": "@sentiae/respond@1.0.0",
+      "promoted": {},
+      "required": [
+        "body"
+      ],
+      "role": "respond",
+      "slug": "reply",
+      "upstream": [
+        "echo"
+      ]
+    }
+  ],
+  "order": [
+    "intake",
+    "pick",
+    "greet",
+    "echo",
+    "reply"
+  ],
+  "responds": [
+    "reply"
+  ],
+  "trigger": "intake"
+}

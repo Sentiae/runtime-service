@@ -69,16 +69,20 @@ func TestExecuteCodeNode_RunsUserCodeFromConfig(t *testing.T) {
 		SortOrder: 0,
 	}
 
-	// Sanity: the resolver must surface the config values (and the node must
-	// validate on those alone, so a config-only code node deploys).
+	// Sanity: the resolver must surface the config values.
+	//
+	// The companion assertion — that such a node also VALIDATES — was removed
+	// in Phase 4 S1, not because it stopped mattering but because it stopped
+	// being true: GraphNode.Validate now requires a bundle type and a resolved
+	// node_ref (D-9), so a code node is refused by design one slice before the
+	// engine that replaces it lands. This file and the code path it covers are
+	// deleted in S2; until then the dispatch and output-shaping assertions
+	// below are what it still proves.
 	if got := codeNode.ResolvedCode(); got != userCode {
 		t.Fatalf("ResolvedCode did not read config.code:\n got %q", got)
 	}
 	if l := codeNode.ResolvedLanguage(); l == nil || *l != domain.LanguageJavaScript {
 		t.Fatalf("ResolvedLanguage did not read config.language: got %v", l)
-	}
-	if err := codeNode.Validate(); err != nil {
-		t.Fatalf("config-only code node failed validation: %v", err)
 	}
 
 	warm := &fakeWarmRunner{}

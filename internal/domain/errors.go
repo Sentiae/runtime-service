@@ -66,6 +66,33 @@ var (
 	ErrTerminalSessionClosed   = errors.New("terminal session is already closed")
 	ErrTerminalVMNotReady      = errors.New("terminal VM is not ready")
 
+	// Phase 4 — a graph node IS a built bundle (D-9). These are the refusals of
+	// the interpreter-shaped inputs the bundle model retires, and of the
+	// node-runner faults that must fail closed rather than run something
+	// unpinned.
+	ErrLegacyGraph           = errors.New("graph has nodes without node_ref (legacy interpreter graph)")
+	ErrNodeRefRequired       = errors.New("node_ref is required")
+	ErrLegacyNodeInput       = errors.New("node_type, language and code are retired; supply node_ref")
+	ErrInvalidNodeRef        = errors.New("invalid node_ref")
+	ErrInvalidPortSpec       = errors.New("invalid port spec")
+	ErrInvalidSecretSpec     = errors.New("invalid secret spec")
+	ErrInvalidRole           = errors.New("role must be \"\", trigger or respond")
+	ErrInvalidEgressPattern  = errors.New("invalid egress pattern")
+	ErrPlanInvalid           = errors.New("execution plan is invalid")
+	ErrSeededOutputsRetired  = errors.New("seeded_outputs is retired (T-RUN-PARTIAL-RERUN)")
+	ErrSecretTokenRequired   = errors.New("graph declares secrets but no secret token was handed (x-sentiae-secret-token)")
+	ErrSecretTokenUnexpected = errors.New("secret token handed to a graph that declares no secrets")
+	ErrRequiredSecretAbsent  = errors.New("required secret absent")
+	ErrTriggerInputInvalid   = errors.New("trigger input is not a request object")
+	ErrNodeConfigInvalid     = errors.New("node config is not a JSON object")
+	ErrNodeFailed            = errors.New("node failed")
+	ErrNoResponse            = errors.New("no_response")
+	ErrMultipleResponses     = errors.New("multiple_responses")
+	ErrGraphDebugRetired     = errors.New("graph debug sessions are retired (T-RUN-DEBUG-SESSIONS-REBUILD)")
+	ErrBundlePullFailed      = errors.New("bundle image pull failed")
+	ErrNodeRunnerNotReady    = errors.New("node runner is not configured")
+	ErrNodeRunnerBusy        = errors.New("node runner has no free invocation subnet")
+
 	// §9.2 hermetic chain integrity. ErrHashMismatch is returned when
 	// a step's verified prior-artifact digest does not match what the
 	// store rehydrates — indicates corruption or tampering.

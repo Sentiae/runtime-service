@@ -16,13 +16,16 @@ const (
 	GraphExecFailed    GraphExecutionStatus = "failed"
 	GraphExecCancelled GraphExecutionStatus = "cancelled"
 	GraphExecTimeout   GraphExecutionStatus = "timeout"
+	// GraphExecSkipped is a NODE outcome: an unfired branch is recorded rather
+	// than left absent, so a run's node rows account for every node in the plan.
+	GraphExecSkipped GraphExecutionStatus = "skipped"
 )
 
 // IsValid checks if the graph execution status is valid
 func (s GraphExecutionStatus) IsValid() bool {
 	switch s {
 	case GraphExecPending, GraphExecRunning, GraphExecCompleted,
-		GraphExecFailed, GraphExecCancelled, GraphExecTimeout:
+		GraphExecFailed, GraphExecCancelled, GraphExecTimeout, GraphExecSkipped:
 		return true
 	}
 	return false

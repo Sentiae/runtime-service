@@ -45,13 +45,17 @@ type CreateGraphRequest struct {
 	Edges       []CreateEdgeRequest `json:"edges"`
 }
 
-// CreateNodeRequest represents a node in the create graph request
+// CreateNodeRequest represents a node in the create graph request.
+//
+// ⚠ This REST surface predates Phase 4 and cannot express a bundle node: it
+// carries no node_ref, so every create through it is refused with
+// ErrNodeRefRequired. The retired node_type/language/code fields are gone
+// rather than accepted-and-ignored — a field a caller can still set and the
+// server silently drops is worse than one it cannot set at all. The surface has
+// no caller today; T-RUN-HTTP-GRAPH-REST-RETIRE removes it.
 type CreateNodeRequest struct {
-	NodeType  string           `json:"node_type"`
 	Name      string           `json:"name"`
 	Config    domain.JSONMap   `json:"config,omitempty"`
-	Language  string           `json:"language,omitempty"`
-	Code      string           `json:"code,omitempty"`
 	Resources *ResourceRequest `json:"resources,omitempty"`
 	Position  domain.JSONMap   `json:"position,omitempty"`
 	SortOrder int              `json:"sort_order"`
@@ -123,16 +127,10 @@ func (h *GraphHandler) CreateGraph(w http.ResponseWriter, r *http.Request) {
 
 	for _, n := range req.Nodes {
 		nodeInput := usecase.CreateGraphNodeInput{
-			NodeType:  domain.GraphNodeType(n.NodeType),
 			Name:      n.Name,
 			Config:    n.Config,
-			Code:      n.Code,
 			Position:  n.Position,
 			SortOrder: n.SortOrder,
-		}
-		if n.Language != "" {
-			lang := domain.Language(n.Language)
-			nodeInput.Language = &lang
 		}
 		if n.Resources != nil {
 			nodeInput.Resources = &domain.ResourceLimit{
@@ -236,16 +234,10 @@ func (h *GraphHandler) UpdateGraph(w http.ResponseWriter, r *http.Request) {
 		var nodes []usecase.CreateGraphNodeInput
 		for _, n := range req.Nodes {
 			nodeInput := usecase.CreateGraphNodeInput{
-				NodeType:  domain.GraphNodeType(n.NodeType),
 				Name:      n.Name,
 				Config:    n.Config,
-				Code:      n.Code,
 				Position:  n.Position,
 				SortOrder: n.SortOrder,
-			}
-			if n.Language != "" {
-				lang := domain.Language(n.Language)
-				nodeInput.Language = &lang
 			}
 			if n.Resources != nil {
 				nodeInput.Resources = &domain.ResourceLimit{

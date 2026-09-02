@@ -20,9 +20,12 @@ type NodeExecution struct {
 	Output           JSONMap              `json:"output,omitempty" gorm:"type:jsonb"`
 	Error            string               `json:"error,omitempty" gorm:"type:text"`
 	ExecutionID      *uuid.UUID           `json:"execution_id,omitempty" gorm:"type:uuid;index"`
-	StartedAt        *time.Time           `json:"started_at,omitempty"`
-	CompletedAt      *time.Time           `json:"completed_at,omitempty"`
-	DurationMS       *int64               `json:"duration_ms,omitempty"`
+	// NodeRef is the bundle this row ACTUALLY ran, recorded per execution so a
+	// finished run stays attributable after the graph is re-pinned.
+	NodeRef     *NodeRef   `json:"node_ref,omitempty" gorm:"type:jsonb;serializer:json"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	DurationMS  *int64     `json:"duration_ms,omitempty"`
 	// Cached is true when this node's output was seeded from the deployment-service
 	// node-output cache instead of being executed — no microVM was spun. The poller
 	// reads it so the caller can distinguish a cached node from an executed one.

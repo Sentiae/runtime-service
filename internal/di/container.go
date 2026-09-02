@@ -321,6 +321,13 @@ type Container struct {
 	TestGenUC    usecase.TestGenerationUseCase
 	AffectedUC   usecase.AffectedTestResolver
 
+	// Node-runner collaborators (Phase 4). They are the ports the invoker will
+	// hold; until the real adapters are wired they are the fail-closed
+	// sentinels, which refuse every call with ErrNodeRunnerNotReady rather than
+	// leaving a nil interface to panic on.
+	NodeBundleRunner   usecase.BundleRunner
+	NodeSidecarManager usecase.SidecarManager
+
 	// Graph Use Cases
 	GraphUC       usecase.GraphUseCase
 	GraphEngine   *usecase.GraphExecutionEngine
@@ -1793,6 +1800,12 @@ func (c *Container) initUseCases(cfg *config.Config) {
 
 	// Initialize reconciliation controller (5-second interval)
 	c.ReconciliationController = usecase.NewReconciliationController(c.VMInstanceUC, 5*time.Second)
+
+	// Node-runner ports. Nothing calls Probe here: the real runner and the real
+	// sidecar manager each probe at the point they are constructed, so boot
+	// behaviour does not change while these are the sentinels.
+	c.NodeBundleRunner = usecase.NotConfiguredBundleRunner{}
+	c.NodeSidecarManager = usecase.NotConfiguredSidecarManager{}
 
 	// Initialize graph use cases
 	c.GraphUC = usecase.NewGraphService(c.GraphDefRepo, c.GraphNodeRepo, c.GraphEdgeRepo, c.EventPublisher)

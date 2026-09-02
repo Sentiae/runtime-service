@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -25,6 +26,39 @@ type Config struct {
 	Fleet         FleetConfig         `mapstructure:"fleet"`
 	Telemetry     TelemetryConfig     `mapstructure:"telemetry"`
 	Resource      ResourceConfig      `mapstructure:"resource"`
+	NodeRunner    NodeRunnerConfig    `mapstructure:"node_runner"`
+}
+
+// NodeRunnerConfig configures the Phase 4 node runner: how a built bundle is
+// pulled, and the sidecar/egress topology one invocation is given.
+type NodeRunnerConfig struct {
+	// RegistryHost is the TLS registry bundles are pulled from, BY DIGEST. It
+	// has no default and Load refuses without it on the container executor:
+	// a plausible-looking fallback here would pull an image from whatever
+	// happens to answer at that address, which is the one thing a
+	// digest-pinned supply chain exists to prevent.
+	RegistryHost string `mapstructure:"registry_host"`
+	// RegistryUser is the registry pull identity. The password is the service
+	// API key (Server.GRPC.ServiceAPIKey) and is deliberately NOT a second
+	// config field — one credential, one source.
+	RegistryUser string `mapstructure:"registry_user"`
+	// RunsVolume is the docker volume holding per-invocation broker sockets;
+	// RunsDir is where this container has it mounted.
+	RunsVolume string `mapstructure:"runs_volume"`
+	RunsDir    string `mapstructure:"runs_dir"`
+	// UplinkNetwork is the non-internal bridge SIDECARS alone join to reach the
+	// outside. Neither the runtime nor a node container ever joins it.
+	UplinkNetwork string `mapstructure:"uplink_network"`
+	// InvocationCIDR is sliced into InvocationPrefixLen blocks, one per
+	// egress-declaring invocation's --internal bridge.
+	InvocationCIDR      string `mapstructure:"invocation_cidr"`
+	InvocationPrefixLen int    `mapstructure:"invocation_prefix_len"`
+	// SidecarReadyTimeout bounds the readiness poll before the node launches.
+	SidecarReadyTimeout time.Duration `mapstructure:"sidecar_ready_timeout"`
+	// PullTimeout bounds one bundle pull.
+	PullTimeout time.Duration `mapstructure:"pull_timeout"`
+	// TunnelMax bounds one proxied CONNECT tunnel.
+	TunnelMax time.Duration `mapstructure:"tunnel_max"`
 }
 
 // ResourceConfig configures the P19 durable resource control plane (CP4.5 §9 #3,
@@ -694,6 +728,18 @@ func Load() (*Config, error) {
 			"resource.protection_cadence":           "1h",
 			"resource.protection_cadence_staleness": "5m",
 			"resource.protection_offsite_staleness": "15m",
+
+			// Phase 4 node runner. registry_host has NO default — see
+			// NodeRunnerConfig.RegistryHost and the refusal in Load.
+			"node_runner.registry_user":         "registry-client",
+			"node_runner.runs_volume":           "sentiae-node-runs",
+			"node_runner.runs_dir":              "/var/lib/sentiae/node-runs",
+			"node_runner.uplink_network":        "sentiae-node-egress-uplink",
+			"node_runner.invocation_cidr":       "10.201.0.0/16",
+			"node_runner.invocation_prefix_len": 29,
+			"node_runner.sidecar_ready_timeout": "5s",
+			"node_runner.pull_timeout":          "120s",
+			"node_runner.tunnel_max":            "130s",
 		},
 		BindEnvs: [][2]string{
 			// App bindings
@@ -868,6 +914,18 @@ func Load() (*Config, error) {
 			{"resource.protection_cadence", "APP_RESOURCE_PROTECTION_CADENCE"},
 			{"resource.protection_cadence_staleness", "APP_RESOURCE_PROTECTION_CADENCE_STALENESS"},
 			{"resource.protection_offsite_staleness", "APP_RESOURCE_PROTECTION_OFFSITE_STALENESS"},
+
+			// Phase 4 node runner
+			{"node_runner.registry_host", "APP_NODE_RUNNER_REGISTRY_HOST"},
+			{"node_runner.registry_user", "APP_NODE_RUNNER_REGISTRY_USER"},
+			{"node_runner.runs_volume", "APP_NODE_RUNNER_RUNS_VOLUME"},
+			{"node_runner.runs_dir", "APP_NODE_RUNNER_RUNS_DIR"},
+			{"node_runner.uplink_network", "APP_NODE_RUNNER_UPLINK_NETWORK"},
+			{"node_runner.invocation_cidr", "APP_NODE_RUNNER_INVOCATION_CIDR"},
+			{"node_runner.invocation_prefix_len", "APP_NODE_RUNNER_INVOCATION_PREFIX_LEN"},
+			{"node_runner.sidecar_ready_timeout", "APP_NODE_RUNNER_SIDECAR_READY_TIMEOUT"},
+			{"node_runner.pull_timeout", "APP_NODE_RUNNER_PULL_TIMEOUT"},
+			{"node_runner.tunnel_max", "APP_NODE_RUNNER_TUNNEL_MAX"},
 		},
 	})
 	if err != nil {
@@ -882,6 +940,16 @@ func Load() (*Config, error) {
 	}
 	if cfg.Firecracker.WarmPoolReady > maxWarmPoolReady {
 		cfg.Firecracker.WarmPoolReady = maxWarmPoolReady
+	}
+
+	// The node runner exists only on the container executor — the firecracker
+	// fleet host boots compiled images and never pulls a node bundle — so the
+	// registry is required exactly where it is used. Requiring it everywhere
+	// would refuse boot on hosts that have no node runner to configure;
+	// defaulting it would let the one host that DOES pull bundles pull them
+	// from an address nobody chose.
+	if cfg.App.ExecutorType == "container" && cfg.NodeRunner.RegistryHost == "" {
+		return nil, errors.New("load config: node runner registry host is required (APP_NODE_RUNNER_REGISTRY_HOST)")
 	}
 
 	return &cfg, nil

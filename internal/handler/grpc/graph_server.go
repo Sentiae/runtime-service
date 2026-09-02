@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 
+	pkerrors "github.com/sentiae/platform-kit/errors"
 	"github.com/sentiae/platform-kit/tenant"
 	runtimev1 "github.com/sentiae/runtime-service/gen/proto/runtime/v1"
 	"github.com/sentiae/runtime-service/internal/domain"
@@ -24,8 +25,8 @@ import (
 type GraphServer struct {
 	runtimev1.UnimplementedGraphServiceServer
 
-	graphUC  usecase.GraphUseCase
-	execEng  *usecase.GraphExecutionEngine
+	graphUC usecase.GraphUseCase
+	execEng *usecase.GraphExecutionEngine
 }
 
 // NewGraphServer constructs the handler.
@@ -81,16 +82,87 @@ func structToJSONMap(s *structpb.Struct) domain.JSONMap {
 	return domain.JSONMap(s.AsMap())
 }
 
-// seededOutputsFromPB converts the proto seeded_outputs map (node name → Struct)
-// into the engine's node-name-keyed JSONMap seeds. Returns nil when empty so the
-// engine executes every node normally.
-func seededOutputsFromPB(m map[string]*structpb.Struct) map[string]domain.JSONMap {
-	if len(m) == 0 {
+// graphNodeInputFromPB maps one wire node onto the use case input, refusing the
+// retired interpreter fields on the way. The refusal is here, at the boundary,
+// because a caller that still sends `language` and `code` is a caller running
+// against the pre-Phase-4 contract, and answering it InvalidArgument names the
+// contract it is missing instead of failing later on something derived.
+func graphNodeInputFromPB(n *runtimev1.GraphNodeInput) (usecase.CreateGraphNodeInput, error) {
+	if n.GetNodeType() != "" && n.GetNodeType() != string(domain.GraphNodeTypeBundle) {
+		return usecase.CreateGraphNodeInput{}, domain.ErrLegacyNodeInput
+	}
+	if n.GetLanguage() != "" || n.GetCode() != "" {
+		return usecase.CreateGraphNodeInput{}, domain.ErrLegacyNodeInput
+	}
+
+	ref := n.GetNodeRef()
+	if ref == nil {
+		return usecase.CreateGraphNodeInput{}, domain.ErrNodeRefRequired
+	}
+	nodeRef, err := domain.NewNodeRef(ref.GetQualifiedName(), ref.GetSemver(), ref.GetLanguage(), ref.GetImageRef(), ref.GetDigest())
+	if err != nil {
+		return usecase.CreateGraphNodeInput{}, err
+	}
+
+	ports, err := domain.NewPortSpecs(portSpecsFromPB(n.GetPorts().GetInputs()), portSpecsFromPB(n.GetPorts().GetOutputs()))
+	if err != nil {
+		return usecase.CreateGraphNodeInput{}, err
+	}
+
+	secrets, err := domain.NewSecretSpecs(secretSpecsFromPB(n.GetSecrets()))
+	if err != nil {
+		return usecase.CreateGraphNodeInput{}, err
+	}
+
+	role, err := domain.ParseNodeRole(n.GetRole())
+	if err != nil {
+		return usecase.CreateGraphNodeInput{}, err
+	}
+
+	var resources *domain.ResourceLimit
+	if n.Resources != nil {
+		resources = &domain.ResourceLimit{
+			VCPU:       int(n.Resources.CpuMillicores / 1000),
+			MemoryMB:   int(n.Resources.MemoryMib),
+			TimeoutSec: int(n.Resources.TimeoutSec),
+		}
+		if resources.VCPU == 0 {
+			resources.VCPU = 1
+		}
+	}
+
+	return usecase.CreateGraphNodeInput{
+		Name:      n.GetName(),
+		Config:    structToJSONMap(n.GetConfig()),
+		Resources: resources,
+		Position:  structToJSONMap(n.GetPosition()),
+		SortOrder: int(n.GetSortOrder()),
+		NodeRef:   nodeRef,
+		Ports:     ports,
+		Role:      role,
+		Secrets:   secrets,
+		Egress:    n.GetEgress(),
+	}, nil
+}
+
+func portSpecsFromPB(in []*runtimev1.PortSpec) []domain.PortSpec {
+	if len(in) == 0 {
 		return nil
 	}
-	out := make(map[string]domain.JSONMap, len(m))
-	for name, s := range m {
-		out[name] = structToJSONMap(s)
+	out := make([]domain.PortSpec, 0, len(in))
+	for _, p := range in {
+		out = append(out, domain.PortSpec{Name: p.GetName(), Required: p.GetRequired()})
+	}
+	return out
+}
+
+func secretSpecsFromPB(in []*runtimev1.SecretSpec) []domain.SecretSpec {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]domain.SecretSpec, 0, len(in))
+	for _, sec := range in {
+		out = append(out, domain.SecretSpec{Name: sec.GetName(), Required: sec.GetRequired()})
 	}
 	return out
 }
@@ -215,32 +287,11 @@ func (s *GraphServer) CreateGraph(ctx context.Context, req *runtimev1.CreateGrap
 
 	nodes := make([]usecase.CreateGraphNodeInput, 0, len(req.Nodes))
 	for _, n := range req.Nodes {
-		var lang *domain.Language
-		if n.Language != "" {
-			l := domain.Language(n.Language)
-			lang = &l
+		node, err := graphNodeInputFromPB(n)
+		if err != nil {
+			return nil, pkerrors.ToGRPC(err)
 		}
-		var resources *domain.ResourceLimit
-		if n.Resources != nil {
-			resources = &domain.ResourceLimit{
-				VCPU:       int(n.Resources.CpuMillicores / 1000),
-				MemoryMB:   int(n.Resources.MemoryMib),
-				TimeoutSec: int(n.Resources.TimeoutSec),
-			}
-			if resources.VCPU == 0 {
-				resources.VCPU = 1
-			}
-		}
-		nodes = append(nodes, usecase.CreateGraphNodeInput{
-			NodeType:  domain.GraphNodeType(n.NodeType),
-			Name:      n.Name,
-			Config:    structToJSONMap(n.Config),
-			Language:  lang,
-			Code:      n.Code,
-			Resources: resources,
-			Position:  structToJSONMap(n.Position),
-			SortOrder: int(n.SortOrder),
-		})
+		nodes = append(nodes, node)
 	}
 	edges := make([]usecase.CreateGraphEdgeInput, 0, len(req.Edges))
 	for _, e := range req.Edges {
@@ -263,7 +314,7 @@ func (s *GraphServer) CreateGraph(ctx context.Context, req *runtimev1.CreateGrap
 		Edges:          edges,
 	})
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "create graph: %v", err)
+		return nil, pkerrors.ToGRPC(err)
 	}
 	return graphToPB(g), nil
 }
@@ -281,6 +332,15 @@ func (s *GraphServer) DeployGraph(ctx context.Context, req *runtimev1.DeployGrap
 }
 
 func (s *GraphServer) ExecuteGraph(ctx context.Context, req *runtimev1.ExecuteGraphRequest) (*runtimev1.GraphExecution, error) {
+	// Retired in Phase 4 (T-RUN-PARTIAL-RERUN). A seeded node was a node the
+	// interpreter did not run; a bundle graph has no such state to seed, and
+	// accepting the map silently would let a caller believe it skipped work it
+	// did not skip. Refused BEFORE the engine and the id are looked at: the
+	// request is malformed under the current contract whatever this host's
+	// engine happens to be.
+	if len(req.GetSeededOutputs()) > 0 {
+		return nil, pkerrors.ToGRPC(domain.ErrSeededOutputsRetired)
+	}
 	if s.execEng == nil {
 		return nil, status.Error(codes.Unavailable, "graph execution engine not configured")
 	}
@@ -291,10 +351,9 @@ func (s *GraphServer) ExecuteGraph(ctx context.Context, req *runtimev1.ExecuteGr
 	orgID := graphOrgIDFromCtx(ctx)
 	userID := graphUserIDFromCtx(ctx)
 	input := structToJSONMap(req.Input)
-	seeded := seededOutputsFromPB(req.GetSeededOutputs())
-	exec, err := s.execEng.ExecuteGraph(ctx, graphID, orgID, userID, input, false, seeded)
+	exec, err := s.execEng.ExecuteGraph(ctx, graphID, orgID, userID, input, false, nil)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "execute graph: %v", err)
+		return nil, pkerrors.ToGRPC(err)
 	}
 	return graphExecToPB(exec), nil
 }

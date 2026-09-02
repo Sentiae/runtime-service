@@ -18,6 +18,11 @@ func TestTelemetryEnabledBinding(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// The node runner's registry is required on the default (container)
+			// executor, so Load refuses without it — see TestNodeRunnerConfig.
+			// This test is about the telemetry binding, so it supplies the
+			// registry rather than exercising that refusal.
+			t.Setenv("APP_NODE_RUNNER_REGISTRY_HOST", "10.0.10.20:8443")
 			if tt.env != "" {
 				t.Setenv("APP_TELEMETRY_ENABLED", tt.env)
 			}

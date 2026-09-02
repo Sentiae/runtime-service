@@ -17,6 +17,8 @@ import (
 	pkerrors "github.com/sentiae/platform-kit/errors"
 	"github.com/sentiae/platform-kit/secret"
 
+	"github.com/sentiae/runtime-service/internal/domain"
+
 	"google.golang.org/grpc/codes"
 )
 
@@ -74,4 +76,43 @@ func RegisterErrors() {
 	// ErrSecurityGateUnavailable (503 + FailedPrecondition).
 	pkerrors.Register(secret.ErrVaultUnavailable, http.StatusServiceUnavailable, codes.FailedPrecondition)
 	pkerrors.Register(secret.ErrNoHandedToken, http.StatusServiceUnavailable, codes.FailedPrecondition)
+
+	// Phase 4 node-runner sentinels. These ARE runtime's own domain errors, so
+	// they look like the exception the note above forbids — they are not.
+	// fleetError hand-maps only what the FLEET RPCs return; the graph RPCs go
+	// through pkerrors.ToGRPC, which reads this registry and nothing else, so
+	// without these registrations every Phase 4 refusal would reach the caller
+	// as Internal and be indistinguishable from a crash. Each mapping states
+	// whose fault the refusal is:
+	//
+	//   FailedPrecondition — the graph or the host is not in a state where the
+	//   call can proceed (a legacy row, a missing secret, an unconfigured
+	//   runner). Retrying the same call unchanged cannot help.
+	pkerrors.Register(domain.ErrLegacyGraph, http.StatusPreconditionFailed, codes.FailedPrecondition)
+	pkerrors.Register(domain.ErrSecretTokenRequired, http.StatusPreconditionFailed, codes.FailedPrecondition)
+	pkerrors.Register(domain.ErrRequiredSecretAbsent, http.StatusPreconditionFailed, codes.FailedPrecondition)
+	pkerrors.Register(domain.ErrGraphDebugRetired, http.StatusPreconditionFailed, codes.FailedPrecondition)
+	pkerrors.Register(domain.ErrNodeRunnerNotReady, http.StatusPreconditionFailed, codes.FailedPrecondition)
+
+	//   InvalidArgument — the request itself is wrong: a retired field, a
+	//   malformed ref, a plan that does not reconstitute. The caller must
+	//   change what it sends.
+	pkerrors.Register(domain.ErrNodeRefRequired, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrLegacyNodeInput, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrInvalidNodeRef, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrInvalidPortSpec, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrInvalidSecretSpec, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrInvalidRole, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrInvalidEgressPattern, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrPlanInvalid, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrSeededOutputsRetired, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrSecretTokenUnexpected, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrTriggerInputInvalid, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrNodeConfigInvalid, http.StatusBadRequest, codes.InvalidArgument)
+
+	//   Unavailable — the registry did not answer. Retrying may succeed.
+	pkerrors.Register(domain.ErrBundlePullFailed, http.StatusServiceUnavailable, codes.Unavailable)
+
+	//   ResourceExhausted — every invocation subnet is in use. Retry later.
+	pkerrors.Register(domain.ErrNodeRunnerBusy, http.StatusTooManyRequests, codes.ResourceExhausted)
 }

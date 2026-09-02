@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/flowlang"
+	"github.com/sentiae/platform-kit/nodeabi"
+	"github.com/sentiae/platform-kit/nodemanifest"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/repository"
 )
@@ -34,16 +38,24 @@ type CreateGraphInput struct {
 	Edges          []CreateGraphEdgeInput
 }
 
-// CreateGraphNodeInput represents a node to create within a graph
+// CreateGraphNodeInput represents a node to create within a graph. A Phase 4
+// node IS a built bundle: it names the pin it runs, the ports it declares, its
+// role in the request/response shape, the secrets it may ask for and the hosts
+// it may reach. There is no node_type, language or code — those were the
+// interpreter's shape (D-9).
 type CreateGraphNodeInput struct {
-	NodeType  domain.GraphNodeType
 	Name      string
 	Config    domain.JSONMap
-	Language  *domain.Language
-	Code      string
 	Resources *domain.ResourceLimit
 	Position  domain.JSONMap
+	// SortOrder is the node's index in the compiled plan's order, and it is the
+	// carried order PlanFromWire reproduces as its Kahn tie-break.
 	SortOrder int
+	NodeRef   *domain.NodeRef
+	Ports     domain.PortSpecs
+	Role      domain.NodeRole
+	Secrets   []domain.SecretSpec
+	Egress    []string
 }
 
 // CreateGraphEdgeInput represents an edge to create within a graph
@@ -106,6 +118,17 @@ func (s *graphService) CreateGraph(ctx context.Context, input CreateGraphInput) 
 		return nil, err
 	}
 
+	// The plan is validated BEFORE the first row is written. A graph whose
+	// nodes and edges do not reconstitute the plan the compiler lowered is not
+	// a graph the runtime can execute, and a half-written one would have to be
+	// found by hand later.
+	if err := validateBundleNodes(input.Nodes); err != nil {
+		return nil, err
+	}
+	if err := validateGraphPlan(input.Nodes, input.Edges); err != nil {
+		return nil, err
+	}
+
 	if err := s.graphRepo.Create(ctx, graph); err != nil {
 		return nil, fmt.Errorf("failed to create graph: %w", err)
 	}
@@ -122,14 +145,17 @@ func (s *graphService) CreateGraph(ctx context.Context, input CreateGraphInput) 
 		nodes[i] = domain.GraphNode{
 			ID:        uuid.New(),
 			GraphID:   graph.ID,
-			NodeType:  n.NodeType,
+			NodeType:  domain.GraphNodeTypeBundle,
 			Name:      n.Name,
 			Config:    n.Config,
-			Language:  n.Language,
-			Code:      n.Code,
 			Resources: resources,
 			Position:  n.Position,
 			SortOrder: n.SortOrder,
+			NodeRef:   n.NodeRef,
+			Ports:     n.Ports,
+			Role:      n.Role,
+			Secrets:   n.Secrets,
+			Egress:    n.Egress,
 			CreatedAt: now,
 		}
 	}
@@ -235,14 +261,17 @@ func (s *graphService) UpdateGraph(ctx context.Context, id uuid.UUID, input Upda
 			nodes[i] = domain.GraphNode{
 				ID:        uuid.New(),
 				GraphID:   id,
-				NodeType:  n.NodeType,
+				NodeType:  domain.GraphNodeTypeBundle,
 				Name:      n.Name,
 				Config:    n.Config,
-				Language:  n.Language,
-				Code:      n.Code,
 				Resources: resources,
 				Position:  n.Position,
 				SortOrder: n.SortOrder,
+				NodeRef:   n.NodeRef,
+				Ports:     n.Ports,
+				Role:      n.Role,
+				Secrets:   n.Secrets,
+				Egress:    n.Egress,
 				CreatedAt: now,
 			}
 		}
@@ -407,5 +436,88 @@ func (s *graphService) ValidateGraph(ctx context.Context, id uuid.UUID) error {
 		return domain.ErrGraphHasCycle
 	}
 
+	return nil
+}
+
+// validateBundleNodes checks every node the way the row itself will be checked,
+// plus the two platform-kit rules that own their vocabularies: the qualified
+// name grammar (nodeabi) and the egress pattern grammar (nodemanifest). Both
+// are called rather than re-implemented — a second copy of either grammar is a
+// second answer to the same question.
+func validateBundleNodes(nodes []CreateGraphNodeInput) error {
+	for _, n := range nodes {
+		if n.Name == "" {
+			return domain.ErrInvalidData
+		}
+		if n.NodeRef == nil {
+			return domain.ErrNodeRefRequired
+		}
+		if _, _, err := nodeabi.ParseQualifiedName(n.NodeRef.QualifiedName); err != nil {
+			return domain.ErrInvalidNodeRef
+		}
+		if _, err := domain.NewNodeRef(n.NodeRef.QualifiedName, n.NodeRef.Semver, n.NodeRef.Language, n.NodeRef.ImageRef, n.NodeRef.Digest); err != nil {
+			return err
+		}
+		if _, err := domain.NewPortSpecs(n.Ports.Inputs, n.Ports.Outputs); err != nil {
+			return err
+		}
+		if _, err := domain.NewSecretSpecs(n.Secrets); err != nil {
+			return err
+		}
+		if _, err := domain.ParseNodeRole(string(n.Role)); err != nil {
+			return err
+		}
+		for _, pattern := range n.Egress {
+			if err := nodemanifest.ValidateEgressPattern(pattern); err != nil {
+				return fmt.Errorf("%w: %w", domain.ErrInvalidEgressPattern, err)
+			}
+		}
+	}
+	return nil
+}
+
+// validateGraphPlan rebuilds the lowered plan from what arrived and refuses if
+// it does not reconstitute. sort_order is the compiler's own order index, so
+// sorting by it recovers the carried order flowlang uses as its Kahn tie-break:
+// if the runtime's recomputed order differs from the one it was handed, the
+// compiler and the runtime would run the same flow in two different sequences,
+// and that is refused here rather than discovered mid-run.
+func validateGraphPlan(nodes []CreateGraphNodeInput, edges []CreateGraphEdgeInput) error {
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	ordered := make([]CreateGraphNodeInput, len(nodes))
+	copy(ordered, nodes)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].SortOrder < ordered[j].SortOrder })
+
+	wire := make([]flowlang.WireNode, 0, len(ordered))
+	for _, n := range ordered {
+		wire = append(wire, flowlang.WireNode{
+			Slug:     n.Name,
+			Pin:      n.NodeRef.Pin(),
+			Role:     string(n.Role),
+			Required: n.Ports.RequiredInputs(),
+			Outputs:  n.Ports.OutputNames(),
+		})
+	}
+
+	wireEdges := make([]flowlang.Edge, 0, len(edges))
+	for _, e := range edges {
+		if e.SourceNodeIndex < 0 || e.SourceNodeIndex >= len(nodes) ||
+			e.TargetNodeIndex < 0 || e.TargetNodeIndex >= len(nodes) {
+			return fmt.Errorf("%w: invalid edge node index", domain.ErrPlanInvalid)
+		}
+		wireEdges = append(wireEdges, flowlang.Edge{
+			From:     nodes[e.SourceNodeIndex].Name,
+			FromPort: e.SourcePort,
+			To:       nodes[e.TargetNodeIndex].Name,
+			ToPort:   e.TargetPort,
+		})
+	}
+
+	if _, err := flowlang.PlanFromWire(wire, wireEdges); err != nil {
+		return fmt.Errorf("%w: %w", domain.ErrPlanInvalid, err)
+	}
 	return nil
 }
