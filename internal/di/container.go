@@ -49,6 +49,7 @@ import (
 	"github.com/sentiae/runtime-service/internal/infrastructure/netfabric"
 	"github.com/sentiae/runtime-service/internal/infrastructure/objectstore"
 	"github.com/sentiae/runtime-service/internal/infrastructure/oci"
+	"github.com/sentiae/runtime-service/internal/infrastructure/secretsource"
 	"github.com/sentiae/runtime-service/internal/infrastructure/simulated"
 	"github.com/sentiae/runtime-service/internal/infrastructure/vaulttoken"
 	volumebackend "github.com/sentiae/runtime-service/internal/infrastructure/volume"
@@ -272,10 +273,15 @@ type Container struct {
 	ProtectionCadence *usecase.FleetProtectionCadenceWorker
 
 	// runtime-fleet P3.4 — the Vault client backing the per-tenant secret
-	// resolver on the fleet host. Non-nil only when the firecracker executor is
-	// selected AND VAULT_ADDR/VAULT_AUTH_MODE are set and the client built.
-	// Closed by Close.
+	// resolver. Non-nil only when VAULT_ADDR/VAULT_AUTH_MODE are set and the
+	// client built. Closed by Close.
 	vaultClient *pkconfig.VaultClient
+
+	// The per-tenant secret resolver (P14), built ONCE at boot for BOTH
+	// consumers: the fleet host's resident boot path and — on the mesh instance,
+	// which is not a fleet host — the flow node secret path. nil when Vault is
+	// unconfigured or was unreachable at boot; every consumer then fails closed.
+	secretResolver secret.Resolver
 
 	// runtime-fleet D-125 — in-memory store of handed per-deployment Vault
 	// tokens (never persisted); renews each for the deployment lifetime and
@@ -368,6 +374,14 @@ func NewContainer(cfg *config.Config) (*Container, error) {
 
 	// Initialize repositories
 	c.initRepositories()
+
+	// P14 — build the per-tenant secret resolver BEFORE the use cases. It used to
+	// be built inside initFleet, which runs after initUseCases and only on a
+	// firecracker fleet host; the flow node secret path needs it on the mesh
+	// instance and needs it at NodeInvoker construction, so the one build is
+	// hoisted here and both consumers read this field. nil ⇒ every secret
+	// consumer fails closed (secretsource.Unavailable for nodes).
+	c.secretResolver = c.buildSecretResolver()
 
 	// Initialize use cases
 	if err := c.initUseCases(cfg); err != nil {
@@ -635,7 +649,7 @@ func (c *Container) initFleet(cfg *config.Config) error {
 		// configured or unreachable at boot, the resolver stays nil and only
 		// secret-less apps boot here — a secret-bearing app then fails closed at
 		// resolve time (ErrSecretResolverUnavailable), never silently secret-less.
-		if resolver := c.buildSecretResolver(); resolver != nil {
+		if resolver := c.secretResolver; resolver != nil {
 			c.FleetReplicaRuntimeUC.SetSecretResolver(resolver)
 			// D-125 — hand the in-memory token store to the boot path so
 			// bootSecrets can stamp the deployment's handed token onto the resolver.
@@ -985,8 +999,9 @@ func (c *Container) initNetworkFabric(cfg *config.Config) {
 }
 
 // buildSecretResolver constructs the per-tenant envelope resolver used to
-// resolve a resident app's secret_refs at boot (P14). It authenticates to Vault
-// via SPIFFE JWT-SVID (as svc/runtime) using the standard VAULT_* env vars, then
+// resolve a resident app's secret_refs at boot AND a flow node's declared
+// secrets at invocation (P14). It authenticates to Vault via SPIFFE JWT-SVID
+// (as svc/runtime) using the standard VAULT_* env vars, then
 // wraps a KV getter + a decrypt-only per-tenant Transit KEK (transit-tenants,
 // AutoCreate:false → decrypt fails closed, I29). It returns nil (never crashes)
 // when Vault is unconfigured or unreachable at boot: a secret-less app still
@@ -1742,19 +1757,6 @@ func (c *Container) initRepositories() {
 	log.Println("Repositories initialized (PostgreSQL)")
 }
 
-// unconfiguredSecretSource is the fail-closed SecretValueSource the invoker
-// holds until the Vault-backed one is wired: a node that declares a secret must
-// refuse, never run with the secret silently absent.
-type unconfiguredSecretSource struct{}
-
-func (unconfiguredSecretSource) Resolve(context.Context, uuid.UUID, string, string, string) (string, bool, error) {
-	return "", false, domain.ErrNodeRunnerNotReady
-}
-
-func (unconfiguredSecretSource) Revoke(context.Context, string) error {
-	return domain.ErrNodeRunnerNotReady
-}
-
 // initUseCases initializes all use cases
 func (c *Container) initUseCases(cfg *config.Config) error {
 	c.VMUC = usecase.NewVMService(c.VMRepo, c.VMProvider)
@@ -1851,8 +1853,19 @@ func (c *Container) initUseCases(cfg *config.Config) error {
 		c.NodeBundleRunner = runner
 	}
 
+	// The node secret path (D-4). With a resolver the source builds
+	// tenants/<org>/flows/<environment>/<name>#value per declared secret and
+	// revokes the run's handed token through the same Vault client's transport;
+	// without one every declared secret refuses (ErrNodeRunnerNotReady) rather
+	// than resolving to nothing.
+	nodeSecrets := usecase.SecretValueSource(secretsource.Unavailable{})
+	if c.secretResolver != nil {
+		nodeSecrets = secretsource.New(c.secretResolver, vaulttoken.New(c.vaultClient.Raw()))
+		log.Println("Node secret source wired on the Vault handed-token resolver (D-4)")
+	}
+
 	c.NodeInvoker = usecase.NewNodeInvoker(
-		c.NodeBundleRunner, c.NodeSidecarManager, unconfiguredSecretSource{},
+		c.NodeBundleRunner, c.NodeSidecarManager, nodeSecrets,
 		c.NodeSubnetPool, cfg.NodeRunner.RegistryHost, usecase.SystemClock{},
 	)
 

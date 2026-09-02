@@ -75,6 +75,25 @@ func graphUserIDFromCtx(ctx context.Context) uuid.UUID {
 	return uuid.Nil
 }
 
+// The two metadata keys ExecuteGraph carries beyond the ambient tenant headers.
+// Each literal is defined once, here, and read nowhere else; delivery spells
+// them identically on the calling side (D-4/R-18).
+const (
+	secretTokenMetadataKey     = "x-sentiae-secret-token"
+	flowEnvironmentMetadataKey = "x-sentiae-flow-environment"
+)
+
+// firstMetadataValue reads one metadata key, or "" when it is absent. "" is a
+// meaningful value to the engine, not a missing one: it is what a caller that
+// handed nothing looks like, and it is what makes a secret-declaring graph
+// refuse.
+func firstMetadataValue(md metadata.MD, key string) string {
+	if vals := md.Get(key); len(vals) > 0 {
+		return vals[0]
+	}
+	return ""
+}
+
 func structToJSONMap(s *structpb.Struct) domain.JSONMap {
 	if s == nil {
 		return nil
@@ -351,10 +370,16 @@ func (s *GraphServer) ExecuteGraph(ctx context.Context, req *runtimev1.ExecuteGr
 	orgID := graphOrgIDFromCtx(ctx)
 	userID := graphUserIDFromCtx(ctx)
 	input := structToJSONMap(req.Input)
-	// The handed secret token and the flow environment travel as request
-	// metadata and are read into these two arguments by S3a; until then a
-	// secret-declaring graph refuses here rather than resolving nothing.
-	exec, err := s.execEng.ExecuteGraph(ctx, graphID, orgID, userID, input, false, "", "")
+	// The handed secret token and the flow environment travel together as
+	// request metadata on THIS rpc only (D-4/R-18), never in the request body:
+	// a live credential does not belong in a message that is logged, replayed
+	// or persisted, and the environment is what runtime builds the secret ref
+	// from, so a run that lost it would silently read another environment.
+	// Both are passed through as handed; the engine owns every refusal.
+	md, _ := metadata.FromIncomingContext(ctx)
+	secretToken := firstMetadataValue(md, secretTokenMetadataKey)
+	environment := firstMetadataValue(md, flowEnvironmentMetadataKey)
+	exec, err := s.execEng.ExecuteGraph(ctx, graphID, orgID, userID, input, false, secretToken, environment)
 	if err != nil {
 		return nil, pkerrors.ToGRPC(err)
 	}
