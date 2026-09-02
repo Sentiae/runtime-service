@@ -1,28 +1,31 @@
 package usecase
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"sort"
+	"slices"
 	"sync"
-	"text/template"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/sentiae/platform-kit/flowlang"
+	"github.com/sentiae/platform-kit/logger"
+	"github.com/sentiae/platform-kit/nodeabi"
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/repository"
 )
 
-// DefaultMaxParallelism caps how many nodes execute concurrently within
-// a single wave. A node graph with hundreds of independent test nodes
-// would otherwise spawn one Firecracker VM per node and exhaust the
-// host. The DI container can override this via SetMaxParallelism.
+// DefaultMaxParallelism caps how many nodes execute concurrently within one
+// wave. Every node is a container, so an unbounded wave on a wide graph would
+// exhaust the host. The DI container can override this via SetMaxParallelism.
 const DefaultMaxParallelism = 4
+
+// flowEnvironments is the closed set a run may resolve secrets from. It is
+// closed on purpose: a typo'd environment must refuse, never silently read a
+// path that does not exist and hand the node an absent secret.
+var flowEnvironments = []string{"dev", "preview", "prod"}
 
 // nodeTimings records the wall-clock window each node ran in. Stored
 // per-execution so the parallelism report can compute critical path,
@@ -38,40 +41,50 @@ type nodeTimings struct {
 	OnCriticalPath bool      `json:"on_critical_path"`
 }
 
-// GraphExecutionEngine orchestrates the execution of node graphs using
-// topological sorting and wave-based parallel execution.
+// runCredential is the per-run secret material the engine holds in memory only:
+// the handed token and the flow environment its refs are built under. It is
+// copied out of the request metadata BEFORE the run goroutine starts and
+// dropped at terminal cleanup, so it never outlives the run and never reaches
+// a row, a log line or an event.
+type runCredential struct {
+	token       string
+	environment string
+}
+
+// GraphExecutionEngine runs a compiled flow: it rebuilds the lowered plan from
+// the graph's rows, walks it with flowlang's ONE wave rule, and hands each node
+// to the invoker. It interprets nothing itself — a node is a built bundle, and
+// the only thing the engine reads out of a node's output is a respond node's
+// `response`.
 type GraphExecutionEngine struct {
 	graphRepo      repository.GraphDefinitionRepository
 	nodeRepo       repository.GraphNodeRepository
 	edgeRepo       repository.GraphEdgeRepository
 	graphExecRepo  repository.GraphExecutionRepository
 	nodeExecRepo   repository.NodeExecutionRepository
-	executionUC    ExecutionUseCase
 	eventPublisher EventPublisher
+	invoker        *NodeInvoker
+	sidecars       SidecarManager
 	traceRecorder  *GraphTraceRecorder
-	httpClient     *http.Client
-
-	// warm runs code nodes on a fast warm CLONE (~160ms) instead of a
-	// cold single-shot boot (~13s). Nil disables the warm path: code
-	// nodes fall back to executionUC.ExecuteSync (zero behavior change).
-	warm WarmCodeRunner
 
 	maxParallelism int
 
-	mu            sync.Mutex
-	cancellations map[uuid.UUID]context.CancelFunc
-	timings       map[uuid.UUID][]nodeTimings // per-execution-id
+	mu             sync.Mutex
+	cancellations  map[uuid.UUID]context.CancelFunc
+	runCredentials map[uuid.UUID]runCredential
+	timings        map[uuid.UUID][]nodeTimings
 }
 
-// NewGraphExecutionEngine creates a new graph execution engine
+// NewGraphExecutionEngine creates a new graph execution engine.
 func NewGraphExecutionEngine(
 	graphRepo repository.GraphDefinitionRepository,
 	nodeRepo repository.GraphNodeRepository,
 	edgeRepo repository.GraphEdgeRepository,
 	graphExecRepo repository.GraphExecutionRepository,
 	nodeExecRepo repository.NodeExecutionRepository,
-	executionUC ExecutionUseCase,
 	eventPublisher EventPublisher,
+	invoker *NodeInvoker,
+	sidecars SidecarManager,
 ) *GraphExecutionEngine {
 	return &GraphExecutionEngine{
 		graphRepo:      graphRepo,
@@ -79,25 +92,19 @@ func NewGraphExecutionEngine(
 		edgeRepo:       edgeRepo,
 		graphExecRepo:  graphExecRepo,
 		nodeExecRepo:   nodeExecRepo,
-		executionUC:    executionUC,
 		eventPublisher: eventPublisher,
-		httpClient:     &http.Client{Timeout: 30 * time.Second},
+		invoker:        invoker,
+		sidecars:       sidecars,
 		maxParallelism: DefaultMaxParallelism,
 		cancellations:  make(map[uuid.UUID]context.CancelFunc),
+		runCredentials: make(map[uuid.UUID]runCredential),
 		timings:        make(map[uuid.UUID][]nodeTimings),
 	}
 }
 
-// SetTraceRecorder sets the trace recorder for execution tracing
+// SetTraceRecorder sets the trace recorder for execution tracing.
 func (e *GraphExecutionEngine) SetTraceRecorder(recorder *GraphTraceRecorder) {
 	e.traceRecorder = recorder
-}
-
-// SetWarmRunner wires the warm-clone code runner. When set, code nodes execute
-// on a fast warm clone instead of a cold single-shot boot. Nil keeps the cold
-// fallback path. Set once at wiring time before serving.
-func (e *GraphExecutionEngine) SetWarmRunner(w WarmCodeRunner) {
-	e.warm = w
 }
 
 // SetMaxParallelism overrides the per-wave concurrency cap. Values <= 0
@@ -118,22 +125,22 @@ func (e *GraphExecutionEngine) MaxParallelism() int {
 	return e.maxParallelism
 }
 
-// ExecuteGraph starts execution of a graph and returns the execution record.
-// The actual execution runs asynchronously in a goroutine.
+// ExecuteGraph starts a run and returns its record; the run itself proceeds in
+// a background goroutine.
 //
-// seededOutputs (keyed by node name = FlowNode.name / GraphNode.Name) lets the
-// caller pre-supply outputs for unchanged upstream nodes: a seeded node is NOT
-// executed (spins no microVM) — its output is taken from the seed, recorded as a
-// completed+cached NodeExecution, and propagated downstream as a real output
-// would. Pass nil to execute every node normally.
+// secretToken is the org-scoped token delivery minted for THIS run, and
+// environment is the flow environment its secret refs are built under. Both
+// arrive as request metadata, are copied into memory here, and are dropped at
+// terminal cleanup — the pair is refused up front rather than half-honoured,
+// because a run that resolves secrets from the wrong environment reads another
+// environment's values instead of failing.
 func (e *GraphExecutionEngine) ExecuteGraph(
 	ctx context.Context,
 	graphID, orgID, requestedBy uuid.UUID,
 	input domain.JSONMap,
 	debugMode bool,
-	seededOutputs map[string]domain.JSONMap,
+	secretToken, environment string,
 ) (*domain.GraphExecution, error) {
-	// Load graph definition
 	graph, err := e.graphRepo.FindByID(ctx, graphID)
 	if err != nil {
 		return nil, err
@@ -146,10 +153,19 @@ func (e *GraphExecutionEngine) ExecuteGraph(
 	if err != nil {
 		return nil, fmt.Errorf("failed to load graph nodes: %w", err)
 	}
-
 	edges, err := e.edgeRepo.FindByGraph(ctx, graphID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load graph edges: %w", err)
+	}
+
+	plan, byName, err := buildRunPlan(nodes, edges)
+	if err != nil {
+		usecaseExecutions.WithLabelValues("execute_graph", outcomeInvalid).Inc()
+		return nil, err
+	}
+	if err := checkRunCredentials(nodes, secretToken, environment); err != nil {
+		usecaseExecutions.WithLabelValues("execute_graph", outcomeInvalid).Inc()
+		return nil, err
 	}
 
 	now := time.Now().UTC()
@@ -165,33 +181,25 @@ func (e *GraphExecutionEngine) ExecuteGraph(
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
-
 	if err := e.graphExecRepo.Create(ctx, graphExec); err != nil {
 		return nil, fmt.Errorf("failed to create graph execution: %w", err)
 	}
-
 	_ = e.eventPublisher.Publish(ctx, EventGraphExecCreated, graphExec.ID.String(), graphExec)
 
-	// Start async execution
-	execCtx, cancel := context.WithCancel(context.Background())
-	e.mu.Lock()
-	e.cancellations[graphExec.ID] = cancel
-	e.mu.Unlock()
+	// The run outlives the RPC that started it, so it detaches from the
+	// caller's context.
+	e.start(context.Background(), graphExec, graph, plan, byName, input,
+		runCredential{token: secretToken, environment: environment})
 
-	go func() {
-		defer func() {
-			cancel()
-			e.mu.Lock()
-			delete(e.cancellations, graphExec.ID)
-			e.mu.Unlock()
-		}()
-		e.runGraph(execCtx, graphExec, graph, nodes, edges, input, seededOutputs)
-	}()
-
+	usecaseExecutions.WithLabelValues("execute_graph", outcomeOK).Inc()
 	return graphExec, nil
 }
 
-// ProcessPendingGraphs processes pending graph executions
+// ProcessPendingGraphs picks up runs left pending by a previous process. They
+// carry no credentials: a handed token is per-request memory and is gone with
+// the process that received it, so a pending run of a secret-declaring graph
+// fails closed on its first secret rather than resolving one with someone
+// else's token.
 func (e *GraphExecutionEngine) ProcessPendingGraphs(ctx context.Context, limit int) (int, error) {
 	pending, err := e.graphExecRepo.FindPending(ctx, limit)
 	if err != nil {
@@ -201,51 +209,72 @@ func (e *GraphExecutionEngine) ProcessPendingGraphs(ctx context.Context, limit i
 	processed := 0
 	for i := range pending {
 		exec := &pending[i]
+		graph, err := e.graphRepo.FindByID(ctx, exec.GraphID)
+		if err != nil {
+			logger.FromContext(ctx).Warn("pending run: load graph", "run", exec.ID.String(), "err", err)
+			continue
+		}
 		nodes, err := e.nodeRepo.FindByGraph(ctx, exec.GraphID)
 		if err != nil {
-			log.Printf("Failed to load nodes for graph execution %s: %v", exec.ID, err)
+			logger.FromContext(ctx).Warn("pending run: load nodes", "run", exec.ID.String(), "err", err)
 			continue
 		}
 		edges, err := e.edgeRepo.FindByGraph(ctx, exec.GraphID)
 		if err != nil {
-			log.Printf("Failed to load edges for graph execution %s: %v", exec.ID, err)
+			logger.FromContext(ctx).Warn("pending run: load edges", "run", exec.ID.String(), "err", err)
 			continue
 		}
-		graph, err := e.graphRepo.FindByID(ctx, exec.GraphID)
+		plan, byName, err := buildRunPlan(nodes, edges)
 		if err != nil {
-			log.Printf("Failed to load graph for execution %s: %v", exec.ID, err)
+			logger.FromContext(ctx).Warn("pending run: rebuild plan", "run", exec.ID.String(), "err", err)
 			continue
 		}
 
-		execCtx, cancel := context.WithCancel(ctx)
-		e.mu.Lock()
-		e.cancellations[exec.ID] = cancel
-		e.mu.Unlock()
-
-		go func(ge *domain.GraphExecution) {
-			defer func() {
-				cancel()
-				e.mu.Lock()
-				delete(e.cancellations, ge.ID)
-				e.mu.Unlock()
-			}()
-			// Pending-poll path carries no seeds — seeding only arrives via the
-			// synchronous ExecuteGraph RPC (the deployment-service cache path).
-			e.runGraph(execCtx, ge, graph, nodes, edges, ge.Input, nil)
-		}(exec)
-
+		e.start(ctx, exec, graph, plan, byName, exec.Input, runCredential{})
 		processed++
 	}
-
 	return processed, nil
 }
 
-// CancelGraphExecution cancels a running graph execution
+// start puts one run on its own goroutine under its own cancellable context,
+// with its credentials in memory before the first node can ask for them. It is
+// the ONE place a run is launched, so cancellation, panic recovery and
+// credential lifetime cannot differ between the two entry points.
+func (e *GraphExecutionEngine) start(
+	parent context.Context,
+	graphExec *domain.GraphExecution,
+	graph *domain.GraphDefinition,
+	plan *flowlang.Plan,
+	byName map[string]*domain.GraphNode,
+	input domain.JSONMap,
+	cred runCredential,
+) {
+	execCtx, cancel := context.WithCancel(parent)
+	e.mu.Lock()
+	e.cancellations[graphExec.ID] = cancel
+	e.runCredentials[graphExec.ID] = cred
+	e.mu.Unlock()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.FromContext(execCtx).Error("graph run panicked",
+					"run", graphExec.ID.String(), "panic", fmt.Sprint(r))
+			}
+			cancel()
+			e.mu.Lock()
+			delete(e.cancellations, graphExec.ID)
+			e.mu.Unlock()
+		}()
+		e.runPlan(execCtx, graphExec, graph, plan, byName, input)
+	}()
+}
+
+// CancelGraphExecution cancels a running graph execution.
 func (e *GraphExecutionEngine) CancelGraphExecution(ctx context.Context, execID uuid.UUID) error {
 	e.mu.Lock()
 	cancel, ok := e.cancellations[execID]
 	e.mu.Unlock()
-
 	if ok {
 		cancel()
 	}
@@ -262,17 +291,16 @@ func (e *GraphExecutionEngine) CancelGraphExecution(ctx context.Context, execID 
 	if err := e.graphExecRepo.Update(ctx, exec); err != nil {
 		return fmt.Errorf("failed to cancel graph execution: %w", err)
 	}
-
 	_ = e.eventPublisher.Publish(ctx, EventGraphExecCancelled, execID.String(), exec)
 	return nil
 }
 
-// GetGraphExecution returns a graph execution by ID
+// GetGraphExecution returns a graph execution by ID.
 func (e *GraphExecutionEngine) GetGraphExecution(ctx context.Context, id uuid.UUID) (*domain.GraphExecution, error) {
 	return e.graphExecRepo.FindByID(ctx, id)
 }
 
-// ListGraphExecutions returns graph executions for a graph
+// ListGraphExecutions returns graph executions for a graph.
 func (e *GraphExecutionEngine) ListGraphExecutions(ctx context.Context, graphID uuid.UUID, limit, offset int) ([]domain.GraphExecution, int64, error) {
 	if limit <= 0 {
 		limit = 20
@@ -283,586 +311,658 @@ func (e *GraphExecutionEngine) ListGraphExecutions(ctx context.Context, graphID 
 	return e.graphExecRepo.FindByGraph(ctx, graphID, limit, offset)
 }
 
-// GetNodeExecution returns a node execution by ID
+// GetNodeExecution returns a node execution by ID.
 func (e *GraphExecutionEngine) GetNodeExecution(ctx context.Context, id uuid.UUID) (*domain.NodeExecution, error) {
 	return e.nodeExecRepo.FindByID(ctx, id)
 }
 
-// ListNodeExecutions returns node executions for a graph execution
+// ListNodeExecutions returns node executions for a graph execution.
 func (e *GraphExecutionEngine) ListNodeExecutions(ctx context.Context, graphExecID uuid.UUID) ([]domain.NodeExecution, error) {
 	return e.nodeExecRepo.FindByGraphExecution(ctx, graphExecID)
 }
 
-// runGraph is the core DAG execution algorithm.
-//
-// seededOutputs (keyed by node name) pre-supplies outputs for unchanged upstream
-// nodes: a node whose name is seeded is NOT executed — it records a completed,
-// cached NodeExecution (duration 0, spins no microVM) and propagates the seed
-// downstream as a real output would. nil/empty means execute every node.
-func (e *GraphExecutionEngine) runGraph(
+// buildRunPlan rebuilds the lowered plan from the graph's own rows. The runtime
+// never re-schedules a document: sort_order is the carried order the compiler
+// lowered, and PlanFromWire refuses if the order it recomputes differs.
+func buildRunPlan(nodes []domain.GraphNode, edges []domain.GraphEdge) (*flowlang.Plan, map[string]*domain.GraphNode, error) {
+	ordered := make([]*domain.GraphNode, 0, len(nodes))
+	for i := range nodes {
+		if nodes[i].NodeRef == nil {
+			return nil, nil, domain.ErrLegacyGraph
+		}
+		ordered = append(ordered, &nodes[i])
+	}
+	slices.SortStableFunc(ordered, func(a, b *domain.GraphNode) int { return a.SortOrder - b.SortOrder })
+
+	byID := make(map[uuid.UUID]*domain.GraphNode, len(nodes))
+	byName := make(map[string]*domain.GraphNode, len(nodes))
+	wire := make([]flowlang.WireNode, 0, len(ordered))
+	for _, n := range ordered {
+		byID[n.ID] = n
+		byName[n.Name] = n
+		wire = append(wire, flowlang.WireNode{
+			Slug:     n.Name,
+			Pin:      n.NodeRef.Pin(),
+			Role:     string(n.Role),
+			Required: n.Ports.RequiredInputs(),
+			Outputs:  n.Ports.OutputNames(),
+		})
+	}
+
+	wireEdges := make([]flowlang.Edge, 0, len(edges))
+	for _, ed := range edges {
+		from, okFrom := byID[ed.SourceNodeID]
+		to, okTo := byID[ed.TargetNodeID]
+		if !okFrom || !okTo {
+			return nil, nil, fmt.Errorf("%w: edge names a node outside this graph", domain.ErrPlanInvalid)
+		}
+		wireEdges = append(wireEdges, flowlang.Edge{
+			From: from.Name, FromPort: ed.SourcePort, To: to.Name, ToPort: ed.TargetPort,
+		})
+	}
+
+	plan, err := flowlang.PlanFromWire(wire, wireEdges)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", domain.ErrPlanInvalid, err)
+	}
+	return plan, byName, nil
+}
+
+// checkRunCredentials refuses a token/environment pair that does not match what
+// the graph declares, BEFORE any node runs.
+func checkRunCredentials(nodes []domain.GraphNode, secretToken, environment string) error {
+	declares := false
+	for i := range nodes {
+		if len(nodes[i].Secrets) > 0 {
+			declares = true
+			break
+		}
+	}
+	switch {
+	case declares && secretToken == "":
+		return domain.ErrSecretTokenRequired
+	case !declares && secretToken != "":
+		return domain.ErrSecretTokenUnexpected
+	case !declares && environment != "":
+		return domain.ErrEnvironmentUnexpected
+	case secretToken != "" && environment == "":
+		return domain.ErrEnvironmentRequired
+	case environment != "" && !slices.Contains(flowEnvironments, environment):
+		return domain.ErrEnvironmentInvalid
+	}
+	return nil
+}
+
+// runPlan is the ONE loop. Every wave is flowlang's own rule — the nodes that
+// are ready and runnable run, the ready-but-unfed ones are recorded skipped,
+// and nothing else decides. The runtime never re-derives an order.
+func (e *GraphExecutionEngine) runPlan(
 	ctx context.Context,
 	graphExec *domain.GraphExecution,
 	graph *domain.GraphDefinition,
-	nodes []domain.GraphNode,
-	edges []domain.GraphEdge,
+	plan *flowlang.Plan,
+	byName map[string]*domain.GraphNode,
 	input domain.JSONMap,
-	seededOutputs map[string]domain.JSONMap,
 ) {
-	// Mark as running
+	defer e.cleanupRun(ctx, graphExec.ID)
+
 	graphExec.MarkRunning()
 	if err := e.graphExecRepo.Update(ctx, graphExec); err != nil {
-		log.Printf("Failed to mark graph execution %s as running: %v", graphExec.ID, err)
+		logger.FromContext(ctx).Error("mark run running", "run", graphExec.ID.String(), "err", err)
 		return
 	}
 	_ = e.eventPublisher.Publish(ctx, EventGraphExecStarted, graphExec.ID.String(), graphExec)
 
-	// Start trace recording
 	var trace *domain.GraphExecutionTrace
 	if e.traceRecorder != nil {
-		var err error
-		trace, err = e.traceRecorder.StartTrace(ctx, graphExec.ID, graph.ID, graphExec.OrganizationID, input)
+		t, err := e.traceRecorder.StartTrace(ctx, graphExec.ID, graph.ID, graphExec.OrganizationID, input)
 		if err != nil {
-			log.Printf("Warning: failed to start trace for graph execution %s: %v", graphExec.ID, err)
+			logger.FromContext(ctx).Warn("start trace", "run", graphExec.ID.String(), "err", err)
+		} else {
+			trace = t
 		}
 	}
 
-	// Build adjacency and in-degree maps
-	inDegree := make(map[uuid.UUID]int, len(nodes))
-	adjacency := make(map[uuid.UUID][]uuid.UUID)
-	nodeMap := make(map[uuid.UUID]*domain.GraphNode, len(nodes))
-	for i := range nodes {
-		inDegree[nodes[i].ID] = 0
-		nodeMap[nodes[i].ID] = &nodes[i]
-	}
-	for _, edge := range edges {
-		adjacency[edge.SourceNodeID] = append(adjacency[edge.SourceNodeID], edge.TargetNodeID)
-		inDegree[edge.TargetNodeID]++
+	state := &runState{
+		status:  map[string]flowlang.Status{},
+		fired:   map[string]map[string]bool{},
+		outputs: map[string]map[string]json.RawMessage{},
 	}
 
-	// Wave-based execution
-	outputs := make(map[uuid.UUID]domain.JSONMap)
-	remaining := make(map[uuid.UUID]bool, len(nodes))
-	for _, n := range nodes {
-		remaining[n.ID] = true
-	}
-
-	completedNodes := 0
-	seqNum := 0
-	var execErr error
-
-	for len(remaining) > 0 {
-		// Check for context cancellation
+	var runErr error
+	for {
 		if ctx.Err() != nil {
-			execErr = ctx.Err()
+			runErr = ctx.Err()
 			break
 		}
-
-		// Find ready nodes (in-degree 0 and still remaining)
-		var ready []*domain.GraphNode
-		for id := range remaining {
-			if inDegree[id] == 0 {
-				ready = append(ready, nodeMap[id])
-			}
-		}
-
-		if len(ready) == 0 {
-			execErr = domain.ErrGraphHasCycle
+		run, skip := plan.Next(state.status, state.fired)
+		if len(run) == 0 && len(skip) == 0 {
 			break
 		}
-
-		// Sort for deterministic execution order
-		sort.Slice(ready, func(i, j int) bool {
-			if ready[i].SortOrder != ready[j].SortOrder {
-				return ready[i].SortOrder < ready[j].SortOrder
-			}
-			return ready[i].Name < ready[j].Name
-		})
-
-		// Execute ready nodes in parallel, bounded by maxParallelism.
-		// We use a buffered channel as a counting semaphore — every
-		// goroutine grabs a slot before doing work and releases it on
-		// exit, capping in-flight execution without throwing away
-		// fairness or ordering.
-		maxPar := e.MaxParallelism()
-		if maxPar <= 0 {
-			maxPar = DefaultMaxParallelism
+		for _, slug := range skip {
+			e.recordSkip(ctx, graphExec, byName[slug], state.nextSeq())
+			state.status[slug] = flowlang.StatusSkipped
 		}
-		sem := make(chan struct{}, maxPar)
-
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		errCh := make(chan error, len(ready))
-		laneAssign := func() int {
-			// Lane assignment is just the order goroutines acquire
-			// the semaphore, modulo maxPar. Used for the
-			// parallelism-report visualisation only.
-			return int(time.Now().UnixNano()) % maxPar
+		if len(run) == 0 {
+			continue
 		}
-
-		for _, node := range ready {
-			wg.Add(1)
-			go func(n *domain.GraphNode) {
-				defer wg.Done()
-				select {
-				case sem <- struct{}{}:
-				case <-ctx.Done():
-					return
-				}
-				defer func() { <-sem }()
-				lane := laneAssign()
-
-				nodeSeq := func() int {
-					mu.Lock()
-					defer mu.Unlock()
-					seqNum++
-					return seqNum
-				}()
-
-				// Resolve inputs for this node
-				nodeInput := e.resolveNodeInput(n.ID, edges, outputs, input)
-
-				startedAt := time.Now().UTC()
-
-				// Create node execution record
-				nodeExec := &domain.NodeExecution{
-					ID:               uuid.New(),
-					GraphExecutionID: graphExec.ID,
-					GraphNodeID:      n.ID,
-					NodeType:         n.NodeType,
-					NodeName:         n.Name,
-					SequenceNumber:   nodeSeq,
-					Status:           domain.GraphExecRunning,
-					Input:            nodeInput,
-					CreatedAt:        time.Now().UTC(),
-				}
-
-				// Seeded-output skip: if this node's output was pre-supplied from the
-				// cache, do NOT execute it. Record it completed+cached (duration 0,
-				// no microVM) and propagate the seed downstream exactly as a real
-				// output would.
-				if seed, ok := seededOutputs[n.Name]; ok {
-					nodeExec.MarkRunning()
-					nodeExec.Cached = true
-					nodeExec.MarkCompleted(seed)
-					if nodeExec.DurationMS != nil {
-						zero := int64(0)
-						nodeExec.DurationMS = &zero
-					}
-					if err := e.nodeExecRepo.Create(ctx, nodeExec); err != nil {
-						log.Printf("Warning: failed to create cached node execution record: %v", err)
-					}
-					_ = e.eventPublisher.Publish(ctx, EventNodeExecCompleted, nodeExec.ID.String(), nodeExec)
-
-					mu.Lock()
-					outputs[n.ID] = seed
-					completedNodes++
-					mu.Unlock()
-					e.recordTiming(graphExec.ID, nodeTimings{
-						NodeID:      n.ID,
-						NodeName:    n.Name,
-						Lane:        lane,
-						StartedAt:   startedAt,
-						CompletedAt: startedAt,
-						DurationMS:  0,
-					})
-					if trace != nil && e.traceRecorder != nil {
-						_ = e.traceRecorder.RecordNode(ctx, trace, n.ID, n.Name, string(n.NodeType), nodeSeq, nodeInput, seed, n.Config, "completed", "", startedAt, startedAt)
-					}
-					return
-				}
-
-				nodeExec.MarkRunning()
-				if err := e.nodeExecRepo.Create(ctx, nodeExec); err != nil {
-					log.Printf("Warning: failed to create node execution record: %v", err)
-				}
-
-				_ = e.eventPublisher.Publish(ctx, EventNodeExecStarted, nodeExec.ID.String(), nodeExec)
-
-				// Execute based on node type
-				output, execID, err := e.executeNode(ctx, n, nodeInput, graphExec)
-				completedAt := time.Now().UTC()
-
-				if err != nil {
-					e.recordTiming(graphExec.ID, nodeTimings{
-						NodeID:      n.ID,
-						NodeName:    n.Name,
-						Lane:        lane,
-						StartedAt:   startedAt,
-						CompletedAt: completedAt,
-						DurationMS:  completedAt.Sub(startedAt).Milliseconds(),
-					})
-					nodeExec.MarkFailed(err.Error())
-					nodeExec.ExecutionID = execID
-					_ = e.nodeExecRepo.Update(ctx, nodeExec)
-					_ = e.eventPublisher.Publish(ctx, EventNodeExecFailed, nodeExec.ID.String(), nodeExec)
-
-					// Record trace
-					if trace != nil && e.traceRecorder != nil {
-						_ = e.traceRecorder.RecordNode(ctx, trace, n.ID, n.Name, string(n.NodeType), nodeSeq, nodeInput, nil, n.Config, "failed", err.Error(), startedAt, completedAt)
-					}
-
-					errCh <- fmt.Errorf("node %q failed: %w", n.Name, err)
-					return
-				}
-
-				nodeExec.MarkCompleted(output)
-				nodeExec.ExecutionID = execID
-				_ = e.nodeExecRepo.Update(ctx, nodeExec)
-				_ = e.eventPublisher.Publish(ctx, EventNodeExecCompleted, nodeExec.ID.String(), nodeExec)
-
-				// Store output, record trace, and persist timings
-				mu.Lock()
-				outputs[n.ID] = output
-				completedNodes++
-				mu.Unlock()
-				e.recordTiming(graphExec.ID, nodeTimings{
-					NodeID:      n.ID,
-					NodeName:    n.Name,
-					Lane:        lane,
-					StartedAt:   startedAt,
-					CompletedAt: completedAt,
-					DurationMS:  completedAt.Sub(startedAt).Milliseconds(),
-				})
-
-				if trace != nil && e.traceRecorder != nil {
-					_ = e.traceRecorder.RecordNode(ctx, trace, n.ID, n.Name, string(n.NodeType), nodeSeq, nodeInput, output, n.Config, "completed", "", startedAt, completedAt)
-				}
-			}(node)
-		}
-
-		wg.Wait()
-		close(errCh)
-
-		// Check for errors
-		for err := range errCh {
-			if execErr == nil {
-				execErr = err
-			}
-		}
-		if execErr != nil {
+		if err := e.runWave(ctx, graphExec, plan, byName, input, run, state, trace); err != nil {
+			runErr = err
 			break
-		}
-
-		// Remove completed nodes and update in-degrees
-		for _, node := range ready {
-			delete(remaining, node.ID)
-			for _, next := range adjacency[node.ID] {
-				inDegree[next]--
-			}
 		}
 	}
 
-	// Finalize execution
-	if execErr != nil {
-		graphExec.MarkFailed(execErr.Error(), completedNodes)
+	e.finalize(ctx, graphExec, plan, state, runErr, trace)
+}
+
+// runState is one run's in-flight bookkeeping, guarded by its own mutex because
+// a wave writes it from several goroutines at once.
+type runState struct {
+	mu      sync.Mutex
+	seq     int
+	done    int
+	status  map[string]flowlang.Status
+	fired   map[string]map[string]bool
+	outputs map[string]map[string]json.RawMessage
+}
+
+func (s *runState) nextSeq() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seq++
+	return s.seq
+}
+
+// runWave executes one wave. The FIRST failure cancels the wave: the remaining
+// nodes of a broken run are work nobody wants paid for, and their outputs could
+// never be used anyway.
+func (e *GraphExecutionEngine) runWave(
+	ctx context.Context,
+	graphExec *domain.GraphExecution,
+	plan *flowlang.Plan,
+	byName map[string]*domain.GraphNode,
+	input domain.JSONMap,
+	run []string,
+	state *runState,
+	trace *domain.GraphExecutionTrace,
+) error {
+	waveCtx, cancelWave := context.WithCancel(ctx)
+	defer cancelWave()
+
+	maxPar := e.MaxParallelism()
+	sem := make(chan struct{}, maxPar)
+	errCh := make(chan error, len(run))
+	var wg sync.WaitGroup
+
+	for _, slug := range run {
+		wg.Add(1)
+		go func(slug string) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					errCh <- fmt.Errorf("node %q failed: crash: %v", slug, r)
+					cancelWave()
+				}
+			}()
+			select {
+			case sem <- struct{}{}:
+			case <-waveCtx.Done():
+				return
+			}
+			defer func() { <-sem }()
+
+			if err := e.runNode(waveCtx, graphExec, plan, byName[slug], slug, input, state, trace); err != nil {
+				errCh <- err
+				cancelWave()
+			}
+		}(slug)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		return err
+	}
+	return nil
+}
+
+// runNode resolves one node's inputs, records the attempt, invokes the bundle
+// and records the outcome.
+func (e *GraphExecutionEngine) runNode(
+	ctx context.Context,
+	graphExec *domain.GraphExecution,
+	plan *flowlang.Plan,
+	node *domain.GraphNode,
+	slug string,
+	input domain.JSONMap,
+	state *runState,
+	trace *domain.GraphExecutionTrace,
+) error {
+	if node == nil {
+		return fmt.Errorf("node %q failed: %w", slug, domain.ErrGraphNodeNotFound)
+	}
+
+	state.mu.Lock()
+	inputs, config, err := nodeInvocation(plan, node, slug, state.outputs, state.fired, input)
+	state.mu.Unlock()
+	if err != nil {
+		e.recordFailure(ctx, graphExec, node, state, nil, err, trace, time.Now().UTC())
+		return fmt.Errorf("node %q failed: %w", slug, err)
+	}
+
+	seq := state.nextSeq()
+	startedAt := time.Now().UTC()
+	nodeExec := newNodeExecutionRow(graphExec, node, seq, rawToJSONMap(inputs), startedAt)
+	nodeExec.MarkRunning()
+	if err := e.nodeExecRepo.Create(ctx, nodeExec); err != nil {
+		logger.FromContext(ctx).Warn("create node execution", "run", graphExec.ID.String(), "node", slug, "err", err)
+	}
+	_ = e.eventPublisher.Publish(ctx, EventNodeExecStarted, nodeExec.ID.String(), nodeExec)
+
+	cred := e.credentialFor(graphExec.ID)
+	out, invErr := e.invoker.Invoke(ctx, InvokeNodeInput{
+		RunID:       graphExec.ID,
+		OrgID:       graphExec.OrganizationID,
+		Environment: cred.environment,
+		Node:        node,
+		Inputs:      inputs,
+		Config:      config,
+		SecretToken: cred.token,
+	})
+	completedAt := time.Now().UTC()
+	e.logNodeLogs(ctx, graphExec.ID, slug, out.Logs)
+	e.recordTiming(graphExec.ID, nodeTimings{
+		NodeID:      node.ID,
+		NodeName:    node.Name,
+		StartedAt:   startedAt,
+		CompletedAt: completedAt,
+		DurationMS:  completedAt.Sub(startedAt).Milliseconds(),
+	})
+
+	if invErr != nil {
+		nodeExec.MarkFailed(invErr.Error())
+		_ = e.nodeExecRepo.Update(ctx, nodeExec)
+		_ = e.eventPublisher.Publish(ctx, EventNodeExecFailed, nodeExec.ID.String(), nodeExec)
+		state.mu.Lock()
+		state.status[slug] = flowlang.StatusFailed
+		state.mu.Unlock()
+		e.recordTrace(ctx, trace, node, seq, nodeExec.Input, nil, "failed", invErr.Error(), startedAt, completedAt)
+		return fmt.Errorf("node %q failed: %w", slug, invErr)
+	}
+
+	outputMap := rawToJSONMap(out.Outputs)
+	nodeExec.MarkCompleted(outputMap)
+	_ = e.nodeExecRepo.Update(ctx, nodeExec)
+	_ = e.eventPublisher.Publish(ctx, EventNodeExecCompleted, nodeExec.ID.String(), nodeExec)
+
+	state.mu.Lock()
+	state.outputs[slug] = out.Outputs
+	state.fired[slug] = out.Fired
+	state.status[slug] = flowlang.StatusDone
+	state.done++
+	state.mu.Unlock()
+
+	e.recordTrace(ctx, trace, node, seq, nodeExec.Input, outputMap, "completed", "", startedAt, completedAt)
+	return nil
+}
+
+// recordSkip writes the row for a node the plan did not fire. A skip is an
+// outcome, not an absence: a run whose rows do not account for every node in
+// the plan cannot be reasoned about afterwards.
+func (e *GraphExecutionEngine) recordSkip(ctx context.Context, graphExec *domain.GraphExecution, node *domain.GraphNode, seq int) {
+	if node == nil {
+		return
+	}
+	now := time.Now().UTC()
+	nodeExec := newNodeExecutionRow(graphExec, node, seq, nil, now)
+	nodeExec.Status = domain.GraphExecSkipped
+	nodeExec.StartedAt, nodeExec.CompletedAt = &now, &now
+	if err := e.nodeExecRepo.Create(ctx, nodeExec); err != nil {
+		logger.FromContext(ctx).Warn("create skipped node execution",
+			"run", graphExec.ID.String(), "node", node.Name, "err", err)
+	}
+	_ = e.eventPublisher.Publish(ctx, EventNodeExecSkipped, nodeExec.ID.String(), nodeExec)
+}
+
+// recordFailure writes the row for a node that failed BEFORE it was invoked —
+// a bad trigger request or an unusable config never reaches a sandbox, and the
+// run still has to show which node refused.
+func (e *GraphExecutionEngine) recordFailure(
+	ctx context.Context,
+	graphExec *domain.GraphExecution,
+	node *domain.GraphNode,
+	state *runState,
+	inputs map[string]json.RawMessage,
+	cause error,
+	trace *domain.GraphExecutionTrace,
+	at time.Time,
+) {
+	nodeExec := newNodeExecutionRow(graphExec, node, state.nextSeq(), rawToJSONMap(inputs), at)
+	nodeExec.MarkRunning()
+	nodeExec.MarkFailed(cause.Error())
+	if err := e.nodeExecRepo.Create(ctx, nodeExec); err != nil {
+		logger.FromContext(ctx).Warn("create failed node execution",
+			"run", graphExec.ID.String(), "node", node.Name, "err", err)
+	}
+	_ = e.eventPublisher.Publish(ctx, EventNodeExecFailed, nodeExec.ID.String(), nodeExec)
+	state.mu.Lock()
+	state.status[node.Name] = flowlang.StatusFailed
+	state.mu.Unlock()
+	e.recordTrace(ctx, trace, node, nodeExec.SequenceNumber, nodeExec.Input, nil, "failed", cause.Error(), at, at)
+}
+
+// newNodeExecutionRow is the ONE shape of a node execution row: which run,
+// which node, and WHICH BUNDLE it ran — recorded per execution so a finished
+// run stays attributable after the graph is re-pinned.
+func newNodeExecutionRow(
+	graphExec *domain.GraphExecution,
+	node *domain.GraphNode,
+	seq int,
+	input domain.JSONMap,
+	at time.Time,
+) *domain.NodeExecution {
+	return &domain.NodeExecution{
+		ID:               uuid.New(),
+		GraphExecutionID: graphExec.ID,
+		GraphNodeID:      node.ID,
+		NodeType:         node.NodeType,
+		NodeName:         node.Name,
+		NodeRef:          node.NodeRef,
+		SequenceNumber:   seq,
+		Status:           domain.GraphExecRunning,
+		Input:            input,
+		CreatedAt:        at,
+	}
+}
+
+// finalize settles the run: a failure keeps its reason, and a clean run answers
+// with whatever the plan says the flow answered.
+func (e *GraphExecutionEngine) finalize(
+	ctx context.Context,
+	graphExec *domain.GraphExecution,
+	plan *flowlang.Plan,
+	state *runState,
+	runErr error,
+	trace *domain.GraphExecutionTrace,
+) {
+	traceStatus := "completed"
+	switch {
+	case runErr != nil && ctx.Err() != nil:
+		graphExec.MarkCancelled(state.done)
+		_ = e.graphExecRepo.Update(ctx, graphExec)
+		_ = e.eventPublisher.Publish(context.WithoutCancel(ctx), EventGraphExecCancelled, graphExec.ID.String(), graphExec)
+		traceStatus = "cancelled"
+	case runErr != nil:
+		graphExec.MarkFailed(runErr.Error(), state.done)
 		_ = e.graphExecRepo.Update(ctx, graphExec)
 		_ = e.eventPublisher.Publish(ctx, EventGraphExecFailed, graphExec.ID.String(), graphExec)
-	} else {
-		// Collect output from output nodes
-		graphOutput := e.collectGraphOutput(nodes, outputs)
-		graphExec.MarkCompleted(graphOutput, completedNodes)
+		traceStatus = "failed"
+	default:
+		output, err := planResult(plan, state)
+		if err != nil {
+			graphExec.MarkFailed(err.Error(), state.done)
+			_ = e.graphExecRepo.Update(ctx, graphExec)
+			_ = e.eventPublisher.Publish(ctx, EventGraphExecFailed, graphExec.ID.String(), graphExec)
+			traceStatus = "failed"
+			break
+		}
+		graphExec.MarkCompleted(output, state.done)
 		_ = e.graphExecRepo.Update(ctx, graphExec)
 		_ = e.eventPublisher.Publish(ctx, EventGraphExecCompleted, graphExec.ID.String(), graphExec)
 	}
 
-	// Complete trace
 	if trace != nil && e.traceRecorder != nil {
-		status := "completed"
-		if execErr != nil {
-			status = "failed"
-		}
-		_ = e.traceRecorder.CompleteTrace(ctx, trace, status)
+		_ = e.traceRecorder.CompleteTrace(context.WithoutCancel(ctx), trace, traceStatus)
 	}
-
-	log.Printf("Graph execution %s finished: status=%s, nodes=%d/%d", graphExec.ID, graphExec.Status, completedNodes, graphExec.TotalNodes)
+	logger.FromContext(ctx).Info("graph run finished",
+		"run", graphExec.ID.String(), "status", string(graphExec.Status),
+		"nodes", state.done, "total", graphExec.TotalNodes)
 }
 
-// resolveNodeInput collects inputs for a node from upstream outputs and graph input
-func (e *GraphExecutionEngine) resolveNodeInput(
-	nodeID uuid.UUID,
-	edges []domain.GraphEdge,
-	outputs map[uuid.UUID]domain.JSONMap,
-	graphInput domain.JSONMap,
-) domain.JSONMap {
-	result := make(domain.JSONMap)
+// planResult is how the flow answered its caller.
+func planResult(plan *flowlang.Plan, state *runState) (domain.JSONMap, error) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	kind, slug := plan.Result(state.fired)
+	switch kind {
+	case flowlang.ResultFireAndForget:
+		return domain.JSONMap{}, nil
+	case flowlang.ResultSingleResponse:
+		raw, ok := state.outputs[slug]["response"]
+		if !ok {
+			return nil, domain.ErrNoResponse
+		}
+		var out domain.JSONMap
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("node %q failed: %s", slug, responseInvalidReason)
+		}
+		return out, nil
+	case flowlang.ResultMultipleResponses:
+		return nil, domain.ErrMultipleResponses
+	default:
+		return nil, domain.ErrNoResponse
+	}
+}
 
-	// Start with graph-level input as base
-	for k, v := range graphInput {
-		result[k] = v
+// cleanupRun is the ONE terminal cleanup: every container, bridge and directory
+// this run labelled is swept, and the handed token is revoked whether the run
+// succeeded, failed or was cancelled.
+func (e *GraphExecutionEngine) cleanupRun(ctx context.Context, runID uuid.UUID) {
+	cleanCtx := context.WithoutCancel(ctx)
+	if err := e.sidecars.SweepRun(cleanCtx, runID); err != nil {
+		logger.FromContext(cleanCtx).Warn("run sweep failed", "run", runID.String(), "err", err)
 	}
 
-	// Overlay outputs from upstream nodes via edges.
-	for _, edge := range edges {
-		if edge.TargetNodeID != nodeID {
+	e.mu.Lock()
+	cred := e.runCredentials[runID]
+	delete(e.runCredentials, runID)
+	e.mu.Unlock()
+
+	if cred.token == "" {
+		return
+	}
+	if err := e.invoker.RevokeSecretToken(cleanCtx, cred.token); err != nil {
+		logger.FromContext(cleanCtx).Warn("secret_token_revoke_failed", "run", runID.String(), "err", err)
+		return
+	}
+	logger.FromContext(cleanCtx).Info("secret_token_revoked", "run", runID.String())
+}
+
+func (e *GraphExecutionEngine) credentialFor(runID uuid.UUID) runCredential {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.runCredentials[runID]
+}
+
+// logNodeLogs surfaces a node's own log entries as runtime log lines. They are
+// deliberately NOT persisted (D-13).
+func (e *GraphExecutionEngine) logNodeLogs(ctx context.Context, runID uuid.UUID, slug string, logs []nodeabi.LogEntry) {
+	for _, entry := range logs {
+		logger.FromContext(ctx).Info("node_log",
+			"run", runID.String(), "node", slug, "level", entry.Level, "message", entry.Message)
+	}
+}
+
+func (e *GraphExecutionEngine) recordTrace(
+	ctx context.Context,
+	trace *domain.GraphExecutionTrace,
+	node *domain.GraphNode,
+	seq int,
+	input, output domain.JSONMap,
+	status, errMsg string,
+	startedAt, completedAt time.Time,
+) {
+	if trace == nil || e.traceRecorder == nil {
+		return
+	}
+	_ = e.traceRecorder.RecordNode(ctx, trace, node.ID, node.Name, string(node.NodeType),
+		seq, input, output, node.Config, status, errMsg, startedAt, completedAt)
+}
+
+// nodeInvocation resolves what ONE node is called with: the values its fired
+// upstream ports produced, and its config with any promoted port folded in.
+//
+// It is called under the run state's lock, so it reads the shared maps directly
+// and returns copies.
+func nodeInvocation(
+	plan *flowlang.Plan,
+	node *domain.GraphNode,
+	slug string,
+	outputs map[string]map[string]json.RawMessage,
+	fired map[string]map[string]bool,
+	graphInput domain.JSONMap,
+) (map[string]json.RawMessage, map[string]json.RawMessage, error) {
+	config, err := configObject(node.Config)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if node.Role == domain.NodeRoleTrigger {
+		request, err := triggerRequest(config, graphInput)
+		if err != nil {
+			return nil, nil, err
+		}
+		return map[string]json.RawMessage{"request": request}, config, nil
+	}
+
+	inputs := map[string]json.RawMessage{}
+	for _, edge := range plan.Edges {
+		if edge.To != slug || !fired[edge.From][edge.FromPort] {
 			continue
 		}
-		srcOutput, ok := outputs[edge.SourceNodeID]
+		value, ok := outputs[edge.From][edge.FromPort]
 		if !ok {
 			continue
 		}
-
-		// Default data transit: connecting A→B makes B's input the fields of
-		// A's output (e.g. a code node emitting {code,url} feeds a database
-		// node's params directly). Spread the whole upstream output, then let
-		// a named port act as an explicit override:
-		//   - source_port names an output field → bind it under target_port
-		//     (point-to-point wiring of a single value).
-		for k, v := range srcOutput {
-			result[k] = v
+		// A promoted wire delivers into the node's CONFIG, not into one of its
+		// manifest inputs. Lowering already rewrote the target, so the runtime
+		// never carries the document's promotion table.
+		if key, promoted := flowlang.PromotedKey(edge.ToPort); promoted {
+			config[key] = value
+			continue
 		}
-		if val, ok := srcOutput[edge.SourcePort]; ok && edge.TargetPort != "" {
-			result[edge.TargetPort] = val
-		}
+		inputs[edge.ToPort] = value
 	}
-
-	return result
+	return inputs, config, nil
 }
 
-// collectGraphOutput aggregates output from output-type nodes
-func (e *GraphExecutionEngine) collectGraphOutput(nodes []domain.GraphNode, outputs map[uuid.UUID]domain.JSONMap) domain.JSONMap {
-	result := make(domain.JSONMap)
-	for _, node := range nodes {
-		if node.NodeType == domain.GraphNodeTypeOutput {
-			if out, ok := outputs[node.ID]; ok {
-				for k, v := range out {
-					result[k] = v
-				}
-			}
-		}
+// configObject copies a node's stored config into the CALL's shape. The row
+// holds a JSON object or nothing at all; anything else is refused rather than
+// handed to a bundle that would read it as an empty configuration.
+func configObject(config domain.JSONMap) (map[string]json.RawMessage, error) {
+	out := map[string]json.RawMessage{}
+	if len(config) == 0 {
+		return out, nil
 	}
-	// If no output nodes, return all outputs from the last nodes
-	if len(result) == 0 {
-		for _, out := range outputs {
-			for k, v := range out {
-				result[k] = v
-			}
-		}
-	}
-	return result
-}
-
-// executeNode dispatches execution to the appropriate handler based on node type
-func (e *GraphExecutionEngine) executeNode(
-	ctx context.Context,
-	node *domain.GraphNode,
-	input domain.JSONMap,
-	graphExec *domain.GraphExecution,
-) (domain.JSONMap, *uuid.UUID, error) {
-	switch node.NodeType {
-	case domain.GraphNodeTypeCode:
-		return e.executeCodeNode(ctx, node, input, graphExec)
-	case domain.GraphNodeTypeTransform:
-		out, err := e.executeTransformNode(node, input)
-		return out, nil, err
-	case domain.GraphNodeTypeCondition:
-		out, err := e.executeConditionNode(node, input)
-		return out, nil, err
-	case domain.GraphNodeTypeHTTP:
-		out, err := e.executeHTTPNode(ctx, node, input)
-		return out, nil, err
-	case domain.GraphNodeTypeDatabase:
-		out, err := e.executeDatabaseNode(ctx, node, input)
-		return out, nil, err
-	case domain.GraphNodeTypeInput:
-		return input, nil, nil
-	case domain.GraphNodeTypeOutput:
-		return input, nil, nil
-	default:
-		return nil, nil, fmt.Errorf("unsupported node type: %s", node.NodeType)
-	}
-}
-
-// executeCodeNode runs a code node. When a warm runner is wired it runs on a
-// fast warm clone (~160ms); otherwise it falls back to the cold single-shot
-// Firecracker boot via ExecutionUseCase. Both paths produce identical node
-// output via shapeCodeOutput.
-func (e *GraphExecutionEngine) executeCodeNode(
-	ctx context.Context,
-	node *domain.GraphNode,
-	input domain.JSONMap,
-	graphExec *domain.GraphExecution,
-) (domain.JSONMap, *uuid.UUID, error) {
-	// Resolve the per-instance user code + language from the node config (the
-	// F1 seam) with a fallback to the dedicated fields — so a Code node runs
-	// the source the user wrote, not a shared stub.
-	language := node.ResolvedLanguage()
-	code := node.ResolvedCode()
-	if language == nil {
-		return nil, nil, fmt.Errorf("code node %q missing language", node.Name)
-	}
-	if code == "" {
-		return nil, nil, fmt.Errorf("code node %q missing code", node.Name)
-	}
-
-	// Convert input to stdin JSON
-	stdinBytes, _ := json.Marshal(input)
-
-	// Warm path: run on a fast warm clone. No Execution record is created,
-	// so there is no execID to return (nil).
-	if e.warm != nil {
-		res, err := e.warm.RunCode(ctx, *language, code, string(stdinBytes))
-		if err != nil {
-			return nil, nil, fmt.Errorf("warm code execution failed: %w", err)
-		}
-		output, runErr := shapeCodeOutput(res.Stdout, res.Stderr, &res.ExitCode)
-		return output, nil, runErr
-	}
-
-	// Cold fallback path: single-shot Firecracker boot via the execution service.
-	exec, err := e.executionUC.ExecuteSync(ctx, CreateExecutionInput{
-		OrganizationID: graphExec.OrganizationID,
-		RequestedBy:    graphExec.RequestedBy,
-		NodeID:         &node.ID,
-		WorkflowID:     &graphExec.GraphID,
-		Language:       *language,
-		Code:           code,
-		Stdin:          string(stdinBytes),
-		Args:           input,
-		Resources:      &node.Resources,
-	})
+	encoded, err := json.Marshal(config)
 	if err != nil {
-		return nil, nil, fmt.Errorf("code execution failed: %w", err)
+		return nil, fmt.Errorf("%w: %w", domain.ErrNodeConfigInvalid, err)
 	}
-
-	execID := exec.ID
-	output, runErr := shapeCodeOutput(exec.Stdout, exec.Stderr, exec.ExitCode)
-	return output, &execID, runErr
+	if err := json.Unmarshal(encoded, &out); err != nil {
+		return nil, fmt.Errorf("%w: %w", domain.ErrNodeConfigInvalid, err)
+	}
+	return out, nil
 }
 
-// shapeCodeOutput builds the canonical code-node output map from a run's
-// stdout / stderr / exit code. It is shared by the warm and cold paths so both
-// produce byte-identical node output: the base {stdout,stderr,exit_code,output}
-// fields, a non-zero-exit error, and a best-effort merge of stdout-parsed JSON
-// for richer downstream wiring. exitCode is nil when the runner reported none.
-func shapeCodeOutput(stdout, stderr string, exitCode *int) (domain.JSONMap, error) {
-	output := domain.JSONMap{
-		"stdout":    stdout,
-		"stderr":    stderr,
-		"exit_code": exitCode,
-		"output":    stdout,
+// triggerRequest builds the ONE input a trigger node receives. The run's input
+// document is the request itself, never spread across the flow: a trigger that
+// silently accepted a different method or path than it was configured for would
+// answer a request the flow was never deployed to serve.
+func triggerRequest(config map[string]json.RawMessage, input domain.JSONMap) (json.RawMessage, error) {
+	method, err := configString(config, "method")
+	if err != nil {
+		return nil, err
 	}
-
-	if exitCode != nil && *exitCode != 0 {
-		return output, fmt.Errorf("code exited with code %d: %s", *exitCode, stderr)
+	path, err := configString(config, "path")
+	if err != nil {
+		return nil, err
 	}
-
-	// Try to parse stdout as JSON for richer output.
-	var parsed domain.JSONMap
-	if err := json.Unmarshal([]byte(stdout), &parsed); err == nil {
-		for k, v := range parsed {
-			output[k] = v
-		}
+	if err := inputMatches(input, "method", method); err != nil {
+		return nil, err
 	}
-
-	return output, nil
+	if err := inputMatches(input, "path", path); err != nil {
+		return nil, err
+	}
+	headers, err := inputObject(input, "headers")
+	if err != nil {
+		return nil, err
+	}
+	query, err := inputObject(input, "query")
+	if err != nil {
+		return nil, err
+	}
+	body, ok := input["body"]
+	if !ok || body == nil {
+		body = map[string]any{}
+	}
+	request := map[string]any{
+		"method":  method,
+		"path":    path,
+		"headers": headers,
+		"query":   query,
+		"body":    body,
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", domain.ErrTriggerInputInvalid, err)
+	}
+	return encoded, nil
 }
 
-// executeTransformNode applies a template transformation to input
-func (e *GraphExecutionEngine) executeTransformNode(node *domain.GraphNode, input domain.JSONMap) (domain.JSONMap, error) {
-	tmplStr, _ := node.Config["template"].(string)
-	if tmplStr == "" {
-		// Pass-through if no template
-		return input, nil
+func configString(config map[string]json.RawMessage, key string) (string, error) {
+	raw, ok := config[key]
+	if !ok {
+		return "", nil
 	}
-
-	tmpl, err := template.New("transform").Parse(tmplStr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid transform template: %w", err)
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("%w: %s", domain.ErrNodeConfigInvalid, key)
 	}
-
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, input); err != nil {
-		return nil, fmt.Errorf("transform template execution failed: %w", err)
-	}
-
-	// Try to parse result as JSON
-	var result domain.JSONMap
-	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
-		return domain.JSONMap{"output": buf.String()}, nil
-	}
-	return result, nil
+	return value, nil
 }
 
-// executeConditionNode evaluates a condition and returns which branch to take
-func (e *GraphExecutionEngine) executeConditionNode(node *domain.GraphNode, input domain.JSONMap) (domain.JSONMap, error) {
-	expr, _ := node.Config["expression"].(string)
-	field, _ := node.Config["field"].(string)
-	expected, _ := node.Config["value"]
-
-	if field != "" {
-		actual, exists := input[field]
-		match := exists && fmt.Sprintf("%v", actual) == fmt.Sprintf("%v", expected)
-		branch := "false"
-		if match {
-			branch = "true"
-		}
-		return domain.JSONMap{"branch": branch, "value": actual}, nil
+func inputMatches(input domain.JSONMap, key, want string) error {
+	value, ok := input[key]
+	if !ok {
+		return nil
 	}
-
-	if expr != "" {
-		// Simple truthy check on the expression field from input
-		val, exists := input[expr]
-		branch := "false"
-		if exists && val != nil && val != false && val != 0 && val != "" {
-			branch = "true"
-		}
-		return domain.JSONMap{"branch": branch, "value": val}, nil
+	got, isString := value.(string)
+	if !isString || got != want {
+		return fmt.Errorf("%w: %s", domain.ErrTriggerInputInvalid, key)
 	}
-
-	return domain.JSONMap{"branch": "true"}, nil
+	return nil
 }
 
-// executeHTTPNode makes an HTTP request
-func (e *GraphExecutionEngine) executeHTTPNode(ctx context.Context, node *domain.GraphNode, input domain.JSONMap) (domain.JSONMap, error) {
-	urlStr, _ := node.Config["url"].(string)
-	method, _ := node.Config["method"].(string)
-	if urlStr == "" {
-		return nil, fmt.Errorf("http node %q missing url", node.Name)
+func inputObject(input domain.JSONMap, key string) (map[string]any, error) {
+	value, ok := input[key]
+	if !ok || value == nil {
+		return map[string]any{}, nil
 	}
-	if method == "" {
-		method = "GET"
+	obj, isObject := value.(map[string]any)
+	if !isObject {
+		return nil, fmt.Errorf("%w: %s", domain.ErrTriggerInputInvalid, key)
 	}
+	return obj, nil
+}
 
-	var bodyReader io.Reader
-	if bodyTmpl, ok := node.Config["body"].(string); ok && bodyTmpl != "" {
-		bodyReader = bytes.NewBufferString(bodyTmpl)
+// rawToJSONMap decodes a node's raw port values for the row that records them.
+// A value that cannot be decoded is kept as its literal JSON text rather than
+// dropped: the row is evidence of what ran, and a hole in it is worse than a
+// string.
+func rawToJSONMap(in map[string]json.RawMessage) domain.JSONMap {
+	if in == nil {
+		return nil
 	}
-
-	req, err := http.NewRequestWithContext(ctx, method, urlStr, bodyReader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create http request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	if headers, ok := node.Config["headers"].(map[string]any); ok {
-		for k, v := range headers {
-			req.Header.Set(k, fmt.Sprintf("%v", v))
+	out := make(domain.JSONMap, len(in))
+	for k, raw := range in {
+		var value any
+		if err := json.Unmarshal(raw, &value); err != nil {
+			out[k] = string(raw)
+			continue
 		}
+		out[k] = value
 	}
-
-	resp, err := e.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read http response: %w", err)
-	}
-
-	output := domain.JSONMap{
-		"status_code": resp.StatusCode,
-		"body":        string(respBody),
-	}
-
-	// Try to parse response as JSON
-	var parsed domain.JSONMap
-	if err := json.Unmarshal(respBody, &parsed); err == nil {
-		output["data"] = parsed
-	}
-
-	return output, nil
+	return out
 }
 
 // recordTiming appends a per-node timing record under the execution ID.
@@ -961,9 +1061,7 @@ func (e *GraphExecutionEngine) GetParallelismReport(execID uuid.UUID) Parallelis
 	// last completion. Sort by completed-ascending then walk backwards
 	// taking the longest predecessor that finishes before each step.
 	sortedByEnd := append([]nodeTimings(nil), rows...)
-	sort.Slice(sortedByEnd, func(i, j int) bool {
-		return sortedByEnd[i].CompletedAt.Before(sortedByEnd[j].CompletedAt)
-	})
+	slices.SortFunc(sortedByEnd, func(a, b nodeTimings) int { return a.CompletedAt.Compare(b.CompletedAt) })
 	type cp struct {
 		idx    int
 		lenMS  int64
@@ -998,8 +1096,6 @@ func (e *GraphExecutionEngine) GetParallelismReport(execID uuid.UUID) Parallelis
 			report.Nodes[i].OnCriticalPath = true
 		}
 	}
-	sort.Slice(report.LaneUtilisation, func(i, j int) bool {
-		return report.LaneUtilisation[i].Lane < report.LaneUtilisation[j].Lane
-	})
+	slices.SortFunc(report.LaneUtilisation, func(a, b LaneReport) int { return a.Lane - b.Lane })
 	return report
 }

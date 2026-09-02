@@ -11,6 +11,7 @@ import (
 
 // BundleLaunch is one sandboxed run of a built node bundle.
 type BundleLaunch struct {
+	RunID        uuid.UUID // the graph execution; labelled on the node container so SweepRun can find it
 	InvocationID string
 	Image        string
 	// Call is the ABI call document handed to the bundle on stdin.

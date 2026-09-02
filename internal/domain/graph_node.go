@@ -14,18 +14,6 @@ const (
 	// a built, digest-pinned bundle the sandbox runs, never a snippet the
 	// runtime interprets (D-9).
 	GraphNodeTypeBundle GraphNodeType = "bundle"
-
-	// The interpreter's types are RETIRED. They remain declared only so the
-	// graph execution engine and the debug service still compile until the S2
-	// rewrite deletes them together with their last consumers; IsValid already
-	// refuses every one of them, so no new row can carry one.
-	GraphNodeTypeCode      GraphNodeType = "code"
-	GraphNodeTypeTransform GraphNodeType = "transform"
-	GraphNodeTypeCondition GraphNodeType = "condition"
-	GraphNodeTypeHTTP      GraphNodeType = "http"
-	GraphNodeTypeInput     GraphNodeType = "input"
-	GraphNodeTypeOutput    GraphNodeType = "output"
-	GraphNodeTypeDatabase  GraphNodeType = "database"
 )
 
 // IsValid checks if the graph node type is valid. Bundle is the whole
@@ -42,8 +30,6 @@ type GraphNode struct {
 	NodeType  GraphNodeType `json:"node_type" gorm:"type:varchar(50);not null"`
 	Name      string        `json:"name" gorm:"type:varchar(255);not null"`
 	Config    JSONMap       `json:"config" gorm:"type:jsonb"`
-	Language  *Language     `json:"language,omitempty" gorm:"type:varchar(20)"`
-	Code      string        `json:"code,omitempty" gorm:"type:text"`
 	Resources ResourceLimit `json:"resources" gorm:"embedded;embeddedPrefix:resource_"`
 	Position  JSONMap       `json:"position" gorm:"type:jsonb"`
 	SortOrder int           `json:"sort_order" gorm:"not null;default:0"`
@@ -73,33 +59,6 @@ func (n *GraphNode) NeedsBridge() bool { return len(n.Egress) > 0 }
 
 // TableName specifies the table name for GORM
 func (GraphNode) TableName() string { return "graph_nodes" }
-
-// ResolvedCode returns the source the node should execute. A placed Code node
-// carries the user's per-instance source under Config["code"] (the F1 seam:
-// node Config = {language, code}); when present it WINS over the dedicated Code
-// field (a shared NodeVersion stub). This makes the execution boundary honor
-// the config seam regardless of how the graph node was populated.
-func (n *GraphNode) ResolvedCode() string {
-	if n.Config != nil {
-		if c, ok := n.Config["code"].(string); ok && c != "" {
-			return c
-		}
-	}
-	return n.Code
-}
-
-// ResolvedLanguage returns the language the node should execute in, preferring
-// the per-instance Config["language"] (the F1 seam) over the dedicated Language
-// field. Returns nil when neither yields a value.
-func (n *GraphNode) ResolvedLanguage() *Language {
-	if n.Config != nil {
-		if l, ok := n.Config["language"].(string); ok && l != "" {
-			lang := Language(l)
-			return &lang
-		}
-	}
-	return n.Language
-}
 
 // Validate performs validation on the graph node. A Phase 4 node is a bundle
 // with a resolved pin — a row that cannot name the bundle it runs is refused

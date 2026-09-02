@@ -351,7 +351,10 @@ func (s *GraphServer) ExecuteGraph(ctx context.Context, req *runtimev1.ExecuteGr
 	orgID := graphOrgIDFromCtx(ctx)
 	userID := graphUserIDFromCtx(ctx)
 	input := structToJSONMap(req.Input)
-	exec, err := s.execEng.ExecuteGraph(ctx, graphID, orgID, userID, input, false, nil)
+	// The handed secret token and the flow environment travel as request
+	// metadata and are read into these two arguments by S3a; until then a
+	// secret-declaring graph refuses here rather than resolving nothing.
+	exec, err := s.execEng.ExecuteGraph(ctx, graphID, orgID, userID, input, false, "", "")
 	if err != nil {
 		return nil, pkerrors.ToGRPC(err)
 	}

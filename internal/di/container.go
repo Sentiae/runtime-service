@@ -327,6 +327,8 @@ type Container struct {
 	// leaving a nil interface to panic on.
 	NodeBundleRunner   usecase.BundleRunner
 	NodeSidecarManager usecase.SidecarManager
+	NodeSubnetPool     *usecase.SubnetPool
+	NodeInvoker        *usecase.NodeInvoker
 
 	// Graph Use Cases
 	GraphUC       usecase.GraphUseCase
@@ -368,7 +370,9 @@ func NewContainer(cfg *config.Config) (*Container, error) {
 	c.initRepositories()
 
 	// Initialize use cases
-	c.initUseCases(cfg)
+	if err := c.initUseCases(cfg); err != nil {
+		return nil, fmt.Errorf("failed to initialize use cases: %w", err)
+	}
 
 	// runtime-fleet CP3 — image-boot materializer, booter, FleetOrchestration.
 	// Runs BEFORE initHandlers so FleetActivatorUC (rt#11) exists when
@@ -1738,8 +1742,21 @@ func (c *Container) initRepositories() {
 	log.Println("Repositories initialized (PostgreSQL)")
 }
 
+// unconfiguredSecretSource is the fail-closed SecretValueSource the invoker
+// holds until the Vault-backed one is wired: a node that declares a secret must
+// refuse, never run with the secret silently absent.
+type unconfiguredSecretSource struct{}
+
+func (unconfiguredSecretSource) Resolve(context.Context, uuid.UUID, string, string, string) (string, bool, error) {
+	return "", false, domain.ErrNodeRunnerNotReady
+}
+
+func (unconfiguredSecretSource) Revoke(context.Context, string) error {
+	return domain.ErrNodeRunnerNotReady
+}
+
 // initUseCases initializes all use cases
-func (c *Container) initUseCases(cfg *config.Config) {
+func (c *Container) initUseCases(cfg *config.Config) error {
 	c.VMUC = usecase.NewVMService(c.VMRepo, c.VMProvider)
 
 	// Durable snapshot object-store backing. When enabled, build a
@@ -1801,11 +1818,43 @@ func (c *Container) initUseCases(cfg *config.Config) {
 	// Initialize reconciliation controller (5-second interval)
 	c.ReconciliationController = usecase.NewReconciliationController(c.VMInstanceUC, 5*time.Second)
 
-	// Node-runner ports. Nothing calls Probe here: the real runner and the real
-	// sidecar manager each probe at the point they are constructed, so boot
-	// behaviour does not change while these are the sentinels.
-	c.NodeBundleRunner = usecase.NotConfiguredBundleRunner{}
+	// Node runner. The sidecar manager is still the fail-closed sentinel (its
+	// adapter lands with the sidecar binary), so a node declaring secrets or
+	// egress refuses instead of running unprotected.
 	c.NodeSidecarManager = usecase.NotConfiguredSidecarManager{}
+	c.NodeBundleRunner = usecase.NotConfiguredBundleRunner{}
+
+	pool, err := usecase.NewSubnetPool(cfg.NodeRunner.InvocationCIDR, cfg.NodeRunner.InvocationPrefixLen)
+	if err != nil {
+		return fmt.Errorf("node runner: invocation cidr %s/%d is unusable: %w",
+			cfg.NodeRunner.InvocationCIDR, cfg.NodeRunner.InvocationPrefixLen, err)
+	}
+	c.NodeSubnetPool = pool
+
+	// Under the container executor this host runs flows, so the bundle runner is
+	// REAL and it probes now: a runtime that cannot authenticate to the registry,
+	// or whose runs volume is not where it believes it is, must refuse to boot
+	// rather than discover it on a customer's first flow run. Under firecracker
+	// no flow runs here at all, the node runner is never validated, and the
+	// sentinel keeps every invocation failing closed.
+	if cfg.App.ExecutorType == "container" {
+		runner, rerr := container.NewBundleRunner(cfg.NodeRunner, cfg.Server.GRPC.ServiceAPIKey)
+		if rerr != nil {
+			return rerr
+		}
+		probeCtx, cancel := context.WithTimeout(context.Background(), cfg.NodeRunner.PullTimeout)
+		perr := runner.Probe(probeCtx)
+		cancel()
+		if perr != nil {
+			return perr
+		}
+		c.NodeBundleRunner = runner
+	}
+
+	c.NodeInvoker = usecase.NewNodeInvoker(
+		c.NodeBundleRunner, c.NodeSidecarManager, unconfiguredSecretSource{},
+		c.NodeSubnetPool, cfg.NodeRunner.RegistryHost, usecase.SystemClock{},
+	)
 
 	// Initialize graph use cases
 	c.GraphUC = usecase.NewGraphService(c.GraphDefRepo, c.GraphNodeRepo, c.GraphEdgeRepo, c.EventPublisher)
@@ -1817,14 +1866,14 @@ func (c *Container) initUseCases(cfg *config.Config) {
 	c.GraphEngine = usecase.NewGraphExecutionEngine(
 		c.GraphDefRepo, c.GraphNodeRepo, c.GraphEdgeRepo,
 		c.GraphExecRepo, c.NodeExecRepo,
-		c.ExecutionUC, c.EventPublisher,
+		c.EventPublisher, c.NodeInvoker, c.NodeSidecarManager,
 	)
 	c.GraphEngine.SetTraceRecorder(c.TraceRecorder)
 
-	// Wire the warm-clone code runner when enabled. Gated on executor
-	// firecracker + a live FCProvider so the WarmManager has the FC config
-	// (binary/kernel/rootfs/socket/snapshot paths) it needs. Disabled →
-	// engine.warm stays nil → code nodes run the cold single-shot path.
+	// Build the warm-clone pool when enabled. It no longer feeds the graph
+	// engine — a Phase 4 node is a built bundle, not a snippet — so this is the
+	// substrate only, kept for the fleet paths and reported as consumer-less
+	// (T-RUN-SANDBOX-REUSE).
 	if cfg.App.ExecutorType == "firecracker" && cfg.Firecracker.WarmPoolEnabled && c.FCProvider != nil {
 		warmMgr := firecracker.NewWarmManager(c.FCProvider)
 		warmAgent := firecracker.NewAgentClient(10 * time.Second)
@@ -1836,18 +1885,17 @@ func (c *Container) initUseCases(cfg *config.Config) {
 		// an execution grabs one instantly; 0 ⇒ on-demand only (no goroutines).
 		readyN := cfg.Firecracker.WarmPoolReady
 		c.WarmPool = firecracker.NewWarmPool(warmMgr, warmAgent, snapshotStore, templateDir, readyN)
-		c.GraphEngine.SetWarmRunner(c.WarmPool)
 		if snapshotStore != nil {
-			log.Printf("[WARM-POOL] enabled — code nodes run on fast warm clones (durable template persistence on, prewarm_ready=%d)", readyN)
+			log.Printf("[WARM-POOL] enabled — warm clones ready (durable template persistence on, prewarm_ready=%d)", readyN)
 		} else {
-			log.Printf("[WARM-POOL] enabled — code nodes run on fast warm clones (prewarm_ready=%d)", readyN)
+			log.Printf("[WARM-POOL] enabled — warm clones ready (prewarm_ready=%d)", readyN)
 		}
 	}
 
 	// Initialize graph debug service
 	c.GraphDebugUC = usecase.NewGraphDebugService(
 		c.DebugSessionRepo, c.GraphDefRepo, c.GraphNodeRepo, c.GraphEdgeRepo,
-		c.GraphExecRepo, c.NodeExecRepo, c.GraphEngine,
+		c.GraphExecRepo, c.NodeExecRepo,
 		c.EventPublisher, c.TraceRecorder,
 	)
 
@@ -2006,6 +2054,7 @@ func (c *Container) initUseCases(cfg *config.Config) {
 	)
 
 	log.Println("Use cases initialized")
+	return nil
 }
 
 // initHandlers initializes HTTP and gRPC handlers

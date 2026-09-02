@@ -286,8 +286,11 @@ func TestGraphNode_Validate(t *testing.T) {
 		{"missing graph id", func(n *GraphNode) { n.GraphID = uuid.Nil }, ErrInvalidID},
 		{"missing name", func(n *GraphNode) { n.Name = "" }, ErrInvalidData},
 		{"missing node ref", func(n *GraphNode) { n.NodeRef = nil }, ErrNodeRefRequired},
-		{"legacy code type", func(n *GraphNode) { n.NodeType = GraphNodeTypeCode }, ErrInvalidData},
-		{"legacy http type", func(n *GraphNode) { n.NodeType = GraphNodeTypeHTTP }, ErrInvalidData},
+		// The interpreter's type constants are gone (S2), so a legacy row is
+		// spelled the way the DATABASE spells it — the raw string — which is
+		// also the only way such a row can still arrive.
+		{"legacy code type", func(n *GraphNode) { n.NodeType = GraphNodeType("code") }, ErrInvalidData},
+		{"legacy http type", func(n *GraphNode) { n.NodeType = GraphNodeType("http") }, ErrInvalidData},
 		{"empty type", func(n *GraphNode) { n.NodeType = "" }, ErrInvalidData},
 	}
 	for _, tt := range tests {

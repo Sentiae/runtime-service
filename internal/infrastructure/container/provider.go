@@ -148,9 +148,33 @@ func (p *Provider) hardenedRunArgs(containerName, image string, bootCfg usecase.
 		cpus = defaultContainerVCPU
 	}
 
-	args := []string{
-		"run", "-d",
-		"--name", containerName,
+	args := []string{"run", "-d", "--name", containerName}
+	args = append(args, hardenedFlags(memMB, cpus)...)
+
+	// Network: isolated by default. Host networking hands hostile code the
+	// host's network namespace, so it is gated behind an explicit operator
+	// opt-in (AllowHostNetwork) AND an explicit host request. Anything else —
+	// isolated, bridged, or unset — collapses to --network none.
+	network := "none"
+	if p.cfg.AllowHostNetwork && bootCfg.NetworkMode == domain.NetworkModeHost {
+		network = "host"
+	}
+	args = append(args, "--network", network)
+
+	args = append(args, image, "sleep", "infinity")
+	return args
+}
+
+// hardenedFlags is the untrusted-sandbox flag list, and it is the SAME list for
+// every hostile container this service launches — the language sandbox, a node
+// bundle, and the trusted sidecar alike. It is extracted rather than repeated
+// because a second copy is a second thing to weaken by accident; the bytes are
+// pinned by TestHardenedFlags_Unchanged.
+//
+// --network is deliberately NOT here: each caller owns its own network decision
+// and the default must be an explicit choice at the call site, never inherited.
+func hardenedFlags(memMB, cpus int) []string {
+	return []string{
 		// --- untrusted-code sandbox hardening ---
 		"--user", untrustedUID,
 		"--cap-drop", "ALL",
@@ -169,19 +193,6 @@ func (p *Provider) hardenedRunArgs(containerName, image string, bootCfg usecase.
 		"-e", "GOCACHE=/tmp/.cache/go-build",
 		"-e", "GOPATH=/tmp/go",
 	}
-
-	// Network: isolated by default. Host networking hands hostile code the
-	// host's network namespace, so it is gated behind an explicit operator
-	// opt-in (AllowHostNetwork) AND an explicit host request. Anything else —
-	// isolated, bridged, or unset — collapses to --network none.
-	network := "none"
-	if p.cfg.AllowHostNetwork && bootCfg.NetworkMode == domain.NetworkModeHost {
-		network = "host"
-	}
-	args = append(args, "--network", network)
-
-	args = append(args, image, "sleep", "infinity")
-	return args
 }
 
 // Terminate forcefully removes a Docker container.
@@ -293,20 +304,6 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 		return nil, fmt.Errorf("docker cp failed: %s: %w", cpStderr.String(), err)
 	}
 
-	// If stdin is provided, write it to a file too
-	if execution.Stdin != "" {
-		stdinHost := filepath.Join(tmpDir, "stdin.txt")
-		if err := os.WriteFile(stdinHost, []byte(execution.Stdin), 0644); err != nil {
-			return nil, fmt.Errorf("write stdin file: %w", err)
-		}
-		stdinCp := exec.CommandContext(execCtx, "docker", "cp", stdinHost, containerName+":/tmp/stdin.txt")
-		var stdinCpErr bytes.Buffer
-		stdinCp.Stderr = &stdinCpErr
-		if err := stdinCp.Run(); err != nil {
-			return nil, fmt.Errorf("docker cp stdin failed: %s: %w", stdinCpErr.String(), err)
-		}
-	}
-
 	// Compile if needed
 	var compileTimeMS *int64
 	if compileCmd != "" {
@@ -338,12 +335,9 @@ func (p *Provider) Run(ctx context.Context, vm *domain.MicroVM, execution *domai
 		}
 	}
 
-	// Run the code
-	stdinRedirect := ""
-	if execution.Stdin != "" {
-		stdinRedirect = " < /tmp/stdin.txt"
-	}
-	result := p.dockerExec(execCtx, containerName, runCmd+stdinRedirect, "")
+	// Run the code. Stdin is PIPED into the exec, never staged as a file the
+	// executing code could read, rewrite or leave behind in the sandbox.
+	result := p.dockerExec(execCtx, containerName, runCmd, execution.Stdin)
 
 	if result.err != nil && execCtx.Err() == context.DeadlineExceeded {
 		return &usecase.RunResult{

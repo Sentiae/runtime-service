@@ -92,6 +92,7 @@ func RegisterErrors() {
 	pkerrors.Register(domain.ErrSecretTokenRequired, http.StatusPreconditionFailed, codes.FailedPrecondition)
 	pkerrors.Register(domain.ErrRequiredSecretAbsent, http.StatusPreconditionFailed, codes.FailedPrecondition)
 	pkerrors.Register(domain.ErrGraphDebugRetired, http.StatusPreconditionFailed, codes.FailedPrecondition)
+	pkerrors.Register(domain.ErrEnvironmentRequired, http.StatusPreconditionFailed, codes.FailedPrecondition)
 	pkerrors.Register(domain.ErrNodeRunnerNotReady, http.StatusPreconditionFailed, codes.FailedPrecondition)
 
 	//   InvalidArgument — the request itself is wrong: a retired field, a
@@ -107,6 +108,8 @@ func RegisterErrors() {
 	pkerrors.Register(domain.ErrPlanInvalid, http.StatusBadRequest, codes.InvalidArgument)
 	pkerrors.Register(domain.ErrSeededOutputsRetired, http.StatusBadRequest, codes.InvalidArgument)
 	pkerrors.Register(domain.ErrSecretTokenUnexpected, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrEnvironmentInvalid, http.StatusBadRequest, codes.InvalidArgument)
+	pkerrors.Register(domain.ErrEnvironmentUnexpected, http.StatusBadRequest, codes.InvalidArgument)
 	pkerrors.Register(domain.ErrTriggerInputInvalid, http.StatusBadRequest, codes.InvalidArgument)
 	pkerrors.Register(domain.ErrNodeConfigInvalid, http.StatusBadRequest, codes.InvalidArgument)
 

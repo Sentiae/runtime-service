@@ -71,7 +71,9 @@ func (h *GraphExecutionHandler) ExecuteGraph(w http.ResponseWriter, r *http.Requ
 		_ = json.NewDecoder(r.Body).Decode(&req)
 	}
 
-	exec, err := h.engine.ExecuteGraph(r.Context(), graphID, orgID, userID, req.Input, req.DebugMode, nil)
+	// This REST surface carries no handed secret token and no flow environment,
+	// so a graph that declares secrets is refused rather than run with none.
+	exec, err := h.engine.ExecuteGraph(r.Context(), graphID, orgID, userID, req.Input, req.DebugMode, "", "")
 	if err != nil {
 		if errors.Is(err, domain.ErrGraphNotFound) {
 			RespondNotFound(w, "Graph not found")

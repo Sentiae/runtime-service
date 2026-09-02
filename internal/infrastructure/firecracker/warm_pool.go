@@ -49,7 +49,11 @@ const (
 // every RunCode clones from that snapshot, POSTs the code to the clone's agent,
 // and always tears the clone down (releasing its index) on return.
 //
-// WarmPool implements usecase.WarmCodeRunner.
+// WarmPool has NO consumer since the graph engine stopped interpreting code
+// nodes (S2): the port it implemented is gone and its result type moved here
+// with it. The substrate itself (CoW clones, template persistence, the
+// replenisher) is intact and reused by the fleet work, so it is reported rather
+// than deleted — T-RUN-SANDBOX-REUSE owns what it becomes.
 type WarmPool struct {
 	mgr   warmManager
 	agent codeAgent
@@ -101,8 +105,13 @@ type WarmPool struct {
 	closeOnce sync.Once
 }
 
-// Compile-time assertion: WarmPool implements the usecase port.
-var _ usecase.WarmCodeRunner = (*WarmPool)(nil)
+// WarmRunResult is the flattened result of a warm-clone run: the guest-agent's
+// stdout / stderr / exit code.
+type WarmRunResult struct {
+	Stdout   string
+	Stderr   string
+	ExitCode int
+}
 
 // NewWarmPool builds a WarmPool over a WarmManager and AgentClient. store may be
 // nil (local-only template builds, no durable persistence); when non-nil the
@@ -144,15 +153,15 @@ func newWarmPool(mgr warmManager, agent codeAgent) *WarmPool {
 // — because a used clone carries execution side effects and is never reused. The
 // replenisher restores a fresh CoW clone to replace what was taken, off the
 // request's critical path. Returns the flattened stdout/stderr/exit-code triple.
-func (p *WarmPool) RunCode(ctx context.Context, language domain.Language, code, stdin string) (usecase.WarmRunResult, error) {
+func (p *WarmPool) RunCode(ctx context.Context, language domain.Language, code, stdin string) (WarmRunResult, error) {
 	snap, err := p.ensureTemplate(ctx, language)
 	if err != nil {
-		return usecase.WarmRunResult{}, fmt.Errorf("ensure template for %s: %w", language, err)
+		return WarmRunResult{}, fmt.Errorf("ensure template for %s: %w", language, err)
 	}
 
 	clone, n, err := p.acquireClone(ctx, language, snap)
 	if err != nil {
-		return usecase.WarmRunResult{}, err
+		return WarmRunResult{}, err
 	}
 	// A used clone is destroyed (with its index freed) on every path —
 	// success, agent error, or panic — so no VM/index leaks past one run.
@@ -170,10 +179,10 @@ func (p *WarmPool) RunCode(ctx context.Context, language domain.Language, code, 
 		Stdin:    stdin,
 	})
 	if err != nil {
-		return usecase.WarmRunResult{}, fmt.Errorf("run code on clone %d: %w", n, err)
+		return WarmRunResult{}, fmt.Errorf("run code on clone %d: %w", n, err)
 	}
 
-	return usecase.WarmRunResult{
+	return WarmRunResult{
 		Stdout:   res.Stdout,
 		Stderr:   res.Stderr,
 		ExitCode: res.ExitCode,
