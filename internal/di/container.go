@@ -333,8 +333,12 @@ type Container struct {
 	// leaving a nil interface to panic on.
 	NodeBundleRunner   usecase.BundleRunner
 	NodeSidecarManager usecase.SidecarManager
-	NodeSubnetPool     *usecase.SubnetPool
-	NodeInvoker        *usecase.NodeInvoker
+	// NodeSidecars is the same object as NodeSidecarManager when the real
+	// adapter is wired. It is held concretely because the orphan sweeper's
+	// start/stop is a lifecycle concern, not part of the port.
+	NodeSidecars   *container.SidecarManager
+	NodeSubnetPool *usecase.SubnetPool
+	NodeInvoker    *usecase.NodeInvoker
 
 	// Graph Use Cases
 	GraphUC       usecase.GraphUseCase
@@ -1820,9 +1824,9 @@ func (c *Container) initUseCases(cfg *config.Config) error {
 	// Initialize reconciliation controller (5-second interval)
 	c.ReconciliationController = usecase.NewReconciliationController(c.VMInstanceUC, 5*time.Second)
 
-	// Node runner. The sidecar manager is still the fail-closed sentinel (its
-	// adapter lands with the sidecar binary), so a node declaring secrets or
-	// egress refuses instead of running unprotected.
+	// Node runner. Both collaborators start as the fail-closed sentinels, so a
+	// node declaring secrets or egress refuses instead of running unprotected on
+	// any executor where the real adapters are not wired.
 	c.NodeSidecarManager = usecase.NotConfiguredSidecarManager{}
 	c.NodeBundleRunner = usecase.NotConfiguredBundleRunner{}
 
@@ -1851,6 +1855,25 @@ func (c *Container) initUseCases(cfg *config.Config) error {
 			return perr
 		}
 		c.NodeBundleRunner = runner
+
+		// The sidecar manager probes too, and its probe is the stricter one: the
+		// uplink must exist in the shape deploy.sh created, the invocation range
+		// must collide with no network on this daemon, every orphan from a
+		// previous process must be gone, and one COMPLETE egress cycle must run
+		// end to end. A runtime that cannot isolate an invocation must not serve
+		// one.
+		sidecars, serr := container.NewSidecarManager(cfg.NodeRunner, pool)
+		if serr != nil {
+			return serr
+		}
+		sidecarCtx, sidecarCancel := context.WithTimeout(context.Background(), cfg.NodeRunner.PullTimeout)
+		serr = sidecars.Probe(sidecarCtx)
+		sidecarCancel()
+		if serr != nil {
+			return serr
+		}
+		c.NodeSidecarManager = sidecars
+		c.NodeSidecars = sidecars
 	}
 
 	// The node secret path (D-4). With a resolver the source builds
@@ -2328,6 +2351,10 @@ func (c *Container) StartBackgroundControllers(ctx context.Context) {
 	if len(c.FCPools) > 0 {
 		log.Printf("[FC-POOL] %d warm pool(s) started", len(c.FCPools))
 	}
+	if c.NodeSidecars != nil {
+		c.NodeSidecars.StartSweeper(ctx)
+		log.Println("Node sidecar orphan sweeper started (R-24: sidecars only, never a node container)")
+	}
 	c.startFleetHeartbeat(ctx)
 	c.startFleetActivityFeed(ctx)
 	// D-184 — a restore in flight when this process died left its resource in
@@ -2633,6 +2660,12 @@ func (c *Container) Close() error {
 	// Stop background processors
 	if c.PendingProcessor != nil {
 		c.PendingProcessor.Stop()
+	}
+
+	// Stop the node sidecar sweeper (waits for the in-flight pass) so a sweep
+	// cannot be removing containers while the rest of shutdown runs.
+	if c.NodeSidecars != nil {
+		c.NodeSidecars.Stop()
 	}
 
 	// Stop reconciliation controller

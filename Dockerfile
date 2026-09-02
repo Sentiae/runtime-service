@@ -73,6 +73,20 @@ RUN CGO_ENABLED=0 go build \
 # Verify the binary was built
 RUN test -f /build/bin/runtime-service || (echo "Binary not found" && exit 1)
 
+# The per-invocation sidecar (Phase 4). It ships in THIS image on purpose: a
+# sidecar runs the runtime's own bytes, so the trusted half of a node sandbox
+# introduces no second image, no second registry pull and no second supply chain
+# to verify. It is launched with `--entrypoint /app/node-sidecar` — this image's
+# ENTRYPOINT is the server, and a trailing command would be appended to it.
+RUN CGO_ENABLED=0 go build \
+    -a \
+    -installsuffix cgo \
+    -ldflags="-w -s" \
+    -o /build/bin/node-sidecar \
+    ./cmd/node-sidecar/
+
+RUN test -f /build/bin/node-sidecar || (echo "Sidecar binary not found" && exit 1)
+
 # Create optional dirs so COPY won't fail
 RUN mkdir -p /build/migrations /build/configs
 
@@ -111,6 +125,9 @@ WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder --chown=runtime:runtime /build/bin/runtime-service /app/runtime-service
+
+# Copy the per-invocation sidecar binary
+COPY --from=builder --chown=runtime:runtime /build/bin/node-sidecar /app/node-sidecar
 
 # Copy migrations directory
 COPY --from=builder --chown=runtime:runtime /build/migrations /app/migrations
