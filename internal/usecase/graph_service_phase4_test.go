@@ -26,7 +26,7 @@ import (
 //
 // Derived by S0 from the file it produced, recomputed independently with
 // `shasum -a 256` (2039 bytes). Never typed from memory.
-const goldenPlanSHA256 = "2b5cd5be7d90f00f5540c9ee301b0047b9dd42eabb40f2b6a589e31a2cc555fd"
+const goldenPlanSHA256 = "2c4f2e028c8896636967d7ed1fd56177923d30f62117b340f70146c60e64b3f9"
 
 const goldenPlanPath = "testdata/09_phase4_acceptance.plan.json"
 
