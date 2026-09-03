@@ -98,11 +98,16 @@ type WarmPool struct {
 
 	// rootCtx/cancel scope every replenisher goroutine; Close() cancels them.
 	// wg waits for the replenishers to exit before the ready buffers are
-	// drained. closeOnce makes Close idempotent.
+	// drained. closeOnce makes Close idempotent. closed — guarded by mu, like
+	// every map above — is set by Close BEFORE it waits, so a concurrent
+	// ensureReplenisher can never wg.Add once the wait has begun: a positive
+	// Add that starts while the counter is zero must happen-before Wait
+	// (sync.WaitGroup contract), and mu is what orders the two.
 	rootCtx   context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	closeOnce sync.Once
+	closed    bool
 }
 
 // WarmRunResult is the flattened result of a warm-clone run: the guest-agent's
@@ -569,12 +574,23 @@ func (p *WarmPool) pokeTaken(language domain.Language) {
 }
 
 // ensureReplenisher starts the per-language replenisher goroutine exactly once
-// (after the template snapshot exists). No-op when readyN==0 or already started.
+// (after the template snapshot exists). No-op when readyN==0, already started,
+// or the pool is closing.
 func (p *WarmPool) ensureReplenisher(language domain.Language, snap *TemplateSnapshot) {
 	if p.readyN <= 0 {
 		return
 	}
+	// mu is held across the wg.Add / goroutine start on purpose: Close sets
+	// closed under the same mutex before wg.Wait, so an Add either happens
+	// before that Wait or does not happen at all. Starting a replenisher after
+	// Close began would both race the WaitGroup and let a clone land in a
+	// ready buffer that the shutdown drain has already passed — a leaked VM.
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		// Closing: RunCode falls through to the on-demand clone path.
+		return
+	}
 	once, ok := p.replenish[language]
 	if !ok {
 		once = &sync.Once{}
@@ -583,7 +599,6 @@ func (p *WarmPool) ensureReplenisher(language domain.Language, snap *TemplateSna
 	if _, ok := p.taken[language]; !ok {
 		p.taken[language] = make(chan struct{}, 1)
 	}
-	p.mu.Unlock()
 
 	once.Do(func() {
 		p.wg.Add(1)
@@ -674,6 +689,12 @@ func (p *WarmPool) replenishLoop(language domain.Language, snap *TemplateSnapsho
 // freeing its index so no VMs / netns / indices leak on shutdown. Idempotent.
 func (p *WarmPool) Close() error {
 	p.closeOnce.Do(func() {
+		// Publish the close BEFORE waiting so no replenisher can be added
+		// behind the wait (see ensureReplenisher).
+		p.mu.Lock()
+		p.closed = true
+		p.mu.Unlock()
+
 		p.cancel()
 		p.wg.Wait()
 
