@@ -5,6 +5,10 @@ package main
 import (
 	"context"
 	"net/netip"
+	"os"
+	"regexp"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -200,6 +204,51 @@ func TestNormalizeHost(t *testing.T) {
 		if got := normalizeHost(tt.in); got != tt.want {
 			t.Fatalf("normalizeHost(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+// denyStatusRx finds every refusal status decide() can produce: the status is
+// always the first argument of a literal deny(<status>, <reason>) call.
+var denyStatusRx = regexp.MustCompile(`deny\((\d+), `)
+
+// TestPolicy_DenyStatusVocabularyIsPinned pins the SET of HTTP statuses a refusal
+// may carry, by reading policy.go as a file.
+//
+// WHY THE SOURCE AND NOT THE BEHAVIOUR. node-sdk-ts recognises a denied tunnel by
+// the STATUS alone — undici discards the CONNECT response's headers, so the
+// X-Sentiae-Egress-Denied header this sidecar sets is unreachable there — and its
+// predicate matches (?:403|407). A deny status added here that TS does not match
+// downgrades a REAL policy denial into a retryable transport error: the C1 lie
+// D-394 closed, in the one direction the header-presence rule cannot cover.
+// Nothing else in either repo goes red for it, so the vocabulary ITSELF is the
+// contract, and it is asserted as literals — reading the statuses back out of
+// whatever the file says would move with any edit and prove nothing (§34b).
+//
+// CONTROLS: (a) add a deny(451, …) line to policy.go — the set becomes
+// {403,407,451} and this goes red; (b) rename the deny helper so the regexp finds
+// nothing — the "no deny call found" branch goes red rather than passing
+// vacuously on an empty set.
+func TestPolicy_DenyStatusVocabularyIsPinned(t *testing.T) {
+	src, err := os.ReadFile("policy.go")
+	if err != nil {
+		t.Fatalf("read policy.go: %v", err)
+	}
+	matches := denyStatusRx.FindAllStringSubmatch(string(src), -1)
+	if len(matches) == 0 {
+		t.Fatal("no deny(<status>, …) call found in policy.go: this guard reads the source, so a shape it can no longer find must be RED, never a pass on an empty set")
+	}
+	seen := map[string]bool{}
+	for _, m := range matches {
+		seen[m[1]] = true
+	}
+	got := make([]string, 0, len(seen))
+	for status := range seen {
+		got = append(got, status)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != "403,407" {
+		t.Fatalf("deny statuses = %v (%d calls), want [403 407]: node-sdk-ts matches (?:403|407) on the CONNECT status alone, so any other status reaches a TS node as a retryable transport error instead of a policy denial",
+			got, len(matches))
 	}
 }
 
