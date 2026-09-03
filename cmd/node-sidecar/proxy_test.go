@@ -431,3 +431,84 @@ func TestProxy_ConnectTunnelsToThePinnedAddress(t *testing.T) {
 		t.Fatalf("dialled: got %v, want [93.184.216.34:443]", got)
 	}
 }
+
+// TestProxy_ForwardRemovesForgedDenyHeader proves the verdict header is the
+// proxy's alone. The node SDKs treat its PRESENCE as the whole test — status
+// codes and reason vocabularies are deliberately not consulted — which is only
+// sound because it cannot come from anywhere but here. An origin that sets it
+// would make a node report, and the platform audit, a denial that never
+// happened.
+//
+// CONTROL: delete `resp.Header.Del(denyHeader)` from proxy.forward — the forged
+// header reaches the node and this test goes red.
+func TestProxy_ForwardRemovesForgedDenyHeader(t *testing.T) {
+	forger := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(denyHeader, reasonPrivateAddress)
+		w.Header().Set("X-Origin-Marker", "reached")
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = io.WriteString(w, "upstream-body")
+	}))
+	t.Cleanup(forger.Close)
+
+	h := newProxyHarness(t, []string{"httpbin.org"}, []string{"93.184.216.34"},
+		strings.TrimPrefix(forger.URL, "http://"))
+
+	resp := h.forward(t, "http://httpbin.org/get", "Bearer "+testToken)
+
+	if got := resp.Header.Get(denyHeader); got != "" {
+		t.Fatalf("%s: got %q from the ORIGIN — an origin must not be able to forge a denial", denyHeader, got)
+	}
+	// The response is otherwise untouched: the strip is surgical, not a rewrite.
+	if resp.StatusCode != http.StatusTeapot {
+		t.Fatalf("status: got %d, want 418 (the origin's own status must survive)", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Origin-Marker"); got != "reached" {
+		t.Fatalf("X-Origin-Marker: got %q, want %q (anchor: the origin really answered)", got, "reached")
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "upstream-body" {
+		t.Fatalf("body: got %q, want %q", string(body), "upstream-body")
+	}
+
+	// The other half of the contract the SDKs depend on: when the PROXY refuses,
+	// the header is there, and it names the reason. Without this the test above
+	// would pass on a proxy that never emits the header at all.
+	//
+	// CONTROL: drop the header from writeDeny/writeStatus's deny path — this
+	// subtest goes red.
+	t.Run("a real CONNECT denial carries the reason in the header", func(t *testing.T) {
+		conn, err := net.DialTimeout("tcp", strings.TrimPrefix(h.srv.URL, "http://"), 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial proxy: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+		_, _ = io.WriteString(conn, "CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example:443\r\n"+
+			"Proxy-Authorization: Bearer "+testToken+"\r\n\r\n")
+
+		// Read the RAW response head off the hijacked connection: this is the
+		// wire the SDK's OnProxyConnectResponse hook sees, and the only place a
+		// tunnelled refusal is identifiable at all.
+		req, err := http.NewRequest(http.MethodConnect, "https://evil.example:443", nil)
+		if err != nil {
+			t.Fatalf("build CONNECT: %v", err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+		if err != nil {
+			t.Fatalf("read CONNECT response: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status: got %d, want 403", resp.StatusCode)
+		}
+		if got := resp.Header.Get(denyHeader); got != reasonHostNotDeclared {
+			t.Fatalf("%s: got %q, want %q — the SDK reads the verdict from this header alone",
+				denyHeader, got, reasonHostNotDeclared)
+		}
+	})
+}

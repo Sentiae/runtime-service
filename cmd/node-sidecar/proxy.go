@@ -206,6 +206,11 @@ func (p *proxy) forward(w http.ResponseWriter, r *http.Request, d decision) {
 	defer func() { _ = resp.Body.Close() }()
 
 	stripHopByHop(resp.Header)
+	// The verdict header is THIS proxy's, and only this proxy's. An origin that
+	// set it would make the node report a denial that never happened — and the
+	// node SDKs treat its presence as the whole test, precisely because the
+	// header cannot come from anywhere but here.
+	resp.Header.Del(denyHeader)
 	for k, values := range resp.Header {
 		for _, v := range values {
 			w.Header().Add(k, v)
