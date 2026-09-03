@@ -1,5 +1,5 @@
 # Build Stage - Compile Go Application
-FROM golang:1.25-alpine AS builder
+FROM golang:1.25-alpine@sha256:523c3effe300580ed375e43f43b1c9b091b68e935a7c3a92bfcc4e7ed55b18c2 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git ca-certificates tzdata
@@ -91,7 +91,7 @@ RUN test -f /build/bin/node-sidecar || (echo "Sidecar binary not found" && exit 
 RUN mkdir -p /build/migrations /build/configs
 
 # Runtime Stage - Minimal Production Image
-FROM alpine:3.19
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 
 # Same build argument that produced the binary's linked revision, so the image
 # label and the binary's /health report cannot disagree. Re-declared because a
@@ -109,6 +109,16 @@ RUN apk --no-cache add \
     openssh-client \
     docker-cli \
     && update-ca-certificates
+
+# The in-image docker CLI is what issues every docker-out-of-docker call, NOT the
+# host's. `--mount ... volume-subpath` needs >= 26, and alpine 3.19 shipped 25.0.5,
+# which refused it at boot with `unexpected key 'volume-subpath'` (P4 §9). volume-subpath
+# is load-bearing for isolation: it confines each invocation to its own subdirectory,
+# so a hostile node cannot see another invocation's broker socket.
+RUN docker --version | grep -Eq '^Docker version (2[6-9]|[3-9][0-9])\.' || { \
+      echo "BUILD REFUSED: docker-cli must be >= 26 for --mount volume-subpath (got: $(docker --version))" >&2; \
+      exit 1; \
+    }
 
 # Create non-root user for security
 RUN addgroup -g 1000 runtime && \
