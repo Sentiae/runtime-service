@@ -81,7 +81,7 @@
         "body",
         "data"
       ],
-      "pin": "@sentiae/http-request@1.0.1",
+      "pin": "@sentiae/http-request@1.0.2",
       "promoted": {},
       "required": [],
       "role": "",
