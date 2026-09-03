@@ -1857,11 +1857,12 @@ func (c *Container) initUseCases(cfg *config.Config) error {
 		c.NodeBundleRunner = runner
 
 		// The sidecar manager probes too, and its probe is the stricter one: the
-		// uplink must exist in the shape deploy.sh created, the invocation range
-		// must collide with no network on this daemon, every orphan from a
-		// previous process must be gone, and one COMPLETE egress cycle must run
-		// end to end. A runtime that cannot isolate an invocation must not serve
-		// one.
+		// uplink must exist in the shape deploy.sh created, every orphan from a
+		// previous process must be gone, the invocation range must collide with
+		// no network REMAINING after that sweep (R-30 — the sweep precedes the
+		// address-space check, because every orphan bridge is inside the range),
+		// and one COMPLETE egress cycle must run end to end. A runtime that
+		// cannot isolate an invocation must not serve one.
 		sidecars, serr := container.NewSidecarManager(cfg.NodeRunner, pool)
 		if serr != nil {
 			return serr

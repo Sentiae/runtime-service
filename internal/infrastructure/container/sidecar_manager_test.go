@@ -405,6 +405,9 @@ func containsSequence(args []string, a, b string) bool {
 //
 // CONTROL (survivor): make SweepAll return the counts it removed instead of
 // re-enumerating — the survivor row reports 0/0 and passes wrongly.
+// CONTROL (R-30 order): move the SweepAll block back below the CIDR check — the
+// survivor rows reach the census first and their "not reached" assertion goes
+// red.
 // CONTROL (CIDR): scope verifyInvocationCIDR to the uplink alone (R-14's
 // original scope) — the "unrelated network" row passes wrongly, and on the
 // homelab every egress invocation would instead fail at run time with docker's
@@ -421,6 +424,11 @@ func TestProbe_Refusals(t *testing.T) {
 		// thing that names the fault.
 		wantErr         string
 		wantErrContains string
+		// wantAttempt is the removal call a survivor refusal is only legal
+		// AFTER (R-30): "still there" is a measurement, and refusing without
+		// having tried is the deadlock this ruling removed. Set on the survivor
+		// rows only; those rows also prove the CIDR census was never reached.
+		wantAttempt []string
 	}{
 		{
 			name: "uplink absent",
@@ -471,7 +479,8 @@ func TestProbe_Refusals(t *testing.T) {
 					"sentiae-inv-inv-old\n", 0)
 				return f
 			},
-			wantErr: "node runner: orphan sweep incomplete: 0 container(s), 1 network(s) remain",
+			wantErr:     "node runner: orphan sweep incomplete: 0 container(s), 1 network(s) remain",
+			wantAttempt: []string{"network", "rm"},
 		},
 		{
 			name: "an orphan container survives the boot sweep",
@@ -481,7 +490,8 @@ func TestProbe_Refusals(t *testing.T) {
 					"sentiae-sc-inv-old\n", 0)
 				return f
 			},
-			wantErr: "node runner: orphan sweep incomplete: 1 container(s), 0 network(s) remain",
+			wantErr:     "node runner: orphan sweep incomplete: 1 container(s), 0 network(s) remain",
+			wantAttempt: []string{"rm", "-f"},
 		},
 		{
 			// The redemption is REFUSED. A broker that answers 403 to the handle
@@ -584,6 +594,19 @@ func TestProbe_Refusals(t *testing.T) {
 			}
 			if err == nil {
 				t.Fatalf("Probe must refuse with %q%q, got nil", tt.wantErr, tt.wantErrContains)
+			}
+			if tt.wantAttempt != nil {
+				if got := docker.indexOf(tt.wantAttempt...); got == -1 {
+					t.Fatalf("a survivor refusal is legal only after removal was attempted: "+
+						"no %q call was ever issued", tt.wantAttempt)
+				}
+				// And the refusal is the SWEEP's, taken before the address
+				// space was ever looked at: under R-30's order the census
+				// cannot have run, so a passing census here would mean the
+				// old, deadlocking sequence is back.
+				if got := docker.indexOf("network", "ls", "-q"); got != -1 {
+					t.Fatalf("the CIDR census must not be reached before the sweep refuses (call %d)", got)
+				}
 			}
 			if tt.wantErrContains != "" {
 				if !strings.Contains(err.Error(), tt.wantErrContains) {
@@ -714,6 +737,215 @@ func assertProbeRedeemedOneSecret(t *testing.T, docker *fakeDaemon) {
 	}
 }
 
+// TestProbe_SweepsLeakedBridgeBeforeCIDRCheck is R-30, modelled on the daemon
+// that produced it. A crash left one labelled invocation bridge on
+// 10.201.250.0/29 with its labelled node container still attached and EXITED —
+// the sidecar launch carries no --rm and both container classes carry
+// sentiae.node.invocation, so a SIGKILL leaks the container as well as its
+// bridge. Every invocation bridge is carved out of invocation_cidr by
+// construction (subnet_pool.go), so the address-space check running FIRST
+// refused on the runtime's own residue and the only step that could remove it
+// never ran: the homelab crash-looped on `node runner: invocation cidr
+// 10.201.0.0/16 overlaps docker network sentiae-inv-… (10.201.250.0/29)` through
+// every restart, and no restart could ever end it.
+//
+// The fake behaves like docker in the two ways that make this a proof rather
+// than a mock: `network rm` fails with "has active endpoints" until the attached
+// container is gone, and every listing — both labelled ones and the unfiltered
+// census — drops the object once it is actually removed.
+//
+// CONTROL: move the SweepAll block back below verifyInvocationCIDR — Probe
+// refuses with the overlap error above and this test goes red.
+func TestProbe_SweepsLeakedBridgeBeforeCIDRCheck(t *testing.T) {
+	const (
+		orphan      = "inv-p4-orphan"
+		orphanNet   = "sentiae-inv-" + orphan
+		orphanNetID = "netorphan"
+		orphanCtr   = "sentiae-node-" + orphan
+	)
+
+	var mu sync.Mutex
+	containerGone := false
+	networkGone := false
+
+	docker := probeDaemon()
+
+	// The labelled container census: the exited node container until it is
+	// force-removed, nothing after.
+	docker.onFunc(
+		func(args []string) bool {
+			return containsAll(args, []string{"ps", "-a", "--filter", "label=" + labelInvocation})
+		},
+		func([]string) (string, string, int) {
+			mu.Lock()
+			defer mu.Unlock()
+			if containerGone {
+				return "", "", 0
+			}
+			return orphanCtr + "\n", "", 0
+		},
+	)
+	docker.onFunc(
+		func(args []string) bool { return containsAll(args, []string{"rm", "-f"}) },
+		func([]string) (string, string, int) {
+			mu.Lock()
+			defer mu.Unlock()
+			containerGone = true
+			return "", "", 0
+		},
+	)
+
+	// The labelled network census, and docker's real refusal: a bridge with an
+	// attached container cannot be removed, however dead that container is.
+	docker.onFunc(
+		func(args []string) bool {
+			return containsAll(args, []string{"network", "ls", "--filter", "label=" + labelInvocation})
+		},
+		func([]string) (string, string, int) {
+			mu.Lock()
+			defer mu.Unlock()
+			if networkGone {
+				return "", "", 0
+			}
+			return orphanNet + "\n", "", 0
+		},
+	)
+	docker.onFunc(
+		func(args []string) bool { return containsAll(args, []string{"network", "rm"}) },
+		func([]string) (string, string, int) {
+			mu.Lock()
+			defer mu.Unlock()
+			if !containerGone {
+				return "", "Error response from daemon: error while removing network: network " +
+					orphanNet + " id 0f1e2d has active endpoints", 1
+			}
+			networkGone = true
+			return orphanNet + "\n", "", 0
+		},
+	)
+
+	// The unfiltered census verifyInvocationCIDR reads. The leaked bridge is in
+	// it until it is removed — which is the whole deadlock.
+	docker.onFunc(
+		func(args []string) bool { return containsAll(args, []string{"network", "ls", "-q"}) },
+		func([]string) (string, string, int) {
+			mu.Lock()
+			defer mu.Unlock()
+			if networkGone {
+				return "netaaa\n", "", 0
+			}
+			return "netaaa\n" + orphanNetID + "\n", "", 0
+		},
+	)
+	docker.on([]string{"network", "inspect", orphanNetID}, orphanNet+"|10.201.250.0/29 \n", 0)
+
+	m := testManager(t, docker)
+	m.image = "" // the probe resolves it, as it does at boot
+
+	if err := m.Probe(context.Background()); err != nil {
+		t.Fatalf("Probe must recover from its own leaked bridge, got: %v", err)
+	}
+
+	removeIdx := docker.indexOf("rm", "-f")
+	networkRemoveIdx := docker.indexOf("network", "rm")
+	censusIdx := docker.indexOf("network", "ls", "-q")
+	if removeIdx == -1 {
+		t.Fatal("the leaked container was never removed")
+	}
+	if networkRemoveIdx == -1 {
+		t.Fatal("the leaked bridge was never removed")
+	}
+	if censusIdx == -1 {
+		t.Fatal("the address space was never checked")
+	}
+	if !(removeIdx < networkRemoveIdx && networkRemoveIdx < censusIdx) {
+		t.Fatalf("order must be rm -f < network rm < network ls -q, got %d %d %d",
+			removeIdx, networkRemoveIdx, censusIdx)
+	}
+
+	cycleIdx := docker.indexOf("run", "-d")
+	if cycleIdx == -1 {
+		t.Fatal("the boot probe cycle must still run after the sweep and the census")
+	}
+	if cycleIdx < censusIdx {
+		t.Fatalf("the cycle must run last, got cycle=%d census=%d", cycleIdx, censusIdx)
+	}
+}
+
+// TestProbe_Order pins the boot sequence itself on a daemon where every step
+// passes. The order is a property in its own right: R-30 was a defect in which
+// each individual check was correct and their sequence was not, so a green
+// probe proves nothing about it and only the indices do.
+//
+// CONTROL: swap any adjacent pair of the five steps in Probe — the index
+// comparison goes red.
+func TestProbe_Order(t *testing.T) {
+	docker := probeDaemon()
+	m := testManager(t, docker)
+	m.image = "" // the probe resolves it, as it does at boot
+
+	if err := m.Probe(context.Background()); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+
+	steps := []struct {
+		name   string
+		tokens []string
+	}{
+		// R-27: the CLI that issues every line below.
+		{"cli", []string{"version", "--format"}},
+		// R-14: deploy-owned static infrastructure, verified before mutation.
+		{"uplink", []string{"network", "inspect", "sentiae-node-egress-uplink"}},
+		// R-30: the sweep's own first census — it must precede the address check.
+		{"sweep", []string{"ps", "-a", "--filter", "label=" + labelInvocation}},
+		// R-25: every network REMAINING after that sweep.
+		{"cidr", []string{"network", "ls", "-q"}},
+		// R-24: the full cycle last; it registers the first live invocation.
+		{"cycle", []string{"run", "-d"}},
+	}
+
+	previous := -1
+	for _, step := range steps {
+		idx := docker.indexOf(step.tokens...)
+		if idx == -1 {
+			t.Fatalf("step %q never ran; the boot order is cli < uplink < sweep < cidr < cycle", step.name)
+		}
+		if idx <= previous {
+			t.Fatalf("step %q ran at call %d, after a step that must follow it (call %d); "+
+				"the boot order is cli < uplink < sweep < cidr < cycle", step.name, idx, previous)
+		}
+		previous = idx
+	}
+}
+
+// TestVerifyInvocationCIDR_IncludesLabelledNetworks is R-25's predicate, which
+// R-30 did NOT amend: the check refuses on EVERY network still present, and a
+// network carrying sentiae.node.invocation is not exempt. A survivor of the boot
+// sweep still occupies pool address space, and one created after the sweep must
+// not slip past the boot guard into a per-invocation failure at run time.
+//
+// CONTROL: skip networks whose name starts with sentiae-inv- in
+// verifyInvocationCIDR — this test goes red.
+func TestVerifyInvocationCIDR_IncludesLabelledNetworks(t *testing.T) {
+	docker := &fakeDaemon{}
+	docker.on([]string{"network", "ls", "-q"}, "netaaa\nnetorphan\n", 0)
+	docker.on([]string{"network", "inspect", "netaaa"}, "sentiae-network|172.20.0.0/16 \n", 0)
+	docker.on([]string{"network", "inspect", "netorphan"},
+		"sentiae-inv-inv-p4-orphan|10.201.250.0/29 \n", 0)
+
+	m := testManager(t, docker)
+
+	err := m.verifyInvocationCIDR(context.Background())
+	if err == nil {
+		t.Fatal("a labelled invocation network inside the range must still refuse")
+	}
+	want := "node runner: invocation cidr 10.201.0.0/16 overlaps docker network " +
+		"sentiae-inv-inv-p4-orphan (10.201.250.0/29)"
+	if err.Error() != want {
+		t.Fatalf("refusal:\n got %q\nwant %q", err.Error(), want)
+	}
+}
+
 // TestProbe_DockerCLIFloor is the runtime half of the P4 §9 guard. The deploy
 // refused to boot with `unexpected key 'volume-subpath'` because the CLI that
 // issues every docker-out-of-docker line is the one INSIDE the image (alpine
@@ -728,6 +960,9 @@ func assertProbeRedeemedOneSecret(t *testing.T, docker *fakeDaemon) {
 //
 // CONTROL (floor): delete the verifyDockerCLI call from Probe — the 25.0.5 rows
 // stop refusing and report "must refuse …, got nil".
+// CONTROL (R-30 order): move the SweepAll block ahead of verifyDockerCLI — the
+// refused rows sweep with a CLI the process just refused to trust, and the
+// "must not sweep" assertion goes red.
 // CONTROL (skew): delete the skew branch — the legal-skew row reports the
 // missing docker_cli_skew log.
 // CONTROL (fail-closed): return nil instead of the unreadable-version error —
@@ -795,6 +1030,15 @@ func TestProbe_DockerCLIFloor(t *testing.T) {
 				// CLI must never have launched a sidecar.
 				if got := docker.indexOf("run", "-d"); got != -1 {
 					t.Fatalf("a refused docker CLI must launch nothing (call %d)", got)
+				}
+				// And before the sweep it protects (R-30). The sweep MUTATES
+				// this daemon; a CLI this process has already refused to trust
+				// is not the CLI to force-remove containers and bridges with.
+				if got := docker.indexOf("ps", "-a", "--filter", "label="+labelInvocation); got != -1 {
+					t.Fatalf("a refused docker CLI must not sweep (call %d)", got)
+				}
+				if got := docker.indexOf("rm", "-f"); got != -1 {
+					t.Fatalf("a refused docker CLI must remove nothing (call %d)", got)
 				}
 				return
 			}
