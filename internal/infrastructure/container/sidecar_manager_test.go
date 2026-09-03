@@ -3,6 +3,7 @@
 package container
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"reflect"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/logger"
 
 	"github.com/sentiae/runtime-service/internal/usecase"
 	"github.com/sentiae/runtime-service/pkg/config"
@@ -524,6 +526,9 @@ func TestProbe_Refusals(t *testing.T) {
 // nothing labelled survives, and a sidecar comes up ready.
 func probeDaemon() *fakeDaemon {
 	f := &fakeDaemon{}
+	// The pair the runtime image and the homelab host actually ship
+	// (docker-cli 28.3.3 in alpine 3.22, daemon 29.5.3).
+	f.on([]string{"version", "--format"}, "28.3.3 29.5.3\n", 0)
 	f.on([]string{"network", "inspect", "sentiae-node-egress-uplink"}, "bridge|false|false\n", 0)
 	f.on([]string{"network", "ls", "-q"}, "netaaa\n", 0)
 	f.on([]string{"network", "inspect", "netaaa"}, "sentiae-network|172.20.0.0/16 \n", 0)
@@ -531,6 +536,132 @@ func probeDaemon() *fakeDaemon {
 		"sha256:036daa5efeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface\n", 0)
 	f.on([]string{"exec", "wget"}, "ok", 0)
 	return f
+}
+
+// TestProbe_DockerCLIFloor is the runtime half of the P4 §9 guard. The deploy
+// refused to boot with `unexpected key 'volume-subpath'` because the CLI that
+// issues every docker-out-of-docker line is the one INSIDE the image (alpine
+// 3.19 → 25.0.5), while the measurement that cleared the feature was taken on
+// the HOST (29.5.3). The Dockerfile now holds a build-time floor; this is the
+// runtime refusal, because an image can be run against any daemon and its CLI
+// can be replaced in place.
+//
+// A major skew is a LOG and never a refusal: docker negotiates its API version,
+// so any fixed maximum skew would be an invented rule — the gap is a discovery
+// signal instead.
+//
+// CONTROL (floor): delete the verifyDockerCLI call from Probe — the 25.0.5 rows
+// stop refusing and report "must refuse …, got nil".
+// CONTROL (skew): delete the skew branch — the legal-skew row reports the
+// missing docker_cli_skew log.
+// CONTROL (fail-closed): return nil instead of the unreadable-version error —
+// the malformed rows pass wrongly.
+func TestProbe_DockerCLIFloor(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  string
+		wantErr  string
+		wantSkew bool
+	}{
+		{
+			name:    "the image's own CLI is below the floor",
+			version: "25.0.5 25.0.5\n",
+			wantErr: "node runner: docker CLI 25.0.5 is older than the minimum 26.0 required for --mount volume-subpath",
+		},
+		{
+			name:    "the real §9 case: image CLI 25.0.5 against host daemon 29.5.3",
+			version: "25.0.5 29.5.3\n",
+			wantErr: "node runner: docker CLI 25.0.5 is older than the minimum 26.0 required for --mount volume-subpath",
+		},
+		{
+			name:    "the shipped pair: 28.3.3 against 29.5.3 — one major apart, no signal",
+			version: "28.3.3 29.5.3\n",
+		},
+		{
+			name:     "a large but legal skew is a signal, not a refusal",
+			version:  "26.1.4 41.0.1\n",
+			wantSkew: true,
+		},
+		{
+			name:    "unparseable output is a refusal, and says what it saw",
+			version: "Client: 28.3.3\n",
+			wantErr: `node runner: unreadable docker version "Client: 28.3.3": want a <client> <server> version pair`,
+		},
+		{
+			name:    "an empty version line is a refusal",
+			version: "\n",
+			wantErr: `node runner: unreadable docker version "": want a <client> <server> version pair`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			docker := probeDaemon()
+			// Registered last, so it overrides probeDaemon's healthy answer.
+			docker.on([]string{"version", "--format"}, tt.version, 0)
+			m := testManager(t, docker)
+			m.image = "" // the probe resolves it, as it does at boot
+
+			sink := &lockedBuffer{}
+			ctx := logger.NewContext(context.Background(),
+				logger.New(logger.Config{Level: "debug", Format: "json", Writer: sink}))
+
+			err := m.Probe(ctx)
+
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("Probe must refuse with %q, got nil", tt.wantErr)
+				}
+				if err.Error() != tt.wantErr {
+					t.Fatalf("refusal:\n got %q\nwant %q", err.Error(), tt.wantErr)
+				}
+				// The floor is checked BEFORE the cycle it protects: a refused
+				// CLI must never have launched a sidecar.
+				if got := docker.indexOf("run", "-d"); got != -1 {
+					t.Fatalf("a refused docker CLI must launch nothing (call %d)", got)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Probe: %v", err)
+			}
+			// The version check does not replace the end-to-end proof.
+			if docker.indexOf("run", "-d") == -1 {
+				t.Fatal("the boot probe cycle must still run after the version check")
+			}
+			logged := strings.Contains(sink.String(), `"msg":"docker_cli_skew"`)
+			if logged != tt.wantSkew {
+				t.Fatalf("docker_cli_skew logged=%v, want %v; logs:\n%s", logged, tt.wantSkew, sink.String())
+			}
+			if tt.wantSkew {
+				client, server, _ := strings.Cut(strings.TrimSpace(tt.version), " ")
+				for _, want := range []string{`"client":"` + client + `"`, `"server":"` + server + `"`} {
+					if !strings.Contains(sink.String(), want) {
+						t.Fatalf("docker_cli_skew must carry %s; logs:\n%s", want, sink.String())
+					}
+				}
+			}
+		})
+	}
+}
+
+// lockedBuffer is a race-safe log sink.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // T4.15 — TestSweeper_TouchesOnlyOrphanSidecars is the safety property R-24

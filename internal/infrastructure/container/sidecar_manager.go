@@ -56,6 +56,12 @@ const (
 	// sweepEvery is the orphan sweeper's period.
 	sweepEvery = 60 * time.Second
 
+	// dockerCLIMinMajor is the first docker CLI major that understands
+	// `--mount type=volume,…,volume-subpath=`. That flag is load-bearing for
+	// isolation — it confines every invocation to its own subdirectory of the
+	// runs volume — so a CLI below this floor cannot open a sidecar at all.
+	dockerCLIMinMajor = 26
+
 	// sidecarMemMB / sidecarVCPU are the sidecar's hardened resources. The
 	// sidecar is TRUSTED code, but it gets the same flags a hostile bundle does:
 	// one flag list, one thing to weaken by accident.
@@ -144,12 +150,15 @@ func NewSidecarManager(cfg config.NodeRunnerConfig, pool *usecase.SubnetPool) (*
 
 // Probe refuses to let this process serve node runs it could not isolate.
 //
-// Order matters: the uplink and the address space are verified before anything
-// is created, every orphan from a previous process is removed before anything
-// is counted live, and only then is one FULL egress cycle driven end to end —
-// because the failure this catches is a topology that looks right and does not
-// work.
+// Order matters: the docker CLI that issues every line below is checked first,
+// the uplink and the address space are verified before anything is created,
+// every orphan from a previous process is removed before anything is counted
+// live, and only then is one FULL egress cycle driven end to end — because the
+// failure this catches is a topology that looks right and does not work.
 func (m *SidecarManager) Probe(ctx context.Context) error {
+	if err := m.verifyDockerCLI(ctx); err != nil {
+		return err
+	}
 	if err := m.verifyUplink(ctx); err != nil {
 		return err
 	}
@@ -168,6 +177,62 @@ func (m *SidecarManager) Probe(ctx context.Context) error {
 		return fmt.Errorf("node runner: boot probe cycle failed: %s", err)
 	}
 	return nil
+}
+
+// verifyDockerCLI refuses a docker CLI that cannot issue the sidecar launch
+// line. The version that decides is the one INSIDE this image, never the host's:
+// alpine 3.19 shipped 25.0.5 and rejected `volume-subpath` at boot with
+// `unexpected key 'volume-subpath'` while the host CLI was 29.5.3 (P4 §9). The
+// Dockerfile holds the build-time floor; this is the runtime one, because the
+// image can be run against any daemon and its CLI can be replaced in place.
+//
+// A major skew against the daemon is LOGGED, never refused: docker's API
+// negotiation makes any fixed maximum skew unsound, so a wide gap is a
+// discovery signal rather than a rejection rule.
+func (m *SidecarManager) verifyDockerCLI(ctx context.Context) error {
+	out, stderr, code, err := m.docker(ctx, nil, nil,
+		"version", "--format", "{{.Client.Version}} {{.Server.Version}}")
+	if err != nil || code != 0 {
+		return fmt.Errorf("node runner: read docker version: %s", failureText(stderr, err))
+	}
+
+	raw := strings.TrimSpace(out)
+	client, server, paired := strings.Cut(raw, " ")
+	clientMajor, clientOK := versionMajor(client)
+	serverMajor, serverOK := versionMajor(server)
+	if !paired || !clientOK || !serverOK {
+		// Fail closed and quote what was read: a version this cannot parse is a
+		// floor this cannot enforce, and the raw line is what names the cause.
+		return fmt.Errorf("node runner: unreadable docker version %q: want a <client> <server> version pair", raw)
+	}
+	if clientMajor < dockerCLIMinMajor {
+		return fmt.Errorf("node runner: docker CLI %s is older than the minimum %d.0 required for --mount volume-subpath",
+			client, dockerCLIMinMajor)
+	}
+
+	skew := clientMajor - serverMajor
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew > 1 {
+		logger.FromContext(ctx).Warn("docker_cli_skew", "client", client, "server", server)
+	}
+	return nil
+}
+
+// versionMajor reads the leading major out of a docker version string
+// ("28.3.3", "26.1.4-ce"). It reports false for anything that does not begin
+// with a number, which its caller turns into a refusal.
+func versionMajor(v string) (int, bool) {
+	digits := strings.TrimSpace(v)
+	if end := strings.IndexFunc(digits, func(r rune) bool { return r < '0' || r > '9' }); end >= 0 {
+		digits = digits[:end]
+	}
+	major, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0, false
+	}
+	return major, true
 }
 
 // verifyUplink checks the shape of the network sidecars reach the internet
