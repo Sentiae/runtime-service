@@ -44,9 +44,15 @@ type axeReport struct {
 			HTML   string   `json:"html"`
 		} `json:"nodes"`
 	} `json:"violations"`
-	Passes      []struct{ ID string `json:"id"` } `json:"passes"`
-	Incomplete  []struct{ ID string `json:"id"` } `json:"incomplete"`
-	Inapplicable []struct{ ID string `json:"id"` } `json:"inapplicable"`
+	Passes []struct {
+		ID string `json:"id"`
+	} `json:"passes"`
+	Incomplete []struct {
+		ID string `json:"id"`
+	} `json:"incomplete"`
+	Inapplicable []struct {
+		ID string `json:"id"`
+	} `json:"inapplicable"`
 }
 
 // DispatchInVM runs axe-core and records the parsed report.
@@ -154,7 +160,7 @@ func parseAxeReport(stdout string, failOnImpacts []string) (domain.JSONMap, int)
 		"pass_count":       len(doc.Passes),
 		"fail_count":       len(doc.Violations),
 		"incomplete_count": len(doc.Incomplete),
-		"inapplicable":    len(doc.Inapplicable),
+		"inapplicable":     len(doc.Inapplicable),
 		"impact_counts":    impactCounts,
 		"blocking_count":   blocking,
 	}, blocking

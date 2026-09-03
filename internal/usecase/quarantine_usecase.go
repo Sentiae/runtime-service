@@ -21,7 +21,7 @@ import (
 // FlakinessScore=0.3 for 10 consecutive runs before the scheduler
 // flips Quarantined to true.
 const (
-	DefaultFlakinessThreshold  = 0.3
+	DefaultFlakinessThreshold   = 0.3
 	DefaultMinRunsForQuarantine = 10
 	DefaultQuarantineTick       = 5 * time.Minute
 )

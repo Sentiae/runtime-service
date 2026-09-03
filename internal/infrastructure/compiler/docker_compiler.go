@@ -83,7 +83,7 @@ func toolchainFor(language string) (toolchain, bool) {
 			buildCmd: "GOFLAGS=-mod=mod CGO_ENABLED=0 go build ./...",
 			parse:    parseGoDiagnostics,
 			caches: map[string]string{
-				"sentiae-compile-gomodcache": "/go/pkg/mod",       // downloaded modules
+				"sentiae-compile-gomodcache": "/go/pkg/mod",           // downloaded modules
 				"sentiae-compile-gocache":    "/root/.cache/go-build", // build cache
 			},
 		}, true
@@ -172,7 +172,7 @@ func (c *DockerCompiler) Compile(ctx context.Context, language string, files []d
 	if runCtx.Err() == context.DeadlineExceeded {
 		return &domain.CompileResult{
 			OK:            false,
-			Diagnostics:  tc.parse(output),
+			Diagnostics:   tc.parse(output),
 			RawOutput:     truncate(output, rawOutputCap),
 			CompileTimeMS: elapsed,
 		}, nil
@@ -181,7 +181,7 @@ func (c *DockerCompiler) Compile(ctx context.Context, language string, files []d
 	ok = runErr == nil // exit 0 → success
 	return &domain.CompileResult{
 		OK:            ok,
-		Diagnostics:  tc.parse(output),
+		Diagnostics:   tc.parse(output),
 		RawOutput:     truncate(output, rawOutputCap),
 		CompileTimeMS: elapsed,
 	}, nil

@@ -34,7 +34,7 @@ func NewPactExecutor(runner executors.VMExecRunner, updater executors.TestRunUpd
 // pactReport mirrors the can-i-deploy JSON shape.
 type pactReport struct {
 	Summary struct {
-		Deployable *bool `json:"deployable"`
+		Deployable *bool  `json:"deployable"`
 		Reason     string `json:"reason"`
 	} `json:"summary"`
 	Matrix []struct {

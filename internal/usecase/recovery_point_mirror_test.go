@@ -29,8 +29,8 @@ type memStore struct {
 	gets    []string
 	puts    []string
 
-	getErr  error
-	putErr  error
+	getErr error
+	putErr error
 	// truncateTo, when > 0, stores only that many bytes of the incoming stream —
 	// the shape of an upload the far end did not fully keep. It is what makes the
 	// confirm step's checksum the load-bearing check rather than decoration.

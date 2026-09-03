@@ -25,11 +25,11 @@ import (
 type PatternKind string
 
 const (
-	PatternKindCRUD              PatternKind = "crud"
-	PatternKindAuth              PatternKind = "auth"
-	PatternKindValidation        PatternKind = "validation"
-	PatternKindBoundary          PatternKind = "boundary"
-	PatternKindUnknown           PatternKind = "unknown"
+	PatternKindCRUD       PatternKind = "crud"
+	PatternKindAuth       PatternKind = "auth"
+	PatternKindValidation PatternKind = "validation"
+	PatternKindBoundary   PatternKind = "boundary"
+	PatternKindUnknown    PatternKind = "unknown"
 )
 
 // AsTestCategory translates a pattern kind into the existing
@@ -61,11 +61,11 @@ type PatternMatch struct {
 type PatternMatcher struct {
 	// precompiled per-pattern regexes, lazily initialised at struct
 	// construction so matching stays hot-path-cheap.
-	crudRE        []*regexp.Regexp
-	authRE        []*regexp.Regexp
-	validationRE  []*regexp.Regexp
-	boundaryRE    []*regexp.Regexp
-	repositoryRE  []*regexp.Regexp
+	crudRE       []*regexp.Regexp
+	authRE       []*regexp.Regexp
+	validationRE []*regexp.Regexp
+	boundaryRE   []*regexp.Regexp
+	repositoryRE []*regexp.Regexp
 }
 
 // NewPatternMatcher builds the matcher with the default pattern set.

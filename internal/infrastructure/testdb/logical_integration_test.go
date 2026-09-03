@@ -171,7 +171,7 @@ func TestProvisionLogical_SeedNotAllowed(t *testing.T) {
 		DBName:           "res_evil",
 		RoleName:         "r_evil",
 		Password:         "pw",
-		SeedTemplate:     "tmpl_app",              // real template …
+		SeedTemplate:     "tmpl_app",             // real template …
 		AllowedTemplates: []string{"tmpl_other"}, // … but NOT allowlisted
 	})
 	if !errors.Is(err, ErrSeedTemplateNotAllowed) {

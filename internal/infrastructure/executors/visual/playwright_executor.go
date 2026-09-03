@@ -48,11 +48,11 @@ type visualReport struct {
 }
 
 type runConfig struct {
-	Script       string
-	ArtifactKey  string
-	Image        string
-	TestCommand  string
-	MaxDiffPct   float64
+	Script      string
+	ArtifactKey string
+	Image       string
+	TestCommand string
+	MaxDiffPct  float64
 }
 
 func extractConfig(run *domain.TestRun) runConfig {
@@ -155,12 +155,12 @@ func parseVisualReport(stdout string) (domain.JSONMap, float64) {
 		return domain.JSONMap{"raw": stdout}, 0
 	}
 	var (
-		maxDiff       float64
-		baseline      string
-		actual        string
-		diffImage     string
-		worstName     string
-		comparisons   = make([]map[string]any, 0, len(doc.Comparisons))
+		maxDiff     float64
+		baseline    string
+		actual      string
+		diffImage   string
+		worstName   string
+		comparisons = make([]map[string]any, 0, len(doc.Comparisons))
 	)
 	for _, c := range doc.Comparisons {
 		if c.DiffPct > maxDiff {
@@ -171,10 +171,10 @@ func parseVisualReport(stdout string) (domain.JSONMap, float64) {
 			worstName = c.Name
 		}
 		comparisons = append(comparisons, map[string]any{
-			"name":          c.Name,
-			"baseline_hash": c.BaselineHash,
-			"actual_hash":   c.ActualHash,
-			"diff_pct":      c.DiffPct,
+			"name":           c.Name,
+			"baseline_hash":  c.BaselineHash,
+			"actual_hash":    c.ActualHash,
+			"diff_pct":       c.DiffPct,
 			"diff_image_ref": c.DiffImageRef,
 		})
 	}

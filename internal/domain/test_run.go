@@ -15,35 +15,35 @@ const DefaultMaxTestRetries = 2
 // to the test and code nodes on the canvas, enabling test history, trends,
 // and quality gate evaluations.
 type TestRun struct {
-	ID             uuid.UUID     `json:"id" gorm:"type:uuid;primary_key"`
-	OrganizationID uuid.UUID     `json:"organization_id" gorm:"type:uuid;not null;index"`
-	ExecutionID    uuid.UUID     `json:"execution_id" gorm:"type:uuid;not null;index"`
-	TestNodeID     uuid.UUID     `json:"test_node_id" gorm:"type:uuid;not null;index:idx_test_runs_node"`
-	CodeNodeID     *uuid.UUID    `json:"code_node_id,omitempty" gorm:"type:uuid;index"`
-	CanvasID       *uuid.UUID    `json:"canvas_id,omitempty" gorm:"type:uuid;index"`
+	ID             uuid.UUID  `json:"id" gorm:"type:uuid;primary_key"`
+	OrganizationID uuid.UUID  `json:"organization_id" gorm:"type:uuid;not null;index"`
+	ExecutionID    uuid.UUID  `json:"execution_id" gorm:"type:uuid;not null;index"`
+	TestNodeID     uuid.UUID  `json:"test_node_id" gorm:"type:uuid;not null;index:idx_test_runs_node"`
+	CodeNodeID     *uuid.UUID `json:"code_node_id,omitempty" gorm:"type:uuid;index"`
+	CanvasID       *uuid.UUID `json:"canvas_id,omitempty" gorm:"type:uuid;index"`
 	// Cross-domain ownership links. A test run targets a specific
 	// service, may verify a Spec's acceptance criteria, and is
 	// produced inside a Session (the branch that ran tests). All are
 	// nullable for legacy rows and ad-hoc canvas runs that aren't
 	// associated with a spec/session pipeline.
-	ServiceID *uuid.UUID  `json:"service_id,omitempty" gorm:"type:uuid;index"`
-	SpecID    *uuid.UUID  `json:"spec_id,omitempty" gorm:"type:uuid;index"`
-	SessionID *uuid.UUID  `json:"session_id,omitempty" gorm:"type:uuid;index"`
+	ServiceID *uuid.UUID `json:"service_id,omitempty" gorm:"type:uuid;index"`
+	SpecID    *uuid.UUID `json:"spec_id,omitempty" gorm:"type:uuid;index"`
+	SessionID *uuid.UUID `json:"session_id,omitempty" gorm:"type:uuid;index"`
 	// FeatureIDs is the M:N capability mapping derived from
 	// spec.features at run-time. Stored as a JSONB array of UUIDs so
 	// the repo layer can stay dialect-free; the consumer is the Pulse
 	// rollup which needs feature-level test signal without a join.
-	FeatureIDs UUIDArray `json:"feature_ids,omitempty" gorm:"type:jsonb;serializer:json"`
-	Language       Language      `json:"language" gorm:"type:varchar(20);not null"`
-	TestType       TestType      `json:"test_type" gorm:"type:varchar(20);not null;default:'unit';index"`
-	Status         TestRunStatus `json:"status" gorm:"type:varchar(20);not null;default:'running';index"`
-	Passed         int           `json:"passed" gorm:"default:0"`
-	Failed         int           `json:"failed" gorm:"default:0"`
-	Skipped        int           `json:"skipped" gorm:"default:0"`
-	Total          int           `json:"total" gorm:"default:0"`
-	CoveragePC     *float64      `json:"coverage_pc,omitempty"`
-	DurationMS     *int64        `json:"duration_ms,omitempty"`
-	ErrorMessage   string        `json:"error_message,omitempty" gorm:"type:text"`
+	FeatureIDs   UUIDArray     `json:"feature_ids,omitempty" gorm:"type:jsonb;serializer:json"`
+	Language     Language      `json:"language" gorm:"type:varchar(20);not null"`
+	TestType     TestType      `json:"test_type" gorm:"type:varchar(20);not null;default:'unit';index"`
+	Status       TestRunStatus `json:"status" gorm:"type:varchar(20);not null;default:'running';index"`
+	Passed       int           `json:"passed" gorm:"default:0"`
+	Failed       int           `json:"failed" gorm:"default:0"`
+	Skipped      int           `json:"skipped" gorm:"default:0"`
+	Total        int           `json:"total" gorm:"default:0"`
+	CoveragePC   *float64      `json:"coverage_pc,omitempty"`
+	DurationMS   *int64        `json:"duration_ms,omitempty"`
+	ErrorMessage string        `json:"error_message,omitempty" gorm:"type:text"`
 	// Transient-failure retry state. A test is retried up to MaxRetries
 	// times when the runner reports a classified-transient error (network
 	// timeout, VM provisioning failure, etc). Non-transient errors land

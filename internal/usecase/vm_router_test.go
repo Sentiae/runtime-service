@@ -53,10 +53,10 @@ func (m *routerMockLocal) Boot(_ context.Context, _ VMBootConfig) (*VMBootResult
 	m.bootCalls++
 	return &VMBootResult{PID: 1}, nil
 }
-func (m *routerMockLocal) Terminate(context.Context, string, int) error            { return nil }
-func (m *routerMockLocal) Pause(context.Context, string) error                     { return nil }
-func (m *routerMockLocal) Resume(context.Context, string) error                    { return nil }
-func (m *routerMockLocal) DeleteSnapshotFiles(string, string) error                { return nil }
+func (m *routerMockLocal) Terminate(context.Context, string, int) error { return nil }
+func (m *routerMockLocal) Pause(context.Context, string) error          { return nil }
+func (m *routerMockLocal) Resume(context.Context, string) error         { return nil }
+func (m *routerMockLocal) DeleteSnapshotFiles(string, string) error     { return nil }
 func (m *routerMockLocal) CollectMetrics(context.Context, string) (*VMMetrics, error) {
 	return &VMMetrics{}, nil
 }

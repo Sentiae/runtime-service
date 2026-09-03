@@ -49,8 +49,8 @@ type HermeticBuildUseCase struct {
 	hashRepo *postgres.StepArtifactHashRepo
 
 	// §9.2 enforcement toggles. Defaults preserve legacy behaviour.
-	enforceBaseImageDigest   bool
-	enforceReproducibility   bool
+	enforceBaseImageDigest bool
+	enforceReproducibility bool
 }
 
 // ErrMissingBaseImageDigest is returned when EnforceBaseImageDigest is

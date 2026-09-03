@@ -65,7 +65,7 @@ func compileResultToProto(r *domain.CompileResult) *runtimev1.CompileResponse {
 	}
 	return &runtimev1.CompileResponse{
 		Ok:            r.OK,
-		Diagnostics:  diags,
+		Diagnostics:   diags,
 		RawOutput:     r.RawOutput,
 		CompileTimeMs: r.CompileTimeMS,
 	}

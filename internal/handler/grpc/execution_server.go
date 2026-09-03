@@ -24,10 +24,10 @@ import (
 // Unavailable rather than panicking.
 type ExecutionServer struct {
 	runtimev1.UnimplementedRuntimeServiceServer
-	executionUC     usecase.ExecutionUseCase
-	testRunRepo     *postgres.TestRunRepo
-	testRunDispatch TestRunDispatcher
-	vmUC            usecase.VMUseCase
+	executionUC      usecase.ExecutionUseCase
+	testRunRepo      *postgres.TestRunRepo
+	testRunDispatch  TestRunDispatcher
+	vmUC             usecase.VMUseCase
 	executionsLister ExecutionsLister
 	// compileUC backs the Compile RPC (multi-file project build). May be
 	// nil — Compile then reports Unavailable rather than panicking.

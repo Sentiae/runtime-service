@@ -37,8 +37,8 @@ type Server struct {
 	fleetHandler         *FleetHandler             // warm-VM fleet visibility + control
 	activatorHandler     *ActivatorHandler         // rt#11 scale-to-zero wake endpoint
 	permissionChecker    PermissionChecker
-	postureSet           *posture.Set             // D-179 Wave-8 — backs /posture
-	consumers            []*kafka.KafkaConsumer    // D-179 Wave-8 — backs /healthz/consumers
+	postureSet           *posture.Set           // D-179 Wave-8 — backs /posture
+	consumers            []*kafka.KafkaConsumer // D-179 Wave-8 — backs /healthz/consumers
 }
 
 // SetOpsSurface wires the Wave-8 uniform ops endpoints (/posture,

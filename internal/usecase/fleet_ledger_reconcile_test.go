@@ -63,7 +63,9 @@ func (f *ledgerResFake) ListRecoveryPoints(_ context.Context, resourceID uuid.UU
 }
 
 // ledgerAppFake resolves the owner org of a volume's app.
-type ledgerAppFake struct{ apps map[uuid.UUID]*domain.FleetApp }
+type ledgerAppFake struct {
+	apps map[uuid.UUID]*domain.FleetApp
+}
 
 func (f *ledgerAppFake) FindByID(_ context.Context, id uuid.UUID) (*domain.FleetApp, error) {
 	app, ok := f.apps[id]

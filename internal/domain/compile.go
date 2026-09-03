@@ -24,7 +24,7 @@ type CompileDiagnostic struct {
 // form. The compiled artifact is never executed.
 type CompileResult struct {
 	OK            bool
-	Diagnostics  []CompileDiagnostic
+	Diagnostics   []CompileDiagnostic
 	RawOutput     string
 	CompileTimeMS int64
 }

@@ -11,12 +11,12 @@ import (
 // fakeProjectCompiler is a test double for ProjectCompiler. It records the
 // last call and returns a canned result/error.
 type fakeProjectCompiler struct {
-	result    *domain.CompileResult
-	err       error
-	gotLang   string
-	gotFiles  []domain.SourceFile
+	result     *domain.CompileResult
+	err        error
+	gotLang    string
+	gotFiles   []domain.SourceFile
 	gotTimeout int
-	called    bool
+	called     bool
 }
 
 func (f *fakeProjectCompiler) Compile(_ context.Context, language string, files []domain.SourceFile, timeoutSec int) (*domain.CompileResult, error) {
@@ -35,12 +35,12 @@ func TestCompileProject_Execute(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
-		in          CompileProjectInput
-		fake        *fakeProjectCompiler
-		wantErr     error
-		wantCalled  bool
-		wantOK      bool
+		name       string
+		in         CompileProjectInput
+		fake       *fakeProjectCompiler
+		wantErr    error
+		wantCalled bool
+		wantOK     bool
 	}{
 		{
 			name: "unsupported language",

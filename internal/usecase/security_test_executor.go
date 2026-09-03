@@ -14,11 +14,11 @@ import (
 type SecurityScanner string
 
 const (
-	SecurityScannerTrivy    SecurityScanner = "trivy"    // container image scan
-	SecurityScannerZAP      SecurityScanner = "zap"      // DAST
-	SecurityScannerBandit   SecurityScanner = "bandit"   // SAST (python)
-	SecurityScannerSemgrep  SecurityScanner = "semgrep"  // SAST
-	SecurityScannerDefault  SecurityScanner = "semgrep"
+	SecurityScannerTrivy   SecurityScanner = "trivy"   // container image scan
+	SecurityScannerZAP     SecurityScanner = "zap"     // DAST
+	SecurityScannerBandit  SecurityScanner = "bandit"  // SAST (python)
+	SecurityScannerSemgrep SecurityScanner = "semgrep" // SAST
+	SecurityScannerDefault SecurityScanner = "semgrep"
 )
 
 // SecurityTestExecutor implements TestRunDispatcher for TestTypeSecurity.

@@ -98,11 +98,11 @@ func main() {
 				Repository: *repo,
 				Digest:     *digest,
 			},
-			Port:          int32(*port),
-			WorkloadClass: "resident",
-			ScaleToZero:   *s2z,
+			Port:           int32(*port),
+			WorkloadClass:  "resident",
+			ScaleToZero:    *s2z,
 			IdleTtlSeconds: int32(*idleTTL),
-			SecretRefs:    secretRefs,
+			SecretRefs:     secretRefs,
 		}
 		if *volSizeMB > 0 {
 			desc.Volumes = []*runtimev1.VolumeSpec{{Id: "", SizeMb: int32(*volSizeMB)}}

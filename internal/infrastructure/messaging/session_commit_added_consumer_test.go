@@ -47,7 +47,7 @@ func (f *fakeRuntimePublisher) Publish(_ context.Context, eventType, _ string, d
 	f.events = append(f.events, fakeCapturedEvent{EventType: eventType, Data: data})
 	return nil
 }
-func (f *fakeRuntimePublisher) Close() error { return nil }
+func (f *fakeRuntimePublisher) Close() error                         { return nil }
 func (f *fakeRuntimePublisher) EnsureTopics(_ context.Context) error { return nil }
 
 // fakeTestRunRepo is a minimal in-memory implementation of the narrow

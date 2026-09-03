@@ -254,12 +254,12 @@ func TestRuntime_GetVMUsage_ByExecution(t *testing.T) {
 	// Seed a metric row attached to an execution.
 	execID := uuid.New()
 	uc.metrics[execID] = &domain.ExecutionMetrics{
-		ID:           uuid.New(),
-		ExecutionID:  execID,
-		CPUTimeMS:    500,
-		MemoryAvgMB:  256,
-		TotalTimeMS:  2000,
-		BootTimeMS:   80,
+		ID:          uuid.New(),
+		ExecutionID: execID,
+		CPUTimeMS:   500,
+		MemoryAvgMB: 256,
+		TotalTimeMS: 2000,
+		BootTimeMS:  80,
 	}
 	// Allow the GetVMUsage code path to look up metrics via the lister
 	// seam so we don't need to attach a TestRunRepo.

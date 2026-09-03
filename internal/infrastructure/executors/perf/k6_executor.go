@@ -187,13 +187,13 @@ func parseK6Summary(stdout string) domain.JSONMap {
 		summary.Iterations = int(m.Values["count"])
 	}
 	return domain.JSONMap{
-		"p50_ms":          summary.P50LatencyMS,
-		"p95_ms":          summary.P95LatencyMS,
-		"p99_ms":          summary.P99LatencyMS,
-		"rps":             summary.RPS,
-		"error_rate_pct":  summary.ErrorRatePct,
-		"vus_max":         summary.VUsMax,
-		"iterations":      summary.Iterations,
-		"duration_ms":     doc.State.TestRunDurationMS,
+		"p50_ms":         summary.P50LatencyMS,
+		"p95_ms":         summary.P95LatencyMS,
+		"p99_ms":         summary.P99LatencyMS,
+		"rps":            summary.RPS,
+		"error_rate_pct": summary.ErrorRatePct,
+		"vus_max":        summary.VUsMax,
+		"iterations":     summary.Iterations,
+		"duration_ms":    doc.State.TestRunDurationMS,
 	}
 }
