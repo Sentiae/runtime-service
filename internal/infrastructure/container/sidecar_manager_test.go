@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sentiae/platform-kit/logger"
+	"github.com/sentiae/platform-kit/nodebroker"
 
 	"github.com/sentiae/runtime-service/internal/usecase"
 	"github.com/sentiae/runtime-service/pkg/config"
@@ -411,9 +413,14 @@ func TestProbe_Refusals(t *testing.T) {
 	uplink := []string{"network", "inspect", "sentiae-node-egress-uplink"}
 
 	tests := []struct {
-		name    string
-		daemon  func() *fakeDaemon
-		wantErr string
+		name   string
+		daemon func() *fakeDaemon
+		// wantErr is the whole refusal, verbatim. wantErrContains is for the
+		// rows whose refusal quotes a randomly-minted invocation id, where a
+		// verbatim match is not expressible — the substring is still the ONE
+		// thing that names the fault.
+		wantErr         string
+		wantErrContains string
 	}{
 		{
 			name: "uplink absent",
@@ -477,6 +484,69 @@ func TestProbe_Refusals(t *testing.T) {
 			wantErr: "node runner: orphan sweep incomplete: 1 container(s), 0 network(s) remain",
 		},
 		{
+			// The redemption is REFUSED. A broker that answers 403 to the handle
+			// the probe itself just bound is not a working secret path, however
+			// healthy every container looks.
+			name: "the probe's own handle is refused by the broker",
+			daemon: func() *fakeDaemon {
+				f := probeDaemon()
+				f.on(redeemCall, `redeem: status=403 code="secret_not_declared" found=false`+"\n", 0)
+				return f
+			},
+			wantErrContains: `got "redeem: status=403 code=\"secret_not_declared\" found=false"`,
+		},
+		{
+			// The probe binds Found:false with an empty value. A broker that
+			// answers found=true is answering with something the probe never
+			// bound, and boot must not proceed past that.
+			name: "the broker answers a secret the probe never bound",
+			daemon: func() *fakeDaemon {
+				f := probeDaemon()
+				f.on(redeemCall, `redeem: status=200 code="" found=true`+"\n", 0)
+				return f
+			},
+			wantErrContains: `got "redeem: status=200 code=\"\" found=true"`,
+		},
+		{
+			// THE 2026-09-03 CASE, seen from the node's side: the socket exists
+			// and the sidecar is healthy, but the node's uid class cannot get
+			// through the directory to it.
+			name: "the node-shaped container cannot dial the broker socket",
+			daemon: func() *fakeDaemon {
+				f := probeDaemon()
+				f.onFunc(
+					func(args []string) bool { return containsAll(args, redeemCall) },
+					func([]string) (string, string, int) {
+						return "", "node sidecar: redeem: dial /run/sentiae/broker.sock: " +
+							"connect: permission denied", 1
+					},
+				)
+				return f
+			},
+			wantErrContains: "dial /run/sentiae/broker.sock: connect: permission denied",
+		},
+		{
+			// THE 2026-09-03 CASE, seen from the sidecar's side, with the real
+			// live text: nodebroker.Listen refuses a directory it cannot make
+			// searchable, the bind exec fails, and boot must stop here rather
+			// than report healthy and fail on the first customer invocation.
+			name: "the sidecar refuses its binding because the socket dir denies search",
+			daemon: func() *fakeDaemon {
+				f := probeDaemon()
+				f.onFunc(
+					func(args []string) bool { return containsAll(args, []string{"exec", "-i", "bind"}) },
+					func([]string) (string, string, int) {
+						return "", "node sidecar: bind: broker socket /run/sentiae-inv/broker.sock: " +
+							"broker socket dir /run/sentiae-inv: mode 0700 denies search to some uid class; " +
+							"chmod 0755: chmod /run/sentiae-inv: operation not permitted", 1
+					},
+				)
+				return f
+			},
+			wantErrContains: "broker socket dir /run/sentiae-inv: mode 0700 denies search to some uid class; " +
+				"chmod 0755: chmod /run/sentiae-inv: operation not permitted",
+		},
+		{
 			name:    "anchor: a correct topology probes green",
 			daemon:  probeDaemon,
 			wantErr: "",
@@ -490,7 +560,7 @@ func TestProbe_Refusals(t *testing.T) {
 			m.image = "" // the probe resolves it, as it does at boot
 
 			err := m.Probe(context.Background())
-			if tt.wantErr == "" {
+			if tt.wantErr == "" && tt.wantErrContains == "" {
 				if err != nil {
 					t.Fatalf("Probe: %v", err)
 				}
@@ -509,10 +579,17 @@ func TestProbe_Refusals(t *testing.T) {
 				if docker.indexOf("rm", "-f") == -1 {
 					t.Fatal("the boot probe must tear its own sidecar down")
 				}
+				assertProbeRedeemedOneSecret(t, docker)
 				return
 			}
 			if err == nil {
-				t.Fatalf("Probe must refuse with %q, got nil", tt.wantErr)
+				t.Fatalf("Probe must refuse with %q%q, got nil", tt.wantErr, tt.wantErrContains)
+			}
+			if tt.wantErrContains != "" {
+				if !strings.Contains(err.Error(), tt.wantErrContains) {
+					t.Fatalf("refusal:\n got %q\nmust contain %q", err.Error(), tt.wantErrContains)
+				}
+				return
 			}
 			if err.Error() != tt.wantErr {
 				t.Fatalf("refusal:\n got %q\nwant %q", err.Error(), tt.wantErr)
@@ -535,7 +612,106 @@ func probeDaemon() *fakeDaemon {
 	f.on([]string{"inspect", "runtime-container"},
 		"sha256:036daa5efeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface\n", 0)
 	f.on([]string{"exec", "wget"}, "ok", 0)
+	// The probe's node-shaped container redeems the one bound secret and answers
+	// the only line that means "a node reached this broker through the directory
+	// and the socket": 200, no refusal code, and the empty answer that was bound.
+	f.on(redeemCall, probeRedeemOK+"\n", 0)
 	return f
+}
+
+// redeemCall is the token set that identifies the boot probe's redemption
+// container. `run --rm` is the node launch line and `redeem` is the subcommand
+// after the image; the sidecar's own `run -d` matches neither.
+var redeemCall = []string{"run", "--rm", "redeem"}
+
+var probeHandleRx = regexp.MustCompile(`^handle:[0-9a-f]{32}$`)
+
+// assertProbeRedeemedOneSecret is the D-393 half of the boot gate. Before this
+// decision the probe bound ZERO secrets, so `if len(b.Secrets) > 0` in the
+// sidecar's apply() meant it never started a broker and nodebroker.Listen never
+// ran: the service reported healthy at 02:17:38 on 2026-09-03 and the first
+// secret-bearing invocation failed at 02:25:39. Guard coverage must be the
+// population at risk.
+//
+// It asserts the whole shape, not just that a redemption happened: exactly one
+// secret, bound with a real handle and NOTHING to leak (Found:false, empty
+// value), redeemed AFTER the bind and BEFORE the teardown, over stdin with no
+// environment, and with no handle anywhere on any argv.
+//
+// CONTROL (coverage): restore `Secrets: map[string]usecase.SecretAnswer{}` in
+// bootProbeCycle — the one-secret assertion goes red and the probe is blind to
+// the entire broker path again.
+// CONTROL (uid class): dial the socket from this process instead of from
+// probeRedeemArgs' container — the "a redeem container ran" assertion goes red.
+// CONTROL (channel): pass the request as an argv token instead of on stdin —
+// the stdin assertion and the no-handle-on-argv assertion both go red.
+func assertProbeRedeemedOneSecret(t *testing.T, docker *fakeDaemon) {
+	t.Helper()
+
+	bindIdx := docker.indexOf("exec", "-i", "bind")
+	if bindIdx == -1 {
+		t.Fatal("the boot probe must deliver a binding")
+	}
+	var bound usecase.SidecarBinding
+	if err := json.Unmarshal(docker.call(bindIdx).stdin, &bound); err != nil {
+		t.Fatalf("the bind stdin is not a binding document: %v", err)
+	}
+	if len(bound.Secrets) != 1 {
+		t.Fatalf("the boot probe must bind exactly ONE secret, got %d — with zero the sidecar "+
+			"never starts a broker and the probe cannot fail on the socket at all", len(bound.Secrets))
+	}
+	answer, declared := bound.Secrets[probeSecretName]
+	if !declared {
+		t.Fatalf("the probe's secret must be named %q, got %v", probeSecretName, bound.Secrets)
+	}
+	if answer.Found || answer.Value != "" {
+		t.Fatalf("the probe's secret must redeem NOTHING, got found=%v value=%q", answer.Found, answer.Value)
+	}
+	if !probeHandleRx.MatchString(answer.Handle) {
+		t.Fatalf("the probe's handle %q does not match %s", answer.Handle, probeHandleRx)
+	}
+
+	redeemIdx := docker.indexOf(redeemCall...)
+	if redeemIdx == -1 {
+		t.Fatal("the boot probe must redeem its secret from a node-shaped container")
+	}
+	teardownIdx := docker.indexOf("rm", "-f")
+	if teardownIdx == -1 {
+		t.Fatal("the boot probe must tear its own sidecar down")
+	}
+	if !(bindIdx < redeemIdx && redeemIdx < teardownIdx) {
+		t.Fatalf("order must be bind < redeem < teardown, got %d %d %d", bindIdx, redeemIdx, teardownIdx)
+	}
+
+	redeemCallRecord := docker.call(redeemIdx)
+	if len(redeemCallRecord.env) != 0 {
+		t.Fatalf("the redeem container must carry no environment, got %q", redeemCallRecord.env)
+	}
+	var request nodebroker.Request
+	if err := json.Unmarshal(redeemCallRecord.stdin, &request); err != nil {
+		t.Fatalf("the redeem stdin is not a broker request: %v", err)
+	}
+	if request.Handle != answer.Handle {
+		t.Fatalf("the redemption presented %q, but the binding minted %q", request.Handle, answer.Handle)
+	}
+	if request.Invocation != bound.Invocation {
+		t.Fatalf("the redemption named invocation %q, but the binding is %q",
+			request.Invocation, bound.Invocation)
+	}
+	if request.Name != probeSecretName {
+		t.Fatalf("the redemption named secret %q, want %q", request.Name, probeSecretName)
+	}
+
+	// The handle is a credential. It crossed on stdin twice and must appear on
+	// no argv anywhere in the whole conversation — `docker inspect` and
+	// /proc/<pid>/cmdline read argv, and R-21 F-3(i) greps for this prefix.
+	for _, args := range docker.argv() {
+		for _, arg := range args {
+			if strings.Contains(arg, "handle:") {
+				t.Fatalf("a handle reached the argv: %q", arg)
+			}
+		}
+	}
 }
 
 // TestProbe_DockerCLIFloor is the runtime half of the P4 §9 guard. The deploy

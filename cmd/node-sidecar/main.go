@@ -8,7 +8,7 @@
 // attached stdin stream, never on argv, never in the environment, never in a
 // file (§3.7, D-4).
 //
-// Two commands:
+// Three commands:
 //
 //	node-sidecar         the long-running sidecar: health, control socket, then
 //	                     the broker (iff the binding carries secrets) and the
@@ -16,6 +16,12 @@
 //	node-sidecar bind    copies ONE binding document from stdin into the running
 //	                     sidecar's private control socket and waits for its ack.
 //	                     This is what `docker exec -i` runs.
+//	node-sidecar redeem  reads ONE broker request from stdin and redeems it over
+//	                     the broker socket, exactly as a node SDK does, printing
+//	                     one status line and never a value. It runs inside a
+//	                     node-shaped container so the BOOT PROBE measures the
+//	                     socket from the node's uid class rather than the
+//	                     runtime's (D-393).
 package main
 
 import (
@@ -28,6 +34,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/sentiae/platform-kit/nodeabi"
 )
 
 const (
@@ -62,6 +70,9 @@ const (
 
 	// bindCommand is the argv[1] `docker exec` uses to deliver the binding.
 	bindCommand = "bind"
+
+	// redeemCommand is the argv[1] the boot probe's node-shaped container runs.
+	redeemCommand = "redeem"
 )
 
 // options is the sidecar's whole configuration.
@@ -111,11 +122,19 @@ func optionsFromEnv(lookup func(string) (string, bool)) (options, error) {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == bindCommand {
-		if err := runBind(os.Stdin, controlSocketPath, bindTimeout); err != nil {
-			log.Fatalf("node sidecar: bind: %v", err)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case bindCommand:
+			if err := runBind(os.Stdin, controlSocketPath, bindTimeout); err != nil {
+				log.Fatalf("node sidecar: bind: %v", err)
+			}
+			return
+		case redeemCommand:
+			if err := runRedeem(os.Stdin, os.Stdout, nodeabi.BrokerSocketPath, redeemTimeout); err != nil {
+				log.Fatalf("node sidecar: redeem: %v", err)
+			}
+			return
 		}
-		return
 	}
 
 	opt, err := optionsFromEnv(os.LookupEnv)

@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sentiae/platform-kit/logger"
+	"github.com/sentiae/platform-kit/nodebroker"
 
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
@@ -67,6 +68,21 @@ const (
 	// one flag list, one thing to weaken by accident.
 	sidecarMemMB = 256
 	sidecarVCPU  = 1
+
+	// probeSecretName is the ONE secret the boot probe binds. Its answer is
+	// Found:false with an empty value — a credential that redeems nothing, so
+	// there is nothing to leak even if every hygiene control failed at once —
+	// and its only job is to make len(b.Secrets) > 0 so the sidecar actually
+	// starts a broker and nodebroker.Listen actually runs its predicate.
+	probeSecretName = "boot-probe"
+
+	// probeRedeemOK is the EXACT line the probe's node-shaped container must
+	// print. 200 with no code and found=false is the whole path: the directory
+	// was searchable from the node's uid class, the socket was connectable, the
+	// invocation matched, the handle was bound, and the answer was the empty one
+	// the probe bound. Anything else — a 403, a 409, a dial error, or a found
+	// answer — is a different topology and must refuse boot.
+	probeRedeemOK = `redeem: status=200 code="" found=false`
 )
 
 var (
@@ -150,19 +166,35 @@ func NewSidecarManager(cfg config.NodeRunnerConfig, pool *usecase.SubnetPool) (*
 
 // Probe refuses to let this process serve node runs it could not isolate.
 //
-// Order matters: the docker CLI that issues every line below is checked first,
-// the uplink and the address space are verified before anything is created,
-// every orphan from a previous process is removed before anything is counted
-// live, and only then is one FULL egress cycle driven end to end — because the
-// failure this catches is a topology that looks right and does not work.
+// Order matters, and every edge below is load-bearing (R-30):
+//
+//   - the docker CLI is checked FIRST (R-27), because it issues every other
+//     line here: a CLI that cannot parse the sidecar launch invalidates every
+//     answer any later step could read;
+//   - the uplink SECOND (R-14). It is deploy-owned static infrastructure that
+//     this process only verifies and never repairs, so it is proven before the
+//     runtime mutates anything — and the sweep provably cannot disturb it,
+//     because the uplink carries sentiae.node.uplink=1 and never
+//     sentiae.node.invocation, which is the only label the sweep selects on;
+//   - the orphan sweep THIRD, and this is the edge R-30 fixes. Every invocation
+//     bridge is carved out of invocation_cidr by construction (subnet_pool.go),
+//     so a verifier placed ahead of the sweep would see the runtime's OWN
+//     leaked bridge, refuse on it, and never reach the one step that could
+//     remove it: a transient crash became an outage no restart could end. The
+//     survivor refusal sits with the sweep, because refusing is only legal
+//     after removal was attempted;
+//   - the address space FOURTH (R-25), against every network still present on
+//     the post-sweep daemon — none exempt by label, since a survivor still
+//     occupies the pool and a network appearing after the sweep must not slip
+//     past the boot guard;
+//   - one FULL egress cycle LAST (R-24), because it registers the first live
+//     invocation — it must run on a daemon already proven clean, and the
+//     failure it catches is a topology that looks right and does not work.
 func (m *SidecarManager) Probe(ctx context.Context) error {
 	if err := m.verifyDockerCLI(ctx); err != nil {
 		return err
 	}
 	if err := m.verifyUplink(ctx); err != nil {
-		return err
-	}
-	if err := m.verifyInvocationCIDR(ctx); err != nil {
 		return err
 	}
 	containers, networks, err := m.SweepAll(ctx)
@@ -172,6 +204,9 @@ func (m *SidecarManager) Probe(ctx context.Context) error {
 	if containers > 0 || networks > 0 {
 		return fmt.Errorf("node runner: orphan sweep incomplete: %d container(s), %d network(s) remain",
 			containers, networks)
+	}
+	if err := m.verifyInvocationCIDR(ctx); err != nil {
+		return err
 	}
 	if err := m.bootProbeCycle(ctx); err != nil {
 		return fmt.Errorf("node runner: boot probe cycle failed: %s", err)
@@ -293,10 +328,23 @@ func (m *SidecarManager) verifyInvocationCIDR(ctx context.Context) error {
 	return nil
 }
 
-// bootProbeCycle drives one COMPLETE egress invocation — bridge, sidecar,
-// binding, uplink, readiness, teardown — before the service reports healthy.
-// It carries no secrets and an empty pattern set, so the proxy it stands up
+// bootProbeCycle drives one COMPLETE invocation — bridge, sidecar, binding,
+// uplink, readiness, ONE SECRET REDEEMED FROM A NODE, teardown — before the
+// service reports healthy. The empty pattern set means the proxy it stands up
 // would refuse every host; what is being proven is the topology, not a grant.
+//
+// It binds exactly one secret, `boot-probe`, with a fresh handle, Found:false
+// and an empty value. That is not decoration: the sidecar starts a broker only
+// `if len(b.Secrets) > 0`, so the probe that carried no secrets could not reach
+// the broker branch at all — it logged sidecar_opened and the service came up
+// healthy at 02:17:38 on 2026-09-03 while the first real secret-bearing
+// invocation failed at 02:25:39 on the socket directory (D-393). Guard coverage
+// is the population at risk.
+//
+// And the redemption is driven from a node-shaped CONTAINER, not from this
+// process: dir-search and connect(2) through the read-only subpath mount are
+// decided by the accessor's uid class, and a runtime-side dial measures the
+// wrong class on both inodes.
 func (m *SidecarManager) bootProbeCycle(ctx context.Context) error {
 	image, err := m.ownImage(ctx)
 	if err != nil {
@@ -311,21 +359,28 @@ func (m *SidecarManager) bootProbeCycle(ctx context.Context) error {
 	defer m.pool.Release(subnet)
 
 	invocation := "inv-" + uuid.NewString()
+	runID := uuid.New()
 	token, err := probeToken()
 	if err != nil {
 		return err
 	}
+	handle := nodebroker.NewHandle()
 	_, err = m.Open(ctx, usecase.SidecarOpen{
 		InvocationID: invocation,
-		RunID:        uuid.New(),
-		Node:         "boot-probe",
+		RunID:        runID,
+		Node:         probeSecretName,
 		Binding: usecase.SidecarBinding{
 			Invocation: invocation,
-			Node:       "boot-probe",
-			Secrets:    map[string]usecase.SecretAnswer{},
-			Egress:     &usecase.EgressBinding{Patterns: []string{}, Token: token, Subnet: subnet},
+			Node:       probeSecretName,
+			Secrets: map[string]usecase.SecretAnswer{
+				probeSecretName: {Handle: handle, Found: false, Value: ""},
+			},
+			Egress: &usecase.EgressBinding{Patterns: []string{}, Token: token, Subnet: subnet},
 		},
 	})
+	if err == nil {
+		err = m.probeRedeem(ctx, invocation, runID, handle)
+	}
 	// Close on both paths: Open already tore down its own partial state, and a
 	// second Close is a no-op by construction.
 	closeErr := m.Close(context.WithoutCancel(ctx), invocation)
@@ -333,6 +388,37 @@ func (m *SidecarManager) bootProbeCycle(ctx context.Context) error {
 		return err
 	}
 	return closeErr
+}
+
+// probeRedeem redeems the probe's one handle from a container launched on the
+// NODE's own line. The request travels on stdin — never argv, never the
+// environment — because it carries a handle, and the container prints one line
+// that carries a status and never a value.
+func (m *SidecarManager) probeRedeem(ctx context.Context, invocation string, runID uuid.UUID, handle string) error {
+	request, err := json.Marshal(nodebroker.Request{
+		Handle:     handle,
+		Invocation: invocation,
+		Name:       probeSecretName,
+		Node:       probeSecretName,
+	})
+	if err != nil {
+		return fmt.Errorf("encode probe redemption: %w", err)
+	}
+	args := probeRedeemArgs(usecase.BundleLaunch{
+		RunID:         runID,
+		InvocationID:  invocation,
+		Image:         m.image,
+		BrokerSubpath: invocation,
+	}, m.cfg.RunsVolume)
+
+	out, stderr, code, err := m.docker(ctx, nil, request, args...)
+	if err != nil || code != 0 {
+		return fmt.Errorf("redeem the probe secret from a node: %s", failureText(stderr, err))
+	}
+	if got := strings.TrimSpace(out); got != probeRedeemOK {
+		return fmt.Errorf("redeem the probe secret from a node: got %q, want %q", got, probeRedeemOK)
+	}
+	return nil
 }
 
 // ownImage reads the image THIS container runs, which is the image a sidecar
@@ -406,8 +492,13 @@ func (m *SidecarManager) open(ctx context.Context, in usecase.SidecarOpen, name,
 	if err := os.MkdirAll(dir, 0o777); err != nil {
 		return usecase.Sidecar{}, fmt.Errorf("node runner: create invocation dir: %w", err)
 	}
-	// MkdirAll's mode is narrowed by the umask, so the mode is set explicitly:
-	// the sidecar runs as 65534 and must be able to create broker.sock in here.
+	// MkdirAll's mode is narrowed by the umask, so the mode is set explicitly
+	// HERE, by the only process that can set it: this directory is owned by the
+	// runtime's uid, and every other party to it — the sidecar at 65534 with
+	// CAP_FOWNER dropped, and the node — can only read it. The sidecar must be
+	// able to create broker.sock and the node must be able to search through to
+	// it, and nodebroker.Listen only VERIFIES that from its side, because a
+	// chmod from there is EPERM by construction (D-393).
 	// The NODE's view of this same directory is a read-only mount, and that is
 	// where the boundary is — not in this mode.
 	if err := os.Chmod(dir, 0o777); err != nil {
@@ -557,6 +648,11 @@ func (m *SidecarManager) SweepRun(ctx context.Context, runID uuid.UUID) error {
 // It is boot-only. Nothing is live at boot, so removing by label alone is safe
 // here; the periodic sweeper (StartSweeper) is the one that must respect the
 // live set.
+//
+// Probe runs it BEFORE the verifier that could refuse on its own leftovers
+// (R-30): every invocation bridge is carved out of invocation_cidr by
+// construction, so verifyInvocationCIDR ahead of this sweep would refuse on a
+// bridge this sweep exists to remove, and no restart could ever clear it.
 func (m *SidecarManager) SweepAll(ctx context.Context) (int, int, error) {
 	filter := "label=" + labelInvocation
 	m.removeContainers(ctx, m.listContainers(ctx, filter))
@@ -796,6 +892,19 @@ func sidecarRunArgs(invocationID string, runID uuid.UUID, network, image, runsVo
 // nil environment: the document goes in on stdin (§3.7, A10).
 func bindExecArgs(name string) []string {
 	return []string{"exec", "-i", name, sidecarBinary, "bind"}
+}
+
+// probeRedeemArgs is the boot probe's redemption container, DERIVED from
+// bundleRunArgs rather than written out: the whole point of the probe is to
+// measure the socket from the node's uid class, so the probe container that
+// cannot drift from the real node launch line is the only one worth trusting.
+// The two differences are the entrypoint (the runtime image's own ENTRYPOINT is
+// the server, and the redeeming binary is the sidecar's) and the `redeem`
+// subcommand after the image.
+func probeRedeemArgs(launch usecase.BundleLaunch, runsVolume string) []string {
+	args := bundleRunArgs(launch, runsVolume)
+	image := args[len(args)-1]
+	return append(args[:len(args)-1], "--entrypoint", sidecarBinary, image, "redeem")
 }
 
 // probeToken mints the boot probe's bearer with the same entropy a real

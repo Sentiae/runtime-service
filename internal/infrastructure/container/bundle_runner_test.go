@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -125,6 +126,71 @@ func TestBundleRunArgs(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestProbeRedeemArgs_IsTheNodeLine pins the boot probe's redemption container
+// as THE NODE LINE. The probe exists to measure dir-search and connect(2) from
+// the node's uid class — a runtime-side dial measures the wrong class on both
+// inodes — so a probe container that differs from the real node launch is a
+// probe that proves the wrong thing. It is DERIVED from bundleRunArgs for
+// exactly that reason, and this asserts the derivation element for element.
+//
+// The two deliberate differences: --entrypoint, because the runtime image's own
+// ENTRYPOINT is the server and the redeeming binary is the sidecar's (R-23);
+// and the `redeem` subcommand, which is the only thing that may follow the
+// image.
+//
+// CONTROL (drift): write the probe's argv by hand instead of deriving it from
+// bundleRunArgs — any later change to the node line (a dropped hardening flag,
+// a mount that stops being readonly) stops reaching the probe and this
+// equality goes red on the next such change.
+// CONTROL (uid class): drop "--user", "65534:65534" from hardenedFlags — the
+// probe would run as root, could search any directory, and the equality here
+// goes red.
+func TestProbeRedeemArgs_IsTheNodeLine(t *testing.T) {
+	runID := uuid.MustParse("33333333-3333-3333-3333-333333333333")
+	image := "sha256:036daa5efeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface"
+	launch := usecase.BundleLaunch{
+		RunID:         runID,
+		InvocationID:  "inv-1234",
+		Image:         image,
+		BrokerSubpath: "inv-1234",
+	}
+
+	want := []string{
+		"run", "--rm", "-i",
+		"--name", "sentiae-node-inv-1234",
+		"--label", "sentiae.node.invocation=inv-1234",
+		"--label", "sentiae.node.run=" + runID.String(),
+		"--user", "65534:65534",
+		"--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges",
+		"--read-only",
+		"--tmpfs", "/tmp:rw,exec,size=256m,mode=1777",
+		"--pids-limit", "256",
+		"--memory", "256m",
+		"--memory-swap", "256m",
+		"--cpus", "1",
+		"-e", "HOME=/tmp",
+		"-e", "TMPDIR=/tmp",
+		"-e", "XDG_CACHE_HOME=/tmp/.cache",
+		"-e", "NPM_CONFIG_CACHE=/tmp/.npm",
+		"-e", "GOCACHE=/tmp/.cache/go-build",
+		"-e", "GOPATH=/tmp/go",
+		"--mount", "type=volume,source=sentiae-node-runs,target=/run/sentiae,readonly,volume-subpath=inv-1234",
+		"--network", "none",
+		"--entrypoint", "/app/node-sidecar",
+		image,
+		"redeem",
+	}
+
+	got := probeRedeemArgs(launch, "sentiae-node-runs")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("probe redeem argv:\n got %q\nwant %q", got, want)
+	}
+	if got[len(got)-1] != "redeem" || got[len(got)-2] != image {
+		t.Fatalf("the image must be followed by `redeem` and nothing else, got %q", got[len(got)-3:])
+	}
 }
 
 func assertPrefix(t *testing.T, args, want []string) {
