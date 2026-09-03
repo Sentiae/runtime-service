@@ -201,9 +201,22 @@ func TestVaultSource_RevokeHandsBackTheRunToken(t *testing.T) {
 		t.Fatalf("revoked %v, want [handed-token]", revoker.tokens)
 	}
 
-	failing := &recordingRevoker{err: errors.New("revoke-self: 403")}
-	if err := New(&recordingResolver{}, failing).Revoke(context.Background(), "handed-token"); err == nil {
+	// A refused revocation must reach the caller with its CAUSE intact, not
+	// merely as "some error": the engine's terminal cleanup is the only place
+	// that learns the per-run credential outlived its run, and D-7 was exactly a
+	// revoke-self 403 whose signal nothing could act on. `err != nil` alone would
+	// stay green if the %w in VaultSource.Revoke became a %v, so the chain is
+	// what is asserted.
+	//
+	// Control: change `revoke handed token: %w` to `%v` in vault_source.go ⇒ the
+	// errors.Is check fails.
+	cause := errors.New("revoke-self: 403")
+	err := New(&recordingResolver{}, &recordingRevoker{err: cause}).Revoke(context.Background(), "handed-token")
+	if err == nil {
 		t.Fatal("Revoke error = nil, want the revoker's failure")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("Revoke error = %v, want it to wrap the revoker's cause", err)
 	}
 }
 

@@ -129,9 +129,12 @@ type fakeSecretSource struct {
 	answers map[string]resolvedSecret
 	asked   []string
 	revoked []string
-	lastEnv string
-	lastTok string
-	lastOrg uuid.UUID
+	// revokeErr is what Revoke answers after recording the token — the live
+	// D-7 shape, where revoke-self is refused but the token was still handed back.
+	revokeErr error
+	lastEnv   string
+	lastTok   string
+	lastOrg   uuid.UUID
 }
 
 func (f *fakeSecretSource) Resolve(_ context.Context, org uuid.UUID, token, environment, name string) (string, bool, error) {
@@ -150,7 +153,7 @@ func (f *fakeSecretSource) Revoke(_ context.Context, token string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.revoked = append(f.revoked, token)
-	return nil
+	return f.revokeErr
 }
 
 func (f *fakeSecretSource) revokedTokens() []string {

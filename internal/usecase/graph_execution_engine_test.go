@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/sentiae/platform-kit/nodeabi"
 	"github.com/sentiae/runtime-service/internal/domain"
@@ -735,5 +736,63 @@ func TestDebug_Retired(t *testing.T) {
 	}
 	if err := svc.Continue(context.Background(), id); !errors.Is(err, domain.ErrGraphDebugRetired) {
 		t.Fatalf("Continue error = %v, want ErrGraphDebugRetired", err)
+	}
+}
+
+// D-7 — a handed token that cannot be revoked is COUNTED and logged at Error,
+// and the run it belongs to still completes.
+//
+// The defect this pins: revoke-self answered 403 on every run for the life of
+// the token role, the only signal was an unwatched WARN, and the `failed` series
+// did not exist because a promauto counter with no observation exports nothing —
+// so "no failures" and "never instrumented" were the same reading.
+//
+// Both halves are asserted deliberately:
+//   - failed +1: the fault is visible as a NUMBER, not only as a log line.
+//   - status still completed: cleanup runs after the terminal transition, and a
+//     revoke failure must not turn a finished run into a failed one (a retry
+//     would mint another token that also cannot be revoked).
+//
+// Control: delete the recordSecretTokenRevocation(revokeOutcomeFailed) call in
+// cleanupRun ⇒ the failed counter never moves and this fails.
+func TestCleanupRun_RevokeFailureIsCountedAndTheRunStillCompletes(t *testing.T) {
+	nodes, edges := triggerRespondGraph(t)
+	// The engine refuses a handed token for a graph that declares no secrets, so
+	// the run that owns a token is the run that has one to resolve.
+	nodes[1].Secrets = []domain.SecretSpec{{Name: "greeting_suffix"}}
+	h := newEngineHarness(t, nodes, edges)
+	h.secrets.answers = map[string]resolvedSecret{"greeting_suffix": {value: " ::x::", found: true}}
+	h.secrets.revokeErr = errors.New("revoke-self: Error making API request. Code: 403. * permission denied")
+	h.runner.result = resultsByNode(t, map[string]BundleRunResult{
+		"intake": okResult(map[string]any{"body": map[string]any{"name": "x"}}),
+		"greet":  okResult(map[string]any{"out": map[string]any{"greeting": "hello x"}}),
+		"reply":  responseResult(200),
+	})
+
+	// Read the counters BEFORE the run: they are process-global on the default
+	// registry, so only the delta this run produced is meaningful.
+	failedBefore := testutil.ToFloat64(secretTokenRevocations.WithLabelValues(revokeOutcomeFailed))
+	okBefore := testutil.ToFloat64(secretTokenRevocations.WithLabelValues(revokeOutcomeOK))
+
+	exec := h.runToTerminal(t, domain.JSONMap{"body": map[string]any{"name": "x"}}, "handed-token", "preview")
+
+	if exec.Status != domain.GraphExecCompleted {
+		t.Fatalf("status = %s (error %q), want completed — a revoke failure must not fail the run",
+			exec.Status, exec.Error)
+	}
+
+	// cleanupRun is deferred, so it lands after the terminal row is written.
+	waitFor(t, "the handed token to be offered for revocation", func() bool {
+		return len(h.secrets.revokedTokens()) == 1
+	})
+	waitFor(t, "the failed revocation to be counted", func() bool {
+		return testutil.ToFloat64(secretTokenRevocations.WithLabelValues(revokeOutcomeFailed)) == failedBefore+1
+	})
+
+	if got := testutil.ToFloat64(secretTokenRevocations.WithLabelValues(revokeOutcomeOK)); got != okBefore {
+		t.Fatalf("revocations{outcome=ok} = %v, want %v — a refused revocation must not count as ok", got, okBefore)
+	}
+	if revoked := h.secrets.revokedTokens(); revoked[0] != "handed-token" {
+		t.Fatalf("revoked %v, want the token handed to this run", revoked)
 	}
 }

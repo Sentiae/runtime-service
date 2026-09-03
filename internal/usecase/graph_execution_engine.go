@@ -86,6 +86,10 @@ func NewGraphExecutionEngine(
 	invoker *NodeInvoker,
 	sidecars SidecarManager,
 ) *GraphExecutionEngine {
+	// Publish both handed-token revocation series at 0 before the first run can
+	// end: an unobserved counter exports no series at all, and "no series" must
+	// never be readable as "no failures" (D-7).
+	precreateSecretTokenRevocationSeries()
 	return &GraphExecutionEngine{
 		graphRepo:      graphRepo,
 		nodeRepo:       nodeRepo,
@@ -761,10 +765,21 @@ func (e *GraphExecutionEngine) cleanupRun(ctx context.Context, runID uuid.UUID) 
 	if cred.token == "" {
 		return
 	}
+	// ERROR, not WARN (D-7): a revocation that fails leaves a live credential for
+	// this run behind until its TTL expires, which is the one property the handed
+	// token exists to bound. The message KEY is unchanged on purpose — §9.6's
+	// acceptance greps for `secret_token_revoke_failed` — and the wrapped cause
+	// from the secret source is passed through as-is.
+	//
+	// The run's persisted status is deliberately untouched here: cleanup runs
+	// after the terminal transition, and failing a completed run would make the
+	// user retry, minting another token that also cannot be revoked.
 	if err := e.invoker.RevokeSecretToken(cleanCtx, cred.token); err != nil {
-		logger.FromContext(cleanCtx).Warn("secret_token_revoke_failed", "run", runID.String(), "err", err)
+		recordSecretTokenRevocation(revokeOutcomeFailed)
+		logger.FromContext(cleanCtx).Error("secret_token_revoke_failed", "run", runID.String(), "err", err)
 		return
 	}
+	recordSecretTokenRevocation(revokeOutcomeOK)
 	logger.FromContext(cleanCtx).Info("secret_token_revoked", "run", runID.String())
 }
 
