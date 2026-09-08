@@ -17,7 +17,6 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 
 	pkconfig "github.com/sentiae/platform-kit/config"
 	"github.com/sentiae/platform-kit/grpcclient"
@@ -1501,9 +1500,13 @@ func (c *Container) registerSelfHost(cfg *config.Config) error {
 
 // initDatabase initializes the database connection
 func (c *Container) initDatabase(cfg *config.Config) error {
-	logLevel := logger.Silent
-	if cfg.App.Environment == "development" {
-		logLevel = logger.Info
+	// The ORM's verbosity is CONFIGURATION, never a function of the environment
+	// name: `APP_ENVIRONMENT` is set nowhere, so the old `== "development"` test
+	// silently decided production behaviour too (D-396). Unknown value = boot
+	// refusal, not a fallback.
+	logLevel, err := postgres.ParseLogLevel(cfg.Database.Postgres.LogLevel)
+	if err != nil {
+		return fmt.Errorf("database log level: %w", err)
 	}
 
 	port := 5432
