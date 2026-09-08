@@ -550,10 +550,14 @@ func TestProbe_Refusals(t *testing.T) {
 			name: "the probe's own handle is refused by the broker",
 			daemon: func() *fakeDaemon {
 				f := probeDaemon()
-				f.on(redeemCall, `redeem: status=403 code="secret_not_declared" found=false`+"\n", 0)
+				// The refusal code is nodebroker's, not ours: bind the fixture to the
+				// exported constant so a rename there is a COMPILE error here, instead
+				// of leaving this test green against a string the broker no longer
+				// emits (§9.8/D-1: the literals live in platform-kit and nowhere else).
+				f.on(redeemCall, `redeem: status=403 code="`+nodebroker.CodeSecretNotDeclared+`" found=false`+"\n", 0)
 				return f
 			},
-			wantErrContains: `got "redeem: status=403 code=\"secret_not_declared\" found=false"`,
+			wantErrContains: `got "redeem: status=403 code=\"` + nodebroker.CodeSecretNotDeclared + `\" found=false"`,
 		},
 		{
 			// The probe binds Found:false with an empty value. A broker that
