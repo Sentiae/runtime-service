@@ -1500,15 +1500,6 @@ func (c *Container) registerSelfHost(cfg *config.Config) error {
 
 // initDatabase initializes the database connection
 func (c *Container) initDatabase(cfg *config.Config) error {
-	// The ORM's verbosity is CONFIGURATION, never a function of the environment
-	// name: `APP_ENVIRONMENT` is set nowhere, so the old `== "development"` test
-	// silently decided production behaviour too (D-396). Unknown value = boot
-	// refusal, not a fallback.
-	logLevel, err := postgres.ParseLogLevel(cfg.Database.Postgres.LogLevel)
-	if err != nil {
-		return fmt.Errorf("database log level: %w", err)
-	}
-
 	port := 5432
 	if p, err := strconv.Atoi(cfg.Database.Postgres.Port); err == nil {
 		port = p
@@ -1525,7 +1516,13 @@ func (c *Container) initDatabase(cfg *config.Config) error {
 		MaxIdleConns:    cfg.Database.Postgres.Pool.MaxIdleConns,
 		ConnMaxLifetime: cfg.Database.Postgres.Pool.MaxLifetime,
 		ConnMaxIdleTime: 5 * time.Minute,
-		LogLevel:        logLevel,
+		// The ORM's verbosity is CONFIGURATION, never a function of the
+		// environment name: `APP_ENVIRONMENT` is set nowhere, so the old
+		// `== "development"` test silently decided production behaviour too
+		// (D-396). The name is parsed fail-closed inside NewDB by
+		// gormlog.ParseLevel — unknown value = boot refusal, not a fallback —
+		// which is why it travels unparsed from here (D-400).
+		LogLevel: cfg.Database.Postgres.LogLevel,
 	}
 
 	db, err := postgres.NewDB(dbConfig)
@@ -1866,7 +1863,11 @@ func (c *Container) initUseCases(cfg *config.Config) error {
 		// address-space check, because every orphan bridge is inside the range),
 		// and one COMPLETE egress cycle must run end to end. A runtime that
 		// cannot isolate an invocation must not serve one.
-		sidecars, serr := container.NewSidecarManager(cfg.NodeRunner, pool, postgres.NewEgressAuditRepository(c.DB))
+		egressAudit, serr := postgres.NewEgressAuditRepository(c.DB)
+		if serr != nil {
+			return serr
+		}
+		sidecars, serr := container.NewSidecarManager(cfg.NodeRunner, pool, egressAudit)
 		if serr != nil {
 			return serr
 		}

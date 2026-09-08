@@ -26,7 +26,6 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 	"gorm.io/gorm"
-	gormlogger "gorm.io/gorm/logger"
 
 	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/repository/postgres"
@@ -90,7 +89,7 @@ func startEchoPG(t *testing.T) (*gorm.DB, *syncBuf) {
 		db, err = postgres.NewDB(postgres.Config{
 			Host: host, Port: p, User: "postgres", Password: "postgres",
 			Database: "runtime", SSLMode: "disable",
-			LogLevel: gormlogger.Info, LogWriter: sink,
+			LogLevel: "info", LogWriter: sink,
 		})
 		if err == nil {
 			break

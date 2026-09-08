@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sentiae/platform-kit/gormlog"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
@@ -23,12 +24,16 @@ const logCanary = "::d396-canary::"
 // dryRunDB builds the SAME gorm stack NewDB builds — this package's logger and
 // this package's dialector — but in DryRun against an address nothing listens
 // on, so statements are rendered by gorm's real pipeline without a server.
-func dryRunDB(t *testing.T, w *bytes.Buffer, level logger.LogLevel) *gorm.DB {
+func dryRunDB(t *testing.T, w *bytes.Buffer, level string) *gorm.DB {
 	t.Helper()
+	gl, err := gormlog.New(w, level)
+	if err != nil {
+		t.Fatalf("build gorm logger: %v", err)
+	}
 	db, err := gorm.Open(
 		newSanitizingDialector("host=127.0.0.1 port=1 user=u password=p dbname=d sslmode=disable"),
 		&gorm.Config{
-			Logger: newGormLogger(w, level),
+			Logger: gl,
 			DryRun: true,
 			// gorm's default create/update transaction would dial a server that is
 			// not there; DryRun only skips the statement itself.
@@ -110,7 +115,7 @@ func TestNewGormLogger_NeverEchoesBoundValues(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			db := dryRunDB(t, &buf, logger.Info)
+			db := dryRunDB(t, &buf, "info")
 
 			db.Create(tc.model)
 
@@ -146,7 +151,7 @@ func TestNewGormLogger_ErrorPathNeverEchoesBoundValues(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			db := dryRunDB(t, &buf, logger.Error)
+			db := dryRunDB(t, &buf, "error")
 			if err := db.Callback().Create().After("gorm:create").Register("d396:force_error", func(tx *gorm.DB) {
 				_ = tx.AddError(errForced)
 			}); err != nil {
@@ -191,7 +196,7 @@ func TestParseLogLevel(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseLogLevel(tt.in)
+			got, err := gormlog.ParseLevel(tt.in)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("ParseLogLevel(%q) = %v, nil; want an error", tt.in, got)

@@ -27,7 +27,10 @@ func TestEgressAuditRepository_Record(t *testing.T) {
 
 	org := uuid.New()
 	run := seedGraphExecution(t, db, org)
-	repo := postgres.NewEgressAuditRepository(db)
+	repo, err := postgres.NewEgressAuditRepository(db)
+	if err != nil {
+		t.Fatalf("build egress audit repository: %v", err)
+	}
 	ctx := context.Background()
 
 	invocation := "inv-" + uuid.NewString()
