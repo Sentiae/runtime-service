@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/platform-kit/nodebroker"
@@ -1699,4 +1700,43 @@ func TestParseSidecarAudit(t *testing.T) {
 			t.Fatalf("redacted row: %+v", got.Decisions)
 		}
 	})
+}
+
+// TestNewSidecarManager_PreRegistersFailureSeries — the alert on this metric is
+// the only thing that turns a lost audit into a page, and a promauto counter
+// with no observation exports NO SERIES AT ALL. An absent series is not "no
+// failures"; it is "no signal", and the two are indistinguishable to the query.
+// Every reason therefore has to exist from the first scrape.
+//
+// It asserts PRESENCE, not the value: other tests in this process increment the
+// same global counters, and asserting 0 would only be true of the first test to
+// run.
+//
+// CONTROL: delete the pre-registration loop in NewSidecarManager — the "read"
+// series (which no test ever increments) is missing, red.
+func TestNewSidecarManager_PreRegistersFailureSeries(t *testing.T) {
+	_ = testManager(t, &fakeDaemon{})
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	present := map[string]bool{}
+	for _, f := range families {
+		if f.GetName() != "node_egress_audit_failures_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "reason" {
+					present[l.GetValue()] = true
+				}
+			}
+		}
+	}
+	for _, reason := range auditFailureReasons {
+		if !present[reason] {
+			t.Fatalf("node_egress_audit_failures_total{reason=%q} exports no series: an absent series reads as no failures", reason)
+		}
+	}
 }
