@@ -358,7 +358,10 @@ func TestMigration0025DownRefusesToDestroyAWaiverAudit(t *testing.T) {
 	migrateAll(t, m)
 
 	// With no waiver on record the down is clean, and the up re-applies (§24).
-	if err := m.Steps(-1); err != nil {
+	// ABSOLUTE versions, never Steps(-1): a relative step silently retargets the
+	// moment a newer migration lands, so this test spent 0026 and 0027 exercising
+	// their downs instead of 0025's. Every sibling migration test pins Migrate(N).
+	if err := m.Migrate(24); err != nil {
 		t.Fatalf("down over a waiver-free ledger must succeed: %v", err)
 	}
 	var hasColumn int64
@@ -369,7 +372,7 @@ func TestMigration0025DownRefusesToDestroyAWaiverAudit(t *testing.T) {
 	if hasColumn != 0 {
 		t.Fatal("after down: fleet_resources.durability must be gone")
 	}
-	if err := m.Steps(1); err != nil {
+	if err := m.Migrate(25); err != nil {
 		t.Fatalf("re-up after down: %v", err)
 	}
 
@@ -379,7 +382,7 @@ func TestMigration0025DownRefusesToDestroyAWaiverAudit(t *testing.T) {
 		SET protection_waived_by = 'user:ops-1', protection_waiver_reason = 'D-205 drill', protection_waived_at = now()
 		WHERE id = ?`, id)
 
-	err := m.Steps(-1)
+	err := m.Migrate(24)
 	if err == nil {
 		t.Fatal("the down must REFUSE while a protection waiver audit exists")
 	}
