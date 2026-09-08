@@ -107,6 +107,13 @@ type NodeExecutionRepository interface {
 	FindByGraphExecution(ctx context.Context, graphExecID uuid.UUID) ([]domain.NodeExecution, error)
 }
 
+// EgressAuditRepository keeps what a sidecar's proxy decided (D-395). Record is
+// idempotent per (invocation, decision, reason, host, port): a second drain of
+// the same sidecar writes nothing.
+type EgressAuditRepository interface {
+	Record(ctx context.Context, decisions []domain.EgressDecision) error
+}
+
 // GraphDebugSessionRepository defines the interface for debug session persistence
 type GraphDebugSessionRepository interface {
 	Create(ctx context.Context, session *domain.GraphDebugSession) error

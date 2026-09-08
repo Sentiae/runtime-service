@@ -11,11 +11,30 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // dialTimeout bounds one upstream connection attempt.
 const dialTimeout = 10 * time.Second
+
+// auditLineCap bounds what one invocation may write to its own audit. The
+// runtime reads this log back at teardown, and a node that floods its proxy must
+// not be able to flood the host's disk on the way. Enforcement never stops at the
+// cap — only the per-decision lines do; the cap line tells the runtime that its
+// rows are a floor, not a total.
+const auditLineCap = 10_000
+
+// redactedHost replaces a requested host that carries one of this invocation's
+// own secrets. The audit keeps the fact of the request and refuses the string:
+// a tenant may put its own credential in a hostname, and the row would then be
+// a secret at rest in a table nothing decrypts.
+const redactedHost = "[redacted]"
+
+// minSensitiveLen is the shortest bound string that may trigger redaction. A
+// shorter secret would match so many ordinary hostnames that the audit would
+// redact itself into uselessness.
+const minSensitiveLen = 8
 
 // hopByHopHeaders never cross a proxy. Proxy-Authorization is in the list for
 // the reason that matters most here: the invocation's bearer is a credential
@@ -45,6 +64,15 @@ type proxy struct {
 	invocation string
 	node       string
 	run        string
+
+	// seq numbers every decision line from 1 so the drain can prove it read all
+	// of them; auditCap is auditLineCap outside tests.
+	seq      atomic.Uint64
+	auditCap uint64
+
+	// sensitive is every bound secret value and handle, lower-cased. A host
+	// containing one of them is recorded as redactedHost.
+	sensitive []string
 
 	// dial is the ONE way out. It takes the already-checked address; it never
 	// takes a hostname, so no code path here can resolve a name a second time.
@@ -76,6 +104,8 @@ func (s *sidecar) startProxy(b binding) (net.Listener, error) {
 		invocation: b.Invocation,
 		node:       b.Node,
 		run:        b.Run,
+		auditCap:   auditLineCap,
+		sensitive:  sensitiveStrings(b.Secrets),
 		dial:       dialTCP,
 	}
 
@@ -113,23 +143,64 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.forward(w, r, d)
 }
 
-// audit emits exactly ONE structured line per decision (§3.7). It carries no
-// credential: the token, the handle and every secret value are refused by the
-// logger's field filter and are never passed to it in the first place.
+// audit emits exactly ONE structured line per decision (§3.7), numbered, up to
+// auditLineCap. It carries no credential: the token, the handle and every
+// secret value are refused by the logger's field filter, are never passed to it
+// in the first place, and a host the NODE built out of one of its own secrets
+// is redacted here before it can become a durable audit row.
 func (p *proxy) audit(d decision) {
+	seq := p.seq.Add(1)
+	if seq > p.auditCap {
+		if seq == p.auditCap+1 {
+			p.log.Warn(eventEgressAuditCapped,
+				"invocation_id", p.invocation, "node", p.node, "run_id", p.run, "cap", p.auditCap)
+		}
+		return
+	}
 	verdict := "deny"
 	if d.Allow {
 		verdict = "allow"
 	}
-	p.log.Info("egress_decision",
+	host, redacted := redactAuditHost(d.Host, p.sensitive)
+	p.log.Info(eventEgressDecision,
 		"decision", verdict,
-		"host", d.Host,
+		"host", host,
+		"host_redacted", redacted,
 		"port", d.Port,
 		"invocation_id", p.invocation,
 		"node", p.node,
 		"reason", d.Reason,
 		"run_id", p.run,
+		"seq", seq,
 	)
+}
+
+// sensitiveStrings is what a host may not contain: every bound handle and every
+// bound value long enough that a match means something. The comparison is
+// case-folded because a host is folded to lower case before it is decided.
+func sensitiveStrings(secrets map[string]secretAnswer) []string {
+	var out []string
+	for _, answer := range secrets {
+		for _, candidate := range []string{answer.Handle, answer.Value} {
+			if len(candidate) >= minSensitiveLen {
+				out = append(out, strings.ToLower(candidate))
+			}
+		}
+	}
+	return out
+}
+
+// redactAuditHost answers the host the audit keeps. It is deterministic and
+// total: either the host carries one of this invocation's secrets and the audit
+// records that it was redacted, or the host is kept verbatim.
+func redactAuditHost(host string, sensitive []string) (string, bool) {
+	folded := strings.ToLower(host)
+	for _, s := range sensitive {
+		if strings.Contains(folded, s) {
+			return redactedHost, true
+		}
+	}
+	return host, false
 }
 
 // tunnel answers CONNECT by joining the client to the ONE checked address.

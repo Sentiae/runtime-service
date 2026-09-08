@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/sentiae/runtime-service/internal/domain"
+	"github.com/sentiae/runtime-service/internal/infrastructure/container"
 	"github.com/sentiae/runtime-service/internal/usecase"
 )
 
@@ -28,6 +31,13 @@ const (
 	// whole assertion (§9.6 greps the live containers for the same shape).
 	canaryValue  = "::p4-canary-secret-value::"
 	canaryHandle = "handle:0123456789abcdef0123456789abcdef"
+
+	// hostCanaryValue is a bound secret VALUE shaped like a DNS label, so a test
+	// can ask the proxy for a host that CARRIES a secret. canaryValue cannot be
+	// used for that: it contains colons, and a CONNECT target with colons is not
+	// a host:port at all — the request would be refused before it is ever
+	// decided, and the redaction would never be exercised.
+	hostCanaryValue = "p4canaryhostsecret"
 )
 
 // shortTempDir is os.MkdirTemp with a SHORT name (R-12): a unix socket path is
@@ -436,13 +446,19 @@ func TestBinding_MatchesRuntimeContract(t *testing.T) {
 // gets the token_missing refusal.
 func denyThrough(t *testing.T, addr string) {
 	t.Helper()
+	denyConnect(t, addr, "httpbin.org:443")
+}
+
+// denyConnect is denyThrough for a named target: the CONNECT the audit records.
+func denyConnect(t *testing.T, addr, hostport string) {
+	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial proxy %s: %v", addr, err)
 	}
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	_, _ = io.WriteString(conn, "CONNECT httpbin.org:443 HTTP/1.1\r\nHost: httpbin.org:443\r\n\r\n")
+	_, _ = io.WriteString(conn, "CONNECT "+hostport+" HTTP/1.1\r\nHost: "+hostport+"\r\n\r\n")
 	buf := make([]byte, 64)
 	n, err := conn.Read(buf)
 	if err != nil && n == 0 {
@@ -515,5 +531,72 @@ func TestOptionsFromEnv(t *testing.T) {
 				t.Fatalf("%s=%q must be refused, not defaulted", tt.key, tt.value)
 			}
 		})
+	}
+}
+
+// TestAudit_MatchesRuntimeDrainContract — the WHOLE real sidecar (control socket,
+// binding, proxy, filtered logger) writes; the runtime's parser reads. This is
+// the check that replaced "the log line exists inside the container": the line
+// now has to be READABLE by the process that keeps it, field for field.
+//
+// CONTROL: rename the "host" key in proxy.audit → red (malformed: empty host).
+// CONTROL: drop "seq" from the line → red (gap: seq 0).
+// CONTROL: change eventSidecarBound → red (blind).
+// CONTROL: return `host, false` from redactAuditHost → red (the secret-bearing
+// host is recorded verbatim).
+func TestAudit_MatchesRuntimeDrainContract(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	b := canaryBinding(true)
+	// A second bound secret, this one usable AS a hostname: the row it produces
+	// must be redacted, which is the hygiene half of the contract.
+	b.Secrets["api_host"] = secretAnswer{Handle: "handle:fedcba9876543210fedcba9876543210", Found: true, Value: hostCanaryValue}
+
+	run := startSidecar(t, ctx, cancel, b, freePort(t))
+	if run.s.proxyAddr() == "" {
+		t.Fatal("the egress binding must have started a proxy")
+	}
+	denyThrough(t, run.s.proxyAddr())
+	denyThrough(t, run.s.proxyAddr())
+	denyConnect(t, run.s.proxyAddr(), hostCanaryValue+".example.com:443")
+	run.stop()
+
+	audit, err := container.ParseSidecarAudit(run.logs.Bytes())
+	if err != nil {
+		t.Fatalf("the runtime cannot read what the sidecar wrote: %v\n%s", err, run.logs.String())
+	}
+	if len(audit.Decisions) != 2 || audit.Capped {
+		t.Fatalf("decisions: got %+v (capped=%v), want two uncapped tuples", audit.Decisions, audit.Capped)
+	}
+
+	got := audit.Decisions[0]
+	want := domain.EgressDecision{
+		RunID: uuid.MustParse(b.Run), InvocationID: b.Invocation, Node: b.Node,
+		Decision: domain.EgressDeny, Reason: reasonTokenMissing,
+		Host: "httpbin.org", Port: 443, Hits: 2, FirstAt: got.FirstAt, LastAt: got.LastAt,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("decision:\n got %+v\nwant %+v", got, want)
+	}
+	if got.FirstAt.IsZero() || got.LastAt.Before(got.FirstAt) {
+		t.Fatalf("timestamps did not survive: first=%v last=%v", got.FirstAt, got.LastAt)
+	}
+
+	redacted := audit.Decisions[1]
+	wantRedacted := domain.EgressDecision{
+		RunID: uuid.MustParse(b.Run), InvocationID: b.Invocation, Node: b.Node,
+		Decision: domain.EgressDeny, Reason: reasonTokenMissing,
+		Host: domain.RedactedEgressHost, HostRedacted: true, Port: 443, Hits: 1,
+		FirstAt: redacted.FirstAt, LastAt: redacted.LastAt,
+	}
+	if !reflect.DeepEqual(redacted, wantRedacted) {
+		t.Fatalf("redacted decision:\n got %+v\nwant %+v", redacted, wantRedacted)
+	}
+	for _, d := range audit.Decisions {
+		if strings.Contains(d.Host, hostCanaryValue) {
+			t.Fatalf("a bound secret survived into a durable row: %+v", d)
+		}
+	}
+	if strings.Contains(run.logs.String(), hostCanaryValue) {
+		t.Fatalf("a bound secret survived into the sidecar log:\n%s", run.logs.String())
 	}
 }

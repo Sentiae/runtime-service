@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
 	"github.com/sentiae/runtime-service/pkg/config"
 )
@@ -64,7 +65,7 @@ func TestTwoOrgsCannotReach(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subnet pool: %v", err)
 	}
-	manager, err := NewSidecarManager(cfg, pool)
+	manager, err := NewSidecarManager(cfg, pool, discardAudit{})
 	if err != nil {
 		t.Fatalf("sidecar manager: %v", err)
 	}
@@ -192,6 +193,13 @@ func mustDocker(t *testing.T, args ...string) {
 		t.Fatalf("docker %s: %v (%s)", strings.Join(args, " "), err, out)
 	}
 }
+
+// discardAudit is the audit sink for a test with a real daemon and no database.
+// This test is about network isolation; the drain still runs on every Close and
+// must have somewhere to put what it reads.
+type discardAudit struct{}
+
+func (discardAudit) Record(context.Context, []domain.EgressDecision) error { return nil }
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {

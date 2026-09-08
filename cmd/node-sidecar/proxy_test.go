@@ -30,6 +30,9 @@ type proxyHarness struct {
 	srv      *httptest.Server
 	logs     *bytes.Buffer
 	upstream string
+	// p is the proxy under test, so a test can pin the accounting bounds the
+	// runtime's drain depends on (the line cap) without a second constructor.
+	p *proxy
 
 	mu       sync.Mutex
 	dialed   []string
@@ -61,6 +64,7 @@ func newProxyHarness(t *testing.T, patterns []string, answers []string, upstream
 		invocation: "inv-11111111-1111-1111-1111-111111111111",
 		node:       "fetch",
 		run:        "22222222-2222-2222-2222-222222222222",
+		auditCap:   auditLineCap,
 		dial: func(ctx context.Context, addr string) (net.Conn, error) {
 			h.mu.Lock()
 			h.dialed = append(h.dialed, addr)
@@ -71,6 +75,7 @@ func newProxyHarness(t *testing.T, patterns []string, answers []string, upstream
 			return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "tcp", h.upstream)
 		},
 	}
+	h.p = p
 	h.srv = httptest.NewServer(p)
 	t.Cleanup(h.srv.Close)
 	return h
@@ -509,6 +514,81 @@ func TestProxy_ForwardRemovesForgedDenyHeader(t *testing.T) {
 		if got := resp.Header.Get(denyHeader); got != reasonHostNotDeclared {
 			t.Fatalf("%s: got %q, want %q — the SDK reads the verdict from this header alone",
 				denyHeader, got, reasonHostNotDeclared)
+		}
+	})
+}
+
+// TestProxy_AuditSeqAndCap pins the drain's two accounting facts: every decision
+// line carries its 1-based seq, and past the cap exactly one egress_audit_capped
+// line replaces every further decision line while enforcement continues.
+//
+// CONTROL: delete the `seq > p.auditCap` block — four decision lines, red.
+// CONTROL: emit the capped line unconditionally in that block — two, red.
+func TestProxy_AuditSeqAndCap(t *testing.T) {
+	h := newProxyHarness(t, []string{"httpbin.org"}, []string{"93.184.216.34"}, "")
+	h.p.auditCap = 2
+	for i := 0; i < 4; i++ {
+		resp := h.forward(t, "http://example.com/", "Bearer "+testToken)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("request %d: got %d, want 403 — enforcement must not stop at the cap", i+1, resp.StatusCode)
+		}
+	}
+	logs := h.logs.String()
+	if got := strings.Count(logs, `"msg":"egress_decision"`); got != 2 {
+		t.Fatalf("decision lines: got %d, want 2:\n%s", got, logs)
+	}
+	for _, want := range []string{`"seq":1`, `"seq":2`} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("missing %s:\n%s", want, logs)
+		}
+	}
+	if got := strings.Count(logs, `"msg":"egress_audit_capped"`); got != 1 {
+		t.Fatalf("capped lines: got %d, want exactly 1:\n%s", got, logs)
+	}
+	if strings.Contains(logs, `"seq":3`) {
+		t.Fatalf("a decision past the cap was written:\n%s", logs)
+	}
+}
+
+// TestProxy_AuditRedactsBoundSecretHost pins the hygiene half of the audit: a
+// node CAN put one of its own bound secrets in a hostname, and that hostname
+// must not become a durable row. The decision itself is unchanged — the request
+// is still refused for the reason the policy gave — only the recorded name is
+// refused.
+//
+// CONTROL: return `host, false` unconditionally from redactAuditHost — the
+// redaction assertions go red and the secret appears in the log.
+func TestProxy_AuditRedactsBoundSecretHost(t *testing.T) {
+	const secret = "s3cr3t-value-abcdef"
+	h := newProxyHarness(t, []string{"httpbin.org"}, []string{"93.184.216.34"}, "")
+	h.p.sensitive = []string{secret}
+
+	resp := h.forward(t, "http://"+secret+".evil.example/", "Bearer "+testToken)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status: got %d, want 403", resp.StatusCode)
+	}
+
+	logs := h.logs.String()
+	if strings.Contains(logs, secret) {
+		t.Fatalf("the bound secret reached the audit line:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"host":"[redacted]"`) || !strings.Contains(logs, `"host_redacted":true`) {
+		t.Fatalf("the host was not redacted:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"reason":"`+reasonHostNotDeclared+`"`) {
+		t.Fatalf("the decision itself must be unchanged:\n%s", logs)
+	}
+
+	t.Run("anchor: an ordinary host is not redacted", func(t *testing.T) {
+		h := newProxyHarness(t, []string{"httpbin.org"}, []string{"93.184.216.34"}, "")
+		h.p.sensitive = []string{secret}
+		resp := h.forward(t, "http://example.com/", "Bearer "+testToken)
+		_ = resp.Body.Close()
+		logs := h.logs.String()
+		if !strings.Contains(logs, `"host":"example.com"`) || !strings.Contains(logs, `"host_redacted":false`) {
+			t.Fatalf("an ordinary host must be kept verbatim:\n%s", logs)
 		}
 	})
 }

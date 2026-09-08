@@ -1863,7 +1863,7 @@ func (c *Container) initUseCases(cfg *config.Config) error {
 		// address-space check, because every orphan bridge is inside the range),
 		// and one COMPLETE egress cycle must run end to end. A runtime that
 		// cannot isolate an invocation must not serve one.
-		sidecars, serr := container.NewSidecarManager(cfg.NodeRunner, pool)
+		sidecars, serr := container.NewSidecarManager(cfg.NodeRunner, pool, postgres.NewEgressAuditRepository(c.DB))
 		if serr != nil {
 			return serr
 		}

@@ -27,6 +27,16 @@ const controlReadTimeout = 10 * time.Second
 // broker and/or proxy are actually up — not merely that bytes were delivered.
 const ackOK = "ok\n"
 
+// The event names the runtime's audit drain reads back
+// (internal/infrastructure/container/sidecar_audit.go). Both sides spell them;
+// TestAudit_MatchesRuntimeDrainContract runs the real sidecar through the real
+// parser, so renaming one side goes red.
+const (
+	eventSidecarBound      = "sidecar_bound"
+	eventEgressDecision    = "egress_decision"
+	eventEgressAuditCapped = "egress_audit_capped"
+)
+
 // binding is the JSON document the runtime hands this process on the attached
 // stdin stream of `docker exec -i … bind`. It mirrors the runtime's
 // usecase.SidecarBinding on the wire; TestBinding_MatchesRuntimeContract pins
@@ -219,7 +229,7 @@ func (s *sidecar) run(ctx context.Context) error {
 	// this sidecar ready, because the runtime launches the node on this signal
 	// and a node that starts first would dial a socket nobody serves.
 	close(s.ready)
-	s.log.Info("sidecar_bound", "invocation", b.Invocation, "node", b.Node,
+	s.log.Info(eventSidecarBound, "invocation", b.Invocation, "node", b.Node,
 		"secret_count", len(b.Secrets), "egress", b.Egress != nil)
 
 	<-ctx.Done()

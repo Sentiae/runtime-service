@@ -101,6 +101,14 @@ var (
 	ErrNodeRunnerNotReady    = errors.New("node runner is not configured")
 	ErrNodeRunnerBusy        = errors.New("node runner has no free invocation subnet")
 
+	// Egress audit drain refusals (D-395). Blind: the sidecar's log carries no
+	// sidecar_bound anchor, so nothing proves it was readable. Gap: the decision
+	// sequence has a hole or a repeat. Malformed: a decision line that does not
+	// parse as one.
+	ErrEgressAuditBlind     = errors.New("egress audit: sidecar log has no anchor line")
+	ErrEgressAuditGap       = errors.New("egress audit: decision sequence is incomplete")
+	ErrEgressAuditMalformed = errors.New("egress audit: malformed sidecar log line")
+
 	// §9.2 hermetic chain integrity. ErrHashMismatch is returned when
 	// a step's verified prior-artifact digest does not match what the
 	// store rehydrates — indicates corruption or tampering.

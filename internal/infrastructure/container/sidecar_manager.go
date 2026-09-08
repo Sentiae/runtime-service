@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"github.com/sentiae/platform-kit/nodebroker"
 
 	"github.com/sentiae/runtime-service/internal/domain"
+	"github.com/sentiae/runtime-service/internal/repository"
 	"github.com/sentiae/runtime-service/internal/usecase"
 	"github.com/sentiae/runtime-service/pkg/config"
 )
@@ -130,6 +132,9 @@ type SidecarManager struct {
 	// Probe. There is no second supply chain to trust.
 	image  string
 	docker dockerFn
+	// audit is where a sidecar's egress decisions go before the container that
+	// holds them is destroyed (D-395).
+	audit repository.EgressAuditRepository
 
 	mu   sync.Mutex
 	live map[string]liveInvocation
@@ -148,7 +153,16 @@ var _ usecase.SidecarManager = (*SidecarManager)(nil)
 // NewSidecarManager builds the manager. The subnet pool is shared with the
 // invoker: the pool is the only thing that keeps two live invocations off the
 // same address range.
-func NewSidecarManager(cfg config.NodeRunnerConfig, pool *usecase.SubnetPool) (*SidecarManager, error) {
+func NewSidecarManager(cfg config.NodeRunnerConfig, pool *usecase.SubnetPool, audit repository.EgressAuditRepository) (*SidecarManager, error) {
+	if audit == nil {
+		return nil, fmt.Errorf("node runner: sidecar manager needs an egress audit repository")
+	}
+	// Every failure series exists at 0 from the first scrape: a promauto counter
+	// with no observation exports NOTHING, and an absent series must never be
+	// read as "no audit was ever lost".
+	for _, reason := range auditFailureReasons {
+		auditFailures.WithLabelValues(reason)
+	}
 	self, err := os.Hostname()
 	if err != nil {
 		return nil, fmt.Errorf("node runner: read own hostname: %w", err)
@@ -158,6 +172,7 @@ func NewSidecarManager(cfg config.NodeRunnerConfig, pool *usecase.SubnetPool) (*
 		pool:   pool,
 		self:   self,
 		docker: dockerCLI,
+		audit:  audit,
 		live:   map[string]liveInvocation{},
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
@@ -470,8 +485,10 @@ func (m *SidecarManager) Open(ctx context.Context, in usecase.SidecarOpen) (usec
 	sc, err := m.open(ctx, in, name, network)
 	if err != nil {
 		// Teardown gets a context that outlives a cancelled one; leaving a
-		// half-open sidecar behind would leak a container AND a bridge.
-		_ = m.Close(context.WithoutCancel(ctx), in.InvocationID)
+		// half-open sidecar behind would leak a container AND a bridge. No
+		// drain: the node is launched only after Open returns, so this sidecar
+		// can hold no decision.
+		_ = m.close(context.WithoutCancel(ctx), in.InvocationID, false)
 		return usecase.Sidecar{}, err
 	}
 
@@ -581,8 +598,16 @@ func (m *SidecarManager) awaitReady(ctx context.Context, name string) error {
 
 // Close removes one invocation's sidecar, its bridge and its directory, in that
 // order and idempotently: it runs on the success path, on every failure path,
-// and again from a sweep, and must be correct from any of them.
+// and again from a sweep, and must be correct from any of them. The sidecar's
+// egress audit is read out FIRST (D-395); its failure is returned, never hidden.
 func (m *SidecarManager) Close(ctx context.Context, invocationID string) error {
+	return m.close(ctx, invocationID, true)
+}
+
+// close is the teardown. drain is false on exactly one path — Open's own
+// failure — where the node was never launched and the sidecar can hold no
+// decision; every other removal reads the audit before it destroys the log.
+func (m *SidecarManager) close(ctx context.Context, invocationID string, drain bool) error {
 	if invocationID == "" {
 		return nil
 	}
@@ -593,8 +618,25 @@ func (m *SidecarManager) Close(ctx context.Context, invocationID string) error {
 	delete(m.live, invocationID)
 	m.mu.Unlock()
 
+	var outcome auditOutcome
+	if drain {
+		outcome = m.drainAudit(ctx, invocationID)
+	}
+
 	name := sidecarContainerName(invocationID)
-	_, _, _, _ = m.docker(ctx, nil, nil, "rm", "-f", name)
+	if outcome.retain {
+		// The decisions exist ONLY in this container's log and the store just
+		// refused them: the container stays (stopped) so the 60 s sweeper can
+		// re-drain it, and everything else it holds is released now — both
+		// network attachments, its bridge, its subnet and its directory — because
+		// the pool already believes them free. Disconnect is forced and explicit
+		// rather than left to the removal, so the bridge below can go away.
+		_, _, _, _ = m.docker(ctx, nil, nil, "network", "disconnect", "-f",
+			invocationNetworkName(invocationID), name)
+		_, _, _, _ = m.docker(ctx, nil, nil, "network", "disconnect", "-f", m.cfg.UplinkNetwork, name)
+	} else {
+		_, _, _, _ = m.docker(ctx, nil, nil, "rm", "-f", name)
+	}
 	// The network removal is attempted whether or not this process remembers a
 	// bridge: after a restart it remembers nothing, and a leaked bridge holds an
 	// address range the pool believes is free.
@@ -611,7 +653,66 @@ func (m *SidecarManager) Close(ctx context.Context, invocationID string) error {
 	sidecarTeardownMS.WithLabelValues(strconv.FormatBool(entry.bridge)).Observe(float64(teardown))
 	logger.FromContext(ctx).Info("sidecar_closed",
 		"run", entry.run.String(), "invocation_id", invocationID, "teardown_ms", teardown)
+	return errors.Join(outcome.err, err)
+}
+
+// auditOutcome is what one drain attempt did. retain is true on exactly one
+// failure — the store refused the write — because then the sidecar's log is
+// still the only copy of the record and destroying it would lose it; every
+// other failure has already lost or never had the record, so holding the
+// container would buy nothing and leak a bridge.
+type auditOutcome struct {
+	err    error
+	retain bool
+}
+
+// drainAudit copies what the sidecar decided out of its log and into the audit
+// store BEFORE the container is removed. The sidecar is stopped first so the
+// daemon has flushed every line it wrote; an exited container's log is complete
+// by construction. A failure is loud — counted, logged at Error, returned.
+func (m *SidecarManager) drainAudit(ctx context.Context, invocationID string) auditOutcome {
+	name := sidecarContainerName(invocationID)
+	_, _, _, _ = m.docker(ctx, nil, nil, "stop", "-t", "2", name)
+	out, stderr, code, err := m.docker(ctx, nil, nil, "logs", name)
+	if err != nil || code != 0 {
+		if strings.Contains(stderr, "No such container") {
+			// Never created, or already gone: nothing was destroyed here.
+			return auditOutcome{}
+		}
+		return auditOutcome{err: m.auditLost(ctx, invocationID, "read",
+			fmt.Errorf("node runner: read sidecar %s log: %s", name, failureText(stderr, err)))}
+	}
+	audit, err := ParseSidecarAudit([]byte(out))
+	if err != nil {
+		return auditOutcome{err: m.auditLost(ctx, invocationID, auditReason(err),
+			fmt.Errorf("node runner: sidecar %s audit: %w", name, err))}
+	}
+	if len(audit.Decisions) == 0 {
+		return auditOutcome{}
+	}
+	if err := m.audit.Record(ctx, audit.Decisions); err != nil {
+		return auditOutcome{retain: true, err: m.auditLost(ctx, invocationID, "write",
+			fmt.Errorf("node runner: record sidecar %s audit: %w", name, err))}
+	}
+	auditRows.Add(float64(len(audit.Decisions)))
+	return auditOutcome{}
+}
+
+func (m *SidecarManager) auditLost(ctx context.Context, invocationID, reason string, err error) error {
+	auditFailures.WithLabelValues(reason).Inc()
+	logger.FromContext(ctx).Error("sidecar_audit_lost", "invocation_id", invocationID, "reason", reason, "err", err)
 	return err
+}
+
+func auditReason(err error) string {
+	switch {
+	case errors.Is(err, domain.ErrEgressAuditBlind):
+		return "blind"
+	case errors.Is(err, domain.ErrEgressAuditGap):
+		return "gap"
+	default:
+		return "malformed"
+	}
 }
 
 // SweepRun removes everything one graph execution left behind: containers
@@ -736,6 +837,12 @@ func (m *SidecarManager) sweepOrphans(ctx context.Context) {
 		if m.isLive(invocation) {
 			continue
 		}
+		// Counted and logged inside. A refused WRITE keeps the container: its
+		// log is the only copy of those decisions and the next tick drains it
+		// again. Every other failure removes (see drainAudit).
+		if outcome := m.drainAudit(ctx, invocation); outcome.retain {
+			continue
+		}
 		if _, stderr, code, err := m.docker(ctx, nil, nil, "rm", "-f", name); err != nil || code != 0 {
 			logger.FromContext(ctx).Warn("sidecar_orphan_remove_failed",
 				"container", name, "err", failureText(stderr, err))
@@ -810,6 +917,12 @@ func (m *SidecarManager) listNetworks(ctx context.Context, filters ...string) []
 
 func (m *SidecarManager) removeContainers(ctx context.Context, names []string) {
 	for _, name := range names {
+		if invocation, ok := strings.CutPrefix(name, sidecarNamePrefix); ok {
+			// Counted and logged inside; the removal proceeds regardless (see
+			// drainAudit). The boot sweep must complete — Probe refuses on a
+			// survivor — and a run sweep must not leave a bridge behind.
+			_ = m.drainAudit(ctx, invocation)
+		}
 		if _, stderr, code, err := m.docker(ctx, nil, nil, "rm", "-f", name); err != nil || code != 0 {
 			logger.FromContext(ctx).Warn("sidecar_sweep_container_failed",
 				"container", name, "err", failureText(stderr, err))
@@ -876,6 +989,11 @@ func sidecarRunArgs(invocationID string, runID uuid.UUID, network, image, runsVo
 		"--label", labelRun + "=" + runID.String(),
 	}
 	args = append(args, hardenedFlags(sidecarMemMB, sidecarVCPU)...)
+	// The audit drain reads this log back with `docker logs` before the
+	// container is removed. The driver is pinned so that read never depends on
+	// the daemon's default: journald rate-limits and drops lines silently, and
+	// `none` has no log to read.
+	args = append(args, "--log-driver", "local")
 	args = append(args, "--mount",
 		"type=volume,source="+runsVolume+",target="+sidecarMountTarget+",volume-subpath="+invocationID)
 

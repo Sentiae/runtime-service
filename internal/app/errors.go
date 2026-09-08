@@ -118,4 +118,10 @@ func RegisterErrors() {
 
 	//   ResourceExhausted — every invocation subnet is in use. Retry later.
 	pkerrors.Register(domain.ErrNodeRunnerBusy, http.StatusTooManyRequests, codes.ResourceExhausted)
+
+	//   Internal — audit drain refusals never cross the wire (Close's error is
+	//   logged), registered so the sentinel rule holds without a silent default.
+	pkerrors.Register(domain.ErrEgressAuditBlind, http.StatusInternalServerError, codes.Internal)
+	pkerrors.Register(domain.ErrEgressAuditGap, http.StatusInternalServerError, codes.Internal)
+	pkerrors.Register(domain.ErrEgressAuditMalformed, http.StatusInternalServerError, codes.Internal)
 }

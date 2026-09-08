@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"reflect"
 	"regexp"
 	"slices"
@@ -15,9 +17,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/platform-kit/nodebroker"
 
+	"github.com/sentiae/runtime-service/internal/domain"
 	"github.com/sentiae/runtime-service/internal/usecase"
 	"github.com/sentiae/runtime-service/pkg/config"
 )
@@ -132,13 +136,54 @@ func testNodeRunnerConfig(t *testing.T) config.NodeRunnerConfig {
 	}
 }
 
+// fakeAudit is the audit store the manager drains into. It records what it was
+// handed, because "the sidecar was stopped and read" is only half the property —
+// the other half is that the tuple actually reached the sink.
+type fakeAudit struct {
+	mu  sync.Mutex
+	got []domain.EgressDecision
+	err error
+}
+
+func (f *fakeAudit) Record(_ context.Context, d []domain.EgressDecision) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.got = append(f.got, d...)
+	return nil
+}
+
+func (f *fakeAudit) recorded() []domain.EgressDecision {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.EgressDecision(nil), f.got...)
+}
+
+// auditBoundLine is the anchor every readable sidecar log carries: without it
+// the drain is BLIND and refuses, which is what keeps "zero decisions" from
+// being believed on an unreadable log.
+const auditBoundLine = `{"time":"2026-09-07T10:00:00Z","level":"INFO","msg":"sidecar_bound","invocation":"inv-x","node":"echo","secret_count":0,"egress":true}`
+
+// decisionLine is one line exactly as the sidecar's proxy writes it.
+func decisionLine(seq int, decision, reason, host string, port int, run, invocation string) string {
+	return fmt.Sprintf(`{"time":"2026-09-07T10:00:%02dZ","level":"INFO","msg":"egress_decision","decision":%q,"host":%q,"host_redacted":false,"port":%d,"invocation_id":%q,"node":"echo","reason":%q,"run_id":%q,"seq":%d}`,
+		seq, decision, host, port, invocation, reason, run, seq)
+}
+
 func testManager(t *testing.T, docker *fakeDaemon) *SidecarManager {
+	t.Helper()
+	return testManagerWithAudit(t, docker, &fakeAudit{})
+}
+
+func testManagerWithAudit(t *testing.T, docker *fakeDaemon, audit *fakeAudit) *SidecarManager {
 	t.Helper()
 	pool, err := usecase.NewSubnetPool("10.201.0.0/16", 29)
 	if err != nil {
 		t.Fatalf("subnet pool: %v", err)
 	}
-	m, err := NewSidecarManager(testNodeRunnerConfig(t), pool)
+	m, err := NewSidecarManager(testNodeRunnerConfig(t), pool, audit)
 	if err != nil {
 		t.Fatalf("new sidecar manager: %v", err)
 	}
@@ -149,9 +194,12 @@ func testManager(t *testing.T, docker *fakeDaemon) *SidecarManager {
 }
 
 // readySidecarDaemon answers the readiness poll and nothing else.
+// readySidecarDaemon answers the readiness poll and hands the drain a readable,
+// empty audit log. Every Close in this file drains, and a log without the anchor
+// is BLIND by design — that refusal is the guard working, not a flake.
 func readySidecarDaemon() *fakeDaemon {
 	f := &fakeDaemon{}
-	return f.on([]string{"exec", "wget"}, "ok", 0)
+	return f.on([]string{"exec", "wget"}, "ok", 0).on([]string{"logs"}, auditBoundLine+"\n", 0)
 }
 
 // T4.10 — TestSidecarManager_ArgsAndOrder pins the launch lines and the ORDER
@@ -221,6 +269,7 @@ func TestSidecarManager_ArgsAndOrder(t *testing.T) {
 			"--label", "sentiae.node.run=" + runID.String(),
 		}, hardenedFlags(256, 1)...)
 		want = append(want,
+			"--log-driver", "local",
 			"--mount", "type=volume,source=sentiae-node-runs,target=/run/sentiae-inv,volume-subpath="+invocation,
 			"--network", "none",
 			"--entrypoint", "/app/node-sidecar",
@@ -635,6 +684,10 @@ func probeDaemon() *fakeDaemon {
 	f.on([]string{"inspect", "runtime-container"},
 		"sha256:036daa5efeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface\n", 0)
 	f.on([]string{"exec", "wget"}, "ok", 0)
+	// …and its sidecar's log is readable, carrying the anchor and no decision:
+	// the boot probe's own Close drains it, and an unreadable log is a BLIND
+	// refusal by design.
+	f.on([]string{"logs"}, auditBoundLine+"\n", 0)
 	// The probe's node-shaped container redeems the one bound secret and answers
 	// the only line that means "a node reached this broker through the directory
 	// and the socket": 200, no refusal code, and the empty answer that was bound.
@@ -1113,6 +1166,7 @@ func TestSweeper_TouchesOnlyOrphanSidecars(t *testing.T) {
 	)
 	docker.on([]string{"network", "ls", "--filter"},
 		"sentiae-inv-"+live+"\nsentiae-inv-"+orphan+"\n", 0)
+	docker.on([]string{"logs"}, auditBoundLine+"\n", 0)
 
 	m := testManager(t, docker)
 	m.live[live] = liveInvocation{run: uuid.New(), bridge: true}
@@ -1159,6 +1213,7 @@ func TestSweepRun_ContainersBeforeNetworks(t *testing.T) {
 	docker := &fakeDaemon{}
 	docker.on([]string{"ps", "-a"}, "sentiae-sc-"+invocation+"\nsentiae-node-"+invocation+"\n", 0)
 	docker.on([]string{"network", "ls"}, "sentiae-inv-"+invocation+"\n", 0)
+	docker.on([]string{"logs"}, auditBoundLine+"\n", 0)
 
 	m := testManager(t, docker)
 	m.live[invocation] = liveInvocation{run: runID, bridge: true}
@@ -1184,4 +1239,464 @@ func TestSweepRun_ContainersBeforeNetworks(t *testing.T) {
 	if m.isLive(invocation) {
 		t.Fatal("a swept invocation must no longer be live")
 	}
+}
+
+// ── the egress audit drain (D-395) ─────────────────────────────────────────
+
+// egressOpen is one invocation with a bridge: the shape whose sidecar can hold
+// egress decisions at all.
+func egressOpen(invocation string, runID uuid.UUID) usecase.SidecarOpen {
+	return usecase.SidecarOpen{
+		InvocationID: invocation,
+		RunID:        runID,
+		Node:         "echo",
+		Binding: usecase.SidecarBinding{
+			Invocation: invocation, Run: runID.String(), Node: "echo",
+			Secrets: map[string]usecase.SecretAnswer{},
+			Egress: &usecase.EgressBinding{
+				Patterns: []string{"httpbin.org"},
+				Token:    "b3f1c0d2e4a5968778695a4e3c2d1b0af9e8d7c6b5a4938271605f4e3d2c1b0a",
+				Subnet:   "10.201.0.0/29",
+			},
+		},
+	}
+}
+
+// TestSidecarManager_DrainsAuditBeforeRemove is the whole point of D-395: the
+// container's log is the write-ahead buffer, so the ONLY safe order is stop (to
+// close the unflushed-tail window) → logs → record → rm. Removing first deletes
+// the only copy of what the tenant's node was allowed to reach.
+//
+// CONTROL: delete the drainAudit call in close() — no logs call, red.
+// CONTROL: move the `rm -f` above the drain — the order assertion, red.
+func TestSidecarManager_DrainsAuditBeforeRemove(t *testing.T) {
+	runID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	invocation := "inv-11111111-1111-1111-1111-111111111111"
+	name := "sentiae-sc-" + invocation
+
+	docker := readySidecarDaemon()
+	docker.on([]string{"logs"}, auditBoundLine+"\n"+
+		decisionLine(1, "allow", "manifest_wildcard", "httpbin.org", 443, runID.String(), invocation)+"\n"+
+		decisionLine(2, "allow", "manifest_wildcard", "httpbin.org", 443, runID.String(), invocation)+"\n", 0)
+
+	audit := &fakeAudit{}
+	m := testManagerWithAudit(t, docker, audit)
+
+	if _, err := m.Open(context.Background(), egressOpen(invocation, runID)); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := m.Close(context.Background(), invocation); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	stopIdx := docker.indexOf("stop", "-t", "2", name)
+	logsIdx := docker.indexOf("logs", name)
+	rmIdx := docker.indexOf("rm", "-f", name)
+	if stopIdx == -1 || logsIdx == -1 || rmIdx == -1 {
+		t.Fatalf("missing step: stop=%d logs=%d rm=%d", stopIdx, logsIdx, rmIdx)
+	}
+	if !(stopIdx < logsIdx && logsIdx < rmIdx) {
+		t.Fatalf("order must be stop < logs < rm, got %d %d %d", stopIdx, logsIdx, rmIdx)
+	}
+
+	got := audit.recorded()
+	want := []domain.EgressDecision{{
+		RunID: runID, InvocationID: invocation, Node: "echo",
+		Decision: domain.EgressAllow, Reason: "manifest_wildcard",
+		Host: "httpbin.org", Port: 443, Hits: 2,
+		FirstAt: time.Date(2026, 9, 7, 10, 0, 1, 0, time.UTC),
+		LastAt:  time.Date(2026, 9, 7, 10, 0, 2, 0, time.UTC),
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("recorded:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// TestSidecarManager_AuditLossIsLoud pins the four ways the record can fail to
+// land. Every one of them is counted on its own series, logged, and RETURNED —
+// an audit that fails silently is worse than no audit, because the metric would
+// read as "nothing was ever lost".
+//
+// The write row is the one with retention: the store refused, so the log is
+// still the only copy and the container must SURVIVE (stopped, detached from
+// both networks) for the sweeper to retry. The other three have already lost or
+// never had the record, so holding the container would only leak a bridge.
+//
+// CONTROL: return nil from auditLost — every row goes red on the error.
+// CONTROL: always `rm -f` in close() — the write row's survival assertion, red.
+func TestSidecarManager_AuditLossIsLoud(t *testing.T) {
+	runID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	invocation := "inv-11111111-1111-1111-1111-111111111111"
+	name := "sentiae-sc-" + invocation
+	line1 := decisionLine(1, "deny", "host_not_declared", "example.com", 443, runID.String(), invocation)
+	line3 := decisionLine(3, "deny", "host_not_declared", "example.com", 443, runID.String(), invocation)
+	sinkErr := errors.New("db down")
+
+	for _, tt := range []struct {
+		name       string
+		logs       string
+		sinkErr    error
+		wantErr    error
+		wantReason string
+		wantRetain bool
+	}{
+		{"blind", line1 + "\n", nil, domain.ErrEgressAuditBlind, "blind", false},
+		{"gap", auditBoundLine + "\n" + line1 + "\n" + line3 + "\n", nil, domain.ErrEgressAuditGap, "gap", false},
+		{"malformed", auditBoundLine + "\nnot json\n", nil, domain.ErrEgressAuditMalformed, "malformed", false},
+		{"write", auditBoundLine + "\n" + line1 + "\n", sinkErr, sinkErr, "write", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			docker := readySidecarDaemon()
+			docker.on([]string{"logs"}, tt.logs, 0)
+			audit := &fakeAudit{err: tt.sinkErr}
+			m := testManagerWithAudit(t, docker, audit)
+
+			before := testutil.ToFloat64(auditFailures.WithLabelValues(tt.wantReason))
+
+			if _, err := m.Open(context.Background(), egressOpen(invocation, runID)); err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			err := m.Close(context.Background(), invocation)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Close error: got %v, want %v", err, tt.wantErr)
+			}
+			if delta := testutil.ToFloat64(auditFailures.WithLabelValues(tt.wantReason)) - before; delta != 1 {
+				t.Fatalf("node_egress_audit_failures_total{reason=%q} delta: got %v, want 1", tt.wantReason, delta)
+			}
+			if got := len(audit.recorded()); got != 0 {
+				t.Fatalf("nothing may be recorded when the drain fails, got %d rows", got)
+			}
+
+			rmIdx := docker.indexOf("rm", "-f", name)
+			if tt.wantRetain {
+				if rmIdx != -1 {
+					t.Fatalf("a sidecar whose rows were refused must SURVIVE for the retry (removed at call %d)", rmIdx)
+				}
+				bridgeIdx := docker.indexOf("network", "disconnect", "-f", "sentiae-inv-"+invocation, name)
+				uplinkIdx := docker.indexOf("network", "disconnect", "-f", "sentiae-node-egress-uplink", name)
+				netRmIdx := docker.indexOf("network", "rm", "sentiae-inv-"+invocation)
+				if bridgeIdx == -1 || uplinkIdx == -1 || netRmIdx == -1 {
+					t.Fatalf("missing step: bridge=%d uplink=%d network rm=%d", bridgeIdx, uplinkIdx, netRmIdx)
+				}
+				if !(bridgeIdx < netRmIdx && uplinkIdx < netRmIdx) {
+					t.Fatalf("both attachments must be released BEFORE the bridge is removed, got %d %d %d",
+						bridgeIdx, uplinkIdx, netRmIdx)
+				}
+				return
+			}
+			if rmIdx == -1 {
+				t.Fatal("a sidecar whose record cannot be recovered must still be removed")
+			}
+		})
+	}
+}
+
+// TestSidecarManager_MissingSidecarIsNotAnAuditLoss — a container that never
+// existed (a secrets-only invocation swept twice, an Open that failed before the
+// run) destroyed no record, so it must not count as one. A drain that counted
+// every absent container would make the failure metric meaningless.
+//
+// CONTROL: drop the "No such container" branch in drainAudit — the counter
+// assertion goes red.
+func TestSidecarManager_MissingSidecarIsNotAnAuditLoss(t *testing.T) {
+	runID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	invocation := "inv-11111111-1111-1111-1111-111111111111"
+
+	docker := readySidecarDaemon()
+	docker.onFunc(
+		func(args []string) bool { return containsAll(args, []string{"logs"}) },
+		func([]string) (string, string, int) {
+			return "", "Error response from daemon: No such container: sentiae-sc-" + invocation, 1
+		},
+	)
+	audit := &fakeAudit{}
+	m := testManagerWithAudit(t, docker, audit)
+
+	before := map[string]float64{}
+	for _, reason := range auditFailureReasons {
+		before[reason] = testutil.ToFloat64(auditFailures.WithLabelValues(reason))
+	}
+	if _, err := m.Open(context.Background(), egressOpen(invocation, runID)); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := m.Close(context.Background(), invocation); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	for _, reason := range auditFailureReasons {
+		if got := testutil.ToFloat64(auditFailures.WithLabelValues(reason)); got != before[reason] {
+			t.Fatalf("reason %q moved (%v → %v): an absent container destroyed no record", reason, before[reason], got)
+		}
+	}
+}
+
+// TestSidecarManager_OpenFailureDoesNotDrain — Open's own teardown runs BEFORE
+// the node was ever launched, so that sidecar can hold no decision. Draining it
+// would spend two docker calls on every failed open and, worse, would make a
+// blind refusal out of a container that never had anything to say.
+//
+// CONTROL: pass drain=true on Open's failure path — the logs/stop assertions go red.
+func TestSidecarManager_OpenFailureDoesNotDrain(t *testing.T) {
+	runID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	invocation := "inv-11111111-1111-1111-1111-111111111111"
+
+	docker := readySidecarDaemon()
+	docker.on([]string{"exec", "-i", "bind"}, "", 1)
+	m := testManagerWithAudit(t, docker, &fakeAudit{})
+
+	if _, err := m.Open(context.Background(), egressOpen(invocation, runID)); err == nil {
+		t.Fatal("a failed bind must fail the open")
+	}
+	if got := docker.indexOf("logs"); got != -1 {
+		t.Fatalf("Open's teardown must not read a log that cannot exist (call %d)", got)
+	}
+	if got := docker.indexOf("stop"); got != -1 {
+		t.Fatalf("Open's teardown must not stop-then-read (call %d)", got)
+	}
+	if docker.indexOf("rm", "-f", "sentiae-sc-"+invocation) == -1 {
+		t.Fatal("Open's teardown must still remove the half-open sidecar")
+	}
+}
+
+// TestSweep_DrainsSidecarsOnly — the sweeps are removal paths too, and after a
+// restart they are the ONLY ones: nothing else will ever read those logs. A node
+// container is not a sidecar and has no audit; draining one would be a log read
+// of tenant code's stdout.
+//
+// CONTROL: remove the drain from removeContainers — both order assertions red.
+func TestSweep_DrainsSidecarsOnly(t *testing.T) {
+	runID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	invocation := "inv-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	sidecar := "sentiae-sc-" + invocation
+	node := "sentiae-node-" + invocation
+	logs := auditBoundLine + "\n" +
+		decisionLine(1, "deny", "host_not_declared", "example.com", 443, runID.String(), invocation) + "\n"
+
+	newDaemon := func() *fakeDaemon {
+		f := &fakeDaemon{}
+		f.on([]string{"ps", "-a"}, sidecar+"\n"+node+"\n", 0)
+		f.on([]string{"network", "ls"}, "", 0)
+		f.on([]string{"logs"}, logs, 0)
+		return f
+	}
+
+	assertDrained := func(t *testing.T, docker *fakeDaemon, audit *fakeAudit) {
+		t.Helper()
+		logsIdx := docker.indexOf("logs", sidecar)
+		rmIdx := docker.indexOf("rm", "-f", sidecar)
+		if logsIdx == -1 || rmIdx == -1 {
+			t.Fatalf("the sidecar must be drained then removed: logs=%d rm=%d", logsIdx, rmIdx)
+		}
+		if logsIdx > rmIdx {
+			t.Fatal("the sidecar's log must be read BEFORE the container is removed")
+		}
+		if got := docker.indexOf("logs", node); got != -1 {
+			t.Fatalf("a NODE container's log was read (call %d)", got)
+		}
+		if got := len(audit.recorded()); got != 1 {
+			t.Fatalf("recorded rows: got %d, want 1", got)
+		}
+	}
+
+	t.Run("SweepAll", func(t *testing.T) {
+		docker := newDaemon()
+		audit := &fakeAudit{}
+		m := testManagerWithAudit(t, docker, audit)
+		if _, _, err := m.SweepAll(context.Background()); err != nil {
+			t.Fatalf("SweepAll: %v", err)
+		}
+		assertDrained(t, docker, audit)
+	})
+
+	t.Run("SweepRun", func(t *testing.T) {
+		docker := newDaemon()
+		audit := &fakeAudit{}
+		m := testManagerWithAudit(t, docker, audit)
+		if err := m.SweepRun(context.Background(), runID); err != nil {
+			t.Fatalf("SweepRun: %v", err)
+		}
+		assertDrained(t, docker, audit)
+	})
+}
+
+// TestSweeper_RetriesRetainedAuditSidecar is the deferral half of D-395: when
+// Postgres refuses the write, the record is NOT lost — the stopped sidecar and
+// its log stay, and every 60 s tick tries again until the INSERT lands. Without
+// the retry the retention would merely leak a container.
+//
+// CONTROL: always `rm -f` in sweepOrphans — tick 2 records nothing, red.
+func TestSweeper_RetriesRetainedAuditSidecar(t *testing.T) {
+	runID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	invocation := "inv-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	name := "sentiae-sc-" + invocation
+
+	docker := &fakeDaemon{}
+	docker.on([]string{"ps", "-a"}, name+"\n", 0)
+	docker.on([]string{"network", "ls"}, "", 0)
+	docker.on([]string{"logs"}, auditBoundLine+"\n"+
+		decisionLine(1, "deny", "host_not_declared", "example.com", 443, runID.String(), invocation)+"\n", 0)
+
+	audit := &fakeAudit{err: errors.New("db down")}
+	m := testManagerWithAudit(t, docker, audit)
+
+	before := testutil.ToFloat64(auditFailures.WithLabelValues("write"))
+
+	m.sweepOrphans(context.Background())
+	if got := docker.indexOf("rm", "-f", name); got != -1 {
+		t.Fatalf("tick 1: the only copy of the record was destroyed (call %d)", got)
+	}
+	if delta := testutil.ToFloat64(auditFailures.WithLabelValues("write")) - before; delta != 1 {
+		t.Fatalf("tick 1: write failures delta: got %v, want 1", delta)
+	}
+
+	audit.mu.Lock()
+	audit.err = nil
+	audit.mu.Unlock()
+
+	m.sweepOrphans(context.Background())
+	if docker.indexOf("rm", "-f", name) == -1 {
+		t.Fatal("tick 2: once the write lands the sidecar must be removed")
+	}
+	if got := len(audit.recorded()); got != 1 {
+		t.Fatalf("tick 2: recorded rows: got %d, want 1", got)
+	}
+}
+
+// TestParseSidecarAudit pins the parser's aggregation AND its strictness. The
+// refusals matter more than the happy path: a drain that skipped a line it could
+// not read would report fewer decisions than the node actually made, and the
+// resulting table would be a quiet lie.
+//
+// CONTROL: skip a malformed line instead of returning — the malformed rows go red.
+// CONTROL: drop the `!anchored` check — the blind row goes red.
+func TestParseSidecarAudit(t *testing.T) {
+	run := "22222222-2222-2222-2222-222222222222"
+	runID := uuid.MustParse(run)
+	inv := "inv-11111111-1111-1111-1111-111111111111"
+	allow := decisionLine(1, "allow", "manifest_exact", "httpbin.org", 443, run, inv)
+	deny := decisionLine(2, "deny", "host_not_declared", "example.com", 443, run, inv)
+
+	t.Run("two tuples in first-seen order", func(t *testing.T) {
+		got, err := ParseSidecarAudit([]byte(auditBoundLine + "\n" + allow + "\n" + deny + "\n"))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		want := []domain.EgressDecision{
+			{RunID: runID, InvocationID: inv, Node: "echo", Decision: domain.EgressAllow,
+				Reason: "manifest_exact", Host: "httpbin.org", Port: 443, Hits: 1,
+				FirstAt: time.Date(2026, 9, 7, 10, 0, 1, 0, time.UTC),
+				LastAt:  time.Date(2026, 9, 7, 10, 0, 1, 0, time.UTC)},
+			{RunID: runID, InvocationID: inv, Node: "echo", Decision: domain.EgressDeny,
+				Reason: "host_not_declared", Host: "example.com", Port: 443, Hits: 1,
+				FirstAt: time.Date(2026, 9, 7, 10, 0, 2, 0, time.UTC),
+				LastAt:  time.Date(2026, 9, 7, 10, 0, 2, 0, time.UTC)},
+		}
+		if !reflect.DeepEqual(got.Decisions, want) {
+			t.Fatalf("decisions:\n got %+v\nwant %+v", got.Decisions, want)
+		}
+		if got.Capped {
+			t.Fatal("nothing capped this log")
+		}
+	})
+
+	t.Run("the same tuple three times is one row with min and max times", func(t *testing.T) {
+		lines := auditBoundLine + "\n" +
+			decisionLine(1, "deny", "host_not_declared", "example.com", 443, run, inv) + "\n" +
+			decisionLine(9, "deny", "host_not_declared", "example.com", 443, run, inv) + "\n" +
+			decisionLine(5, "deny", "host_not_declared", "example.com", 443, run, inv) + "\n"
+		// seq 1,9,5 has a hole, so renumber to a complete 1..3 run with the
+		// timestamps deliberately out of order.
+		lines = strings.Replace(lines, `"seq":9`, `"seq":2`, 1)
+		lines = strings.Replace(lines, `"seq":5`, `"seq":3`, 1)
+		got, err := ParseSidecarAudit([]byte(lines))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(got.Decisions) != 1 || got.Decisions[0].Hits != 3 {
+			t.Fatalf("aggregation: %+v", got.Decisions)
+		}
+		if !got.Decisions[0].FirstAt.Equal(time.Date(2026, 9, 7, 10, 0, 1, 0, time.UTC)) ||
+			!got.Decisions[0].LastAt.Equal(time.Date(2026, 9, 7, 10, 0, 9, 0, time.UTC)) {
+			t.Fatalf("first/last: %+v", got.Decisions[0])
+		}
+	})
+
+	t.Run("a capped log marks every row", func(t *testing.T) {
+		capped := `{"time":"2026-09-07T10:00:03Z","level":"WARN","msg":"egress_audit_capped","invocation_id":"` +
+			inv + `","node":"echo","run_id":"` + run + `","cap":10000}`
+		got, err := ParseSidecarAudit([]byte(auditBoundLine + "\n" + allow + "\n" + deny + "\n" + capped + "\n"))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if !got.Capped {
+			t.Fatal("the audit must be marked capped")
+		}
+		for _, d := range got.Decisions {
+			if !d.Capped {
+				t.Fatalf("every row of a capped log is a floor: %+v", d)
+			}
+		}
+	})
+
+	t.Run("an anchor with no decision is an empty audit, not an error", func(t *testing.T) {
+		got, err := ParseSidecarAudit([]byte(auditBoundLine + "\n"))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(got.Decisions) != 0 {
+			t.Fatalf("decisions: %+v", got.Decisions)
+		}
+	})
+
+	for _, tt := range []struct {
+		name  string
+		log   string
+		wantE error
+	}{
+		{"no anchor is blind", allow + "\n", domain.ErrEgressAuditBlind},
+		{"a repeated seq is a gap", auditBoundLine + "\n" + allow + "\n" + allow + "\n", domain.ErrEgressAuditGap},
+		{"a missing seq is a gap", auditBoundLine + "\n" +
+			decisionLine(1, "deny", "host_not_declared", "example.com", 443, run, inv) + "\n" +
+			decisionLine(2, "deny", "host_not_declared", "other.example", 443, run, inv) + "\n" +
+			decisionLine(4, "deny", "host_not_declared", "third.example", 443, run, inv) + "\n",
+			domain.ErrEgressAuditGap},
+		{"a seq of zero is a gap", strings.Replace(auditBoundLine+"\n"+allow+"\n", `"seq":1`, `"seq":0`, 1),
+			domain.ErrEgressAuditGap},
+		{"a line that is not JSON is malformed", auditBoundLine + "\nnot json\n", domain.ErrEgressAuditMalformed},
+		{"an over-long host is malformed", auditBoundLine + "\n" +
+			decisionLine(1, "deny", "host_not_declared", strings.Repeat("a", 254), 443, run, inv) + "\n",
+			domain.ErrEgressAuditMalformed},
+		{"an unknown verdict is malformed", auditBoundLine + "\n" +
+			decisionLine(1, "maybe", "host_not_declared", "example.com", 443, run, inv) + "\n",
+			domain.ErrEgressAuditMalformed},
+		{"a run id that is not a uuid is malformed", auditBoundLine + "\n" +
+			decisionLine(1, "deny", "host_not_declared", "example.com", 443, "x", inv) + "\n",
+			domain.ErrEgressAuditMalformed},
+		{"a redaction flag that disagrees with the host is malformed", auditBoundLine + "\n" +
+			strings.Replace(decisionLine(1, "deny", "host_not_declared", "[redacted]", 443, run, inv),
+				`"host_redacted":false`, `"host_redacted":false`, 1) + "\n",
+			domain.ErrEgressAuditMalformed},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseSidecarAudit([]byte(tt.log))
+			if !errors.Is(err, tt.wantE) {
+				t.Fatalf("error: got %v, want %v", err, tt.wantE)
+			}
+			if len(got.Decisions) != 0 {
+				t.Fatalf("a refused log yields nothing, got %+v", got.Decisions)
+			}
+		})
+	}
+
+	t.Run("a redacted host with its flag set parses", func(t *testing.T) {
+		line := strings.Replace(decisionLine(1, "deny", "host_not_declared", "[redacted]", 443, run, inv),
+			`"host_redacted":false`, `"host_redacted":true`, 1)
+		got, err := ParseSidecarAudit([]byte(auditBoundLine + "\n" + line + "\n"))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(got.Decisions) != 1 || !got.Decisions[0].HostRedacted ||
+			got.Decisions[0].Host != domain.RedactedEgressHost {
+			t.Fatalf("redacted row: %+v", got.Decisions)
+		}
+	})
 }
