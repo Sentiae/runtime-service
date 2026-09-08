@@ -4,11 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strings"
 	"time"
 
+	pklogger "github.com/sentiae/platform-kit/logger"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -50,12 +50,21 @@ func newGormLogger(w io.Writer, level logger.LogLevel) logger.Interface {
 	if w == nil {
 		w = os.Stdout
 	}
-	return logger.New(log.New(w, "\r\n", log.LstdFlags), logger.Config{
+	// The slog level is hardcoded and MUST NOT read the service's logger config:
+	// slog's gate has to stay permanently open so gorm's own LogLevel — parsed
+	// fail-closed by ParseLogLevel — stays the single authority over how much the
+	// ORM prints. "debug" is strictly below every level slogLogger emits, and even
+	// a typo here degrades to Info, which still gates nothing.
+	base := pklogger.New(pklogger.Config{
+		Writer: w,
+		Level:  "debug",
+		Format: "json",
+	})
+	return logger.NewSlogLogger(base, logger.Config{
 		SlowThreshold:             gormSlowThreshold,
 		LogLevel:                  level,
 		IgnoreRecordNotFoundError: false,
 		ParameterizedQueries:      true,
-		Colorful:                  true,
 	})
 }
 
@@ -85,8 +94,17 @@ func NewDB(cfg Config) (*gorm.DB, error) {
 		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.Database, cfg.SSLMode,
 	)
 
+	gl := newGormLogger(cfg.LogWriter, cfg.LogLevel)
+	// ParameterizedQueries only takes effect through gorm.ParamsFilter, and that
+	// assertion (callbacks.go:143) is OPTIONAL: a logger failing it leaves
+	// stmt.Vars populated and Explain inlines every bound value. Refuse to boot
+	// rather than run a logger that would echo tenant data into the log (D-396).
+	if _, ok := gl.(gorm.ParamsFilter); !ok {
+		return nil, fmt.Errorf("gorm logger %T does not implement ParamsFilter; bound values would echo into logs (D-396)", gl)
+	}
+
 	db, err := gorm.Open(newSanitizingDialector(dsn), &gorm.Config{
-		Logger: newGormLogger(cfg.LogWriter, cfg.LogLevel),
+		Logger: gl,
 		NowFunc: func() time.Time {
 			return time.Now().UTC()
 		},

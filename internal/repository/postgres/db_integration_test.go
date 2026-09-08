@@ -7,6 +7,9 @@ package postgres_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
@@ -164,7 +167,10 @@ func TestNewDB_LogNeverCarriesBoundValues(t *testing.T) {
 	}
 
 	out := sink.String()
-	for _, table := range []string{`INSERT INTO "node_executions"`, `INSERT INTO "graph_trace_node_snapshots"`} {
+	for _, table := range []string{
+		jsonSQLFragment(`INSERT INTO "node_executions"`),
+		jsonSQLFragment(`INSERT INTO "graph_trace_node_snapshots"`),
+	} {
 		if !strings.Contains(out, table) {
 			t.Fatalf("precondition failed: %s never reached the ORM log, so an absence assertion proves nothing.\ngot:\n%s", table, out)
 		}
@@ -249,4 +255,99 @@ func assertSanitized(t *testing.T, err error, wantCode string) {
 		t.Fatalf("free-text fields must be dropped, not filtered: detail=%q where=%q hint=%q internal_query=%q",
 			pgErr.Detail, pgErr.Where, pgErr.Hint, pgErr.InternalQuery)
 	}
+}
+
+// randSentinel returns a value that cannot collide with anything else in the
+// captured log, so "the sentinel is absent" is a claim about THIS statement's
+// bound parameter and nothing else.
+func randSentinel(t *testing.T) string {
+	t.Helper()
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("crypto/rand: %v", err)
+	}
+	return "d396-" + hex.EncodeToString(b[:])
+}
+
+// TestGormLogger_BoundValuesNeverEchoThroughCallbacks proves the guard on the
+// REAL path: gorm's processor renders every logged statement inside the closure
+// at callbacks.go:141-146, and that closure only strips bound values if the
+// configured logger satisfies the OPTIONAL gorm.ParamsFilter assertion. The
+// ParameterizedQueries flag alone is not the control — the interface is.
+//
+// The control that turns this test red: wrap the value newGormLogger returns in
+// `struct{ logger.Interface }`. Embedding an interface promotes only the
+// methods that interface declares, so ParamsFilter vanishes from the concrete
+// type, the assertion at callbacks.go:143 fails, stmt.Vars stay populated,
+// Dialector.Explain inlines them, and the sentinel appears in the output below.
+// NewDB refuses to boot on exactly that shape, so reproducing the control also
+// requires bypassing that refusal.
+func TestGormLogger_BoundValuesNeverEchoThroughCallbacks(t *testing.T) {
+	db, sink := startEchoPG(t)
+	ctx := context.Background()
+
+	// --- the success path (Info) ---
+	sentinel := randSentinel(t)
+	var count int64
+	if err := db.WithContext(ctx).
+		Table("node_executions").
+		Where("node_name = ?", sentinel).
+		Count(&count).Error; err != nil {
+		t.Fatalf("count node_executions by node_name: %v", err)
+	}
+
+	out := sink.String()
+	// POSITIVE FIRST — a blank page must fail this test. An absence assertion on
+	// empty output proves nothing at all.
+	if !strings.Contains(out, "SQL executed") {
+		t.Fatalf("positive control failed: the ORM logged no statement, so the absence assertion below would prove nothing.\ngot:\n%s", out)
+	}
+	if !strings.Contains(out, jsonSQLFragment(`"node_executions"`)) {
+		t.Fatalf("positive control failed: the counted statement never reached the log.\ngot:\n%s", out)
+	}
+	if !strings.Contains(out, "$1") {
+		t.Fatalf("positive control failed: no placeholder in the rendered statement — the bound value was not parameterised out, it was never bound.\ngot:\n%s", out)
+	}
+	// ...and only now the claim itself.
+	if strings.Contains(out, sentinel) {
+		t.Fatalf("a bound value echoed into the ORM log (D-396):\n%s", out)
+	}
+
+	// --- the error path (Error): gorm renders the FULL statement for a FAILED
+	// one and appends the driver error as its own attribute. Both channels have
+	// to be clean. Binding a non-uuid to a uuid column is the cheapest forced
+	// failure that still carries a bound value.
+	errSentinel := randSentinel(t)
+	err := db.WithContext(ctx).Exec(
+		`SELECT 1 FROM node_executions WHERE id = ?`, errSentinel,
+	).Error
+	if err == nil {
+		t.Fatal("control failed: binding a non-uuid to a uuid column did not fail, so the Error path never ran")
+	}
+
+	out = sink.String()
+	// POSITIVE FIRST again.
+	if !strings.Contains(out, `"level":"ERROR"`) {
+		t.Fatalf("positive control failed: the failed statement was not logged at Error, so nothing below is being checked.\ngot:\n%s", out)
+	}
+	if !strings.Contains(out, `"error":`) {
+		t.Fatalf("positive control failed: the Error record carries no error attribute.\ngot:\n%s", out)
+	}
+	if strings.Contains(out, errSentinel) {
+		t.Fatalf("a bound value echoed into the ORM log on the error path (D-396):\n%s", out)
+	}
+	if strings.Contains(err.Error(), errSentinel) {
+		t.Fatalf("the returned error carries the bound value: %q", err.Error())
+	}
+}
+
+// jsonSQLFragment renders a SQL fragment the way it appears inside the ORM's
+// JSON log line — gorm's identifier quoting is escaped on the way out, so an
+// assertion written against the raw form would silently stop checking anything.
+func jsonSQLFragment(sqlFragment string) string {
+	b, err := json.Marshal(sqlFragment)
+	if err != nil {
+		panic(err)
+	}
+	return strings.Trim(string(b), `"`)
 }

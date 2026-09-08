@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -42,6 +43,18 @@ func dryRunDB(t *testing.T, w *bytes.Buffer, level logger.LogLevel) *gorm.DB {
 		t.Fatalf("open dry-run db: %v", err)
 	}
 	return db
+}
+
+// jsonSQLToken renders a SQL fragment the way it appears inside the ORM's log
+// line. The logger emits JSON now, so the identifier quoting gorm produces is
+// escaped on the way out; the assertion has to look for the escaped form or it
+// would silently stop checking anything.
+func jsonSQLToken(sqlFragment string) string {
+	b, err := json.Marshal(sqlFragment)
+	if err != nil {
+		panic(err)
+	}
+	return strings.Trim(string(b), `"`)
 }
 
 func canaryNodeExecution() *domain.NodeExecution {
@@ -91,8 +104,8 @@ func TestNewGormLogger_NeverEchoesBoundValues(t *testing.T) {
 		model any
 		table string
 	}{
-		{"node_executions", canaryNodeExecution(), `INSERT INTO "node_executions"`},
-		{"graph_trace_node_snapshots", canaryTraceSnapshot(), `INSERT INTO "graph_trace_node_snapshots"`},
+		{"node_executions", canaryNodeExecution(), jsonSQLToken(`INSERT INTO "node_executions"`)},
+		{"graph_trace_node_snapshots", canaryTraceSnapshot(), jsonSQLToken(`INSERT INTO "graph_trace_node_snapshots"`)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -127,8 +140,8 @@ func TestNewGormLogger_ErrorPathNeverEchoesBoundValues(t *testing.T) {
 		model any
 		table string
 	}{
-		{"node_executions", canaryNodeExecution(), `INSERT INTO "node_executions"`},
-		{"graph_trace_node_snapshots", canaryTraceSnapshot(), `INSERT INTO "graph_trace_node_snapshots"`},
+		{"node_executions", canaryNodeExecution(), jsonSQLToken(`INSERT INTO "node_executions"`)},
+		{"graph_trace_node_snapshots", canaryTraceSnapshot(), jsonSQLToken(`INSERT INTO "graph_trace_node_snapshots"`)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
