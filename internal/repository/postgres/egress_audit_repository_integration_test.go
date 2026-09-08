@@ -83,15 +83,15 @@ func TestEgressAuditRepository_Record(t *testing.T) {
 	})
 
 	t.Run("the org is read by joining the run", func(t *testing.T) {
-		var got uuid.UUID
-		err := db.Raw(`SELECT ge.organization_id FROM node_egress_decisions d
+		var got string
+		err := db.Raw(`SELECT ge.organization_id::text FROM node_egress_decisions d
 			JOIN graph_executions ge ON ge.id = d.run_id
 			WHERE d.invocation_id = ? LIMIT 1`, invocation).Scan(&got).Error
 		if err != nil {
 			t.Fatalf("join: %v", err)
 		}
-		if got != org {
-			t.Fatalf("organization: got %s, want %s", got, org)
+		if got != org.String() {
+			t.Fatalf("organization: got %s, want %s", got, org.String())
 		}
 	})
 

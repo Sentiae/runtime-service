@@ -23,6 +23,10 @@
 -- cannot disagree with the string). The proxy token, the handles and every
 -- secret value are never in the sidecar's decision and never reach this table.
 --
+-- port is bigint, not integer: squawk's prefer-bigint-over-int is a hard rule of
+-- the migration gate and the only ignore this file is permitted is the foreign
+-- key one. The CHECK is what actually bounds a port to 1..65535.
+--
 -- Numbering: 0027 is next-free (0026's note on m.Up() and skipped versions).
 -- New table: no rewrite, no lock held on existing rows. One explicit transaction.
 SET statement_timeout = '60s';
@@ -39,7 +43,7 @@ CREATE TABLE node_egress_decisions (
     reason        text        NOT NULL,
     host          text        NOT NULL,
     host_redacted boolean     NOT NULL DEFAULT false,
-    port          integer     NOT NULL,
+    port          bigint      NOT NULL,
     request_count bigint      NOT NULL,
     first_seen_at timestamptz NOT NULL,
     last_seen_at  timestamptz NOT NULL,
