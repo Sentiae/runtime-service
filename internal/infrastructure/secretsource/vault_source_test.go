@@ -45,7 +45,7 @@ func mustSecretValue(t *testing.T, value string) secret.SecretValue {
 	org := uuid.New()
 	v, err := secret.NewVaultResolver(staticGetter{value: value}).Resolve(
 		context.Background(),
-		secret.TenantRef(org, "flows/preview/mint", "value"),
+		secret.TenantRef(org, "flows/staging/mint", "value"),
 		secret.Principal{Service: "test", OrgID: org.String()},
 	)
 	if err != nil {
@@ -77,8 +77,8 @@ func TestVaultSource_RefAndPrincipal(t *testing.T) {
 		wantErr     error
 	}{
 		{
-			name: "preview", environment: "preview", secretName: "greeting_suffix",
-			wantRef:   "tenants/11111111-2222-3333-4444-555555555555/flows/preview/greeting_suffix#value",
+			name: "staging", environment: "staging", secretName: "greeting_suffix",
+			wantRef:   "tenants/11111111-2222-3333-4444-555555555555/flows/staging/greeting_suffix#value",
 			wantValue: "s3cr3t", wantFound: true,
 		},
 		{
@@ -92,20 +92,20 @@ func TestVaultSource_RefAndPrincipal(t *testing.T) {
 			wantValue: "s3cr3t", wantFound: true,
 		},
 		{
-			name: "absent secret is not an error", environment: "preview", secretName: "greeting_suffix",
+			name: "absent secret is not an error", environment: "staging", secretName: "greeting_suffix",
 			resolverErr: fmt.Errorf("%w: some ref", secret.ErrSecretNotFound),
-			wantRef:     "tenants/11111111-2222-3333-4444-555555555555/flows/preview/greeting_suffix#value",
+			wantRef:     "tenants/11111111-2222-3333-4444-555555555555/flows/staging/greeting_suffix#value",
 		},
 		{
-			name: "vault failure is an error", environment: "preview", secretName: "greeting_suffix",
+			name: "vault failure is an error", environment: "staging", secretName: "greeting_suffix",
 			resolverErr: secret.ErrVaultUnavailable,
-			wantRef:     "tenants/11111111-2222-3333-4444-555555555555/flows/preview/greeting_suffix#value",
+			wantRef:     "tenants/11111111-2222-3333-4444-555555555555/flows/staging/greeting_suffix#value",
 			wantErr:     secret.ErrVaultUnavailable,
 		},
 		{
-			name: "no handed token is an error", environment: "preview", secretName: "greeting_suffix",
+			name: "no handed token is an error", environment: "staging", secretName: "greeting_suffix",
 			resolverErr: secret.ErrNoHandedToken,
-			wantRef:     "tenants/11111111-2222-3333-4444-555555555555/flows/preview/greeting_suffix#value",
+			wantRef:     "tenants/11111111-2222-3333-4444-555555555555/flows/staging/greeting_suffix#value",
 			wantErr:     secret.ErrNoHandedToken,
 		},
 	}
@@ -157,13 +157,13 @@ func TestVaultSource_ErrorCarriesNoValue(t *testing.T) {
 	org := uuid.New()
 
 	ok := &recordingResolver{value: mustSecretValue(t, canary)}
-	value, found, err := New(ok, &recordingRevoker{}).Resolve(context.Background(), org, "handed-token", "preview", "greeting_suffix")
+	value, found, err := New(ok, &recordingRevoker{}).Resolve(context.Background(), org, "handed-token", "staging", "greeting_suffix")
 	if err != nil || !found || value != canary {
 		t.Fatalf("anchor: Resolve = (%q, %v, %v), want (%q, true, nil)", value, found, err, canary)
 	}
 
 	failing := &recordingResolver{value: mustSecretValue(t, canary), err: secret.ErrVaultUnavailable}
-	_, _, err = New(failing, &recordingRevoker{}).Resolve(context.Background(), org, "handed-token", "preview", "greeting_suffix")
+	_, _, err = New(failing, &recordingRevoker{}).Resolve(context.Background(), org, "handed-token", "staging", "greeting_suffix")
 	if err == nil {
 		t.Fatal("Resolve error = nil, want the vault failure")
 	}
@@ -226,7 +226,7 @@ func TestVaultSource_RevokeHandsBackTheRunToken(t *testing.T) {
 //
 // Control: return ("", false, nil) from Unavailable.Resolve ⇒ both rows fail.
 func TestUnavailable_FailsClosed(t *testing.T) {
-	if _, _, err := (Unavailable{}).Resolve(context.Background(), uuid.New(), "t", "preview", "greeting_suffix"); !errors.Is(err, domain.ErrNodeRunnerNotReady) {
+	if _, _, err := (Unavailable{}).Resolve(context.Background(), uuid.New(), "t", "staging", "greeting_suffix"); !errors.Is(err, domain.ErrNodeRunnerNotReady) {
 		t.Fatalf("Resolve error = %v, want ErrNodeRunnerNotReady", err)
 	}
 	if err := (Unavailable{}).Revoke(context.Background(), "t"); !errors.Is(err, domain.ErrNodeRunnerNotReady) {

@@ -25,7 +25,7 @@ const DefaultMaxParallelism = 4
 // flowEnvironments is the closed set a run may resolve secrets from. It is
 // closed on purpose: a typo'd environment must refuse, never silently read a
 // path that does not exist and hand the node an absent secret.
-var flowEnvironments = []string{"dev", "preview", "prod"}
+var flowEnvironments = []string{"dev", "staging", "prod"}
 
 // nodeTimings records the wall-clock window each node ran in. Stored
 // per-execution so the parallelism report can compute critical path,

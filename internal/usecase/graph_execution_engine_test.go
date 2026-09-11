@@ -374,7 +374,7 @@ func TestRunPlan_TriggerRespondSingle(t *testing.T) {
 	exec := h.runToTerminal(t, domain.JSONMap{
 		"body":      map[string]any{"name": "x"},
 		"root_only": "never-wired",
-	}, "handed-token", "preview")
+	}, "handed-token", "staging")
 
 	if exec.Status != domain.GraphExecCompleted {
 		t.Fatalf("status = %s (error %q), want completed", exec.Status, exec.Error)
@@ -629,11 +629,11 @@ func TestExecuteGraph_Refusals(t *testing.T) {
 		{name: "graph is not active", draft: true, wantErr: domain.ErrGraphNotActive},
 		{name: "secrets declared without a token", wantErr: domain.ErrSecretTokenRequired,
 			mutate: func(n []domain.GraphNode) []domain.GraphNode { n[1].Secrets = secretSpec; return n }},
-		{name: "token without secrets", token: "handed-token", env: "preview", wantErr: domain.ErrSecretTokenUnexpected},
-		{name: "environment without secrets", env: "preview", wantErr: domain.ErrEnvironmentUnexpected},
+		{name: "token without secrets", token: "handed-token", env: "staging", wantErr: domain.ErrSecretTokenUnexpected},
+		{name: "environment without secrets", env: "staging", wantErr: domain.ErrEnvironmentUnexpected},
 		{name: "token without an environment", token: "handed-token", wantErr: domain.ErrEnvironmentRequired,
 			mutate: func(n []domain.GraphNode) []domain.GraphNode { n[1].Secrets = secretSpec; return n }},
-		{name: "environment is not one of the three", token: "handed-token", env: "staging", wantErr: domain.ErrEnvironmentInvalid,
+		{name: "environment is not one of the three", token: "handed-token", env: "preview", wantErr: domain.ErrEnvironmentInvalid,
 			mutate: func(n []domain.GraphNode) []domain.GraphNode { n[1].Secrets = secretSpec; return n }},
 	}
 
@@ -661,6 +661,35 @@ func TestExecuteGraph_Refusals(t *testing.T) {
 			}
 			if len(h.runner.launch) != 0 {
 				t.Fatalf("a refused request launched %d bundle(s)", len(h.runner.launch))
+			}
+		})
+	}
+}
+
+// T2.11b — the flow-environment vocabulary is the closed set dev|staging|prod
+// (owner ruling D-470). A value outside it refuses instead of building a Vault
+// path that does not exist and handing the node an absent secret.
+//
+// Control: put "preview" back into flowEnvironments ⇒ the retired row passes.
+func TestCheckRunCredentials_FlowEnvironment(t *testing.T) {
+	declaring := []domain.GraphNode{{Secrets: []domain.SecretSpec{{Name: "greeting_suffix"}}}}
+
+	tests := []struct {
+		name    string
+		env     string
+		wantErr error
+	}{
+		{"dev", "dev", nil},
+		{"staging", "staging", nil},
+		{"prod", "prod", nil},
+		{"retired preview", "preview", domain.ErrEnvironmentInvalid},
+		{"unknown", "wonderland", domain.ErrEnvironmentInvalid},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := checkRunCredentials(declaring, "handed-token", tt.env)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("checkRunCredentials(%q) = %v, want %v", tt.env, err, tt.wantErr)
 			}
 		})
 	}
@@ -774,7 +803,7 @@ func TestCleanupRun_RevokeFailureIsCountedAndTheRunStillCompletes(t *testing.T) 
 	failedBefore := testutil.ToFloat64(secretTokenRevocations.WithLabelValues(revokeOutcomeFailed))
 	okBefore := testutil.ToFloat64(secretTokenRevocations.WithLabelValues(revokeOutcomeOK))
 
-	exec := h.runToTerminal(t, domain.JSONMap{"body": map[string]any{"name": "x"}}, "handed-token", "preview")
+	exec := h.runToTerminal(t, domain.JSONMap{"body": map[string]any{"name": "x"}}, "handed-token", "staging")
 
 	if exec.Status != domain.GraphExecCompleted {
 		t.Fatalf("status = %s (error %q), want completed — a revoke failure must not fail the run",

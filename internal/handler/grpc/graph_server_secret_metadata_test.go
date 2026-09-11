@@ -161,7 +161,7 @@ func TestExecuteGraph_PassesSecretToken(t *testing.T) {
 	}{
 		{
 			name: "both values reach the engine", secrets: declared,
-			md:      map[string]string{"x-sentiae-secret-token": "handed-token", "x-sentiae-flow-environment": "preview"},
+			md:      map[string]string{"x-sentiae-secret-token": "handed-token", "x-sentiae-flow-environment": "staging"},
 			wantErr: errRunRowRefused,
 		},
 		{
@@ -171,7 +171,7 @@ func TestExecuteGraph_PassesSecretToken(t *testing.T) {
 		},
 		{
 			name: "the environment reaches the engine and is checked", secrets: declared,
-			md:      map[string]string{"x-sentiae-secret-token": "handed-token", "x-sentiae-flow-environment": "staging"},
+			md:      map[string]string{"x-sentiae-secret-token": "handed-token", "x-sentiae-flow-environment": "preview"},
 			wantErr: domain.ErrEnvironmentInvalid,
 		},
 		{
@@ -180,12 +180,12 @@ func TestExecuteGraph_PassesSecretToken(t *testing.T) {
 		},
 		{
 			name: "an environment on a secretless graph is refused", secrets: nil,
-			md:      map[string]string{"x-sentiae-flow-environment": "preview"},
+			md:      map[string]string{"x-sentiae-flow-environment": "staging"},
 			wantErr: domain.ErrEnvironmentUnexpected,
 		},
 		{
 			name: "a token on a secretless graph is refused", secrets: nil,
-			md:      map[string]string{"x-sentiae-secret-token": "handed-token", "x-sentiae-flow-environment": "preview"},
+			md:      map[string]string{"x-sentiae-secret-token": "handed-token", "x-sentiae-flow-environment": "staging"},
 			wantErr: domain.ErrSecretTokenUnexpected,
 		},
 		{

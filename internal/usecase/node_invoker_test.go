@@ -280,7 +280,7 @@ func TestInvoke_CallDocument(t *testing.T) {
 	if _, err := inv.Invoke(context.Background(), InvokeNodeInput{
 		RunID:       runID,
 		OrgID:       uuid.New(),
-		Environment: "preview",
+		Environment: "staging",
 		Node:        node,
 		Inputs:      map[string]json.RawMessage{"name": json.RawMessage(`"x"`)},
 		Config:      map[string]json.RawMessage{"prefix": json.RawMessage(`"hello"`)},
@@ -325,7 +325,7 @@ func TestInvoke_CallDocument(t *testing.T) {
 	}
 
 	// The resolution used the run's credentials, not the process's.
-	if secrets.lastEnv != "preview" || secrets.lastTok != "handed-token" {
+	if secrets.lastEnv != "staging" || secrets.lastTok != "handed-token" {
 		t.Fatalf("resolve used environment=%q token=%q", secrets.lastEnv, secrets.lastTok)
 	}
 }
@@ -442,7 +442,7 @@ func TestInvoke_SecretsNeverLeaveTheBinding(t *testing.T) {
 	node := helloNode(t, []domain.SecretSpec{{Name: "greeting_suffix", Required: true}}, nil)
 	inputs := map[string]json.RawMessage{"name": json.RawMessage(`"x"`)}
 	if _, err := inv.Invoke(context.Background(), InvokeNodeInput{
-		RunID: uuid.New(), OrgID: uuid.New(), Environment: "preview",
+		RunID: uuid.New(), OrgID: uuid.New(), Environment: "staging",
 		Node: node, Inputs: inputs, SecretToken: "handed-token",
 	}); err != nil {
 		t.Fatalf("Invoke: %v", err)
@@ -486,7 +486,7 @@ func TestInvoke_RequiredSecretAbsent(t *testing.T) {
 		node := helloNode(t, []domain.SecretSpec{{Name: "greeting_suffix", Required: true}}, nil)
 
 		_, err := inv.Invoke(context.Background(), InvokeNodeInput{
-			RunID: uuid.New(), OrgID: uuid.New(), Environment: "preview",
+			RunID: uuid.New(), OrgID: uuid.New(), Environment: "staging",
 			Node: node, SecretToken: "handed-token",
 		})
 		if !errors.Is(err, domain.ErrRequiredSecretAbsent) {
@@ -507,7 +507,7 @@ func TestInvoke_RequiredSecretAbsent(t *testing.T) {
 		node := helloNode(t, []domain.SecretSpec{{Name: "greeting_suffix"}}, nil)
 
 		if _, err := inv.Invoke(context.Background(), InvokeNodeInput{
-			RunID: uuid.New(), OrgID: uuid.New(), Environment: "preview",
+			RunID: uuid.New(), OrgID: uuid.New(), Environment: "staging",
 			Node: node, SecretToken: "handed-token",
 		}); err != nil {
 			t.Fatalf("Invoke: %v", err)
@@ -567,7 +567,7 @@ func TestInvoke_SidecarLifecycle(t *testing.T) {
 
 			node := helloNode(t, tt.secrets, tt.egress)
 			_, invErr := inv.Invoke(context.Background(), InvokeNodeInput{
-				RunID: uuid.New(), OrgID: uuid.New(), Environment: "preview",
+				RunID: uuid.New(), OrgID: uuid.New(), Environment: "staging",
 				Node: node, SecretToken: "handed-token",
 			})
 			if tt.fail && invErr == nil {
@@ -665,7 +665,7 @@ func TestInvoke_SecretResolveFailureIsClassifiedNotNarrated(t *testing.T) {
 		slog.New(slog.NewJSONHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	_, err := inv.Invoke(ctx, InvokeNodeInput{
-		RunID: uuid.New(), OrgID: uuid.New(), Environment: "preview",
+		RunID: uuid.New(), OrgID: uuid.New(), Environment: "staging",
 		Node: node, SecretToken: "handed-token",
 	})
 	if err == nil {

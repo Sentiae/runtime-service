@@ -88,7 +88,7 @@ var (
 	// org's environments the run resolves its secrets from, so a wrong value
 	// would read another environment's secret rather than fail.
 	ErrEnvironmentRequired   = errors.New("secret token handed without a flow environment (x-sentiae-flow-environment)")
-	ErrEnvironmentInvalid    = errors.New("flow environment must be dev, preview or prod (x-sentiae-flow-environment)")
+	ErrEnvironmentInvalid    = errors.New("flow environment must be dev, staging or prod (x-sentiae-flow-environment)")
 	ErrEnvironmentUnexpected = errors.New("flow environment handed to a graph that declares no secrets")
 	ErrRequiredSecretAbsent  = errors.New("required secret absent")
 	ErrTriggerInputInvalid   = errors.New("trigger input is not a request object")
