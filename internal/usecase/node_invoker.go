@@ -232,6 +232,29 @@ func (i *NodeInvoker) invoke(ctx context.Context, in InvokeNodeInput, invocation
 	return i.result(node, res)
 }
 
+// secretResolveUnavailablePhrase is the FIXED tail of a secret-resolution
+// failure as the caller sees it. The resolver's own text is deliberately not
+// carried: a Vault refusal names the mount, the path, the policy and the token's
+// accessor, and this string lands verbatim on the node execution row and in the
+// editor. The class (`secret_resolve_failed`) and the secret NAME are the parts
+// a flow author can act on; the cause belongs to the operator, in the log.
+const secretResolveUnavailablePhrase = "unavailable"
+
+// secretResolveError fixes the TEXT a caller sees while keeping the CHAIN a
+// caller in-process can inspect: Error() never renders the cause, Unwrap()
+// still exposes it, so errors.Is/As keep working on the resolver's sentinels
+// without the transport detail ever reaching a user-facing string.
+type secretResolveError struct {
+	name  string
+	cause error
+}
+
+func (e *secretResolveError) Error() string {
+	return "secret_resolve_failed: " + e.name + ": " + secretResolveUnavailablePhrase
+}
+
+func (e *secretResolveError) Unwrap() error { return e.cause }
+
 // resolveSecrets turns the node's DECLARED secrets into handles for the node
 // and answers for the sidecar. The value never enters the CALL, a log line, an
 // argument or an environment variable.
@@ -241,7 +264,14 @@ func (i *NodeInvoker) resolveSecrets(ctx context.Context, in InvokeNodeInput) (m
 	for _, spec := range in.Node.Secrets {
 		value, found, err := i.secrets.Resolve(ctx, in.OrgID, in.SecretToken, in.Environment, spec.Name)
 		if err != nil {
-			return nil, nil, fmt.Errorf("secret_resolve_failed: %s: %w", spec.Name, err)
+			// A resolver failure is a FAILURE — a 403 is never softened into
+			// "not set", which would empty every optional secret and let the run
+			// report success on a misconfigured tenant. Only the wording is
+			// reduced; the full cause goes to the operator's log at ERROR.
+			logger.FromContext(ctx).Error("secret_resolve_failed",
+				"run", in.RunID.String(), "org", in.OrgID.String(),
+				"environment", in.Environment, "secret", spec.Name, "err", err)
+			return nil, nil, &secretResolveError{name: spec.Name, cause: err}
 		}
 		if spec.Required && !found {
 			return nil, nil, fmt.Errorf("%w: %s", domain.ErrRequiredSecretAbsent, spec.Name)

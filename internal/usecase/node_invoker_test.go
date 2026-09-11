@@ -1,9 +1,11 @@
 package usecase
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/sentiae/platform-kit/logger"
 	"github.com/sentiae/platform-kit/nodeabi"
 	"github.com/sentiae/runtime-service/internal/domain"
 )
@@ -632,5 +635,80 @@ func TestInvoke_SidecarLifecycle(t *testing.T) {
 				t.Fatalf("closes = %v, want exactly the opened invocation %q", sidecars.closes, open.InvocationID)
 			}
 		})
+	}
+}
+
+// D-457 — a secret the resolver REFUSES (Vault 403) fails the invocation, and
+// the caller-visible reason names the class and the secret but carries none of
+// Vault's transport/permission text. The full cause is logged at ERROR for the
+// operator.
+//
+// Control: restore `%w` on the resolver error in resolveSecrets ⇒ the
+// "permission denied" assertion fails. Control for the chain: delete
+// secretResolveError.Unwrap ⇒ the errors.Is assertion fails.
+func TestInvoke_SecretResolveFailureIsClassifiedNotNarrated(t *testing.T) {
+	const vaultErr = `resolve tenants/8a1f.../greeting#value: Error making API request. ` +
+		`URL: GET https://vault:8200/v1/secret/data/tenants/8a1f/app. Code: 403. ` +
+		`Errors: * 1 error occurred: * permission denied`
+
+	cause := errors.New(vaultErr)
+	runner := &fakeBundleRunner{}
+	sidecars := &fakeSidecarManager{}
+	secrets := &fakeSecretSource{answers: map[string]resolvedSecret{
+		"greeting_suffix": {err: cause},
+	}}
+	inv := newTestInvoker(t, runner, sidecars, secrets)
+	node := helloNode(t, []domain.SecretSpec{{Name: "greeting_suffix"}}, nil)
+
+	var logged bytes.Buffer
+	ctx := logger.NewContext(context.Background(),
+		slog.New(slog.NewJSONHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	_, err := inv.Invoke(ctx, InvokeNodeInput{
+		RunID: uuid.New(), OrgID: uuid.New(), Environment: "preview",
+		Node: node, SecretToken: "handed-token",
+	})
+	if err == nil {
+		t.Fatal("a refused secret resolution must FAIL the invocation, not pass as 'not set'")
+	}
+
+	msg := err.Error()
+	if !strings.Contains(msg, "secret_resolve_failed") {
+		t.Fatalf("the failure lost its class: %q", msg)
+	}
+	if !strings.Contains(msg, "greeting_suffix") {
+		t.Fatalf("the failure does not name the secret: %q", msg)
+	}
+	if !strings.Contains(msg, secretResolveUnavailablePhrase) {
+		t.Fatalf("the failure does not carry the fixed phrase %q: %q", secretResolveUnavailablePhrase, msg)
+	}
+	for _, leak := range []string{"permission denied", "403", "vault:8200", "secret/data/tenants"} {
+		if strings.Contains(msg, leak) {
+			t.Fatalf("the caller-visible failure leaks Vault detail %q: %q", leak, msg)
+		}
+	}
+
+	// The CHAIN survives even though the TEXT does not: an in-process caller can
+	// still match the resolver's own error, which is what keeps the fixed phrase
+	// from being a lie by omission.
+	if !errors.Is(err, cause) {
+		t.Fatalf("the resolver cause is no longer reachable through errors.Is: %v", err)
+	}
+
+	// Nothing ran: a node that cannot get a declared secret never launches.
+	if len(sidecars.opens) != 0 || len(runner.launch) != 0 {
+		t.Fatalf("a refused invocation opened %d sidecar(s) and launched %d bundle(s)", len(sidecars.opens), len(runner.launch))
+	}
+
+	// …and the operator still gets the whole cause, at ERROR.
+	out := logged.String()
+	if !strings.Contains(out, `"level":"ERROR"`) || !strings.Contains(out, "secret_resolve_failed") {
+		t.Fatalf("the cause was not logged at ERROR: %q", out)
+	}
+	if !strings.Contains(out, "permission denied") {
+		t.Fatalf("the server-side log dropped the Vault cause: %q", out)
+	}
+	if !strings.Contains(out, "greeting_suffix") {
+		t.Fatalf("the server-side log does not name the secret: %q", out)
 	}
 }
