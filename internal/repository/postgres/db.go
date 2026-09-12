@@ -12,12 +12,11 @@ import (
 
 // Config holds database configuration
 type Config struct {
-	Host            string
-	Port            int
-	User            string
-	Password        string
-	Database        string
-	SSLMode         string
+	// DSN is the libpq keyword/value connection string. The caller builds it
+	// from config.DatabaseDSN (the serving app role) or config.MigrateDatabaseDSN
+	// (the owner role) — which role a pool authenticates as is decided there,
+	// never here (D-490).
+	DSN             string
 	MaxOpenConns    int
 	MaxIdleConns    int
 	ConnMaxLifetime time.Duration
@@ -35,11 +34,6 @@ type Config struct {
 
 // NewDB creates a new database connection with proper configuration
 func NewDB(cfg Config) (*gorm.DB, error) {
-	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.Database, cfg.SSLMode,
-	)
-
 	// gormlog.New is the fleet's ONLY approved ORM logger (D-400). It sets
 	// ParameterizedQueries — the security-relevant flag gorm applies inside the
 	// `fc()` closure that renders the statement, so bound values become `$N` on
@@ -63,7 +57,7 @@ func NewDB(cfg Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("gorm logger %T does not implement ParamsFilter; bound values would echo into logs (D-396)", gl)
 	}
 
-	db, err := gorm.Open(newSanitizingDialector(dsn), &gorm.Config{
+	db, err := gorm.Open(newSanitizingDialector(cfg.DSN), &gorm.Config{
 		Logger: gl,
 		NowFunc: func() time.Time {
 			return time.Now().UTC()

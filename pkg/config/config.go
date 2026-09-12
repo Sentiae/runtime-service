@@ -366,15 +366,22 @@ type DatabaseConfig struct {
 
 // PostgresConfig contains PostgreSQL configuration.
 type PostgresConfig struct {
-	Host       string           `mapstructure:"host"`
-	Port       string           `mapstructure:"port"`
-	User       string           `mapstructure:"user"`
-	Password   string           `mapstructure:"password"`
-	Database   string           `mapstructure:"database"`
-	SSLMode    string           `mapstructure:"ssl_mode"`
-	Pool       PoolConfig       `mapstructure:"pool"`
-	Migrations MigrationsConfig `mapstructure:"migrations"`
-	LogLevel   string           `mapstructure:"log_level"`
+	Host     string `mapstructure:"host"`
+	Port     string `mapstructure:"port"`
+	User     string `mapstructure:"user"`
+	Password string `mapstructure:"password"`
+	// MigrateUser/MigratePassword are the OWNER role: the only credentials that
+	// run migrations (D-490). They carry NO default and there is deliberately NO
+	// fallback to User/Password — a config-name miss must refuse the boot, not
+	// silently run DDL as the serving role. Required only when migrations are
+	// enabled: a host that never migrates (a fleet host) must not hold them.
+	MigrateUser     string           `mapstructure:"migrate_user"`
+	MigratePassword string           `mapstructure:"migrate_password"`
+	Database        string           `mapstructure:"database"`
+	SSLMode         string           `mapstructure:"ssl_mode"`
+	Pool            PoolConfig       `mapstructure:"pool"`
+	Migrations      MigrationsConfig `mapstructure:"migrations"`
+	LogLevel        string           `mapstructure:"log_level"`
 }
 
 // PoolConfig contains connection pool settings.
@@ -387,6 +394,11 @@ type PoolConfig struct {
 
 // MigrationsConfig contains migration settings.
 type MigrationsConfig struct {
+	// Enabled decides what boot does to the schema. true: open the owner
+	// connection, migrate, close it, then serve. false: never migrate — boot
+	// reads schema_migrations and refuses unless it is exactly the newest
+	// embedded version and clean (APP_DATABASE_MIGRATIONS_ENABLED=false, the
+	// fleet host, which is migrated from the control plane).
 	Enabled bool   `mapstructure:"enabled"`
 	Path    string `mapstructure:"path"`
 }
@@ -777,6 +789,8 @@ func Load() (*Config, error) {
 			{"database.postgres.port", "APP_DATABASE_PORT"},
 			{"database.postgres.user", "APP_DATABASE_USER"},
 			{"database.postgres.password", "APP_DATABASE_PASSWORD"},
+			{"database.postgres.migrate_user", "APP_DATABASE_MIGRATE_USER"},
+			{"database.postgres.migrate_password", "APP_DATABASE_MIGRATE_PASSWORD"},
 			{"database.postgres.database", "APP_DATABASE_NAME"},
 			{"database.postgres.ssl_mode", "APP_DATABASE_SSL_MODE"},
 			{"database.postgres.pool.max_open_conns", "APP_DATABASE_MAX_OPEN_CONNS"},
@@ -952,17 +966,42 @@ func Load() (*Config, error) {
 		return nil, errors.New("load config: node runner registry host is required (APP_NODE_RUNNER_REGISTRY_HOST)")
 	}
 
+	// A process that migrates at boot must hold the owner credentials. One that
+	// does not migrate needs none, and a fleet host must not carry them at all.
+	if cfg.Database.Postgres.Migrations.Enabled {
+		if err := cfg.ValidateMigrateCredentials(); err != nil {
+			return nil, err
+		}
+	}
+
 	return &cfg, nil
 }
 
-// GetDatabaseURL returns the PostgreSQL connection URL.
-func (c *Config) GetDatabaseURL() string {
+// ValidateMigrateCredentials refuses an absent owner credential. Load applies
+// it when boot migrates; the `migrate` command applies it unconditionally,
+// because migrating is the only thing that command does.
+func (c *Config) ValidateMigrateCredentials() error {
+	if c.Database.Postgres.MigrateUser == "" {
+		return errors.New("load config: database migrate user is required (APP_DATABASE_MIGRATE_USER)")
+	}
+	if c.Database.Postgres.MigratePassword == "" {
+		return errors.New("load config: database migrate password is required (APP_DATABASE_MIGRATE_PASSWORD)")
+	}
+	return nil
+}
+
+// DatabaseDSN builds the SERVING DSN: the app role every request runs as.
+func (c *Config) DatabaseDSN() string {
 	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		c.Database.Postgres.Host,
-		c.Database.Postgres.Port,
-		c.Database.Postgres.User,
-		c.Database.Postgres.Password,
-		c.Database.Postgres.Database,
-		c.Database.Postgres.SSLMode,
-	)
+		c.Database.Postgres.Host, c.Database.Postgres.Port, c.Database.Postgres.User,
+		c.Database.Postgres.Password, c.Database.Postgres.Database, c.Database.Postgres.SSLMode)
+}
+
+// MigrateDatabaseDSN builds the OWNER DSN: migrations and nothing else. It uses
+// the migrate credentials and nothing else — ValidateMigrateCredentials already
+// refused a run without them, so this never falls back to the app role.
+func (c *Config) MigrateDatabaseDSN() string {
+	return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		c.Database.Postgres.Host, c.Database.Postgres.Port, c.Database.Postgres.MigrateUser,
+		c.Database.Postgres.MigratePassword, c.Database.Postgres.Database, c.Database.Postgres.SSLMode)
 }

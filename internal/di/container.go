@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -1498,20 +1497,23 @@ func (c *Container) registerSelfHost(cfg *config.Config) error {
 	return nil
 }
 
-// initDatabase initializes the database connection
+// initDatabase gives the container its SERVING pool, and settles the schema
+// first (D-490). Migrations enabled: the owner connection migrates and is
+// closed, THEN the serving pool opens as the app role — the serving role never
+// issues DDL. Migrations disabled (a fleet host, migrated from the control
+// plane): nothing is migrated; boot reads schema_migrations and refuses unless
+// it is exactly the version this binary embeds, and clean.
 func (c *Container) initDatabase(cfg *config.Config) error {
-	port := 5432
-	if p, err := strconv.Atoi(cfg.Database.Postgres.Port); err == nil {
-		port = p
+	if cfg.Database.Postgres.Migrations.Enabled {
+		version, applied, err := MigrateDatabase(cfg)
+		if err != nil {
+			return fmt.Errorf("failed to run migrations: %w", err)
+		}
+		log.Printf("Migrations complete as the owner role (version=%d applied=%t); owner connection closed", version, applied)
 	}
 
-	dbConfig := postgres.Config{
-		Host:            cfg.Database.Postgres.Host,
-		Port:            port,
-		User:            cfg.Database.Postgres.User,
-		Password:        cfg.Database.Postgres.Password,
-		Database:        cfg.Database.Postgres.Database,
-		SSLMode:         cfg.Database.Postgres.SSLMode,
+	db, err := postgres.NewDB(postgres.Config{
+		DSN:             cfg.DatabaseDSN(),
 		MaxOpenConns:    cfg.Database.Postgres.Pool.MaxOpenConns,
 		MaxIdleConns:    cfg.Database.Postgres.Pool.MaxIdleConns,
 		ConnMaxLifetime: cfg.Database.Postgres.Pool.MaxLifetime,
@@ -1523,26 +1525,57 @@ func (c *Container) initDatabase(cfg *config.Config) error {
 		// gormlog.ParseLevel — unknown value = boot refusal, not a fallback —
 		// which is why it travels unparsed from here (D-400).
 		LogLevel: cfg.Database.Postgres.LogLevel,
-	}
-
-	db, err := postgres.NewDB(dbConfig)
+	})
 	if err != nil {
 		return err
 	}
 
+	if !cfg.Database.Postgres.Migrations.Enabled {
+		ctx, cancel := context.WithTimeout(context.Background(), schemaCheckTimeout)
+		version, err := postgres.AssertSchemaCurrent(ctx, db)
+		cancel()
+		if err != nil {
+			_ = postgres.Close(db) // reason: boot is refused; the schema error is the one to report
+			return fmt.Errorf("migrations disabled (APP_DATABASE_MIGRATIONS_ENABLED=false) and the schema is not current — migrate it as the owner role (runtime-service migrate) first: %w", err)
+		}
+		log.Printf("Migrations disabled: schema version %d verified current and clean (read-only check)", version)
+	}
+
 	c.DB = db
 	log.Println("Database connection initialized successfully")
-
-	// Run golang-migrate migrations (durable path, idempotent) — the SOLE
-	// schema authority (D-178). Every runtime table, core + fleet control-plane,
-	// is owned by migrations/ now; GORM AutoMigrate was retired.
-	version, applied, err := postgres.RunMigrations(db)
-	if err != nil {
-		return fmt.Errorf("failed to run migrations: %w", err)
-	}
-	log.Printf("Migrations complete (version=%d applied=%t)", version, applied)
-
 	return nil
+}
+
+// schemaCheckTimeout bounds the read-only schema check of a non-migrating boot.
+const schemaCheckTimeout = 10 * time.Second
+
+// ownerMaxOpenConns/ownerMaxIdleConns size the owner connection: it runs
+// golang-migrate and nothing else, then is closed (node-service's owner budget).
+const (
+	ownerMaxOpenConns = 2
+	ownerMaxIdleConns = 1
+)
+
+// MigrateDatabase opens the OWNER connection (config.MigrateDatabaseDSN), applies
+// the embedded migrations and closes it. It is the only path that migrates:
+// boot with migrations enabled and the `runtime-service migrate` command both
+// call it. Returns the schema version now current and whether anything was
+// applied.
+func MigrateDatabase(cfg *config.Config) (version uint, applied bool, err error) {
+	if err := cfg.ValidateMigrateCredentials(); err != nil {
+		return 0, false, err
+	}
+	ownerDB, err := postgres.NewDB(postgres.Config{
+		DSN:          cfg.MigrateDatabaseDSN(),
+		MaxOpenConns: ownerMaxOpenConns,
+		MaxIdleConns: ownerMaxIdleConns,
+		LogLevel:     cfg.Database.Postgres.LogLevel,
+	})
+	if err != nil {
+		return 0, false, fmt.Errorf("open owner connection: %w", err)
+	}
+	// RunMigrations closes ownerDB on every return path.
+	return postgres.RunMigrations(ownerDB)
 }
 
 // initInfrastructure initializes infrastructure providers
@@ -1695,12 +1728,8 @@ func (c *Container) initRepositories() {
 	// CS11 — shared time-travel recorder wired into write-path repos
 	// so TestRun / HermeticBuild / HermeticBuildStep / VMSnapshot
 	// writes land in the platform entity_snapshots table.
+	// entity_snapshots is created by migration 0028, never at boot (D-490).
 	recorder := timetravel.NewGORMRecorder(c.DB, "runtime-service", nil)
-	// Ensure the schema exists. Failures are logged but never fatal;
-	// the platform-wide cross-service recorder is a best-effort path.
-	if err := timetravel.AutoMigrate(c.DB); err != nil {
-		log.Printf("[timetravel] AutoMigrate failed: %v", err)
-	}
 
 	c.ExecutionRepo = postgres.NewExecutionRepository(c.DB)
 	c.VMRepo = postgres.NewMicroVMRepository(c.DB)

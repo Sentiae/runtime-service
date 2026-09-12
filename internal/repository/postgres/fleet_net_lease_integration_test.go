@@ -67,8 +67,7 @@ func startLeasePG(t *testing.T) (*gorm.DB, *migrate.Migrate) {
 	var db *gorm.DB
 	for i := 0; i < 30; i++ {
 		db, err = postgres.NewDB(postgres.Config{
-			Host: host, Port: p, User: "postgres", Password: "postgres",
-			Database: "runtime", SSLMode: "disable",
+			DSN: fmt.Sprintf("host=%s port=%d user=postgres password=postgres dbname=runtime sslmode=disable", host, p),
 		})
 		if err == nil {
 			break

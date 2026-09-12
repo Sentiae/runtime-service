@@ -23,6 +23,7 @@ func TestTelemetryEnabledBinding(t *testing.T) {
 			// This test is about the telemetry binding, so it supplies the
 			// registry rather than exercising that refusal.
 			t.Setenv("APP_NODE_RUNNER_REGISTRY_HOST", "10.0.10.20:8443")
+			withOwnerCredentials(t)
 			if tt.env != "" {
 				t.Setenv("APP_TELEMETRY_ENABLED", tt.env)
 			}

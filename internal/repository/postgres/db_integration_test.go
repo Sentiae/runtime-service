@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,8 +88,7 @@ func startEchoPG(t *testing.T) (*gorm.DB, *syncBuf) {
 	var db *gorm.DB
 	for i := 0; i < 30; i++ {
 		db, err = postgres.NewDB(postgres.Config{
-			Host: host, Port: p, User: "postgres", Password: "postgres",
-			Database: "runtime", SSLMode: "disable",
+			DSN:      fmt.Sprintf("host=%s port=%d user=postgres password=postgres dbname=runtime sslmode=disable", host, p),
 			LogLevel: "info", LogWriter: sink,
 		})
 		if err == nil {

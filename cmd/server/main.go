@@ -56,7 +56,34 @@ func maybeRegisterKafkaSchemas() {
 	log.Printf("schema-registry bootstrap: registered %d schemas", result.Registered)
 }
 
+// migrateCommand is the migrate-only mode (D-490): `runtime-service migrate`
+// opens the OWNER connection against the configured database, applies the
+// embedded migrations, closes it and exits 0 — no server, no container, no
+// background work. It is how the control plane migrates the fleet ledger
+// (runtime_service_fc) before a fleet host, which never migrates and never
+// holds the owner credential, boots against it.
+const migrateCommand = "migrate"
+
+// runMigrate is the migrate-only mode. Any failure exits non-zero.
+func runMigrate() {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("migrate: failed to load config: %v", err)
+	}
+	version, applied, err := di.MigrateDatabase(cfg)
+	if err != nil {
+		log.Fatalf("migrate: %v", err)
+	}
+	log.Printf("migrate: database %s is at schema version %d (applied=%t); owner connection closed",
+		cfg.Database.Postgres.Database, version, applied)
+}
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == migrateCommand {
+		runMigrate()
+		return
+	}
+
 	stopPprof := pkdebug.StartPprofServer(context.Background(), "RUNTIME_DEBUG_PPROF")
 	defer func() { _ = stopPprof() }()
 	go maybeRegisterKafkaSchemas()

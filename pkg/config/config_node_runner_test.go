@@ -41,6 +41,7 @@ func TestNodeRunnerConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			withOwnerCredentials(t)
 			if tt.executorType != "" {
 				t.Setenv("APP_EXECUTOR_TYPE", tt.executorType)
 			}
@@ -74,6 +75,7 @@ func TestNodeRunnerConfig(t *testing.T) {
 //
 // Control: change any default in Load ⇒ its row fails.
 func TestNodeRunnerConfig_Defaults(t *testing.T) {
+	withOwnerCredentials(t)
 	t.Setenv("APP_NODE_RUNNER_REGISTRY_HOST", nodeRunnerHost)
 
 	cfg, err := Load()
@@ -116,6 +118,7 @@ func TestNodeRunnerConfig_Defaults(t *testing.T) {
 // itself: rename `tunnel_max` to `tunnelmax` ⇒ the env name no longer maps and
 // the row fails with `tunnel_max = 0s`.
 func TestNodeRunnerConfig_EnvBindings(t *testing.T) {
+	withOwnerCredentials(t)
 	t.Setenv("APP_NODE_RUNNER_REGISTRY_HOST", "registry.example:8443")
 	t.Setenv("APP_NODE_RUNNER_REGISTRY_USER", "puller")
 	t.Setenv("APP_NODE_RUNNER_RUNS_VOLUME", "vol")
